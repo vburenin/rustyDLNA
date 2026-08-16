@@ -1,13 +1,19 @@
-# Example config. Copy to rusty-dlna.local.toml for host paths (gitignored).
+# Example container rustyDLNA config. Baked into the image at
+# /etc/rusty-dlna.toml. Bind-mount rusty-dlna.live.toml (gitignored
+# house file) from compose if you need a private uuid, advertise_ip,
+# or remap table.
 
 friendly_name = "rustyDLNA"
-# network_interface = ["eth0"]
-# media_dir = ["/media/video"]
-# exclude_dir = ["incomplete"]
+media_dir = ["V,/storage/video"]
+exclude_dir = ["incomplete"]
+root_container = "V"
+listen_ip = "0.0.0.0"
+cache_dir = "/var/cache/rusty-dlna"
+db_dir = "/var/cache/rusty-dlna"
 
 [transcode]
 enable = false
-encoder = "hevc_nvenc"
+encoder = "libx264"
 max_jobs = 2
 
 # Ad-hoc codec remaps, **per software**. Unset fields are wildcards.

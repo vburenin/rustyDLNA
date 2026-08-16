@@ -160,11 +160,32 @@ impl MediaTypes {
             image: true,
         }
     }
+    pub fn none() -> Self {
+        Self {
+            video: false,
+            audio: false,
+            image: false,
+        }
+    }
     pub fn video_only() -> Self {
         Self {
             video: true,
             audio: false,
             image: false,
+        }
+    }
+    pub fn audio_only() -> Self {
+        Self {
+            video: false,
+            audio: true,
+            image: false,
+        }
+    }
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            video: self.video || other.video,
+            audio: self.audio || other.audio,
+            image: self.image || other.image,
         }
     }
     pub fn allows(&self, name: &str) -> bool {
@@ -200,6 +221,29 @@ pub fn parse_media_dir(spec: &str) -> (MediaTypes, PathBuf) {
         }
     }
     (MediaTypes::all(), PathBuf::from(spec))
+}
+
+/// Combine MiniDLNA `media_dir=` specs. Each prefix is parsed; the
+/// returned `MediaTypes` is the **union** so a later `A,` cannot wipe an
+/// earlier `V,`. Empty list → all types (AVP), no dirs.
+pub fn collect_media_dirs<I, S>(specs: I) -> (Vec<PathBuf>, MediaTypes)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut dirs = Vec::new();
+    let mut types = MediaTypes::none();
+    let mut any = false;
+    for spec in specs {
+        let (t, p) = parse_media_dir(spec.as_ref());
+        types = types.union(t);
+        dirs.push(p);
+        any = true;
+    }
+    if !any {
+        types = MediaTypes::all();
+    }
+    (dirs, types)
 }
 
 /// MiniDLNA `GetVideoMetadata`: reject non-media. Strong container magic
@@ -938,6 +982,118 @@ pub fn path_is_live_file(path: &Path) -> bool {
     std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
 }
 
+/// If `stored` is missing, rebase it onto a configured media root.
+///
+/// Host scans often persist the realpath (`/storage/z2-5x20tb/video/…`)
+/// while the container only mounts that tree at `/storage/video`. Match
+/// the media-root directory name in `stored` and try the remainder under
+/// each configured root.
+pub fn rebase_media_path(stored: &Path, roots: &[PathBuf]) -> PathBuf {
+    if stored.as_os_str().is_empty() {
+        return stored.to_path_buf();
+    }
+    if path_is_live_file(stored) {
+        return stored.to_path_buf();
+    }
+    for root in roots {
+        let Some(key) = root.file_name() else {
+            continue;
+        };
+        if let Some(rel) = rel_after_component(stored, key) {
+            let cand = root.join(&rel);
+            if path_is_live_file(&cand) {
+                return cand;
+            }
+        }
+    }
+    stored.to_path_buf()
+}
+
+/// Relative path after the media-root directory name (`video` in
+/// `/storage/video` and `/storage/z2-5x20tb/video`).
+pub fn media_rel_key(path: &Path, roots: &[PathBuf]) -> String {
+    for root in roots {
+        if let Some(key) = root.file_name() {
+            if let Some(rel) = rel_after_component(path, key) {
+                return rel.to_string_lossy().into_owned();
+            }
+        }
+        if let Ok(rel) = path.strip_prefix(root) {
+            return rel.to_string_lossy().into_owned();
+        }
+    }
+    path.to_string_lossy().into_owned()
+}
+
+fn rel_after_component(path: &Path, key: &std::ffi::OsStr) -> Option<PathBuf> {
+    let comps: Vec<_> = path.components().collect();
+    let i = comps.iter().position(|c| c.as_os_str() == key)?;
+    let mut rel = PathBuf::new();
+    for c in &comps[i + 1..] {
+        rel.push(c.as_os_str());
+    }
+    Some(rel)
+}
+
+fn paths_are_same_media(stored: &str, event: &Path, roots: &[PathBuf]) -> bool {
+    if Path::new(stored) == event {
+        return true;
+    }
+    let key = media_rel_key(event, roots);
+    !key.is_empty() && media_rel_key(Path::new(stored), roots) == key
+}
+
+fn path_is_under_watched(stored: &str, dir: &Path, roots: &[PathBuf]) -> bool {
+    let stored_p = Path::new(stored);
+    if stored_p == dir || stored_p.starts_with(dir) {
+        return true;
+    }
+    let drel = media_rel_key(dir, roots);
+    if drel.is_empty() {
+        return false;
+    }
+    let frel = media_rel_key(stored_p, roots);
+    frel == drel || frel.starts_with(&format!("{drel}/"))
+}
+
+fn open_library(cfg: &ScanConfig) -> Option<LibraryDb> {
+    match &cfg.db_path {
+        Some(p) => LibraryDb::open(p).ok(),
+        None => None,
+    }
+}
+
+/// Drop DETAILS/OBJECTS for `path`, matching host-realpath vs container-mount
+/// prefixes (`/storage/z2-…/video/…` vs `/storage/video/…`).
+pub fn forget_path(cfg: &ScanConfig, path: &Path) -> usize {
+    forget_matching(cfg, path, false)
+}
+
+/// Drop every DETAILS row under `dir`, using the same prefix-alias rules.
+pub fn forget_tree(cfg: &ScanConfig, dir: &Path) -> usize {
+    forget_matching(cfg, dir, true)
+}
+
+fn forget_matching(cfg: &ScanConfig, path: &Path, tree: bool) -> usize {
+    let _write = library_write_guard();
+    let Some(db) = open_library(cfg) else {
+        return 0;
+    };
+    let rows = db.all_detail_stats().unwrap_or_default();
+    let mut n = 0usize;
+    for (p, _, _, _) in rows {
+        let hit = if tree {
+            path_is_under_watched(&p, path, &cfg.media_dirs)
+        } else {
+            paths_are_same_media(&p, path, &cfg.media_dirs)
+        };
+        if hit {
+            n += db.remove_path_and_symlink_aliases(&p).unwrap_or(0);
+        }
+    }
+    n
+}
+
 pub fn path_is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
@@ -1137,55 +1293,99 @@ fn scan_inner(cfg: &ScanConfig, rebuild: bool) -> Catalog {
     let _ = db.commit();
     let _ = db.prune_missing_files();
     let _ = db.prune_excluded_paths(cfg);
+    let _ = db.prune_empty_folders();
     let n = db.detail_count().unwrap_or(0);
     eprintln!("rusty-dlna scan: {n} DETAILS rows in {}", db.path.display());
     db.load_catalog().unwrap_or_else(|_| Catalog::new())
 }
 
+pub(crate) fn library_write_guard() -> std::sync::MutexGuard<'static, ()> {
+    static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    M.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// List files on disk (skip `exclude_dir` / junk), compare to DETAILS, apply
 /// only adds/changes/deletes. Does not wipe OBJECTS or rewrite unchanged rows.
 pub fn monitor(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta) {
+    let _write = library_write_guard();
     let db = match &cfg.db_path {
         Some(p) => LibraryDb::open(p).expect("open files.db"),
         None => LibraryDb::open_memory().expect("open memory db"),
     };
     let listed = list_media_files(cfg);
     let db_rows = db.all_detail_stats().unwrap_or_default();
-    let mut in_db: HashMap<String, (i64, i64, i64)> = HashMap::new();
-    for (p, id, sz, ts) in db_rows {
-        in_db.insert(p, (id, sz, ts));
+    let mut listed_by_rel: HashMap<String, &ListedFile> = HashMap::new();
+    for (p, st) in &listed {
+        listed_by_rel.insert(media_rel_key(Path::new(p), &cfg.media_dirs), st);
+    }
+    let mut in_db_by_rel: HashMap<String, Vec<(String, i64, i64, i64)>> = HashMap::new();
+    for (p, id, sz, ts) in &db_rows {
+        in_db_by_rel
+            .entry(media_rel_key(Path::new(p), &cfg.media_dirs))
+            .or_default()
+            .push((p.clone(), *id, *sz, *ts));
     }
     let _ = db.seed_virtual_containers();
     let _ = db.begin();
     let mut added = 0usize;
     let mut removed = 0usize;
     let mut changed = 0usize;
-    for path in in_db.keys() {
+    for (path, _, _, _) in &db_rows {
         let name = Path::new(path)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
-        if path_excluded(Path::new(path), name, cfg) || !listed.contains_key(path) {
+        let key = media_rel_key(Path::new(path), &cfg.media_dirs);
+        if path_excluded(Path::new(path), name, cfg) || !listed_by_rel.contains_key(&key) {
             if db.remove_path_and_symlink_aliases(path).unwrap_or(0) > 0 {
                 removed += 1;
             }
         }
     }
-    for (path_s, st) in &listed {
-        match in_db.get(path_s) {
-            Some((id, sz, ts)) if *sz == st.size && *ts == st.mtime => {
-                // DETAILS survived a killed rewrite that wiped OBJECTS.
-                if !db.detail_has_object(*id) {
-                    if let Some(folder_id) = ensure_folder_chain(&db, cfg, &st.path) {
-                        if index_one_file(&db, cfg, &st.path, &folder_id) {
-                            added += 1;
-                        }
-                    }
-                }
+    // Same on-disk file stored under the host realpath and the container
+    // mount is one library item. Keep the live listed path, drop extras.
+    for (key, rows) in &in_db_by_rel {
+        if rows.len() < 2 || !listed_by_rel.contains_key(key) {
+            continue;
+        }
+        let listed_path = listed_by_rel[key].path.to_string_lossy();
+        let keep = rows
+            .iter()
+            .find(|(p, _, _, _)| p.as_str() == listed_path)
+            .or_else(|| {
+                rows.iter()
+                    .find(|(p, _, _, _)| path_is_live_file(Path::new(p)))
+            })
+            .map(|(p, _, _, _)| p.clone());
+        let Some(keep) = keep else {
+            continue;
+        };
+        for (p, id, _, _) in rows {
+            if p == &keep {
+                continue;
             }
-            Some((id, _, _)) => {
+            if db.remove_detail_id(*id).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    for (path_s, st) in &listed {
+        let key = media_rel_key(Path::new(path_s), &cfg.media_dirs);
+        let existing = in_db_by_rel.get(&key).and_then(|v| {
+            v.iter()
+                .find(|(p, _, _, _)| p == path_s)
+                .or_else(|| v.first())
+        });
+        match existing {
+            Some((_, id, sz, ts)) if *sz == st.size && *ts == st.mtime => {
+                // Leave unchanged rows alone. Re-running attach_objects
+                // on a genre-alias path canonicalizes into the original
+                // folder and steals that title's OBJECTS.
+                let _ = id;
+            }
+            Some((db_path, id, _, _)) => {
                 if !file_is_viable(&st.path) {
-                    let _ = db.remove_path_and_symlink_aliases(path_s);
+                    let _ = db.remove_path_and_symlink_aliases(db_path);
                     removed += 1;
                 } else {
                     let _ = db.update_detail_stat(*id, st.size, st.mtime);
@@ -1193,6 +1393,13 @@ pub fn monitor(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta) {
                 }
             }
             None => {
+                // Rel-key miss is not "new": the row may already exist at
+                // this exact path (genre aliases) or under another prefix.
+                if let Some((_, sz, ts)) = db.find_detail_by_path(path_s).ok().flatten() {
+                    if sz == st.size && ts == st.mtime {
+                        continue;
+                    }
+                }
                 if let Some(folder_id) = ensure_folder_chain(&db, cfg, &st.path) {
                     if index_one_file(&db, cfg, &st.path, &folder_id) {
                         added += 1;
@@ -1202,6 +1409,7 @@ pub fn monitor(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta) {
         }
     }
     let _ = db.commit();
+    removed += db.prune_empty_folders().unwrap_or(0);
     let delta = ScanDelta {
         added,
         removed,
@@ -1319,8 +1527,16 @@ pub(crate) fn ensure_folder_chain(db: &LibraryDb, cfg: &ScanConfig, file: &Path)
     let parent = file.parent()?;
     for root in &cfg.media_dirs {
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-        let parent_c = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
-        let Ok(rel) = parent_c.strip_prefix(&root) else {
+        // Prefer the walked path so a symlink directory tree (genres/…)
+        // keeps its own folders. Canonicalize only as a fallback.
+        let rel: PathBuf = if let Ok(r) = parent.strip_prefix(&root) {
+            r.to_path_buf()
+        } else if let Ok(canon) = std::fs::canonicalize(parent) {
+            match canon.strip_prefix(&root) {
+                Ok(r) => r.to_path_buf(),
+                Err(_) => continue,
+            }
+        } else {
             continue;
         };
         let root_title = root
@@ -1338,7 +1554,7 @@ pub(crate) fn ensure_folder_chain(db: &LibraryDb, cfg: &ScanConfig, file: &Path)
             }
             if is_junk_dir(&name)
                 || is_sample_or_trailer_dir(&name)
-                || path_excluded(&parent_c, &name, cfg)
+                || path_excluded(parent, &name, cfg)
             {
                 return None;
             }
@@ -1383,7 +1599,19 @@ pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, fold
 
     // MiniDLNA clone_detail_for_path: symlink/hardlink of a known inode
     // reuses TITLE/DATE/MIME/DLNA_PN — no GetVideoMetadata / ffprobe.
-    if let Ok(Some((src, src_ts))) = db.find_inode_source(dev as i64, ino as i64) {
+    if let Ok(Some((src, src_ts, src_path))) = db.find_inode_source(dev as i64, ino as i64) {
+        let src_key = media_rel_key(Path::new(&src_path), &cfg.media_dirs);
+        let new_key = media_rel_key(path, &cfg.media_dirs);
+        // Host realpath vs container mount of the same file — not a new alias.
+        if !src_key.is_empty() && src_key == new_key {
+            if let Some((_, old_sz, old_ts)) = db.find_detail_by_path(&src_path).ok().flatten() {
+                if old_sz != size || old_ts != mtime {
+                    let _ = db.update_detail_stat(src, size, mtime);
+                }
+            }
+            attach_objects(db, folder_id, src, &title, class, dev, ino);
+            return true;
+        }
         if src_ts >= mtime {
             if let Ok(id) =
                 db.clone_detail_for_path(src, &path_s, size, mtime, dev as i64, ino as i64)
@@ -1427,6 +1655,17 @@ pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, fold
     true
 }
 
+fn allocate_child_id(db: &LibraryDb, parent_id: &str) -> String {
+    let mut n = db.next_child_seq(parent_id).unwrap_or(1);
+    loop {
+        let id = format!("{parent_id}${n:X}");
+        if !db.object_exists(&id) {
+            return id;
+        }
+        n += 1;
+    }
+}
+
 fn attach_objects(
     db: &LibraryDb,
     folder_id: &str,
@@ -1436,10 +1675,15 @@ fn attach_objects(
     dev: u64,
     ino: u64,
 ) {
-    let object_id = db.find_child_object(folder_id, title).unwrap_or_else(|| {
-        let n = db.next_child_seq(folder_id).unwrap_or(1);
-        format!("{folder_id}${n:X}")
-    });
+    let object_id = match db.find_child_object(folder_id, title) {
+        Some(oid) => match db.object_detail_id(&oid) {
+            None => oid,
+            Some(did) if did == detail => oid,
+            // Same title, different file — never steal the other item's row.
+            Some(_) => allocate_child_id(db, folder_id),
+        },
+        None => allocate_child_id(db, folder_id),
+    };
     let _ = db.upsert_object(&object_id, folder_id, class, Some(detail), title, None);
     if class.contains("video") {
         if !db
@@ -1467,6 +1711,43 @@ fn attach_objects(
         let iid = format!("{IMAGE_ALL_ID}${detail:X}");
         let _ = db.upsert_object(&iid, IMAGE_ALL_ID, class, Some(detail), title, Some(&object_id));
     }
+}
+
+/// Rebuild OBJECTS from live DETAILS paths without re-probing files.
+/// Fixes folder-id reuse that left children under the wrong title
+/// (e.g. a new show folder inheriting a deleted sibling's items).
+pub fn rebuild_objects(cfg: &ScanConfig) -> Catalog {
+    let db = match &cfg.db_path {
+        Some(p) => LibraryDb::open(p).expect("open files.db"),
+        None => return Catalog::new(),
+    };
+    let rows = db.all_detail_stats().unwrap_or_default();
+    let _ = db.clear_objects();
+    let _ = db.seed_virtual_containers();
+    let _ = db.begin();
+    let mut n = 0usize;
+    for (path, _, _, _) in &rows {
+        let p = Path::new(path);
+        if !path_is_live_file(p) {
+            continue;
+        }
+        let name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if path_excluded(p, name, cfg) {
+            continue;
+        }
+        if let Some(folder) = ensure_folder_chain(&db, cfg, p) {
+            if index_one_file(&db, cfg, p, &folder) {
+                n += 1;
+            }
+        }
+    }
+    let _ = db.commit();
+    let _ = db.prune_empty_folders();
+    eprintln!("rusty-dlna rebuild-objects: {n} files");
+    db.load_catalog().unwrap_or_else(|_| Catalog::new())
 }
 
 /// Re-walk the tree into SQLite, drop missing/dangling paths (and their
@@ -1525,8 +1806,7 @@ fn folder_object_id(db: &LibraryDb, parent_id: &str, title: &str) -> String {
     if let Some(id) = db.find_child_object(parent_id, title) {
         return id;
     }
-    let n = db.next_child_seq(parent_id).unwrap_or(1);
-    let id = format!("{parent_id}${n:X}");
+    let id = allocate_child_id(db, parent_id);
     let _ = db.upsert_object(&id, parent_id, "container.storageFolder", None, title, None);
     id
 }
@@ -1860,6 +2140,56 @@ mod tests {
     }
 
     #[test]
+    fn removing_old_path_keeps_live_symlink_aliases() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-live-alias-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("old")).unwrap();
+        std::fs::create_dir_all(tmp.join("action")).unwrap();
+        std::fs::create_dir_all(tmp.join("genres/action")).unwrap();
+        write_fake_mkv(&tmp.join("old/film.mkv"), 64);
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let _ = scan(&cfg);
+        std::fs::rename(tmp.join("old/film.mkv"), tmp.join("action/film.mkv")).unwrap();
+        std::os::unix::fs::symlink(
+            tmp.join("action/film.mkv"),
+            tmp.join("genres/action/film.mkv"),
+        )
+        .unwrap();
+        let _ = monitor(&cfg);
+        let n = forget_path(&cfg, &tmp.join("old/film.mkv"));
+        let _ = n;
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        let cat = db.load_catalog().unwrap();
+        assert!(
+            cat.items
+                .values()
+                .any(|i| i.path.ends_with("action/film.mkv")),
+            "moved file must stay"
+        );
+        assert!(
+            cat.items
+                .values()
+                .any(|i| i.path.to_string_lossy().contains("genres/action/film.mkv")),
+            "live genre symlink must survive deleting the old path"
+        );
+        assert!(
+            !cat.items
+                .values()
+                .any(|i| i.path.to_string_lossy().contains("/old/")),
+            "old path must be gone"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn rescan_detects_new_and_removed() {
         let tmp = std::env::temp_dir().join(format!(
             "rusty-dlna-rescan-{}",
@@ -2117,5 +2447,410 @@ mod tests {
         let (t, p) = parse_media_dir("V,/storage/video");
         assert_eq!(t, MediaTypes::video_only());
         assert_eq!(p, PathBuf::from("/storage/video"));
+    }
+
+    #[test]
+    fn rebase_media_path_maps_host_realpath_onto_media_root() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-rebase-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("storage/video");
+        let rel = PathBuf::from("shows/clip.mkv");
+        write_fake_mkv(&root.join(&rel), 64);
+        let stored = tmp.join("storage/z2-5x20tb/video").join(&rel);
+        assert!(!stored.exists(), "stored realpath must be absent");
+        let got = rebase_media_path(&stored, &[root.clone()]);
+        assert_eq!(got, root.join(&rel));
+        assert!(path_is_live_file(&got));
+        let live = root.join(&rel);
+        assert_eq!(rebase_media_path(&live, &[root.clone()]), live);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn collect_media_dirs_unions_v_then_a() {
+        let (dirs, t) = collect_media_dirs(["V,/storage/video", "A,/storage/audio"]);
+        assert_eq!(dirs.len(), 2);
+        assert!(t.video, "later A, must not wipe V: {t:?}");
+        assert!(t.audio, "A, must be kept: {t:?}");
+        assert!(!t.image);
+        assert_eq!(dirs[0], PathBuf::from("/storage/video"));
+        assert_eq!(dirs[1], PathBuf::from("/storage/audio"));
+    }
+
+    #[test]
+    fn media_rel_key_equates_host_realpath_and_mount() {
+        let root = PathBuf::from("/storage/video");
+        assert_eq!(
+            media_rel_key(Path::new("/storage/video/Show/ep.mkv"), &[root.clone()]),
+            "Show/ep.mkv"
+        );
+        assert_eq!(
+            media_rel_key(
+                Path::new("/storage/z2-5x20tb/video/Show/ep.mkv"),
+                &[root.clone()]
+            ),
+            "Show/ep.mkv"
+        );
+        assert!(paths_are_same_media(
+            "/storage/z2-5x20tb/video/Show/ep.mkv",
+            Path::new("/storage/video/Show/ep.mkv"),
+            &[root.clone()]
+        ));
+        assert!(path_is_under_watched(
+            "/storage/z2-5x20tb/video/Show/S01/ep.mkv",
+            Path::new("/storage/video/Show"),
+            &[root]
+        ));
+    }
+
+    #[test]
+    fn monitor_drops_moved_file_and_empty_folder() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-move-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("old")).unwrap();
+        std::fs::create_dir_all(tmp.join("new")).unwrap();
+        write_fake_mkv(&tmp.join("old/episode.mkv"), 64);
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let c1 = scan(&cfg);
+        assert!(c1.items.values().any(|i| i.path.ends_with("old/episode.mkv")));
+        std::fs::rename(tmp.join("old/episode.mkv"), tmp.join("new/episode.mkv")).unwrap();
+        let (c2, d) = rescan(&cfg, &c1);
+        assert!(d.removed >= 1, "move must drop the source: {d:?}");
+        assert!(d.added >= 1, "move must index the dest: {d:?}");
+        assert!(
+            !c2.items
+                .values()
+                .any(|i| i.path.to_string_lossy().contains("/old/")),
+            "source path must leave the catalog"
+        );
+        assert!(c2.items.values().any(|i| i.path.ends_with("new/episode.mkv")));
+        assert!(
+            !c2.containers.values().any(|c| c.title == "old"),
+            "empty source folder must be pruned"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn forget_path_matches_host_realpath_prefix() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-forget-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("mnt/video");
+        std::fs::create_dir_all(root.join("Show")).unwrap();
+        write_fake_mkv(&root.join("Show/ep.mkv"), 64);
+        let cfg = ScanConfig {
+            media_dirs: vec![root.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let _ = scan(&cfg);
+        let dbp = cfg.db_path.as_ref().unwrap();
+        {
+            let conn = rusqlite::Connection::open(dbp).unwrap();
+            conn.execute(
+                "UPDATE DETAILS SET PATH = ?1 WHERE PATH = ?2",
+                rusqlite::params![
+                    tmp.join("host/z2/video/Show/ep.mkv")
+                        .to_string_lossy()
+                        .as_ref(),
+                    root.join("Show/ep.mkv").to_string_lossy().as_ref(),
+                ],
+            )
+            .unwrap();
+        }
+        let n = forget_path(&cfg, &root.join("Show/ep.mkv"));
+        assert!(n >= 1, "inotify mount path must delete the realpath row");
+        let db = LibraryDb::open(dbp).unwrap();
+        let left = db
+            .all_detail_stats()
+            .unwrap()
+            .into_iter()
+            .filter(|(p, _, _, _)| p.ends_with("ep.mkv"))
+            .count();
+        assert_eq!(left, 0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn monitor_does_not_rewrite_equivalent_realpath_prefix() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-equiv-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("mnt/video");
+        std::fs::create_dir_all(root.join("Show")).unwrap();
+        write_fake_mkv(&root.join("Show/ep.mkv"), 64);
+        let cfg = ScanConfig {
+            media_dirs: vec![root.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let _ = scan(&cfg);
+        {
+            let conn = rusqlite::Connection::open(cfg.db_path.as_ref().unwrap()).unwrap();
+            conn.execute(
+                "UPDATE DETAILS SET PATH = ?1 WHERE PATH = ?2",
+                rusqlite::params![
+                    tmp.join("host/z2/video/Show/ep.mkv")
+                        .to_string_lossy()
+                        .as_ref(),
+                    root.join("Show/ep.mkv").to_string_lossy().as_ref(),
+                ],
+            )
+            .unwrap();
+        }
+        let (none, d) = monitor(&cfg);
+        assert!(
+            none.is_none(),
+            "same file under host realpath must not be rewritten: {d:?}"
+        );
+        assert_eq!(d, ScanDelta::default());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn next_child_seq_skips_gaps_so_upsert_cannot_rename_a_folder() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-seq-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dbp = tmp.join("files.db");
+        let db = LibraryDb::open(&dbp).unwrap();
+        db.seed_virtual_containers().unwrap();
+        db.upsert_object("64$1", "64", "container.storageFolder", None, "video", None)
+            .unwrap();
+        db.upsert_object("64$1$1", "64$1", "container.storageFolder", None, "keep", None)
+            .unwrap();
+        db.upsert_object("64$1$2", "64$1", "container.storageFolder", None, "mid", None)
+            .unwrap();
+        db.upsert_object(
+            "64$1$3",
+            "64$1",
+            "container.storageFolder",
+            None,
+            "sport",
+            None,
+        )
+        .unwrap();
+        drop(db);
+        // Delete $1 only. count(*)+1 == 3, which is still "sport".
+        {
+            let conn = rusqlite::Connection::open(&dbp).unwrap();
+            conn.execute("DELETE FROM OBJECTS WHERE OBJECT_ID = '64$1$1'", [])
+                .unwrap();
+        }
+        let db = LibraryDb::open(&dbp).unwrap();
+        let next = db.next_child_seq("64$1").unwrap();
+        assert_eq!(next, 4, "must be max(2,3)+1, not count(*)+1=3");
+        assert!(db.object_exists("64$1$3"));
+        let name = db.object_name("64$1$3").unwrap();
+        assert_eq!(name, "sport");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn new_folder_after_sibling_delete_does_not_inherit_old_children() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-id-reuse-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("keep")).unwrap();
+        std::fs::create_dir_all(tmp.join("mid")).unwrap();
+        std::fs::create_dir_all(tmp.join("sport")).unwrap();
+        write_fake_mkv(&tmp.join("keep/keep.mkv"), 64);
+        write_fake_mkv(&tmp.join("mid/mid.mkv"), 64);
+        write_fake_mkv(&tmp.join("sport/game.mkv"), 64);
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let c1 = scan(&cfg);
+        let sport = c1
+            .containers
+            .values()
+            .find(|c| c.title == "sport" && c.object_id.starts_with("64"))
+            .expect("sport folder")
+            .clone();
+        assert!(
+            c1.items
+                .values()
+                .any(|i| i.parent_id == sport.object_id && i.title == "game")
+        );
+
+        std::fs::remove_file(tmp.join("keep/keep.mkv")).unwrap();
+        let _ = std::fs::remove_dir(tmp.join("keep"));
+        let (c2, _) = rescan(&cfg, &c1);
+        let sport2 = c2
+            .containers
+            .values()
+            .find(|c| c.title == "sport" && c.object_id.starts_with("64"))
+            .expect("sport survives")
+            .clone();
+        assert_eq!(sport2.object_id, sport.object_id);
+
+        std::fs::create_dir_all(
+            tmp.join("Fallout.S01.Hybrid.2160p.Remux.DoVi.HDR10Plus.H"),
+        )
+        .unwrap();
+        write_fake_mkv(
+            &tmp.join("Fallout.S01.Hybrid.2160p.Remux.DoVi.HDR10Plus.H/ep.mkv"),
+            64,
+        );
+        let (c3, d) = rescan(&cfg, &c2);
+        assert!(d.added >= 1, "Fallout episode must be added: {d:?}");
+
+        let fallout = c3
+            .containers
+            .values()
+            .find(|c| c.title.starts_with("Fallout.S01") && c.object_id.starts_with("64"))
+            .expect("Fallout folder");
+        assert_ne!(
+            fallout.object_id, sport2.object_id,
+            "Fallout must get a new id, not sport's"
+        );
+        let fallout_titles: Vec<_> = c3
+            .items
+            .values()
+            .filter(|i| i.parent_id == fallout.object_id)
+            .map(|i| i.title.as_str())
+            .collect();
+        assert!(
+            fallout_titles.iter().any(|t| *t == "ep"),
+            "Fallout children={fallout_titles:?}"
+        );
+        assert!(
+            !fallout_titles.iter().any(|t| *t == "game"),
+            "sport file leaked into Fallout: {fallout_titles:?}"
+        );
+        let sport3 = c3
+            .containers
+            .values()
+            .find(|c| c.title == "sport" && c.object_id.starts_with("64"))
+            .expect("sport must keep its name");
+        assert!(
+            c3.items
+                .values()
+                .any(|i| i.parent_id == sport3.object_id && i.title == "game"),
+            "sport/game.mkv must stay under sport"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn monitor_second_pass_does_not_readd_existing_files() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-noop-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("action")).unwrap();
+        std::fs::create_dir_all(tmp.join("genres/crime")).unwrap();
+        write_fake_mkv(&tmp.join("action/film.mkv"), 64);
+        std::os::unix::fs::symlink(
+            tmp.join("action/film.mkv"),
+            tmp.join("genres/crime/film.mkv"),
+        )
+        .unwrap();
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let _ = scan(&cfg);
+        let (first, d1) = monitor(&cfg);
+        let _ = first;
+        let _ = d1;
+        let (second, d2) = monitor(&cfg);
+        assert!(
+            second.is_none(),
+            "unchanged library must not rewrite: {d2:?}"
+        );
+        assert_eq!(d2.added, 0, "must not count already-indexed files as adds");
+        assert_eq!(d2.removed, 0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn symlink_dir_alias_does_not_steal_original_object() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-steal-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("action/Now You See Me")).unwrap();
+        std::fs::create_dir_all(tmp.join("genres/action")).unwrap();
+        write_fake_mkv(
+            &tmp.join("action/Now You See Me/film.mkv"),
+            64,
+        );
+        std::os::unix::fs::symlink(
+            tmp.join("action/Now You See Me"),
+            tmp.join("genres/action/Now You See Me"),
+        )
+        .unwrap();
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let c1 = scan(&cfg);
+        let orig_path = tmp.join("action/Now You See Me/film.mkv");
+        let orig = c1
+            .items
+            .values()
+            .find(|i| i.path == orig_path && i.ref_id.is_none())
+            .expect("original")
+            .clone();
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        let alias = tmp.join("genres/action/Now You See Me/film.mkv");
+        let folder = ensure_folder_chain(&db, &cfg, &alias).expect("genre folder chain");
+        assert!(
+            folder.contains('$'),
+            "genre path must get its own folder id: {folder}"
+        );
+        assert_ne!(
+            folder, orig.parent_id,
+            "symlink-dir walk must not collapse onto the original folder"
+        );
+        assert!(index_one_file(&db, &cfg, &alias, &folder));
+        let c2 = db.load_catalog().unwrap();
+        let still = c2.items.get(&orig.object_id).expect("original object kept");
+        assert_eq!(
+            still.detail_id, orig.detail_id,
+            "alias must not steal the original OBJECTS.DETAIL_ID"
+        );
+        assert_eq!(still.parent_id, orig.parent_id);
+        assert!(
+            c2.items.values().any(|i| {
+                i.path.ends_with("genres/action/Now You See Me/film.mkv")
+                    && i.parent_id == folder
+            }),
+            "alias should live under the genre folder"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -1,0 +1,13 @@
+# Copy this file to docker-compose.override.yaml and edit the host paths.
+# docker-compose.override.yaml is gitignored and merged automatically.
+services:
+  rusty-dlna:
+    environment:
+      TZ: UTC
+    volumes:
+      - /path/to/your/videos:/storage/video:ro
+      # If DETAILS.PATH used the host realpath, bind that path onto itself:
+      # - /storage/z2-5x20tb/video:/storage/z2-5x20tb/video:ro
+      - /path/to/rusty-dlna-cache:/var/cache/rusty-dlna
+      # Optional: house config (uuid, advertise_ip, remaps) instead of the image default
+      # - ./rusty-dlna.live.toml:/etc/rusty-dlna.toml:ro

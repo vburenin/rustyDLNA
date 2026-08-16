@@ -1,23 +1,21 @@
 # rustyDLNA execution checklist
 
 This is the work list. Tick items only when the **verify** command
-passed and MiniDLNA on this host is still `MiniDLNA/1.3.3-kodi` on
-`:8200`.
+passed. Phase 9 cutover is done: the live daemon is rustyDLNA on
+TCP **8200** and UDP **1900**.
 
-The live server is the Docker container `minidlna` (`network_mode: host`,
-TCP **8200**, UDP **1900** / `239.255.255.250`). rustyDLNA must not take
-those until a deliberate cutover (phase 9).
+Tests and `docker-compose.test.yaml` still use **18200** / **11900** on
+a bridge network. They must not publish 8200/1900 or use host networking.
 
 ## Isolation rules (every phase)
 
 | Rule | Why |
 |---|---|
-| Do not `docker stop` / `restart` / `rm` `minidlna` | House is watching it |
-| Do not `network_mode: host` on any rustyDLNA container | Would steal SSDP |
-| Do not publish `8200` or `1900` | Host already bound |
-| Do not name a rusty container `minidlna` | Compose / restart-all confusion |
-| Unit tests bind nothing | Current crate tests are packet/string only |
-| Future listen tests use **18200** / **11900** inside a **bridge** network | `rusty_dlna_protocol::isolation` |
+| Do not `network_mode: host` on rusty **test** containers | Would collide with live SSDP |
+| Do not publish `8200` or `1900` from test compose | Host already bound (rustyDLNA) |
+| Do not name a rusty test container `minidlna` | Compose / restart-all confusion |
+| Unit tests bind nothing | Packet/string tests; listen tests use 18200/11900 |
+| Listen tests use **18200** / **11900** inside a **bridge** network | `rusty_dlna_protocol::isolation` |
 | Host `cargo test` is allowed | It does not listen |
 | Integration / ffmpeg tests run in `docker-compose.test.yaml` | Isolated target + cargo cache volumes |
 
@@ -27,10 +25,10 @@ Prove isolation after any change that might listen:
 ./scripts/prove.sh
 ```
 
-That script snapshots `curl -sI :8200`, runs tests **in a bridge
-container with no published ports**, snapshots `:8200` again, and fails
-if the Server header is no longer MiniDLNA or if compose would use host
-networking.
+That script checks test compose is not host-network and does not publish
+8200/1900, runs tests **in a bridge container with no published ports**,
+and fails if compose isolation is broken. It does **not** require
+MiniDLNA on `:8200`.
 
 ---
 
@@ -42,18 +40,18 @@ networking.
 - [x] Isolation constants `8200`/`1900` vs `18200`/`11900`
 - [x] Codec `[[remap]]` table (not titles); empty list = original
 - [x] Test compose file with **no** `network_mode: host` and **no** `ports:`
-- [x] `./scripts/prove.sh` (container tests + MiniDLNA still up)
+- [x] `./scripts/prove.sh` (container tests + compose isolation)
 
 **Verify**
 
 ```bash
 cd /root/containers/rustyDLNA
 ./scripts/prove.sh
-curl -sI http://127.0.0.1:8200/ | grep 'MiniDLNA/1.3.3-kodi'
-docker inspect minidlna --format '{{.State.Status}} {{.HostConfig.NetworkMode}}'
+curl -sI http://127.0.0.1:8200/ | grep 'rustyDLNA/'
 ```
 
-**Prove** `prove.sh` prints `PROVE OK` and MiniDLNA `Server:` is unchanged.
+**Prove** `prove.sh` prints `PROVE OK` and test compose still has no host
+network and no published 8200/1900.
 
 ---
 
@@ -113,7 +111,7 @@ Goal: `/rootDesc.xml` and SCPDs match `replica.md`. Listen on **18200**.
 **Verify** `curl` against `http://127.0.0.1:18200` **inside** the test
 container (not the host).
 
-**Prove** host `curl -sI :8200` is still MiniDLNA.
+**Prove** host `curl -sI :8200` is still the live rustyDLNA daemon (tests did not steal the port).
 
 ---
 
@@ -130,8 +128,8 @@ container (not the host).
 
 **Verify** scripted SOAP against container `:18200`.
 
-**Prove** same SOAP against host `:8200` still returns MiniDLNA
-`BrowseResponse` (oracle). Diff shapes, do not change MiniDLNA.
+**Prove** same SOAP against host `:8200` still returns rustyDLNA
+`BrowseResponse` (oracle gold in `testdata/oracle/`). Diff shapes.
 
 ---
 
@@ -162,8 +160,8 @@ container (not the host).
 
 **Verify** serve a 1 MiB fixture; `curl -r` two ranges.
 
-**Prove** host `:8200` still MiniDLNA; no rusty `sendfile` of the live
-library.
+**Prove** host `:8200` is still the live rustyDLNA daemon; tests did not
+`sendfile` the live library from the test container.
 
 ---
 
@@ -182,7 +180,7 @@ library.
 (not the live remux unless copied to a scratch dir). GPU optional.
 
 **Prove** no NVENC session on the host from rusty during unit prove.
-MiniDLNA still 200.
+Live `:8200` still 200.
 
 ---
 
@@ -202,9 +200,8 @@ Run each UA against the **container** (18200), not 8200.
 
 - [x] Phase 8 UA matrix against handlers / container `:18200` — `cargo test -p rusty-dlna --lib client_matrix_handlers` and `RUSTY_DLNA_HTTP_PORT=18200 RUSTY_DLNA_SSDP_PORT=11900 cargo test -p rusty-dlna --test listen_e2e`
 
-**Prove** capture MiniDLNA `:8200` Browse for Kodi and keep it as the
-oracle gold file (`testdata/oracle/`). rusty Browse for Kodi must match
-that dialect (dates, ids, mime), not the transcode path.
+**Prove** Kodi Browse dialect matches the gold file
+(`testdata/oracle/`) — dates, ids, mime — not the transcode path.
 
 ---
 
@@ -222,23 +219,21 @@ Only then:
 5. `curl -sI :8200` shows `rustyDLNA/`
 6. Kodi refresh; Streamer plays a DV title via transcode or sidecar
 
-Until phase 9, **both** may exist: MiniDLNA on the LAN, rustyDLNA only
-in a bridge / `--check`.
+Phase 9 is done. rustyDLNA is the LAN daemon. Tests stay on 18200/11900.
 
 ---
 
 ## Commands cheat sheet
 
 ```bash
-# Live MiniDLNA (do not stop)
+# Live rustyDLNA
 curl -sI http://127.0.0.1:8200/ | head
-docker ps --filter name=minidlna
 
 # Host unit tests (no listen)
 source /etc/profile.d/rust.sh
 cargo test --workspace
 
-# Isolated container tests + MiniDLNA still up
+# Isolated container tests + compose isolation
 ./scripts/prove.sh
 
 # Compose file sanity (must fail if someone adds host net)
@@ -251,5 +246,5 @@ A phase is done when:
 
 1. Automated tests for that phase pass **in** `rusty-dlna-test`
 2. `assert-isolation.sh` passes
-3. Host `:8200` `Server:` still contains `MiniDLNA/1.3.3-kodi`
+3. Host `:8200` `Server:` still contains `rustyDLNA/` (tests did not steal it)
 4. The checklist box is ticked with the command that proved it

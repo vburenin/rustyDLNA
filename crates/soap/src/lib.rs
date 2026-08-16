@@ -284,7 +284,12 @@ pub fn parse_soap_call(action: &str, body: &str) -> SoapCall {
 #[derive(Clone, Debug)]
 pub enum SoapOutcome {
     Ok(String),
-    Fault { http: u16, code: u16, desc: &'static str },
+    Fault {
+        http: u16,
+        code: u16,
+        desc: &'static str,
+        persist: bool,
+    },
 }
 
 impl SoapOutcome {
@@ -293,6 +298,7 @@ impl SoapOutcome {
             http: 500,
             code: 401,
             desc: "Invalid Action",
+            persist: false,
         }
     }
     pub fn fault402() -> Self {
@@ -300,6 +306,7 @@ impl SoapOutcome {
             http: 500,
             code: 402,
             desc: "Invalid Args",
+            persist: false,
         }
     }
     pub fn fault701() -> Self {
@@ -307,6 +314,7 @@ impl SoapOutcome {
             http: 500,
             code: 701,
             desc: "No such object error",
+            persist: false,
         }
     }
 }

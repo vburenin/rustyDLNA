@@ -1,0 +1,32 @@
+# rustyDLNA must use host networking so SSDP multicast (239.255.255.250:1900)
+# reaches LAN clients such as Kodi. Bridge/NAT will not advertise correctly.
+#
+# This file is the *live* daemon. Tests stay in docker-compose.test.yaml
+# (bridge, no ports, no host network). Do not name this container minidlna.
+#
+# Copy docker-compose.override.yaml.example to docker-compose.override.yaml
+# and/or copy .env.example to .env. Compose merges both; do not commit them.
+services:
+  rusty-dlna:
+    container_name: rusty-dlna
+    build:
+      context: .
+    image: rusty-dlna:local
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TZ: ${TZ:-UTC}
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      # Config media_dir is V,/storage/video (same as MiniDLNA).
+      - ${RUSTY_DLNA_MEDIA:-./media}:/storage/video:ro
+      # Inherited files.db rows store the host realpath after symlink
+      # resolve (/storage/z2-5x20tb/video/...). Bind that path onto
+      # itself so GET /MediaItems/ can open them. Set RUSTY_DLNA_MEDIA_AT
+      # to the real directory; default is a no-op /storage/video bind.
+      - ${RUSTY_DLNA_MEDIA_AT:-/storage/video}:${RUSTY_DLNA_MEDIA_AT:-/storage/video}:ro
+      - ${RUSTY_DLNA_CACHE:-./data/cache}:/var/cache/rusty-dlna
+      - ${RUSTY_DLNA_CONF:-./rusty-dlna.toml}:/etc/rusty-dlna.toml:ro
+      - /etc/localtime:/etc/localtime:ro

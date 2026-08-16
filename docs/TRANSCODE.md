@@ -56,36 +56,39 @@ Empty `[[remap]]` list → every client, including Cast, gets the remux.
   That is what blacks out Google Streamer. The encoder must strip EL/RPU
   (ffmpeg already logs `Skipping NAL 63`). Output is HDR10, not DV.
 - CUDA decode of DV P7 failed on the box that proved the offline path
-  (`Impossible to convert… Function not implemented`). Live jobs should
-  default to **software decode + NVENC**, same as that encode.
+  (`Impossible to convert… Function not implemented`). Encode jobs
+  default to **software decode + NVENC** (or libx264), same as that encode.
 - Copy mastering display / MaxCLL when present (`-mastering_display`,
   `-max_cll`) so tone-map matches the disc.
 
-## Live ffmpeg shape
+## Serve path: file cache (not a live pipe)
 
-`ffmpeg_live_args` builds a **pipe**, not a `.mp4` on disk:
+`GET /Transcode/{id}` waits for (or reuses) a **cache file** under
+`cache_dir`, then serves it with the same byte-`Range` path as
+`/MediaItems/`. That is why remux Range is honest.
 
-- No `-movflags +faststart` (needs a finished file).
-- Use `frag_keyframe+empty_moov+default_base_moof` for fMP4, or MPEG-TS.
-- Map `0:v:0` and a chosen audio (not “whatever is default” — some remuxes
-  default to a non-English AC-3).
-- TrueHD / Atmos → AC-3 640k (or copy an existing AC-3 track).
-- Supervisor: spawn, read stdout → socket, `kill` on client drop / seek
-  restart. Cap `max_jobs` (a consumer NVENC is not a farm).
+`ffmpeg_live_args` still builds a stdout pipe
+(`frag_keyframe+empty_moov+default_base_moof`, `pipe:1`) for tests and
+a future supervisor. It is **not** what the HTTP handler serves today.
 
-Offline sidecar MP4s remain valid: if `decide` says original, MiniDLNA’s
-sendfile path (here: blocking read) is enough. Live transcode is for
-titles you refuse to pre-encode.
+Cache jobs:
+
+- Map `0:v:0` and a chosen audio (not “whatever is default”).
+- TrueHD / Atmos → AC-3 640k or AAC per `audio_out`.
+- `JobGate` caps `max_jobs`; `Drop` kills the ffmpeg process.
+- A finished non-empty dest is reused (no re-encode).
+
+If `decide` says original, the handler serves the source file.
 
 ## HTTP
 
-Transcoded GETs:
+Transcoded GETs (file cache):
 
 - `Connection: close`
 - `transferMode.dlna.org: Streaming`
-- `contentFeatures.dlna.org: … DLNA.ORG_CI=1; DLNA.ORG_OP=00…` (or time-seek)
-- No honest `Content-Length` (chunked or estimated)
-- TimeSeek without Range is still 406 unless we implement TimeSeek
+- `contentFeatures.dlna.org: … DLNA.ORG_CI=1; DLNA.ORG_OP=01…`
+- Honest `Content-Length` / `Accept-Ranges: bytes` (it is a file)
+- TimeSeek without Range is still 406
 
 Do not reuse `stream_buffer_mb` for encoded bytes. That window is source
 file data.

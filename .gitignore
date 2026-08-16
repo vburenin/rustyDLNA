@@ -9,5 +9,7 @@
 /cache
 testdata/cache/
 /data
+/media
 # host-only; never commit living-room paths
 rusty-dlna.local.toml
+docker-compose.override.yaml

@@ -8,13 +8,17 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use rusty_dlna_protocol::object_id::{
-    BROWSEDIR_ID, IMAGE_ALL_ID, IMAGE_ID, MUSIC_ALL_ID, MUSIC_ID, ROOT_ID, VIDEO_ALL_ID,
-    VIDEO_DIR_ID, VIDEO_ID, VIDEO_RECENT_ID,
+    BROWSEDIR_ID, IMAGE_ALL_ID, IMAGE_ALBUM_ID, IMAGE_CAMERA_ID, IMAGE_DATE_ID, IMAGE_DIR_ID,
+    IMAGE_ID, IMAGE_PLIST_ID, IMAGE_RATING_ID, IMAGE_RECENT_ID, MUSIC_ALBUM_ARTIST_ID,
+    MUSIC_ALBUM_ID, MUSIC_ALL_ID, MUSIC_ARTIST_ID, MUSIC_COMPOSER_ID, MUSIC_CONTRIB_ARTIST_ID,
+    MUSIC_DIR_ID, MUSIC_GENRE_ID, MUSIC_ID, MUSIC_PLIST_ID, MUSIC_RATING_ID, MUSIC_RECENT_ID,
+    ROOT_ID, SAMSUNG_AUDIO, SAMSUNG_IMAGE, SAMSUNG_VIDEO, VIDEO_ACTOR_ID, VIDEO_ALL_ID,
+    VIDEO_DIR_ID, VIDEO_GENRE_ID, VIDEO_ID, VIDEO_PLIST_ID, VIDEO_RATING_ID, VIDEO_RECENT_ID,
+    VIDEO_SERIES_ID,
 };
 
 use crate::{
-    path_excluded, path_is_live_file, path_is_symlink, Caption, Catalog, Container, MediaItem,
-    ScanConfig,
+    path_excluded, path_is_live_file, Caption, Catalog, Container, MediaItem, ScanConfig,
 };
 
 /// MiniDLNA schema from `/home/vlad/workspace/minidlna/src/scanner_sqlite.h`.
@@ -127,7 +131,19 @@ impl LibraryDb {
     }
 
     pub fn find_detail_by_inode(&self, device: i64, inode: i64) -> rusqlite::Result<Option<i64>> {
-        Ok(self.find_inode_source(device, inode)?.map(|(id, _)| id))
+        Ok(self.find_inode_source(device, inode)?.map(|(id, _, _)| id))
+    }
+
+    pub fn remove_detail_id(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM OBJECTS WHERE DETAIL_ID = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM CAPTIONS WHERE ID = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM BOOKMARKS WHERE ID = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM DETAILS WHERE ID = ?1", [id])?;
+        Ok(())
     }
 
     /// MiniDLNA `find_detail_by_inode` + TIMESTAMP so aliases can reuse
@@ -136,16 +152,22 @@ impl LibraryDb {
         &self,
         device: i64,
         inode: i64,
-    ) -> rusqlite::Result<Option<(i64, i64)>> {
+    ) -> rusqlite::Result<Option<(i64, i64, String)>> {
         if inode == 0 {
             return Ok(None);
         }
         self.conn
             .query_row(
-                "SELECT ID, TIMESTAMP FROM DETAILS
+                "SELECT ID, TIMESTAMP, PATH FROM DETAILS
                  WHERE DEVICE = ?1 AND INODE = ?2 AND MIME IS NOT NULL LIMIT 1",
                 params![device, inode],
-                |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                        r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    ))
+                },
             )
             .optional()
     }
@@ -323,18 +345,55 @@ impl LibraryDb {
         Ok(n > 0)
     }
 
+    /// Next `$HEX` suffix for a new child of `parent`. Uses the max existing
+    /// suffix, not `count(*)+1`, so deleting a sibling cannot reuse an id
+    /// and `upsert` cannot rename another folder onto leftover children.
     pub fn next_child_seq(&self, parent: &str) -> rusqlite::Result<i64> {
-        let n: i64 = self.conn.query_row(
-            "SELECT count(*) FROM OBJECTS WHERE PARENT_ID = ?1",
-            [parent],
-            |r| r.get(0),
-        )?;
-        Ok(n + 1)
+        let prefix = format!("{parent}$");
+        let mut stmt = self
+            .conn
+            .prepare("SELECT OBJECT_ID FROM OBJECTS WHERE PARENT_ID = ?1")?;
+        let rows = stmt.query_map([parent], |r| r.get::<_, String>(0))?;
+        let mut max = 0i64;
+        for id in rows {
+            let id = id?;
+            let Some(rest) = id.strip_prefix(&prefix) else {
+                continue;
+            };
+            let suffix = rest.split('$').next().unwrap_or(rest);
+            if let Ok(n) = i64::from_str_radix(suffix, 16) {
+                max = max.max(n);
+            }
+        }
+        Ok(max + 1)
     }
 
-    /// Delete this path. If it is the last live file for the inode, or the
-    /// original is gone, drop **symlink** aliases (dangling or still pointing
-    /// at the deleted target). Hardlinks that still exist are kept.
+    pub fn object_exists(&self, object_id: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM OBJECTS WHERE OBJECT_ID = ?1",
+                [object_id],
+                |_| Ok(()),
+            )
+            .ok()
+            .is_some()
+    }
+
+    pub fn object_detail_id(&self, object_id: &str) -> Option<i64> {
+        self.conn
+            .query_row(
+                "SELECT DETAIL_ID FROM OBJECTS WHERE OBJECT_ID = ?1",
+                [object_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+    }
+
+    /// Delete this path. Also drop other DETAILS rows for the same inode
+    /// whose files are gone (dangling symlink aliases). Live hardlinks and
+    /// live symlinks that still resolve — e.g. a genre tree retargeted at
+    /// the file's new location — are kept.
     pub fn remove_path_and_symlink_aliases(&self, path: &str) -> rusqlite::Result<usize> {
         let row = self
             .conn
@@ -361,7 +420,7 @@ impl LibraryDb {
         }
         let mut n = 0usize;
         for (id, p) in victims {
-            let gone = p == path || path_is_symlink(Path::new(&p)) || !path_is_live_file(Path::new(&p));
+            let gone = p == path || !path_is_live_file(Path::new(&p));
             if !gone {
                 continue;
             }
@@ -417,6 +476,41 @@ impl LibraryDb {
                 .unwrap_or("");
             if path_excluded(std::path::Path::new(&p), name, cfg) {
                 n += self.remove_path_and_symlink_aliases(&p)?;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Drop folder OBJECTS that have no remaining children. Virtual
+    /// containers (root, Browse Folders, All Video, …) stay even if empty.
+    pub fn prune_empty_folders(&self) -> rusqlite::Result<usize> {
+        let mut n = 0usize;
+        loop {
+            let empty: Vec<String> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT o.OBJECT_ID FROM OBJECTS o
+                     WHERE o.DETAIL_ID IS NULL
+                       AND NOT EXISTS (
+                         SELECT 1 FROM OBJECTS c WHERE c.PARENT_ID = o.OBJECT_ID
+                       )",
+                )?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                let mut ids = Vec::new();
+                for r in rows {
+                    let id = r?;
+                    if !is_virtual_container(&id) {
+                        ids.push(id);
+                    }
+                }
+                ids
+            };
+            if empty.is_empty() {
+                break;
+            }
+            for id in empty {
+                n += self
+                    .conn
+                    .execute("DELETE FROM OBJECTS WHERE OBJECT_ID = ?1", [id])?;
             }
         }
         Ok(n)
@@ -687,6 +781,47 @@ impl LibraryDb {
         cat.ensure_video_folder_mirrors();
         Ok(cat)
     }
+}
+
+fn is_virtual_container(id: &str) -> bool {
+    matches!(
+        id,
+        ROOT_ID
+            | BROWSEDIR_ID
+            | MUSIC_ID
+            | MUSIC_ALL_ID
+            | MUSIC_GENRE_ID
+            | MUSIC_ARTIST_ID
+            | MUSIC_ALBUM_ID
+            | MUSIC_PLIST_ID
+            | MUSIC_DIR_ID
+            | MUSIC_CONTRIB_ARTIST_ID
+            | MUSIC_ALBUM_ARTIST_ID
+            | MUSIC_COMPOSER_ID
+            | MUSIC_RATING_ID
+            | MUSIC_RECENT_ID
+            | VIDEO_ID
+            | VIDEO_ALL_ID
+            | VIDEO_GENRE_ID
+            | VIDEO_ACTOR_ID
+            | VIDEO_SERIES_ID
+            | VIDEO_PLIST_ID
+            | VIDEO_DIR_ID
+            | VIDEO_RATING_ID
+            | VIDEO_RECENT_ID
+            | IMAGE_ID
+            | IMAGE_ALL_ID
+            | IMAGE_DATE_ID
+            | IMAGE_ALBUM_ID
+            | IMAGE_CAMERA_ID
+            | IMAGE_PLIST_ID
+            | IMAGE_DIR_ID
+            | IMAGE_RATING_ID
+            | IMAGE_RECENT_ID
+            | SAMSUNG_AUDIO
+            | SAMSUNG_VIDEO
+            | SAMSUNG_IMAGE
+    )
 }
 
 pub fn mime_to_ext(mime: &str) -> &'static str {

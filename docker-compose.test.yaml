@@ -1,5 +1,5 @@
 # Isolated test runner. Intentionally NOT host-network.
-# MiniDLNA (`minidlna` container) keeps 0.0.0.0:8200 and UDP 1900.
+# Live rustyDLNA keeps host 0.0.0.0:8200 and UDP 1900.
 #
 # Do not add:
 #   network_mode: host

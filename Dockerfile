@@ -1,20 +1,38 @@
-# Test/build image only. Never `network_mode: host`.
-# Do not publish 8200 or 1900 — those belong to the live MiniDLNA container.
-FROM rust:bookworm
+# Production rustyDLNA image. SSDP needs host networking at *run* time
+# (see docker-compose.yaml). This file must not request host network —
+# docker-compose.test.yaml stays on a bridge with no published 8200/1900.
 
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+FROM rust:bookworm AS build
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
-COPY replica.md rusty-dlna.toml ./
-COPY docs ./docs
 
-ENV CARGO_TERM_COLOR=always \
-    RUSTY_DLNA_HTTP_PORT=18200 \
-    RUSTY_DLNA_SSDP_PORT=11900
+RUN cargo build --release -p rusty-dlna \
+    && strip target/release/rusty-dlna
 
-# Default command is unit tests + dialect check. No sockets on 8200/1900.
-CMD ["sh", "-c", "cargo test --workspace && cargo run -p rusty-dlna -- --check"]
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        ca-certificates \
+        tzdata \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone \
+    && mkdir -p /var/cache/rusty-dlna /storage/video \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/target/release/rusty-dlna /usr/local/bin/rusty-dlna
+COPY rusty-dlna.toml /etc/rusty-dlna.toml
+
+# HTTP descriptions/SOAP/media. SSDP is UDP/1900 (host network at run time).
+EXPOSE 8200/tcp 1900/udp
+
+# Foreground (container PID 1). Config is bind-mounted over this default
+# from compose when RUSTY_DLNA_CONF / override is set.
+CMD ["rusty-dlna", "--config", "/etc/rusty-dlna.toml"]

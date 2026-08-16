@@ -9,9 +9,9 @@ use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 
 use crate::db::LibraryDb;
 use crate::{
-    ensure_folder_chain, index_one_file, is_album_art_name, is_caption_name, is_junk_dir,
-    is_sample_or_trailer_dir, is_unfinished_name, looks_like_sample_file, path_excluded, Catalog,
-    ScanConfig, ScanDelta,
+    ensure_folder_chain, forget_path, forget_tree, index_one_file, is_album_art_name,
+    is_caption_name, is_junk_dir, is_sample_or_trailer_dir, is_unfinished_name,
+    looks_like_sample_file, path_excluded, Catalog, ScanConfig, ScanDelta,
 };
 
 const MASK: WatchMask = WatchMask::CREATE
@@ -80,10 +80,10 @@ pub fn run_inotify(
             }
             if ev.mask.intersects(EventMask::DELETE | EventMask::MOVED_FROM) {
                 if ev.mask.contains(EventMask::ISDIR) {
-                    removed += remove_tree(&cfg, &path);
+                    removed += forget_tree(&cfg, &path);
                     wds.retain(|_, p| !p.starts_with(&path));
                 } else {
-                    removed += remove_one(&cfg, &path);
+                    removed += forget_path(&cfg, &path);
                 }
                 continue;
             }
@@ -118,6 +118,7 @@ pub fn run_inotify(
         }
         if let Some(dbp) = &cfg.db_path {
             if let Ok(db) = LibraryDb::open(dbp) {
+                removed += db.prune_empty_folders().unwrap_or(0);
                 if let Ok(cat) = db.load_catalog() {
                     on_change(
                         cat,
@@ -210,6 +211,7 @@ fn insert_directory(
 }
 
 fn add_one(cfg: &ScanConfig, path: &Path) -> bool {
+    let _write = crate::library_write_guard();
     let db = match &cfg.db_path {
         Some(p) => match LibraryDb::open(p) {
             Ok(d) => d,
@@ -221,37 +223,6 @@ fn add_one(cfg: &ScanConfig, path: &Path) -> bool {
         return false;
     };
     index_one_file(&db, cfg, path, &folder)
-}
-
-fn remove_one(cfg: &ScanConfig, path: &Path) -> usize {
-    let db = match &cfg.db_path {
-        Some(p) => match LibraryDb::open(p) {
-            Ok(d) => d,
-            Err(_) => return 0,
-        },
-        None => return 0,
-    };
-    db.remove_path_and_symlink_aliases(&path.to_string_lossy())
-        .unwrap_or(0)
-}
-
-fn remove_tree(cfg: &ScanConfig, dir: &Path) -> usize {
-    let db = match &cfg.db_path {
-        Some(p) => match LibraryDb::open(p) {
-            Ok(d) => d,
-            Err(_) => return 0,
-        },
-        None => return 0,
-    };
-    let prefix = format!("{}/", dir.to_string_lossy());
-    let rows = db.all_detail_stats().unwrap_or_default();
-    let mut n = 0;
-    for (p, _, _, _) in rows {
-        if p.starts_with(&prefix) || Path::new(&p) == dir {
-            n += db.remove_path_and_symlink_aliases(&p).unwrap_or(0);
-        }
-    }
-    n
 }
 
 fn raise_watch_limit(want: u32) {

@@ -13,8 +13,8 @@ rustyDLNA keeps the dialect in `replica.md` and changes the process.
    GENA notify      │    http/soap tasks (Keep-Alive)     │
                     │    client cache (by IPv4 + MAC)     │
                     │           │                         │
-                    │           ├─ original file ──► spawn_blocking / sendfile
-                    │           └─ transcode job ──► ffmpeg supervisor
+                    │           ├─ original file ──► ranged file read
+                    │           └─ remux/transcode ──► ffmpeg → cache file → Range
                     └─────────────────────────────────────┘
 ```
 
@@ -25,8 +25,8 @@ rustyDLNA keeps the dialect in `replica.md` and changes the process.
 | SSDP announce + M-SEARCH | async UDP | cheap, periodic |
 | SOAP Browse/Search | async, one DB pool | shared library |
 | Description / art / captions | async, Keep-Alive | MiniDLNA persist rule |
-| Original `/MediaItems/` | blocking pool | large `Range` reads; **Connection: close** |
-| Transcode | dedicated supervisor, cap `max_jobs` | NVENC / CPU; kill process group on drop |
+| Original `/MediaItems/` | file Range | large `Range` reads; **Connection: close** |
+| Transcode | ffmpeg → cache file, cap `max_jobs` | NVENC / CPU; `Drop` kills the job; GET is Range on the dest |
 | Scan / inotify | background task | must not stall Browse |
 
 Do **not** `fork` the HTTP server to serve a file. Isolation is a
@@ -52,7 +52,7 @@ Two `<res>` rows only when the client is `NEED_SAFE_VIDEO` **and**
 `decide` says `Transcode`:
 
 1. Optional: original, listed **second** (some clients pick the first).
-2. Transcode URL first, `DLNA.ORG_CI=1`, `OP=00` or time-seek, mime
+2. Transcode URL first, `DLNA.ORG_CI=1`, `OP=01` (file cache), mime
    `video/mp4`.
 
 Kodi (`FLAG_DLNA`, no `NEED_SAFE_VIDEO`) sees **only** the original, same
@@ -66,12 +66,10 @@ says the client cannot play the source.
 
 Original files: `Accept-Ranges: bytes`, `DLNA.ORG_OP=01`, same as MiniDLNA.
 
-Live transcode: no honest byte map.
-
-- Advertise `OP=00` or implement `TimeSeekRange.dlna.org`.
-- Practical: on `Range`, restart ffmpeg with `-ss` estimated from
-  bytes/duration. Document that VBR makes this sloppy.
-- Do not Keep-Alive a transcode pipe.
+Remux / transcode **serve path** is a finished cache file, so Range is
+the same as original (`OP=01`, honest `Content-Length`). A live ffmpeg
+pipe is not the HTTP path; do not advertise `OP=00` for today’s
+`/Transcode/` URLs.
 
 ## Database
 

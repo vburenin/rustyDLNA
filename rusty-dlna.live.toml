@@ -11,7 +11,7 @@ advertise_ip = "10.0.1.2"
 cache_dir = "/var/cache/rusty-dlna"
 db_dir = "/var/cache/rusty-dlna"
 notify_interval = 180
-rescan_secs = 30
+rescan_secs = 0
 # MiniDLNA uuidvalue: "4d696e69-444c-164e-9d41-" + enp4s0 MAC.
 uuid = "uuid:4d696e69-444c-164e-9d41-98b7852028d3"
 serial = "681019810597110"

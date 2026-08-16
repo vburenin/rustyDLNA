@@ -25,8 +25,9 @@ use rusty_dlna_protocol::{
     ClientKind, ClientProfile, CLIENTS,
 };
 use rusty_dlna_scan::{
-    caption_http_mime, load_existing, parse_media_dir, probe_av_meta, repair_objects_if_needed,
-    run_inotify, scan, Catalog, CatalogChild, LibraryDb, MediaItem, MediaTypes, ScanConfig,
+    caption_http_mime, collect_media_dirs, load_existing, monitor, probe_av_meta,
+    repair_objects_if_needed, run_inotify, scan, Catalog, CatalogChild, LibraryDb, MediaItem,
+    ScanConfig, ScanDelta,
 };
 
 pub use rusty_dlna_scan::ensure_pattern_fixture;
@@ -180,13 +181,10 @@ impl App {
         ssdp_port: u16,
         config_dir: &Path,
     ) -> Self {
-        let mut types = MediaTypes::all();
-        let media_dirs: Vec<PathBuf> = cfg
-            .media_dir
-            .iter()
-            .map(|p| {
-                let (t, pb) = parse_media_dir(p);
-                types = t;
+        let (raw_dirs, types) = collect_media_dirs(&cfg.media_dir);
+        let media_dirs: Vec<PathBuf> = raw_dirs
+            .into_iter()
+            .map(|pb| {
                 if pb.is_absolute() {
                     pb
                 } else {
@@ -724,9 +722,13 @@ impl App {
                 0u8,
             )
         };
+        let path = rusty_dlna_scan::rebase_media_path(&path, &self.scan_cfg.media_dirs);
         let size = match std::fs::metadata(&path) {
             Ok(m) => m.len(),
-            Err(_) => return HttpResponse::html(404, "Not Found", "missing file"),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), %e, "media missing");
+                return HttpResponse::html(404, "Not Found", "missing file");
+            }
         };
         let range = match req.header("Range") {
             None => None,
@@ -815,7 +817,8 @@ impl App {
         let Some(cap) = item.captions.iter().find(|c| c.index == idx) else {
             return HttpResponse::html(404, "Not Found", "no caption");
         };
-        match std::fs::read(&cap.path) {
+        let cap_path = rusty_dlna_scan::rebase_media_path(&cap.path, &self.scan_cfg.media_dirs);
+        match std::fs::read(&cap_path) {
             Ok(body) => {
                 let mut r = HttpResponse::new(200, "OK");
                 r.set("Content-Type", caption_http_mime(&cap.ext));
@@ -831,7 +834,19 @@ impl App {
 fn soap_to_http(out: SoapOutcome, persist: bool) -> HttpResponse {
     match out {
         SoapOutcome::Ok(xml) => HttpResponse::xml(200, xml, persist),
-        SoapOutcome::Fault { http, code, desc } => fault_resp(soap_fault(code, desc), persist && false || http == 200),
+        SoapOutcome::Fault {
+            http,
+            code,
+            desc,
+            persist: fault_persist,
+        } => {
+            let mut r = fault_resp(soap_fault(code, desc), fault_persist);
+            r.status = http;
+            if http == 500 {
+                r.reason = "Internal Server Error".into();
+            }
+            r
+        }
     }
 }
 
@@ -841,24 +856,42 @@ fn fault_resp(xml: String, persist: bool) -> HttpResponse {
     r
 }
 
+/// 1×1 PNG (magic `\x89PNG`).
+const ICON_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+    0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+    0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8,
+    0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d, 0xb0, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// 1×1 JPEG (SOI `FF D8` + JFIF). Must not be PNG bytes.
+const ICON_JPEG: &[u8] = &[
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06,
+    0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b, 0x0b,
+    0x0c, 0x19, 0x12, 0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d, 0x1a, 0x1c, 0x1c, 0x20,
+    0x24, 0x2e, 0x27, 0x20, 0x22, 0x2c, 0x23, 0x1c, 0x1c, 0x28, 0x37, 0x29, 0x2c, 0x30, 0x31,
+    0x34, 0x34, 0x34, 0x1f, 0x27, 0x39, 0x3d, 0x38, 0x32, 0x3c, 0x2e, 0x33, 0x34, 0x32, 0xff,
+    0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xff, 0xc4, 0x00,
+    0x1f, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
+    0xff, 0xc4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00,
+    0x3f, 0x00, 0x7f, 0xff, 0xd9,
+];
+
 fn icon_response(path: &str) -> HttpResponse {
-    // 1×1 PNG
-    const PNG: &[u8] = &[
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
-        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
-        0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8,
-        0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d, 0xb0, 0x00, 0x00, 0x00,
-        0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-    ];
-    let mime = if path.ends_with(".jpg") {
-        "image/jpeg"
+    let lower = path.to_ascii_lowercase();
+    let (mime, body) = if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        ("image/jpeg", ICON_JPEG)
     } else {
-        "image/png"
+        ("image/png", ICON_PNG)
     };
     let mut r = HttpResponse::new(200, "OK");
     r.set("Content-Type", mime);
-    r.set("Content-Length", PNG.len());
-    r.body = PNG.to_vec();
+    r.set("Content-Length", body.len());
+    r.body = body.to_vec();
     r
 }
 
@@ -914,10 +947,33 @@ pub async fn serve(app: Arc<App>) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+fn apply_catalog(app: &App, next: Catalog, delta: ScanDelta, why: &'static str) {
+    let items = next.items.len();
+    *app.catalog.lock().expect("catalog") = next;
+    app.update_id.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(
+        items,
+        added = delta.added,
+        removed = delta.removed,
+        changed = delta.changed,
+        "{why}"
+    );
+}
+
+fn reconcile_library(app: &App, why: &'static str) {
+    match monitor(&app.scan_cfg) {
+        (Some(next), delta) => apply_catalog(app, next, delta, why),
+        _ => {}
+    }
+}
+
 fn spawn_library_watch(app: Arc<App>) {
+    let rescan_secs = app.cfg.rescan_secs;
+    let inotify_app = app.clone();
     std::thread::Builder::new()
         .name("inotify".into())
         .spawn(move || {
+            let app = inotify_app;
             let cfg = app.scan_cfg.clone();
             let empty = app
                 .catalog
@@ -935,38 +991,33 @@ fn spawn_library_watch(app: Arc<App>) {
             } else {
                 match repair_objects_if_needed(&cfg) {
                     (Some(next), delta) => {
-                        let items = next.items.len();
-                        *app.catalog.lock().expect("catalog") = next;
-                        app.update_id.fetch_add(1, Ordering::Relaxed);
-                        tracing::info!(
-                            items,
-                            added = delta.added,
-                            removed = delta.removed,
-                            changed = delta.changed,
-                            "library object repair"
-                        );
+                        apply_catalog(&app, next, delta, "library object repair")
                     }
                     _ => {}
                 }
+                // Drop gone files / empty folders left by inotify path-prefix misses.
+                reconcile_library(&app, "library reconcile");
             }
             fill_missing_av_meta(&app);
             let watch_app = app.clone();
             if let Err(e) = run_inotify(cfg, move |next, delta| {
-                let items = next.items.len();
-                *watch_app.catalog.lock().expect("catalog") = next;
-                watch_app.update_id.fetch_add(1, Ordering::Relaxed);
-                tracing::info!(
-                    items,
-                    added = delta.added,
-                    removed = delta.removed,
-                    changed = delta.changed,
-                    "inotify library update"
-                );
+                apply_catalog(&watch_app, next, delta, "inotify library update");
             }) {
                 tracing::warn!("inotify: {e}");
             }
         })
         .expect("inotify thread");
+    if rescan_secs > 0 {
+        std::thread::Builder::new()
+            .name("rescan".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(rescan_secs));
+                // Skip if a walk is still running. A 30s interval with a
+                // 45s tree walk was stacking +11k "adds" every cycle.
+                reconcile_library(&app, "periodic rescan");
+            })
+            .expect("rescan thread");
+    }
 }
 
 fn fill_missing_av_meta(app: &App) {
@@ -1797,5 +1848,160 @@ audio_out = "to-aac"
         app.remaps.clear();
         let (_, cr) = soap_browse(&app, "2$8", "BrowseDirectChildren", "CrKey/1.54");
         assert!(!cr.contains("/Transcode/"));
+    }
+
+    fn response_content_type(r: &HttpResponse) -> &str {
+        r.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    }
+
+    fn body_is_png(body: &[u8]) -> bool {
+        body.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+    }
+
+    fn body_is_jpeg(body: &[u8]) -> bool {
+        body.len() >= 3 && body[0] == 0xff && body[1] == 0xd8 && body[2] == 0xff
+    }
+
+    #[test]
+    fn icon_png_and_jpg_magic_matches_content_type() {
+        let app = testdata_app();
+        let png = app.handle(&req(&get("/icons/sm.png", "Kodi/21.0")));
+        assert_eq!(png.status, 200);
+        let png_ct = response_content_type(&png);
+        assert!(
+            png_ct.eq_ignore_ascii_case("image/png"),
+            "png Content-Type={png_ct}"
+        );
+        assert!(
+            body_is_png(&png.body),
+            "png body missing PNG magic: {:02x?}",
+            &png.body[..png.body.len().min(8)]
+        );
+
+        let jpg = app.handle(&req(&get("/icons/sm.jpg", "Kodi/21.0")));
+        assert_eq!(jpg.status, 200);
+        let jpg_ct = response_content_type(&jpg);
+        assert!(
+            jpg_ct.eq_ignore_ascii_case("image/jpeg"),
+            "jpg Content-Type={jpg_ct}"
+        );
+        assert!(
+            body_is_jpeg(&jpg.body),
+            "jpg body missing JPEG SOI: {:02x?}",
+            &jpg.body[..jpg.body.len().min(8)]
+        );
+        assert!(
+            !body_is_png(&jpg.body),
+            "image/jpeg response must not be PNG bytes"
+        );
+    }
+
+    fn soap_fault_persist(out: SoapOutcome) -> bool {
+        match out {
+            SoapOutcome::Fault { persist, .. } => persist,
+            SoapOutcome::Ok(_) => panic!("expected Fault persist bit"),
+        }
+    }
+
+    #[test]
+    fn soap_faults_are_500_upnperror_with_outcome_persist() {
+        let app = testdata_app();
+
+        let body = r#"<s:Envelope><s:Body><u:Browse></u:Browse></s:Body></s:Envelope>"#;
+        let raw = format!(
+            "POST /ctl/ContentDir HTTP/1.1\r\nHost: 127.0.0.1\r\nSOAPAction: \"urn:x#Browse\"\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let r402 = app.handle(&req_from(&raw, body.as_bytes()));
+        assert_eq!(r402.status, 500);
+        let xml402 = String::from_utf8_lossy(&r402.body);
+        assert!(xml402.contains("UPnPError"), "{xml402}");
+        assert!(xml402.contains("<errorCode>402</errorCode>"), "{xml402}");
+        assert_eq!(r402.persist, soap_fault_persist(SoapOutcome::fault402()));
+
+        let r401 = app.handle(&req_from(
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nSOAPAction: \"urn:x#Nope\"\r\nContent-Length: 0\r\n\r\n",
+            b"",
+        ));
+        assert_eq!(r401.status, 500);
+        let xml401 = String::from_utf8_lossy(&r401.body);
+        assert!(xml401.contains("UPnPError"), "{xml401}");
+        assert!(xml401.contains("<errorCode>401</errorCode>"), "{xml401}");
+        assert_eq!(r401.persist, soap_fault_persist(SoapOutcome::fault401()));
+
+        let (st701, xml701) = soap_browse(&app, "no-such-object", "BrowseMetadata", "Kodi/21.0");
+        assert_eq!(st701, 500);
+        assert!(xml701.contains("UPnPError"), "{xml701}");
+        assert!(xml701.contains("<errorCode>701</errorCode>"), "{xml701}");
+        let r701 = {
+            let body = format!(
+                r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>no-such-object</ObjectID><BrowseFlag>BrowseMetadata</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"#
+            );
+            let raw = format!(
+                "POST /ctl/ContentDir HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Kodi/21.0\r\nSOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n",
+                body.len()
+            );
+            let mut req = HttpRequest::parse_headers(&raw).unwrap();
+            req.body = body.into_bytes();
+            app.handle(&req)
+        };
+        assert_eq!(r701.persist, soap_fault_persist(SoapOutcome::fault701()));
+    }
+
+    #[test]
+    fn two_typed_media_dirs_keep_both_classes() {
+        let tmp = workspace().join(format!(
+            "testdata/cache/twodir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let vdir = tmp.join("video");
+        let adir = tmp.join("audio");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::create_dir_all(&adir).unwrap();
+        rusty_dlna_scan::write_fake_mkv(&vdir.join("clip.mkv"), 64);
+        let mut flac = b"fLaC".to_vec();
+        flac.extend_from_slice(&[0u8; 48]);
+        std::fs::write(adir.join("song.flac"), flac).unwrap();
+        let cfg = Config {
+            friendly_name: "twodir".into(),
+            media_dir: vec![
+                format!("V,{}", vdir.display()),
+                format!("A,{}", adir.display()),
+            ],
+            cache_dir: Some(tmp.join("cache").display().to_string()),
+            rescan_secs: 0,
+            ..Config::default()
+        };
+        let app = App::from_config(cfg, 18200, 11900, &tmp);
+        assert!(
+            app.scan_cfg.types.video,
+            "V, prefix must survive a later A, (got {:?})",
+            app.scan_cfg.types
+        );
+        assert!(
+            app.scan_cfg.types.audio,
+            "A, prefix must remain (got {:?})",
+            app.scan_cfg.types
+        );
+        let cat = scan(&app.scan_cfg);
+        let titles: Vec<_> = cat.items.values().map(|i| i.title.as_str()).collect();
+        assert!(
+            titles.iter().any(|t| *t == "clip"),
+            "video under V dir must be accepted: {titles:?}"
+        );
+        assert!(
+            titles.iter().any(|t| *t == "song"),
+            "audio under A dir must be accepted: {titles:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
