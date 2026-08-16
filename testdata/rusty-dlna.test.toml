@@ -1,0 +1,21 @@
+# Isolated fixture config. Used by container listen tests (18200/11900).
+friendly_name = "rustyDLNA-test"
+media_dir = ["library"]
+exclude_dir = ["exclude_me"]
+cache_dir = "cache"
+advertise_ip = "127.0.0.1"
+uuid = "uuid:00000000-0000-4000-8000-000000000001"
+notify_interval = 895
+
+[transcode]
+enable = true
+encoder = "libx264"
+max_jobs = 1
+
+[[remap]]
+name = "crkey-dvp7"
+client = "CrKey"
+hdr = "dv-p7"
+action = "remux-p8"
+encoder = "copy"
+audio_out = "to-aac"

@@ -1,0 +1,10 @@
+[package]
+name = "rusty-dlna-soap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SOAP ContentDirectory / ConnectionManager / MS registrar"
+
+[dependencies]
+rusty-dlna-protocol.workspace = true
+thiserror.workspace = true

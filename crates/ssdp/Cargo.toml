@@ -1,0 +1,10 @@
+[package]
+name = "rusty-dlna-ssdp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SSDP announce and M-SEARCH (MiniDLNA dialect)"
+
+[dependencies]
+rusty-dlna-protocol.workspace = true
+thiserror.workspace = true

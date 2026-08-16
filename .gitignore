@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+.idea
+.vscode
+*.swp
+.env
+.env.local
+*.log
+/cache
+testdata/cache/
+/data
+# host-only; never commit living-room paths
+rusty-dlna.local.toml

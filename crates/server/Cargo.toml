@@ -1,0 +1,30 @@
+[package]
+name = "rusty-dlna"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Multithreaded DLNA media server (MiniDLNA dialect + live transcode)"
+
+[lib]
+name = "rusty_dlna"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rusty-dlna"
+path = "src/main.rs"
+
+[dependencies]
+rusty-dlna-protocol.workspace = true
+rusty-dlna-ssdp.workspace = true
+rusty-dlna-soap.workspace = true
+rusty-dlna-http.workspace = true
+rusty-dlna-scan.workspace = true
+rusty-dlna-transcode.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+socket2 = { version = "0.5", features = ["all"] }

@@ -1,0 +1,30 @@
+# Phase 9 live server. Host process, ports 8200/1900.
+friendly_name = "rustyDLNA"
+media_dir = ["V,/storage/video"]
+exclude_dir = ["incomplete"]
+root_container = "V"
+# HTTP on every address (.2 and .67). SSDP LOCATION / replies use the
+# primary 10.0.1.2 — that is what MiniDLNA advertised and what Kodi
+# already talks to. The secondary .67 never received a rootDesc GET.
+listen_ip = "0.0.0.0"
+advertise_ip = "10.0.1.2"
+cache_dir = "/var/cache/rusty-dlna"
+db_dir = "/var/cache/rusty-dlna"
+notify_interval = 180
+rescan_secs = 30
+# MiniDLNA uuidvalue: "4d696e69-444c-164e-9d41-" + enp4s0 MAC.
+uuid = "uuid:4d696e69-444c-164e-9d41-98b7852028d3"
+serial = "681019810597110"
+
+[transcode]
+enable = true
+encoder = "libx264"
+max_jobs = 1
+
+[[remap]]
+name = "crkey-dvp7"
+client = "CrKey"
+hdr = "dv-p7"
+action = "remux-p8"
+encoder = "copy"
+audio_out = "to-aac"

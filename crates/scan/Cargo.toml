@@ -1,0 +1,12 @@
+[package]
+name = "rusty-dlna-scan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Library scan, inode reuse, NFO, and object IDs"
+
+[dependencies]
+rusty-dlna-protocol.workspace = true
+thiserror.workspace = true
+rusqlite.workspace = true
+inotify = "0.11"

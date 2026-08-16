@@ -1,0 +1,32 @@
+# Example config. Copy to rusty-dlna.local.toml for host paths (gitignored).
+
+friendly_name = "rustyDLNA"
+# network_interface = ["eth0"]
+# media_dir = ["/media/video"]
+# exclude_dir = ["incomplete"]
+
+[transcode]
+enable = false
+encoder = "hevc_nvenc"
+max_jobs = 2
+
+# Ad-hoc codec remaps, **per software**. Unset fields are wildcards.
+# First match wins. Match codecs + which player asked — not titles.
+# client: UA token ("CrKey", "Kodi"), table name, or alias
+#         (google-cast | streamer | samsung | any).
+# clients = ["CrKey", "BubbleUPnP"]  is the same field as a list.
+# action: original | remux-p8 | hdr10 | audio-ac3
+#
+# [[remap]]
+# name = "streamer-p7"
+# client = "CrKey"
+# hdr = "dv-p7"
+# action = "hdr10"
+# encoder = "hevc_nvenc"
+# audio_out = "to-ac3"
+#
+# [[remap]]
+# name = "kodi-p7-leave"
+# client = "Kodi"
+# hdr = "dv-p7"
+# action = "original"

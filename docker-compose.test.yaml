@@ -1,0 +1,43 @@
+# Isolated test runner. Intentionally NOT host-network.
+# MiniDLNA (`minidlna` container) keeps 0.0.0.0:8200 and UDP 1900.
+#
+# Do not add:
+#   network_mode: host
+#   ports: ["8200:...", "1900:..."]
+#   container_name: minidlna
+name: rusty-dlna-test
+
+services:
+  rusty-dlna-test:
+    image: rust:bookworm
+    container_name: rusty-dlna-test
+    working_dir: /src
+    # Default bridge. Reachable only inside this compose project.
+    # No `ports:` — nothing is published on the host.
+    environment:
+      CARGO_TERM_COLOR: always
+      CARGO_HOME: /usr/local/cargo
+      RUSTY_DLNA_HTTP_PORT: "18200"
+      RUSTY_DLNA_SSDP_PORT: "11900"
+    volumes:
+      - .:/src
+      - rusty-dlna-cargo-registry:/usr/local/cargo/registry
+      - rusty-dlna-cargo-git:/usr/local/cargo/git
+      - rusty-dlna-target:/src/target
+    command:
+      - sh
+      - -c
+      - |
+        if ! command -v ffmpeg >/dev/null 2>&1; then
+          apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg
+        fi
+        cargo test --workspace && cargo run -p rusty-dlna -- --check
+    # cap_drop is extra insurance we are not a LAN advertiser
+    cap_drop:
+      - NET_RAW
+      - NET_ADMIN
+
+volumes:
+  rusty-dlna-cargo-registry:
+  rusty-dlna-cargo-git:
+  rusty-dlna-target:
