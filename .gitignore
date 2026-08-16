@@ -10,6 +10,7 @@
 testdata/cache/
 /data
 /media
-# host-only; never commit living-room paths
+# host-only deploy settings (paths, uuid, advertise_ip)
 rusty-dlna.local.toml
+rusty-dlna.live.toml
 docker-compose.override.yaml

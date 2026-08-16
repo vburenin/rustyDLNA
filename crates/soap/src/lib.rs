@@ -10,6 +10,15 @@ use rusty_dlna_protocol::{ClientFlags, ClientProfile};
 
 pub fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    xml_escape_into(s, &mut out);
+    out
+}
+
+fn xml_escape_into(s: &str, out: &mut String) {
+    if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'')) {
+        out.push_str(s);
+        return;
+    }
     for c in s.chars() {
         match c {
             '&' => out.push_str("&amp;"),
@@ -20,14 +29,22 @@ pub fn xml_escape(s: &str) -> String {
             _ => out.push(c),
         }
     }
-    out
 }
 
-/// MiniDLNA DIDL-inside-`<Result>`: escape `&` `<` `>` only. Attribute
+/// rustyDLNA DIDL-inside-`<Result>`: escape `&` `<` `>` only. Attribute
 /// quotes stay raw (`id="2$8"`). VLC's ixml / some Windows stacks treat
 /// `childCount=&quot;…&quot;` as a file, not an expandable folder.
 pub fn xml_escape_didl_result(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut out = String::with_capacity(s.len() + s.len() / 8);
+    xml_escape_didl_into(s, &mut out);
+    out
+}
+
+fn xml_escape_didl_into(s: &str, out: &mut String) {
+    if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>')) {
+        out.push_str(s);
+        return;
+    }
     for c in s.chars() {
         match c {
             '&' => out.push_str("&amp;"),
@@ -36,17 +53,14 @@ pub fn xml_escape_didl_result(s: &str) -> String {
             _ => out.push(c),
         }
     }
-    out
 }
 
 /// Text of `<tag>`, `<u:tag>`, or `<ns:tag>` (first match, case-insensitive).
 pub fn xml_tag_text(hay: &str, tag: &str) -> Option<String> {
-    let lower = hay.to_ascii_lowercase();
-    let tag_l = tag.to_ascii_lowercase();
     let mut search = 0;
-    while let Some(rel) = lower[search..].find('<') {
+    while let Some(rel) = hay[search..].find('<') {
         let abs = search + rel;
-        let after = &lower[abs + 1..];
+        let after = &hay[abs + 1..];
         if after.starts_with('/') || after.starts_with('!') || after.starts_with('?') {
             search = abs + 1;
             continue;
@@ -60,7 +74,7 @@ pub fn xml_tag_text(hay: &str, tag: &str) -> Option<String> {
         }
         let raw_name = &after[..name_end];
         let local = raw_name.rsplit(':').next().unwrap_or(raw_name);
-        if local != tag_l {
+        if !local.eq_ignore_ascii_case(tag) {
             search = abs + 1;
             continue;
         }
@@ -69,15 +83,27 @@ pub fn xml_tag_text(hay: &str, tag: &str) -> Option<String> {
             return Some(String::new());
         }
         let content_start = abs + 1 + gt + 1;
-        let close1 = format!("</{raw_name}>");
-        let close2 = format!("</{tag_l}>");
-        let close3 = format!("</{local}>");
-        let rest = &lower[content_start..];
-        let rel_end = rest
-            .find(&close1)
-            .or_else(|| rest.find(&close2))
-            .or_else(|| rest.find(&close3))?;
+        let rest = &hay[content_start..];
+        let rel_end = find_close_tag(rest, raw_name)
+            .or_else(|| find_close_tag(rest, tag))
+            .or_else(|| find_close_tag(rest, local))?;
         return Some(hay[content_start..content_start + rel_end].to_string());
+    }
+    None
+}
+
+fn find_close_tag(hay: &str, name: &str) -> Option<usize> {
+    let mut i = 0;
+    while let Some(rel) = hay[i..].find("</") {
+        let abs = i + rel;
+        let after = &hay[abs + 2..];
+        if after.len() >= name.len()
+            && after[..name.len()].eq_ignore_ascii_case(name)
+            && after.as_bytes().get(name.len()) == Some(&b'>')
+        {
+            return Some(abs);
+        }
+        i = abs + 2;
     }
     None
 }
@@ -188,7 +214,7 @@ pub fn emit_didl_object(o: &DidlObject) -> String {
             xml_escape(&o.title),
             o.class
         ));
-        // MiniDLNA always emits this for storageFolder (upnpsoap.c
+        // The dialect always emits this for storageFolder (upnpsoap.c
         // `strcmp(class+10, "storageFolder")`). Windows UPnP / VLC use it
         // with `<container>` + childCount as the folder expand marker.
         if o.class.contains("storageFolder") {
@@ -246,7 +272,11 @@ pub fn emit_didl_object(o: &DidlObject) -> String {
 }
 
 pub fn emit_didl(objects: &[DidlObject]) -> String {
-    objects.iter().map(emit_didl_object).collect()
+    let mut s = String::with_capacity(objects.len().saturating_mul(384));
+    for o in objects {
+        s.push_str(&emit_didl_object(o));
+    }
+    s
 }
 
 #[derive(Clone, Debug)]
@@ -319,7 +349,7 @@ impl SoapOutcome {
     }
 }
 
-/// MiniDLNA `X_SetBookmark`: CONVERT_MS divides by 1000; values < 30 store as 0.
+/// dialect `X_SetBookmark`: CONVERT_MS divides by 1000; values < 30 store as 0.
 pub fn bookmark_seconds(pos: i64, convert_ms: bool) -> i64 {
     let sec = if convert_ms { pos / 1000 } else { pos };
     if sec < 30 {
@@ -388,7 +418,7 @@ pub fn dispatch_simple(
     uuid: &str,
     update_id: u32,
     root_container: Option<&str>,
-    bookmarks: &mut std::collections::HashMap<String, i64>,
+    bookmarks: Option<&mut std::collections::HashMap<String, i64>>,
 ) -> Option<SoapOutcome> {
     let method = call.method?;
     match method {
@@ -456,7 +486,9 @@ pub fn dispatch_simple(
             };
             let pos = call.pos_second.unwrap_or(0);
             let sec = bookmark_seconds(pos, client.flags.contains(ClientFlags::CONVERT_MS));
-            bookmarks.insert(oid.clone(), sec);
+            if let Some(map) = bookmarks {
+                map.insert(oid.clone(), sec);
+            }
             Some(SoapOutcome::Ok(ok_tag(method, CONTENTDIRECTORY_TYPE, "")))
         }
         "QueryStateVariable" | "UpdateObject" => {
@@ -507,7 +539,7 @@ mod tests {
         assert!(xml.contains("&lt;DIDL-Lite"));
         assert!(
             xml.contains("&lt;container id=\"0\"/&gt;"),
-            "MiniDLNA leaves attribute quotes raw in Result: {xml}"
+            "The dialect leaves attribute quotes raw in Result: {xml}"
         );
         assert!(xml.contains("xmlns:dc=\"http://purl.org/dc/elements/1.1/\""));
         assert!(xml.contains("<NumberReturned>1</NumberReturned>"));
@@ -550,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn container_didl_is_minidlna_storage_folder() {
+    fn container_didl_is_storage_folder() {
         let xml = emit_didl_object(&DidlObject {
             id: "2$15".into(),
             parent_id: "0".into(),

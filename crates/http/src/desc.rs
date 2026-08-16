@@ -32,7 +32,7 @@ impl Default for RootDescOpts {
             model_number: "1".into(),
             manufacturer: "Justin Maggard".into(),
             model_name: "Windows Media Connect compatible (rustyDLNA)".into(),
-            model_description: "MiniDLNA on Linux".into(),
+            model_description: "rustyDLNA on Linux".into(),
             serial: "1".into(),
             presentation_url: None,
             xbox: false,
@@ -132,7 +132,7 @@ pub fn minimal_scpd() -> &'static str {
     scpd_content_directory()
 }
 
-/// MiniDLNA `genServiceDesc` for ContentDirectory. Kodi/Platinum
+/// dialect `genServiceDesc` for ContentDirectory. Kodi/Platinum
 /// `FindAction("Browse")` requires these actions in the SCPD.
 pub fn scpd_content_directory() -> &'static str {
     concat!(

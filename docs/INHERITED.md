@@ -1,6 +1,6 @@
-# Inherited product behavior (MiniDLNA 1.3.3-kodi)
+# Inherited product behavior
 
-A replica that only copies UPnP 1.0 will still fail this house. Keep
+A replica that only copies generic UPnP 1.0 will still fail real clients. Keep
 these behaviors when `scan` / SOAP land.
 
 ## Dates (Kodi 1905)
@@ -48,9 +48,7 @@ without Range → 406.
 
 ## Version / name
 
-MiniDLNA reported `MiniDLNA/1.3.3-kodi` and default friendly name
-`{host}: {user} (kodi)`. rustyDLNA reports `rustyDLNA/{version}` with
-the same `DLNADOC/1.50 UPnP/1.0` tokens.
+rustyDLNA reports `rustyDLNA/{version}` with `DLNADOC/1.50 UPnP/1.0` tokens.
 
 ## Not inherited as architecture
 

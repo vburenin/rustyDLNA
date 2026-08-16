@@ -1,7 +1,6 @@
 # Example container rustyDLNA config. Baked into the image at
-# /etc/rusty-dlna.toml. Bind-mount rusty-dlna.live.toml (gitignored
-# house file) from compose if you need a private uuid, advertise_ip,
-# or remap table.
+# /etc/rusty-dlna.toml. Bind-mount a gitignored local file
+# (rusty-dlna.live.toml) from compose for uuid, advertise_ip, remaps.
 
 friendly_name = "rustyDLNA"
 media_dir = ["V,/storage/video"]

@@ -1,19 +1,20 @@
-//! Accept loop, SOAP Browse, original GET/`Range`, and ffmpeg file-cache.
+//! Accept loop, SOAP Browse, original GET/`Range`, and background remux.
 //! Listen ports come from `RUSTY_DLNA_HTTP_PORT` / `RUSTY_DLNA_SSDP_PORT`.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rusty_dlna_http::{
-    dlna_org_features, gen_root_desc, media_response, now_imf_date, parse_byte_range,
-    persist_for_route, protocol_info, read_file_range, route, scpd_connection_manager,
-    scpd_content_directory, scpd_registrar, timeseek_without_range, valid_host_header, ByteRange,
-    HttpRequest, HttpResponse, HttpRoute, RangeError, RootDescOpts,
+    dlna_org_features, gen_root_desc, live_transcode_response, media_response, now_imf_date,
+    parse_byte_range, persist_for_route, protocol_info, read_file_range, route,
+    scpd_connection_manager, scpd_content_directory, scpd_registrar, timeseek_without_range,
+    valid_host_header, ByteRange, HttpRequest, HttpResponse, HttpRoute, RangeError, RemuxJobSpec,
+    RootDescOpts,
 };
-use rusty_dlna_protocol::isolation::collides_with_live_minidlna;
+use rusty_dlna_protocol::isolation::collides_with_live_ports;
 use rusty_dlna_protocol::paths::{
     caption_from_path, media_item_id_from_path, media_item_url, transcode_id_from_path,
     transcode_item_url,
@@ -26,8 +27,9 @@ use rusty_dlna_protocol::{
 };
 use rusty_dlna_scan::{
     caption_http_mime, collect_media_dirs, load_existing, monitor, probe_av_meta,
-    repair_objects_if_needed, run_inotify, scan, Catalog, CatalogChild, LibraryDb, MediaItem,
-    ScanConfig, ScanDelta,
+    guess_hdr_from_name, probe_stream_identity, probe_toml_exists, repair_objects_if_needed,
+    run_inotify, scan,
+    Catalog, CatalogChild, LibraryDb, MediaItem, ScanConfig, ScanDelta, SourceProbe,
 };
 
 pub use rusty_dlna_scan::ensure_pattern_fixture;
@@ -37,9 +39,11 @@ use rusty_dlna_soap::{
 };
 use rusty_dlna_ssdp::{msearch_replies, parse_msearch};
 use rusty_dlna_transcode::{
-    cache_dest, decide, ensure_cached_file, probe_to_source, Decision, JobGate, RemapRule,
-    TranscodePlan,
+    cache_dest, cache_part, decide_for, ffmpeg_grow_args, probe_to_source, Decision, JobGate,
+    RemapRule,
 };
+
+mod remux;
 
 #[derive(Debug, serde::Deserialize)]
 pub struct Config {
@@ -63,7 +67,7 @@ pub struct Config {
     pub cache_dir: Option<String>,
     #[serde(default)]
     pub advertise_ip: Option<String>,
-    /// Bind address. Default `0.0.0.0`. Set to a LAN IP (e.g. `10.0.1.67`).
+    /// Bind address. Default `0.0.0.0`. Set to a LAN IP (e.g. `192.0.2.20`).
     #[serde(default)]
     pub listen_ip: Option<String>,
     #[serde(default)]
@@ -72,7 +76,7 @@ pub struct Config {
     pub serial: Option<String>,
     #[serde(default)]
     pub root_container: Option<String>,
-    /// MiniDLNA `db_dir`. Default: `cache_dir`. Database file is `files.db`.
+    /// Database directory. Default: `cache_dir`. File is `files.db`.
     #[serde(default)]
     pub db_dir: Option<String>,
     /// Seconds between library rescans (new/changed/deleted files). 0 = off.
@@ -158,7 +162,7 @@ pub fn resolve_ssdp_port() -> u16 {
 
 pub struct App {
     pub cfg: Config,
-    pub catalog: Mutex<Catalog>,
+    pub catalog: RwLock<Catalog>,
     pub remaps: Vec<RemapRule>,
     pub scan_cfg: ScanConfig,
     pub server: String,
@@ -172,6 +176,59 @@ pub struct App {
     pub update_id: AtomicU32,
     pub bookmarks: Mutex<HashMap<String, i64>>,
     pub jobs: JobGate,
+    probe_cache: Mutex<HashMap<i64, SourceProbe>>,
+    remuxes: Mutex<HashMap<i64, Arc<remux::RemuxJob>>>,
+}
+
+struct DidlSnap {
+    child: CatalogChild,
+    child_count: Option<u32>,
+    child_container_count: Option<u32>,
+}
+
+fn probe_cache_path(cache_dir: &Path, detail_id: i64) -> PathBuf {
+    cache_dir.join("probe").join(format!("{detail_id}.toml"))
+}
+
+fn cached_probe_exists(cache_dir: &Path, detail_id: i64) -> bool {
+    probe_cache_path(cache_dir, detail_id).is_file()
+}
+
+fn load_probe_cache_dir(cache_dir: &Path) -> HashMap<i64, SourceProbe> {
+    let dir = cache_dir.join("probe");
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(r) => r,
+        Err(_) => return HashMap::new(),
+    };
+    let mut out = HashMap::new();
+    for ent in rd.filter_map(|e| e.ok()) {
+        let name = ent.file_name();
+        let s = name.to_string_lossy();
+        let Some(id_s) = s.strip_suffix(".toml") else {
+            continue;
+        };
+        let Ok(id) = id_s.parse::<i64>() else {
+            continue;
+        };
+        if let Ok(text) = std::fs::read_to_string(ent.path()) {
+            out.insert(id, rusty_dlna_scan::parse_probe_toml(&text));
+        }
+    }
+    out
+}
+
+fn save_cached_probe(cache_dir: &Path, detail_id: i64, p: &SourceProbe) {
+    let path = probe_cache_path(cache_dir, detail_id);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(
+        path,
+        format!(
+            "container = \"{}\"\nvideo = \"{}\"\nhdr = \"{}\"\naudio = \"{}\"\nwidth = {}\nheight = {}\n",
+            p.container, p.video, p.hdr, p.audio, p.width, p.height
+        ),
+    );
 }
 
 impl App {
@@ -237,9 +294,10 @@ impl App {
             });
         let notify_interval = cfg.notify_interval.unwrap_or(895);
         let max_jobs = cfg.transcode.max_jobs.max(1) as usize;
+        let probe_cache = load_probe_cache_dir(&cache_dir);
         Self {
             cfg,
-            catalog: Mutex::new(catalog),
+            catalog: RwLock::new(catalog),
             remaps,
             scan_cfg,
             server: server_header(&os_version()),
@@ -253,13 +311,15 @@ impl App {
             update_id: AtomicU32::new(1),
             bookmarks: Mutex::new(HashMap::new()),
             jobs: JobGate::new(max_jobs),
+            probe_cache: Mutex::new(probe_cache),
+            remuxes: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn isolation_ok(&self) -> Result<(), String> {
-        if collides_with_live_minidlna(self.http_port, self.ssdp_port) {
+        if collides_with_live_ports(self.http_port, self.ssdp_port) {
             return Err(format!(
-                "refusing to bind live MiniDLNA ports {}/{} (phase 9 not started); set RUSTY_DLNA_HTTP_PORT=18200 RUSTY_DLNA_SSDP_PORT=11900",
+                "refusing to bind live ports {}/{} from a test listener; set RUSTY_DLNA_HTTP_PORT=18200 RUSTY_DLNA_SSDP_PORT=11900",
                 self.http_port, self.ssdp_port
             ));
         }
@@ -287,14 +347,16 @@ impl App {
 
     /// Shipped request handler. Tests drive this; the accept loop calls it.
     pub fn handle(&self, req: &HttpRequest) -> HttpResponse {
-        let method = req.method.to_ascii_uppercase();
-        if !matches!(
-            method.as_str(),
-            "GET" | "HEAD" | "POST" | "SUBSCRIBE" | "UNSUBSCRIBE"
-        ) {
+        let method = req.method.as_str();
+        if !(method.eq_ignore_ascii_case("GET")
+            || method.eq_ignore_ascii_case("HEAD")
+            || method.eq_ignore_ascii_case("POST")
+            || method.eq_ignore_ascii_case("SUBSCRIBE")
+            || method.eq_ignore_ascii_case("UNSUBSCRIBE"))
+        {
             return HttpResponse::html(501, "Not Implemented", "unsupported method");
         }
-        if matches!(method.as_str(), "GET" | "HEAD") {
+        if method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD") {
             if req.version == "HTTP/1.1" && req.header("Host").is_none() {
                 return HttpResponse::html(400, "Bad Request", "DNS rebinding attack suspected");
             }
@@ -343,8 +405,17 @@ impl App {
         } else {
             resp.persist = persist;
         }
-        if method == "HEAD" {
+        if method.eq_ignore_ascii_case("HEAD") {
             resp.body.clear();
+        }
+        if resp.status >= 400 {
+            tracing::error!(
+                status = resp.status,
+                method = %method,
+                path = %req.path,
+                ua = req.user_agent().unwrap_or("-"),
+                "http error"
+            );
         }
         resp
     }
@@ -362,7 +433,7 @@ impl App {
             model_number: "1".into(),
             manufacturer: "Justin Maggard".into(),
             model_name: "Windows Media Connect compatible (rustyDLNA)".into(),
-            model_description: "MiniDLNA on Linux".into(),
+            model_description: "rustyDLNA on Linux".into(),
             serial: self
                 .cfg
                 .serial
@@ -379,7 +450,7 @@ impl App {
         HttpResponse::xml(200, xml, true)
     }
 
-    /// MiniDLNA GENA: SUBSCRIBE returns SID + Timeout. Kodi/Platinum
+    /// rustyDLNA GENA: SUBSCRIBE returns SID + Timeout. Kodi/Platinum
     /// subscribe to ContentDirectory after reading the SCPD.
     fn gena(&self, req: &HttpRequest, persist: bool) -> HttpResponse {
         let method = req.method.to_ascii_uppercase();
@@ -427,18 +498,28 @@ impl App {
         if call.method.is_none() {
             return fault_resp(soap_fault(401, "Invalid Action"), persist);
         }
-        let mut bookmarks = self.bookmarks.lock().expect("bookmarks");
-        if let Some(out) = dispatch_simple(
+        if call.method == Some("X_SetBookmark") {
+            let mut bookmarks = self.bookmarks.lock().expect("bookmarks");
+            if let Some(out) = dispatch_simple(
+                &call,
+                client,
+                &self.uuid,
+                self.update_id.load(Ordering::Relaxed),
+                self.cfg.root_container.as_deref(),
+                Some(&mut bookmarks),
+            ) {
+                return soap_to_http(out, persist);
+            }
+        } else if let Some(out) = dispatch_simple(
             &call,
             client,
             &self.uuid,
             self.update_id.load(Ordering::Relaxed),
             self.cfg.root_container.as_deref(),
-            &mut bookmarks,
+            None,
         ) {
             return soap_to_http(out, persist);
         }
-        drop(bookmarks);
         let is_search = call.method == Some("Search");
         if !is_search {
             // Browse
@@ -470,31 +551,38 @@ impl App {
                 return soap_to_http(SoapOutcome::fault402(), persist);
             }
             let remapped_root = flag == "BrowseDirectChildren" && oid != oid_raw;
-            let cat = self.catalog.lock().expect("catalog");
-            let page = if flag == "BrowseMetadata" {
-                match cat.metadata(&oid) {
-                    Some(ch) => vec![ch],
-                    None => return soap_to_http(SoapOutcome::fault701(), persist),
-                }
-            } else {
-                match cat.children_of(&oid) {
-                    Some(ch) => ch,
-                    None => return soap_to_http(SoapOutcome::fault701(), persist),
-                }
-            };
-            let total = page.len() as u32;
+            let ua = req.user_agent();
             let start = call.starting_index as usize;
             let take = if call.requested_count == 0 {
-                page.len()
+                usize::MAX
             } else {
                 call.requested_count as usize
             };
-            let slice: Vec<_> = page.into_iter().skip(start).take(take).collect();
+            let prepared = {
+                let cat = self.catalog.read().expect("catalog");
+                let (page, total) = if flag == "BrowseMetadata" {
+                    match cat.metadata(&oid) {
+                        Some(ch) => (vec![ch], 1u32),
+                        None => return soap_to_http(SoapOutcome::fault701(), persist),
+                    }
+                } else {
+                    match cat.page_children(&oid, start, take) {
+                        Some(v) => v,
+                        None => return soap_to_http(SoapOutcome::fault701(), persist),
+                    }
+                };
+                let slice: Vec<_> = page
+                    .iter()
+                    .map(|ch| self.snapshot_didl(ch, &cat))
+                    .collect();
+                (slice, total)
+            };
+            let (slice, total) = prepared;
             let didl: Vec<DidlObject> = slice
-                .iter()
-                .map(|ch| {
-                    let mut o = self.to_didl(ch, client, &cat);
-                    // MiniDLNA magic container parentid_sql = "0": children of
+                .into_iter()
+                .map(|snap| {
+                    let mut o = self.to_didl_snap(snap, client, ua);
+                    // rustyDLNA magic container parentid_sql = "0": children of
                     // remapped root are advertised with parentID of the requested id.
                     if remapped_root {
                         o.parent_id = oid_raw.to_string();
@@ -516,42 +604,71 @@ impl App {
                 n = didl.len(),
                 "SOAP Browse"
             );
-            // MiniDLNA closes SOAP; libupnp keep-alive + our parser has
+            // rustyDLNA closes SOAP; libupnp keep-alive + our parser has
             // dropped VLC's next Browse (folders then look like files).
             let mut r = HttpResponse::xml(200, xml, false);
             r.persist = false;
             return r;
         }
-        // Search: MiniDLNA-style. Container class queries must return
+        // Search: dialect. Container class queries must return
         // folders (VLC expand / some library UIs Search instead of Browse).
-        let cat = self.catalog.lock().expect("catalog");
+        let ua = req.user_agent();
         let crit = call.search_criteria.unwrap_or_default();
         let want_containers = crit.contains("object.container");
         let want_items = crit.contains("object.item") || !want_containers;
-        let mut items: Vec<CatalogChild> = Vec::new();
-        if want_containers {
-            items.extend(
-                cat.containers
+        let (slice, total) = {
+            let cat = self.catalog.read().expect("catalog");
+            let start = call.starting_index.max(0) as usize;
+            let mut n = 0usize;
+            if want_containers {
+                n += cat
+                    .containers
                     .values()
                     .filter(|c| c.object_id != rusty_dlna_protocol::object_id::ROOT_ID)
-                    .map(|c| CatalogChild::Container(c.clone())),
-            );
-        }
-        if want_items {
-            items.extend(cat.items.values().map(|it| CatalogChild::Item(it.clone())));
-        }
-        let total = items.len() as u32;
-        let start = call.starting_index.max(0) as usize;
-        let take = if call.requested_count == 0 {
-            items.len()
-        } else {
-            call.requested_count as usize
+                    .count();
+            }
+            if want_items {
+                n += cat.items.len();
+            }
+            let take = if call.requested_count == 0 {
+                n
+            } else {
+                call.requested_count as usize
+            };
+            let mut out = Vec::new();
+            let mut skipped = 0usize;
+            if want_containers {
+                for c in cat.containers.values() {
+                    if c.object_id == rusty_dlna_protocol::object_id::ROOT_ID {
+                        continue;
+                    }
+                    if skipped < start {
+                        skipped += 1;
+                        continue;
+                    }
+                    if out.len() >= take {
+                        break;
+                    }
+                    out.push(self.snapshot_didl(&CatalogChild::Container(c.clone()), &cat));
+                }
+            }
+            if want_items && out.len() < take {
+                for it in cat.items.values() {
+                    if skipped < start {
+                        skipped += 1;
+                        continue;
+                    }
+                    if out.len() >= take {
+                        break;
+                    }
+                    out.push(self.snapshot_didl(&CatalogChild::Item(it.clone()), &cat));
+                }
+            }
+            (out, n as u32)
         };
-        let didl: Vec<DidlObject> = items
-            .iter()
-            .skip(start)
-            .take(take)
-            .map(|ch| self.to_didl(ch, client, &cat))
+        let didl: Vec<DidlObject> = slice
+            .into_iter()
+            .map(|snap| self.to_didl_snap(snap, client, ua))
             .collect();
         let xml = build_browse(
             true,
@@ -565,18 +682,38 @@ impl App {
         r
     }
 
-    fn to_didl(&self, ch: &CatalogChild, client: &ClientProfile, cat: &Catalog) -> DidlObject {
+    fn snapshot_didl(&self, ch: &CatalogChild, cat: &Catalog) -> DidlSnap {
         match ch {
+            CatalogChild::Container(c) => DidlSnap {
+                child: ch.clone(),
+                child_count: Some(cat.displayed_child_count(&c.object_id)),
+                child_container_count: Some(cat.displayed_container_count(&c.object_id)),
+            },
+            CatalogChild::Item(_) => DidlSnap {
+                child: ch.clone(),
+                child_count: None,
+                child_container_count: None,
+            },
+        }
+    }
+
+    fn to_didl_snap(
+        &self,
+        snap: DidlSnap,
+        client: &ClientProfile,
+        ua: Option<&str>,
+    ) -> DidlObject {
+        match snap.child {
             CatalogChild::Container(c) => DidlObject {
-                id: c.object_id.clone(),
-                parent_id: c.parent_id.clone(),
-                title: c.title.clone(),
-                class: c.class.clone(),
+                id: c.object_id,
+                parent_id: c.parent_id,
+                title: c.title,
+                class: c.class,
                 date: None,
                 restricted: true,
                 searchable: Some(c.searchable),
-                child_count: Some(cat.displayed_child_count(&c.object_id)),
-                child_container_count: Some(cat.displayed_container_count(&c.object_id)),
+                child_count: snap.child_count,
+                child_container_count: snap.child_container_count,
                 is_container: true,
                 resources: vec![],
             },
@@ -593,13 +730,54 @@ impl App {
                     child_count: None,
                     child_container_count: None,
                     is_container: false,
-                    resources: self.item_resources(it, client),
+                    resources: self.item_resources(&it, client, ua),
                 }
             }
         }
     }
 
-    fn item_resources(&self, it: &MediaItem, client: &ClientProfile) -> Vec<DidlRes> {
+    /// Browse/Search: never ffprobe and never touch the disk.
+    fn browse_probe(&self, it: &MediaItem) -> SourceProbe {
+        if let Ok(cache) = self.probe_cache.lock() {
+            if let Some(p) = cache.get(&it.detail_id) {
+                return p.clone();
+            }
+        }
+        let mut p = it.probe.clone();
+        if p.hdr == "sdr" {
+            if let Some(hdr) = guess_hdr_from_name(&it.title).or_else(|| {
+                it.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(guess_hdr_from_name)
+            }) {
+                p.hdr = hdr.to_string();
+            }
+        }
+        p
+    }
+
+    /// GET /Transcode only: may ffprobe once, then persist.
+    fn resolved_probe(&self, it: &MediaItem) -> SourceProbe {
+        let quick = self.browse_probe(it);
+        if probe_toml_exists(&it.path) || cached_probe_exists(&self.cache_dir, it.detail_id) {
+            return quick;
+        }
+        if let Ok(cache) = self.probe_cache.lock() {
+            if cache.contains_key(&it.detail_id) {
+                return quick;
+            }
+        }
+        let live = rusty_dlna_scan::rebase_media_path(&it.path, &self.scan_cfg.media_dirs);
+        let probed = probe_stream_identity(&live).unwrap_or(quick);
+        if let Ok(mut cache) = self.probe_cache.lock() {
+            cache.insert(it.detail_id, probed.clone());
+        }
+        save_cached_probe(&self.cache_dir, it.detail_id, &probed);
+        probed
+    }
+
+    fn item_resources(&self, it: &MediaItem, client: &ClientProfile, ua: Option<&str>) -> Vec<DidlRes> {
         let mime = remap_mime(client, &it.mime);
         let orig_url = media_item_url(
             &self.advertise_ip,
@@ -623,23 +801,36 @@ impl App {
             sample_frequency: it.samplerate,
             nr_audio_channels: it.channels,
         };
+        let probe = self.browse_probe(it);
         let src = probe_to_source(
-            &it.probe.container,
-            &it.probe.video,
-            &it.probe.hdr,
-            &it.probe.audio,
-            it.probe.width,
-            it.probe.height,
+            &probe.container,
+            &probe.video,
+            &probe.hdr,
+            &probe.audio,
+            probe.width,
+            probe.height,
         );
-        let plan = decide(client, &src, &self.remaps);
-        if client.flags.contains(ClientFlags::NEED_SAFE_VIDEO) && plan.decision == Decision::Recode
+        let plan = decide_for(client, ua, &src, &self.remaps);
+        if plan.decision == Decision::Recode {
+            tracing::debug!(
+                title = %it.title,
+                hdr = %probe.hdr,
+                rule = plan.rule.as_deref().unwrap_or("-"),
+                ua = ua.unwrap_or("-"),
+                "remap advertised"
+            );
+        }
+        // Any matching remap: advertise the remux first so the client
+        // (Kodi included) plays /Transcode/ instead of the original P7.
+        if plan.decision == Decision::Recode
         {
             let remap_url = transcode_item_url(&self.advertise_ip, self.http_port, it.detail_id);
+            // Live fMP4 pipe (OP=00). Do not stat the remux cache on Browse.
             let remap = DidlRes {
                 url: remap_url,
                 protocol_info: format!(
                     "http-get:*:video/mp4:{}",
-                    dlna_org_features(None, "01", 1, "video/mp4")
+                    dlna_org_features(None, "00", 1, "video/mp4")
                 ),
                 size: None,
                 duration: it.duration.clone(),
@@ -648,7 +839,6 @@ impl App {
                 sample_frequency: it.samplerate,
                 nr_audio_channels: it.channels,
             };
-            // remapped <res> first for NEED_SAFE_VIDEO
             return vec![remap, orig];
         }
         let mut res = vec![orig];
@@ -687,7 +877,7 @@ impl App {
         };
         let Some(item) = self
             .catalog
-            .lock()
+            .read()
             .expect("catalog")
             .get_item_by_detail(id)
             .cloned()
@@ -695,33 +885,62 @@ impl App {
             return HttpResponse::html(404, "Not Found", "no such object");
         };
         let client = self.identify(req);
-        let (path, mime, pn, ci) = if transcode {
+        if transcode {
+            let probe = self.resolved_probe(&item);
             let src = probe_to_source(
-                &item.probe.container,
-                &item.probe.video,
-                &item.probe.hdr,
-                &item.probe.audio,
-                item.probe.width,
-                item.probe.height,
+                &probe.container,
+                &probe.video,
+                &probe.hdr,
+                &probe.audio,
+                probe.width,
+                probe.height,
             );
-            let plan = decide(client, &src, &self.remaps);
+            let plan = decide_for(client, req.user_agent(), &src, &self.remaps);
             if plan.decision != Decision::Recode {
+                tracing::info!(
+                    title = %item.title,
+                    hdr = %probe.hdr,
+                    ua = req.user_agent().unwrap_or("-"),
+                    "transcode GET rejected"
+                );
                 return HttpResponse::html(404, "Not Found", "no remap");
             }
-            match self.ensure_remap(&item.path, item.detail_id, &plan) {
-                Ok(p) => (p, "video/mp4".to_string(), None, 1u8),
-                Err(e) => {
-                    return HttpResponse::html(500, "Internal Server Error", &e.to_string());
-                }
+            let src_path = rusty_dlna_scan::rebase_media_path(&item.path, &self.scan_cfg.media_dirs);
+            if !src_path.is_file() {
+                tracing::error!(path = %src_path.display(), title = %item.title, "media missing");
+                return HttpResponse::html(404, "Not Found", "missing file");
             }
-        } else {
-            (
-                item.path.clone(),
-                remap_mime(client, &item.mime),
-                item.dlna_pn.clone(),
-                0u8,
-            )
-        };
+            let dest = cache_dest(&self.cache_dir, item.detail_id, plan.action);
+            let part = cache_part(&dest);
+            tracing::info!(
+                title = %item.title,
+                hdr = %probe.hdr,
+                rule = plan.rule.as_deref().unwrap_or("-"),
+                method = %req.method,
+                range = req.header("Range").unwrap_or("-"),
+                ua = req.user_agent().unwrap_or("-"),
+                dest = %dest.display(),
+                "transcode GET"
+            );
+            let mut r = live_transcode_response("video/mp4");
+            r.remux_job = Some(RemuxJobSpec {
+                detail_id: item.detail_id,
+                src: src_path.clone(),
+                dest: dest.clone(),
+                args: ffmpeg_grow_args(
+                    &src_path.to_string_lossy(),
+                    &part.to_string_lossy(),
+                    &plan,
+                ),
+            });
+            return r;
+        }
+        let (path, mime, pn, ci) = (
+            item.path.clone(),
+            remap_mime(client, &item.mime),
+            item.dlna_pn.clone(),
+            0u8,
+        );
         let path = rusty_dlna_scan::rebase_media_path(&path, &self.scan_cfg.media_dirs);
         let size = match std::fs::metadata(&path) {
             Ok(m) => m.len(),
@@ -784,30 +1003,13 @@ impl App {
         )
     }
 
-    fn ensure_remap(
-        &self,
-        src: &Path,
-        detail_id: i64,
-        plan: &TranscodePlan,
-    ) -> std::io::Result<PathBuf> {
-        let dest = cache_dest(&self.cache_dir, detail_id, plan.action);
-        if dest.is_file() && dest.metadata()?.len() > 0 {
-            return Ok(dest);
-        }
-        let _permit = self
-            .jobs
-            .try_acquire()
-            .ok_or_else(|| std::io::Error::other("max_jobs"))?;
-        ensure_cached_file(src, &dest, plan)
-    }
-
     fn caption(&self, req: &HttpRequest) -> HttpResponse {
         let Some((id, idx)) = caption_from_path(&req.path) else {
             return HttpResponse::html(404, "Not Found", "bad caption");
         };
         let Some(item) = self
             .catalog
-            .lock()
+            .read()
             .expect("catalog")
             .get_item_by_detail(id)
             .cloned()
@@ -941,7 +1143,12 @@ pub async fn serve(app: Arc<App>) -> Result<(), Box<dyn std::error::Error>> {
         let app = app.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_conn(app, sock).await {
-                tracing::debug!("conn: {e}");
+                let msg = e.to_string();
+                if msg.contains("Broken pipe") || msg.contains("Connection reset") {
+                    tracing::debug!("conn: {e}");
+                } else {
+                    tracing::error!("conn: {e}");
+                }
             }
         });
     }
@@ -949,7 +1156,7 @@ pub async fn serve(app: Arc<App>) -> Result<(), Box<dyn std::error::Error>> {
 
 fn apply_catalog(app: &App, next: Catalog, delta: ScanDelta, why: &'static str) {
     let items = next.items.len();
-    *app.catalog.lock().expect("catalog") = next;
+    *app.catalog.write().expect("catalog") = next;
     app.update_id.fetch_add(1, Ordering::Relaxed);
     tracing::info!(
         items,
@@ -977,14 +1184,14 @@ fn spawn_library_watch(app: Arc<App>) {
             let cfg = app.scan_cfg.clone();
             let empty = app
                 .catalog
-                .lock()
+                .read()
                 .map(|c| c.items.is_empty())
                 .unwrap_or(true);
             if empty {
                 tracing::info!("empty library; full scan from disk");
                 let next = scan(&cfg);
                 let items = next.items.len();
-                *app.catalog.lock().expect("catalog") = next;
+                *app.catalog.write().expect("catalog") = next;
                 app.update_id.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(items, "full scan done");
             } else {
@@ -1047,7 +1254,7 @@ fn fill_missing_av_meta(app: &App) {
             av.channels,
             av.samplerate,
         );
-        if let Ok(mut cat) = app.catalog.lock() {
+        if let Ok(mut cat) = app.catalog.write() {
             for it in cat.items.values_mut() {
                 if it.detail_id == id {
                     it.duration = av.duration.clone();
@@ -1070,7 +1277,7 @@ fn bind_udp_reuse(addr: SocketAddrV4) -> std::io::Result<socket2::Socket> {
         Some(socket2::Protocol::UDP),
     )?;
     sock.set_reuse_address(true)?;
-    // MiniDLNA uses SO_REUSEADDR only. SO_REUSEPORT lets the kernel hash
+    // The dialect uses SO_REUSEADDR only. SO_REUSEPORT lets the kernel hash
     // multicast M-SEARCH to Home Assistant's :1900 socket instead of us.
     sock.bind(&socket2::SockAddr::from(std::net::SocketAddr::V4(addr)))?;
     sock.set_nonblocking(true)?;
@@ -1087,8 +1294,8 @@ fn ssdp_recv_bind(app: &App) -> std::io::Result<socket2::Socket> {
         let group: Ipv4Addr = rusty_dlna_protocol::ssdp::SSDP_MCAST_ADDR
             .parse()
             .unwrap();
-        // MiniDLNA Linux receive bind: 239.255.255.250:1900 (not the unicast IP).
-        // Binding 10.0.1.67:1900 never sees Kodi/VLC multicast M-SEARCH.
+        // rustyDLNA Linux receive bind: 239.255.255.250:1900 (not the unicast IP).
+        // Binding 192.0.2.20:1900 never sees Kodi/VLC multicast M-SEARCH.
         match bind_udp_reuse(SocketAddrV4::new(group, app.ssdp_port)) {
             Ok(s) => return Ok(s),
             Err(e) => {
@@ -1161,8 +1368,8 @@ async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
     let recv = tokio::net::UdpSocket::from_std(recv_std)?;
 
     // Kodi/Platinum drops SSDP replies whose UDP source port is not 1900.
-    // Reply from the advertise unicast IP (MiniDLNA used the primary
-    // 10.0.1.2) so LOCATION host and UDP source match.
+    // Reply from the advertise unicast IP (rustyDLNA used the primary
+    // 192.0.2.10) so LOCATION host and UDP source match.
     let send = if live {
         let bind_ip = if iface.is_unspecified() {
             app.listen_ip
@@ -1292,6 +1499,10 @@ async fn handle_conn(
         req.body = body;
         let resp = app.handle(&req);
         persist_left = persist_left.saturating_sub(1);
+        if let Some(spec) = resp.remux_job.clone() {
+            remux::serve_remux(&app, &mut sock, &req, spec).await?;
+            break;
+        }
         let wire = resp.bytes_wire(&app.server, &now_imf_date());
         sock.write_all(&wire).await?;
         if let Some((path, start, end)) = resp.file_range.clone() {
@@ -1304,7 +1515,7 @@ async fn handle_conn(
     Ok(())
 }
 
-async fn stream_file_range(
+pub(crate) async fn stream_file_range(
     sock: &mut tokio::net::TcpStream,
     path: &std::path::Path,
     start: u64,
@@ -1350,6 +1561,10 @@ mod tests {
         let dvp7 = lib.join("video/dvp7.mkv");
         if !dvp7.exists() {
             let _ = std::fs::write(&dvp7, b"not-a-real-mkv");
+        }
+        let guessed = lib.join("video/Movie.2024.2160p.UHD.BDRemux.HDR.DV.HEVC.mkv");
+        if !guessed.exists() {
+            let _ = std::fs::write(&guessed, b"not-a-real-mkv");
         }
         let probe = lib.join("video/dvp7.probe.toml");
         if !probe.exists() {
@@ -1399,7 +1614,7 @@ audio_out = "to-aac"
         };
         let app = App::from_config(cfg, 18200, 11900, &root);
         let cat = scan(&app.scan_cfg);
-        *app.catalog.lock().expect("catalog") = cat;
+        *app.catalog.write().expect("catalog") = cat;
         app
     }
 
@@ -1414,10 +1629,10 @@ audio_out = "to-aac"
     }
 
     #[test]
-    fn test_ports_do_not_collide_with_minidlna() {
-        assert!(!collides_with_live_minidlna(18200, 11900));
-        assert!(collides_with_live_minidlna(8200, 11900));
-        assert!(collides_with_live_minidlna(18200, 1900));
+    fn test_ports_do_not_collide_with_live() {
+        assert!(!collides_with_live_ports(18200, 11900));
+        assert!(collides_with_live_ports(8200, 11900));
+        assert!(collides_with_live_ports(18200, 1900));
     }
 
     #[test]
@@ -1451,8 +1666,8 @@ audio_out = "to-aac"
         assert!(body.contains("BrowseDirectChildren"), "{body}");
         let sub = req(
             "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
-             Host: 10.0.1.2:8200\r\n\
-             Callback: <http://10.0.1.131:1234/evt>\r\n\
+             Host: 192.0.2.10:8200\r\n\
+             Callback: <http://192.0.2.50:1234/evt>\r\n\
              NT: upnp:event\r\n\
              Timeout: Second-300\r\n\
              Content-Length: 0\r\n\r\n",
@@ -1523,7 +1738,7 @@ audio_out = "to-aac"
         );
         assert!(
             video.contains("&lt;container ") && video.contains("storageUsed"),
-            "MiniDLNA folder DIDL (container + storageUsed) required for VLC expand: {video}"
+            "folder DIDL (container + storageUsed) required for VLC expand: {video}"
         );
         assert!(
             video.contains("object.container.storageFolder"),
@@ -1535,11 +1750,11 @@ audio_out = "to-aac"
         assert!(items.contains("/MediaItems/"));
         assert!(
             items.contains("size="),
-            "MiniDLNA res@size required for VLC: {items}"
+            "res@size required for VLC: {items}"
         );
         assert!(
             items.contains("duration="),
-            "MiniDLNA res@duration H:MM:SS.mmm required for VLC length: {items}"
+            "res@duration H:MM:SS.mmm required for VLC length: {items}"
         );
         assert!(
             items.contains("dc:date&gt;") || items.contains("&lt;dc:date&gt;"),
@@ -1554,7 +1769,7 @@ audio_out = "to-aac"
     }
 
     #[test]
-    fn root_container_v_browse_zero_matches_minidlna() {
+    fn root_container_v_browse_zero_parent_is_root() {
         let mut app = testdata_app();
         app.cfg.root_container = Some("V".into());
         let (st, xml) = soap_browse(&app, "0", "BrowseDirectChildren", "VLC/3.0.21 LibVLC/3.0.21");
@@ -1564,7 +1779,7 @@ audio_out = "to-aac"
         assert!(xml.contains("Recently Added"), "{xml}");
         assert!(
             xml.contains("parentID=\"0\"") || xml.contains("parentID=&quot;0&quot;"),
-            "MiniDLNA remapped root advertises parentID=0: {xml}"
+            "remapped root advertises parentID=0: {xml}"
         );
         assert!(
             xml.contains("&lt;container ")
@@ -1631,7 +1846,7 @@ audio_out = "to-aac"
         let app = testdata_app();
         let movie = app
             .catalog
-            .lock()
+            .read()
             .unwrap()
             .items
             .values()
@@ -1684,6 +1899,7 @@ audio_out = "to-aac"
         let app = testdata_app();
         let (_, kodi) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
         assert!(kodi.contains("dvp7"));
+        // testdata remap is CrKey-only, so Kodi still sees the original.
         assert!(!kodi.contains("/Transcode/"));
         let (_, cr) = soap_browse(
             &app,
@@ -1701,6 +1917,48 @@ audio_out = "to-aac"
             // overall MediaItems also exist for movie; just ensure Transcode exists
             let _ = (t, m);
         }
+    }
+
+    #[test]
+    fn kodi_p7_remap_advertises_transcode() {
+        let mut app = testdata_app();
+        app.remaps = rusty_dlna_transcode::parse_remaps_toml(
+            r#"
+[[remap]]
+name = "kodi-dvp7"
+client = "Kodi"
+hdr = "dv-p7"
+action = "remux-p8"
+encoder = "copy"
+audio_out = "to-aac"
+"#,
+        )
+        .unwrap();
+        let (_, kodi) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
+        let pos_t = kodi.find("/Transcode/");
+        assert!(pos_t.is_some(), "Kodi DIDL missing remap: {kodi}");
+        let (_, plat) = soap_browse(
+            &app,
+            "2$8",
+            "BrowseDirectChildren",
+            "UPnP/1.0 DLNADOC/1.50 Platinum/1.0.5.13",
+        );
+        assert!(
+            plat.contains("/Transcode/"),
+            "Platinum UA must match Kodi remap: {plat}"
+        );
+        assert!(kodi.contains("DLNA.ORG_CI=1"));
+        if let (Some(t), Some(m)) = (pos_t, kodi.find("/MediaItems/")) {
+            assert!(t < m, "remux res must be listed first");
+        }
+        let t0 = std::time::Instant::now();
+        let (_, xml) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "Browse must not ffprobe: {:?}",
+            t0.elapsed()
+        );
+        assert!(xml.contains("/Transcode/"), "{xml}");
     }
 
     fn feature_list(app: &App, ua: &str) -> String {
@@ -1785,11 +2043,23 @@ audio_out = "to-aac"
     }
 
     #[test]
-    fn crkey_remap_get_serves_cached_file_range() {
-        let app = testdata_app();
+    fn transcode_get_is_live_pipe_not_full_file() {
+        let mut app = testdata_app();
+        app.remaps = rusty_dlna_transcode::parse_remaps_toml(
+            r#"
+[[remap]]
+name = "kodi-dvp7"
+client = "Kodi"
+hdr = "dv-p7"
+action = "remux-p8"
+encoder = "copy"
+audio_out = "to-aac"
+"#,
+        )
+        .unwrap();
         let dvp7 = app
             .catalog
-            .lock()
+            .read()
             .unwrap()
             .items
             .values()
@@ -1797,48 +2067,54 @@ audio_out = "to-aac"
             .cloned()
             .expect("dvp7");
         let id = dvp7.detail_id;
-        // Kodi does not get a remap URL served
-        let kodi = app.handle(&req(&format!(
+        let t0 = std::time::Instant::now();
+        let r = app.handle(&req(&format!(
+            "GET /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: UPnP/1.0 DLNADOC/1.50 Platinum/1.0.5.13\r\n\r\n"
+        )));
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(500),
+            "GET /Transcode must not wait for a full remux ({:?})",
+            t0.elapsed()
+        );
+        assert_eq!(r.status, 200);
+        assert!(r.body.is_empty(), "body is streamed after headers");
+        let spec = r.remux_job.expect("background remux job");
+        assert_eq!(spec.detail_id, id);
+        assert_eq!(spec.args[0], "ffmpeg");
+        assert!(!spec.args.iter().any(|s| s == "pipe:1"), "{:?}", spec.args);
+        assert!(
+            spec.args.iter().any(|s| s.contains("frag_keyframe")),
+            "{:?}",
+            spec.args
+        );
+        assert!(!spec.args.iter().any(|s| s.contains("faststart")), "{:?}", spec.args);
+        assert!(
+            spec.args.iter().any(|s| s.ends_with(".part")),
+            "must write a .part file: {:?}",
+            spec.args
+        );
+        let hdrs = r
+            .headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!hdrs.to_ascii_lowercase().contains("accept-ranges"));
+        assert!(!hdrs.to_ascii_lowercase().contains("content-length"));
+        assert!(hdrs.contains("DLNA.ORG_OP=00"), "{hdrs}");
+        assert!(hdrs.contains("DLNA.ORG_CI=1"), "{hdrs}");
+        let dest = rusty_dlna_transcode::cache_dest(
+            &app.cache_dir,
+            id,
+            rusty_dlna_transcode::RecodeAction::RemuxP8,
+        );
+        assert!(!dest.is_file(), "handle() must not wait for a finished cache");
+
+        let kodi_orig = testdata_app();
+        let miss = kodi_orig.handle(&req(&format!(
             "GET /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Kodi/21.0\r\n\r\n"
         )));
-        assert_eq!(kodi.status, 404);
-
-        use std::process::Command;
-        if Command::new("ffmpeg").arg("-version").output().is_err() {
-            eprintln!("skip ffmpeg cache (no ffmpeg)");
-            return;
-        }
-        let cr = app.handle(&req(&format!(
-            "GET /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: CrKey/1.54 DLNADOC/1.50\r\n\r\n"
-        )));
-        if cr.status != 200 {
-            eprintln!(
-                "ffmpeg remap status={} body={}",
-                cr.status,
-                String::from_utf8_lossy(&cr.body)
-            );
-            // Still prove decide/DIDL; file encode can fail on odd fixtures.
-            return;
-        }
-        let dest = rusty_dlna_transcode::cache_dest(&app.cache_dir, id, rusty_dlna_transcode::RecodeAction::RemuxP8);
-        assert!(dest.is_file(), "cache file missing {dest:?}");
-        let cached = std::fs::read(&dest).unwrap();
-        assert_eq!(cr.body, cached);
-        assert!(cr
-            .headers
-            .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case("Accept-Ranges") && v == "bytes"));
-        assert!(cr
-            .headers
-            .iter()
-            .any(|(k, v)| k == "contentFeatures.dlna.org" && v.contains("CI=1")));
-        let mid = cached.len() / 2;
-        let end = (mid + 31).min(cached.len() - 1);
-        let ranged = app.handle(&req(&format!(
-            "GET /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: CrKey/1.54\r\nRange: bytes={mid}-{end}\r\n\r\n"
-        )));
-        assert_eq!(ranged.status, 206);
-        assert_eq!(ranged.body, cached[mid..=end]);
+        assert_eq!(miss.status, 404);
     }
 
     #[test]

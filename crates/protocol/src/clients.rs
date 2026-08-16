@@ -67,7 +67,7 @@ pub enum ClientKind {
     Tivo,
     StandardDlna150,
     StandardUpnp,
-    /// New: Google Cast / Streamer / Chromecast (not in MiniDLNA).
+    /// New: Google Cast / Streamer / Chromecast (not in the dialect).
     GoogleCast,
 }
 
@@ -94,7 +94,7 @@ const fn f(bits: u32) -> ClientFlags {
     ClientFlags::from_bits_truncate(bits)
 }
 
-/// MiniDLNA table, then rustyDLNA additions. Do not reorder Samsung rows.
+/// rustyDLNA table, then rustyDLNA additions. Do not reorder Samsung rows.
 pub static CLIENTS: &[ClientProfile] = &[
     ClientProfile {
         kind: ClientKind::Unknown,
@@ -378,6 +378,16 @@ pub static CLIENTS: &[ClientProfile] = &[
         match_str: Some("Kodi"),
         match_kind: MatchKind::UserAgent,
     },
+    // Kodi's UPnP stack (Platinum) often omits "Kodi" from User-Agent.
+    ClientProfile {
+        kind: ClientKind::Kodi,
+        flags: f(ClientFlags::DLNA.bits()
+            | ClientFlags::MIME_AVI_AVI.bits()
+            | ClientFlags::CAPTION_RES.bits()),
+        name: "Kodi",
+        match_str: Some("Platinum/"),
+        match_kind: MatchKind::UserAgent,
+    },
     ClientProfile {
         kind: ClientKind::Windows,
         flags: f(ClientFlags::DLNA.bits() | ClientFlags::MIME_AVI_AVI.bits()),
@@ -465,6 +475,9 @@ mod tests {
         assert!(c.flags.contains(ClientFlags::DLNA));
         assert!(c.flags.contains(ClientFlags::CAPTION_RES));
         assert!(!c.flags.contains(ClientFlags::NEED_SAFE_VIDEO));
+        let plat = identify_user_agent("UPnP/1.0 DLNADOC/1.50 Platinum/1.0.5.13").unwrap();
+        assert_eq!(plat.kind, ClientKind::Kodi);
+        assert_eq!(plat.name, "Kodi");
     }
 
     #[test]

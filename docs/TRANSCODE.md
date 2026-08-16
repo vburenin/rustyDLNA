@@ -1,6 +1,6 @@
 # Transcode
 
-MiniDLNA does not transcode. rustyDLNA does, as a **job**, not as a
+rustyDLNA transcodes as a **job**, not as a
 rewrite of `/MediaItems/`.
 
 ## Decision
@@ -61,33 +61,32 @@ Empty `[[remap]]` list → every client, including Cast, gets the remux.
 - Copy mastering display / MaxCLL when present (`-mastering_display`,
   `-max_cll`) so tone-map matches the disc.
 
-## Serve path: file cache (not a live pipe)
+## Serve path: background growing fMP4
 
-`GET /Transcode/{id}` waits for (or reuses) a **cache file** under
-`cache_dir`, then serves it with the same byte-`Range` path as
-`/MediaItems/`. That is why remux Range is honest.
+`GET /Transcode/{id}` starts **one** ffmpeg job per title that writes a
+fragmented MP4 (`.part`, then rename). The first ~16 KiB (`ftyp` +
+init) is enough to start playback. The rest fills in behind the client.
 
-`ffmpeg_live_args` still builds a stdout pipe
-(`frag_keyframe+empty_moov+default_base_moof`, `pipe:1`) for tests and
-a future supervisor. It is **not** what the HTTP handler serves today.
+Kodi opens several GETs at once. They **attach** to the same job. A
+probe disconnect does **not** kill ffmpeg.
 
-Cache jobs:
-
-- Map `0:v:0` and a chosen audio (not “whatever is default”).
-- TrueHD / Atmos → AC-3 640k or AAC per `audio_out`.
-- `JobGate` caps `max_jobs`; `Drop` kills the ffmpeg process.
-- A finished non-empty dest is reused (no re-encode).
+- `-movflags frag_keyframe+empty_moov+default_base_moof` (no `+faststart`)
+- `-flush_packets 1` and ~1 s `-frag_duration`
+- Map `0:v:0` and a chosen audio
+- `JobGate` caps **titles** (`max_jobs`), not TCP connections
+- Finished dest is reused (Range / `OP=01`). Growing dest is `OP=00`.
+- ffmpeg stderr and HTTP 4xx/5xx are logged at **error**
 
 If `decide` says original, the handler serves the source file.
 
 ## HTTP
 
-Transcoded GETs (file cache):
+Transcoded GETs (live pipe):
 
 - `Connection: close`
 - `transferMode.dlna.org: Streaming`
-- `contentFeatures.dlna.org: … DLNA.ORG_CI=1; DLNA.ORG_OP=01…`
-- Honest `Content-Length` / `Accept-Ranges: bytes` (it is a file)
+- `contentFeatures.dlna.org: … DLNA.ORG_CI=1; DLNA.ORG_OP=00…`
+- No `Content-Length`, no `Accept-Ranges`
 - TimeSeek without Range is still 406
 
 Do not reuse `stream_buffer_mb` for encoded bytes. That window is source
@@ -97,7 +96,7 @@ file data.
 
 Not “transcode everything.” Proper means:
 
-1. Know the source (container, codec, HDR, audio) — MiniDLNA DB does not.
+1. Know the source (container, codec, HDR, audio) — rustyDLNA DB does not.
 2. Know the client (table + `NEED_SAFE_VIDEO`).
 3. Hide or demote the unplayable `<res>` for that client.
 4. Preserve HDR10; drop DV.

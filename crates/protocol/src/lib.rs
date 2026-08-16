@@ -1,6 +1,6 @@
-//! MiniDLNA-compatible protocol dialect.
+//! rustyDLNA on-the-wire protocol dialect.
 //!
-//! Constants and helpers here are the on-the-wire contract documented in
+//! Constants and helpers here are the contract documented in
 //! `docs/replica.md`. A rewrite that changes these without a client reason
 //! will break TVs that already work.
 
@@ -22,8 +22,8 @@ pub use clients::{
 };
 pub use date::{w3c_date_from_unix, w3c_normalize_date};
 pub use isolation::{
-    collides_with_live_minidlna, test_listen_ports, LIVE_MINIDLNA_HTTP_PORT, LIVE_MINIDLNA_SSDP_PORT,
-    TEST_HTTP_PORT, TEST_SSDP_PORT,
+    collides_with_live_ports, test_listen_ports, LIVE_HTTP_PORT, LIVE_SSDP_PORT, TEST_HTTP_PORT,
+    TEST_SSDP_PORT,
 };
 pub use paths::{
     caption_from_path, media_item_id_from_path, strtoll_prefix, transcode_id_from_path,
@@ -33,8 +33,7 @@ pub use persist::http_should_persist;
 pub const SERVER_NAME: &str = "rustyDLNA";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// `Server:` product token. MiniDLNA used `MiniDLNA/1.3.3-kodi`.
-/// Keep `DLNADOC/1.50 UPnP/1.0` — clients parse those tokens.
+/// `Server:` product token. Keep `DLNADOC/1.50 UPnP/1.0` — clients parse those tokens.
 pub fn server_header(os_version: &str) -> String {
     format!("{os_version} DLNADOC/1.50 UPnP/1.0 {SERVER_NAME}/{SERVER_VERSION}")
 }

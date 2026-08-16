@@ -13,7 +13,7 @@ a bridge network. They must not publish 8200/1900 or use host networking.
 |---|---|
 | Do not `network_mode: host` on rusty **test** containers | Would collide with live SSDP |
 | Do not publish `8200` or `1900` from test compose | Host already bound (rustyDLNA) |
-| Do not name a rusty test container `minidlna` | Compose / restart-all confusion |
+| Do not reuse another product's container name | Compose / restart-all confusion |
 | Unit tests bind nothing | Packet/string tests; listen tests use 18200/11900 |
 | Listen tests use **18200** / **11900** inside a **bridge** network | `rusty_dlna_protocol::isolation` |
 | Host `cargo test` is allowed | It does not listen |
@@ -28,13 +28,13 @@ Prove isolation after any change that might listen:
 That script checks test compose is not host-network and does not publish
 8200/1900, runs tests **in a bridge container with no published ports**,
 and fails if compose isolation is broken. It does **not** require
-MiniDLNA on `:8200`.
+rustyDLNA on `:8200`.
 
 ---
 
 ## Phase 0 — Workspace (current)
 
-- [x] Copy `replica.md` and MiniDLNA oracle headers
+- [x] Copy `replica.md` and oracle headers
 - [x] Architecture / transcode / inherited docs
 - [x] Protocol crates + unit tests
 - [x] Isolation constants `8200`/`1900` vs `18200`/`11900`
@@ -45,7 +45,7 @@ MiniDLNA on `:8200`.
 **Verify**
 
 ```bash
-cd /root/containers/rustyDLNA
+# from the repository root
 ./scripts/prove.sh
 curl -sI http://127.0.0.1:8200/ | grep 'rustyDLNA/'
 ```
@@ -59,7 +59,7 @@ network and no published 8200/1900.
 
 Goal: the C oracle and Rust constants cannot drift silently.
 
-- [x] Test: `ROOTDESC_PATH`, control/event URLs match `docs/minidlna-oracle/minidlnapath.h` — `cargo test -p rusty-dlna-protocol oracle::path_literals_appear_in_minidlnapath_h`
+- [x] Test: `ROOTDESC_PATH`, control/event URLs match `docs/oracle/` — `cargo test -p rusty-dlna-protocol oracle::path_literals_appear_in_oracle_paths`
 - [x] Test: object IDs `0` `64` `1` `2` `3` match `scanner.h` — `cargo test -p rusty-dlna-protocol oracle::object_ids_appear_in_scanner_h`
 - [x] Test: `soapMethods[]` names match `replica.md` / `upnpsoap.c` — `cargo test -p rusty-dlna-protocol oracle::soap_method_names_appear_in_replica`
 - [x] Test: `w3c_normalize_date` cases match `w3c_date.c` (19-char → `Z`, year → `YYYY-01-01`, EXIF) — `cargo test -p rusty-dlna-protocol oracle::w3c_normalize_matches_w3c_date_c_cases`
@@ -77,7 +77,7 @@ values that can rot).
 
 ## Phase 2 — SSDP (no LAN)
 
-Goal: packet bytes match MiniDLNA; **no** multicast on the host.
+Goal: packet bytes match the dialect; **no** multicast on the host.
 
 - [x] Bind M-SEARCH receiver only in the test container on `TEST_SSDP_PORT` (11900) — `RUSTY_DLNA_HTTP_PORT=18200 RUSTY_DLNA_SSDP_PORT=11900 cargo test -p rusty-dlna --test listen_e2e`
 - [x] Do not `IP_ADD_MEMBERSHIP` on `239.255.255.250` from the host — no `IP_ADD_MEMBERSHIP` in tree (`rg IP_ADD_MEMBERSHIP` empty); unicast bind only
@@ -90,7 +90,7 @@ Goal: packet bytes match MiniDLNA; **no** multicast on the host.
 **Verify** in-container only: send a UDP M-SEARCH to `127.0.0.1:11900`
 inside `rusty-dlna-test`.
 
-**Prove** host `ss -ulnp | grep ':1900'` still lists `minidlnad` only
+**Prove** host `ss -ulnp | grep ':1900'` still lists `rusty-dlna` only
 (plus whatever else was already there). rusty-dlna must not appear.
 
 ---
@@ -117,7 +117,7 @@ container (not the host).
 
 ## Phase 4 — SOAP Browse / Search
 
-- [x] POST any path with `SOAPAction` `#Browse` works (MiniDLNA ignores URL) — `cargo test -p rusty-dlna --lib soap_caps_and_unknown_path_browse`
+- [x] POST any path with `SOAPAction` `#Browse` works (The dialect ignores URL) — `cargo test -p rusty-dlna --lib soap_caps_and_unknown_path_browse`
 - [x] `BrowseDirectChildren` / `BrowseMetadata` / missing ObjectID → 402 — `cargo test -p rusty-dlna --lib missing_objectid_is_402_unknown_is_401`
 - [x] Result is XML-escaped DIDL (`&lt;DIDL-Lite`) — `cargo test -p rusty-dlna --lib browse_root_and_kodi_original`
 - [x] Roots: `0` (parent `-1`), children include `64` / `1` / `2` as configured — same
@@ -146,7 +146,7 @@ container (not the host).
 
 **Verify** fixture library of a few tiny files in `testdata/`.
 
-**Prove** MiniDLNA cache path is not opened (`lsof` / container mounts).
+**Prove** rustyDLNA cache path is not opened (`lsof` / container mounts).
 
 ---
 
@@ -171,7 +171,7 @@ container (not the host).
 - [x] `CrKey` + DV MKV / TrueHD → `Transcode`, drop DV, keep HDR10 flags — `cargo test -p rusty-dlna-transcode cast_p7_hits_hdr10_remap`
 - [x] `CrKey` + HDR10 MP4 AC-3 → original — `cargo test -p rusty-dlna-transcode cast_p8_is_not_p7` (P8/HDR10 not matching `hdr = "dv-p7"`)
 - [x] ffmpeg supervisor: `Drop` kills the process; `max_jobs` cap — `cargo test -p rusty-dlna-transcode drop_kills_ffmpeg_job_and_max_jobs_caps`
-- [x] Live pipe: fragmented MP4, no `faststart` — `ffmpeg_live_args` still emits `frag_keyframe+empty_moov+default_base_moof` / `pipe:1` (`file_cache_argv_is_not_a_live_pipe`). Serve path caches remux/hdr10 to a **file** so Range works (OBJECTIVE).
+- [x] Background remux: growing fMP4 `.part`, shared job across Kodi’s parallel GETs, first fragment then stream (`transcode_get_is_live_pipe_not_full_file`, `grow_file_emits_ftyp_before_process_exits`). HTTP 4xx/5xx and ffmpeg stderr at **error**.
 - [x] Transcode URL **first** in DIDL for `NEED_SAFE_VIDEO` only — `cargo test -p rusty-dlna --lib crkey_dvp7_remap_first_kodi_original`
 - [x] `[[remap]]` matches codec/hdr/audio/client; first row wins
 - [x] CUDA decode not required (software decode + NVENC) — test remap uses `copy` / `libx264`
@@ -207,13 +207,13 @@ Run each UA against the **container** (18200), not 8200.
 
 ## Phase 9 — Cutover (do not do until 1–8 are green)
 
-- [x] MiniDLNA stopped (`restart=no`); rustyDLNA serves `/storage/video` on 8200/1900.
+- [x] Live daemon serves the configured `media_dir` on 8200/1900.
 
 Only then:
 
 1. `./scripts/prove.sh` green
 2. Tell the operator
-3. `docker stop minidlna` **and** disable `restart: always` / compose
+3. `docker stop rusty-dlna` **and** disable `restart: always` / compose
    so it does not come back
 4. Run rustyDLNA with host network, ports 8200/1900
 5. `curl -sI :8200` shows `rustyDLNA/`

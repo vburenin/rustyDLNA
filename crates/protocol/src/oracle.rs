@@ -1,6 +1,6 @@
-//! Dialect lock: live Rust `&str`s must appear in the MiniDLNA oracle
-//! headers / replica notes. Expected values are **not** hand-copied here
-//! so they cannot rot independently of the C tree.
+//! Dialect lock: live Rust `&str`s must appear in the oracle headers /
+//! replica notes. Expected values are **not** hand-copied here so they
+//! cannot rot independently of those files.
 
 use std::path::PathBuf;
 
@@ -23,7 +23,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn oracle(name: &str) -> String {
-    let p = workspace_root().join("docs/minidlna-oracle").join(name);
+    let p = workspace_root().join("docs/oracle").join(name);
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
@@ -37,8 +37,8 @@ fn quoted(s: &str) -> String {
 }
 
 #[test]
-fn path_literals_appear_in_minidlnapath_h() {
-    let h = oracle("minidlnapath.h");
+fn path_literals_appear_in_oracle_paths() {
+    let h = oracle("paths.h");
     for lit in [
         ROOTDESC_PATH,
         CONTENTDIRECTORY_PATH,
@@ -53,7 +53,7 @@ fn path_literals_appear_in_minidlnapath_h() {
     ] {
         assert!(
             h.contains(&quoted(lit)),
-            "oracle minidlnapath.h missing {lit:?}"
+            "oracle path header missing {lit:?}"
         );
     }
 }

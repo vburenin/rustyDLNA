@@ -3,7 +3,7 @@ name = "rusty-dlna-ssdp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SSDP announce and M-SEARCH (MiniDLNA dialect)"
+description = "SSDP announce and M-SEARCH"
 
 [dependencies]
 rusty-dlna-protocol.workspace = true

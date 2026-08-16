@@ -1,4 +1,4 @@
-//! HTTP paths from `src/minidlnapath.h` and `upnphttp.c` URL dispatch.
+//! HTTP paths used by description and SOAP dispatch.
 
 pub const ROOTDESC_PATH: &str = "/rootDesc.xml";
 pub const CONTENTDIRECTORY_PATH: &str = "/ContentDir.xml";
@@ -20,7 +20,7 @@ pub const ICONS_PREFIX: &str = "/icons/";
 pub const CAPTIONS_PREFIX: &str = "/Captions/";
 pub const STATUS_PATH: &str = "/status";
 
-/// MiniDLNA `strtoll(object, NULL, 10)` — leading integer, ignore any suffix
+/// dialect `strtoll(object, NULL, 10)` — leading integer, ignore any suffix
 /// (so `/MediaItems/{id}.{ext}` treats `{ext}` as decorative).
 pub fn strtoll_prefix(s: &str) -> Option<i64> {
     let s = s.trim();
@@ -94,7 +94,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn minidlna_path_literals() {
+    fn path_literals_locked() {
         assert_eq!(ROOTDESC_PATH, "/rootDesc.xml");
         assert_eq!(CONTENTDIRECTORY_CONTROLURL, "/ctl/ContentDir");
         assert_eq!(CONNECTIONMGR_CONTROLURL, "/ctl/ConnectionMgr");

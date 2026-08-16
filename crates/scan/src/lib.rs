@@ -1,6 +1,6 @@
 //! Library scan: skip rules, NFO dates, captions, inode reuse, SQLite store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub mod db;
@@ -28,9 +28,37 @@ pub fn is_junk_dir(name: &str) -> bool {
 }
 
 /// Built-in sample/trailer skip is case-sensitive on the directory name
-/// (`sample/` not `Sample/`) — MiniDLNA `is_sample` path.
+/// (`sample/` not `Sample/`) — dialect `is_sample` path.
 pub fn is_sample_or_trailer_dir(name: &str) -> bool {
     name == "sample" || name == "trailer"
+}
+
+/// Blu-ray / DVD disc trees. Hundreds of menu/clip bitstreams, not titles.
+pub fn is_disc_structure_dir(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "BDMV" | "CERTIFICATE" | "AACS" | "VIDEO_TS" | "AUDIO_TS"
+    )
+}
+
+/// Any directory the walker must not enter.
+pub fn is_skipped_dir(name: &str) -> bool {
+    is_junk_dir(name) || is_sample_or_trailer_dir(name) || is_disc_structure_dir(name)
+}
+
+/// True when a stored path sits under a skip/exclude rule.
+pub fn path_is_unwanted(path: &Path, cfg: &ScanConfig) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    path_excluded(path, name, cfg)
+        || path
+            .components()
+            .any(|c| c.as_os_str().to_str().is_some_and(is_skipped_dir))
+        || is_unfinished_name(name)
+        || looks_like_sample_file(name)
+        || is_album_art_name(name)
 }
 
 pub fn is_unfinished_name(name: &str) -> bool {
@@ -93,14 +121,14 @@ pub fn caption_http_mime(ext: &str) -> &'static str {
     }
 }
 
-/// MiniDLNA `ends_with` is `strcasecmp` on the suffix (`src/utils.c`).
+/// dialect `ends_with` is `strcasecmp` on the suffix (`src/utils.c`).
 fn ends_with_ci(name: &str, suffix: &str) -> bool {
     let nb = name.as_bytes();
     let sb = suffix.as_bytes();
     nb.len() >= sb.len() && nb[nb.len() - sb.len()..].eq_ignore_ascii_case(sb)
 }
 
-/// MiniDLNA `is_video` (`/home/vlad/workspace/minidlna/src/utils.c`).
+/// dialect `is_video` (`scanner skip rules`).
 pub fn is_video(name: &str) -> bool {
     [
         ".mpg", ".mpeg", ".avi", ".divx", ".asf", ".wmv", ".mp4", ".m4v", ".mts",
@@ -111,7 +139,7 @@ pub fn is_video(name: &str) -> bool {
     .any(|s| ends_with_ci(name, s))
 }
 
-/// MiniDLNA `is_audio`.
+/// dialect `is_audio`.
 pub fn is_audio(name: &str) -> bool {
     [
         ".mp3", ".flac", ".wma", ".asf", ".fla", ".flc", ".m4a", ".aac", ".mp4",
@@ -121,7 +149,7 @@ pub fn is_audio(name: &str) -> bool {
     .any(|s| ends_with_ci(name, s))
 }
 
-/// MiniDLNA `is_image` — JPEG only (not PNG).
+/// dialect `is_image` — JPEG only (not PNG).
 pub fn is_image(name: &str) -> bool {
     ends_with_ci(name, ".jpg") || ends_with_ci(name, ".jpeg")
 }
@@ -144,7 +172,7 @@ pub fn is_album_art_name(name: &str) -> bool {
         || l.ends_with("-fanart.jpg")
 }
 
-/// Which media classes a `media_dir=` root accepts (MiniDLNA `V,` / `A,` / `P,`).
+/// Which media classes a `media_dir=` root accepts (dialect `V,` / `A,` / `P,`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MediaTypes {
     pub video: bool,
@@ -199,7 +227,7 @@ impl Default for MediaTypes {
     }
 }
 
-/// Parse MiniDLNA `media_dir=V,/path` or a bare path. Default types = AVP.
+/// Parse dialect `media_dir=V,/path` or a bare path. Default types = AVP.
 pub fn parse_media_dir(spec: &str) -> (MediaTypes, PathBuf) {
     if let Some((prefix, rest)) = spec.split_once(',') {
         let p = prefix.trim();
@@ -223,7 +251,7 @@ pub fn parse_media_dir(spec: &str) -> (MediaTypes, PathBuf) {
     (MediaTypes::all(), PathBuf::from(spec))
 }
 
-/// Combine MiniDLNA `media_dir=` specs. Each prefix is parsed; the
+/// Combine dialect `media_dir=` specs. Each prefix is parsed; the
 /// returned `MediaTypes` is the **union** so a later `A,` cannot wipe an
 /// earlier `V,`. Empty list → all types (AVP), no dirs.
 pub fn collect_media_dirs<I, S>(specs: I) -> (Vec<PathBuf>, MediaTypes)
@@ -246,7 +274,7 @@ where
     (dirs, types)
 }
 
-/// MiniDLNA `GetVideoMetadata`: reject non-media. Strong container magic
+/// dialect `GetVideoMetadata`: reject non-media. Strong container magic
 /// (EBML/ftyp/RIFF/…) is proof the file is a real bitstream, not text.
 /// Ambiguous headers (TS/MPEG/MP3) get a short `ffprobe`.
 pub fn file_is_viable(path: &Path) -> bool {
@@ -549,7 +577,7 @@ pub struct MediaItem {
     pub samplerate: Option<i64>,
 }
 
-/// MiniDLNA `duration_str` (`H:MM:SS.mmm` from milliseconds).
+/// dialect `duration_str` (`H:MM:SS.mmm` from milliseconds).
 pub fn duration_str(msec: i64) -> String {
     let msec = msec.max(0);
     format!(
@@ -570,7 +598,7 @@ pub struct AvMeta {
     pub samplerate: Option<i64>,
 }
 
-/// MiniDLNA `GetVideoMetadata` / lav: duration, bitrate/8, WxH, audio.
+/// dialect `GetVideoMetadata` / lav: duration, bitrate/8, WxH, audio.
 pub fn probe_av_meta(path: &Path) -> Option<AvMeta> {
     let out = std::process::Command::new("ffprobe")
         .args([
@@ -649,6 +677,10 @@ pub struct Catalog {
     pub items: HashMap<String, MediaItem>,
     pub by_detail: HashMap<i64, String>,
     pub next_detail: i64,
+    /// Unique browse-folder videos, capped at `RECENT_MAX`.
+    pub recent_count: u32,
+    /// Newest unique browse-folder item ids (already sorted).
+    pub recent_ids: Vec<String>,
 }
 
 impl Catalog {
@@ -658,6 +690,8 @@ impl Catalog {
             items: HashMap::new(),
             by_detail: HashMap::new(),
             next_detail: 1,
+            recent_count: 0,
+            recent_ids: Vec::new(),
         };
         c.add_container(ROOT_ID, "-1", "root", "container.storageFolder", true);
         c.add_container(
@@ -754,36 +788,61 @@ impl Catalog {
     }
 
     pub fn children_of(&self, id: &str) -> Option<Vec<CatalogChild>> {
+        self.page_children(id, 0, usize::MAX).map(|(ch, _)| ch)
+    }
+
+    /// Sorted children, cloning only `[start, start+take)`. Folders first,
+    /// then title (ASCII case-insensitive) so VLC shows expand controls
+    /// above loose files.
+    pub fn page_children(
+        &self,
+        id: &str,
+        start: usize,
+        take: usize,
+    ) -> Option<(Vec<CatalogChild>, u32)> {
         if id == VIDEO_RECENT_ID {
-            return Some(self.recent_videos());
+            let mut all = self.recent_videos();
+            let total = all.len() as u32;
+            if start >= all.len() || take == 0 {
+                return Some((Vec::new(), total));
+            }
+            let end = all.len().min(start.saturating_add(take));
+            let page = all.drain(start..end).collect();
+            return Some((page, total));
         }
         let c = self.containers.get(id)?;
-        let mut out = Vec::new();
+        let mut keys: Vec<(bool, &str, &str)> = Vec::with_capacity(c.children.len());
         for ch in &c.children {
             if let Some(cont) = self.containers.get(ch) {
-                out.push(CatalogChild::Container(cont.clone()));
+                keys.push((true, cont.title.as_str(), ch.as_str()));
             } else if let Some(it) = self.items.get(ch) {
-                out.push(CatalogChild::Item(it.clone()));
+                keys.push((false, it.title.as_str(), ch.as_str()));
             }
         }
-        // MiniDLNA CLASS sort: folders first so VLC shows expand controls
-        // above loose files in mixed directories.
-        out.sort_by(|a, b| match (a, b) {
-            (CatalogChild::Container(_), CatalogChild::Item(_)) => std::cmp::Ordering::Less,
-            (CatalogChild::Item(_), CatalogChild::Container(_)) => std::cmp::Ordering::Greater,
-            (CatalogChild::Container(x), CatalogChild::Container(y)) => {
-                x.title.to_ascii_lowercase().cmp(&y.title.to_ascii_lowercase())
-            }
-            (CatalogChild::Item(x), CatalogChild::Item(y)) => {
-                x.title.to_ascii_lowercase().cmp(&y.title.to_ascii_lowercase())
-            }
+        keys.sort_by(|a, b| match (a.0, b.0) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => cmp_ignore_ascii_case(a.1, b.1),
         });
-        Some(out)
+        let total = keys.len() as u32;
+        let page = keys
+            .into_iter()
+            .skip(start)
+            .take(take)
+            .filter_map(|(_, _, oid)| {
+                if let Some(cont) = self.containers.get(oid) {
+                    Some(CatalogChild::Container(cont.clone()))
+                } else {
+                    self.items.get(oid).cloned().map(CatalogChild::Item)
+                }
+            })
+            .collect();
+        Some((page, total))
     }
 
     pub fn displayed_child_count(&self, id: &str) -> u32 {
         if id == VIDEO_RECENT_ID {
-            return self.recent_videos().len() as u32;
+            return self.recent_count;
         }
         self.containers
             .get(id)
@@ -809,6 +868,28 @@ impl Catalog {
     /// Newest unique videos (inode-deduped so symlink aliases count once),
     /// newest first, up to `RECENT_MAX`. Object IDs are `2$FF0$` + source id.
     pub fn recent_videos(&self) -> Vec<CatalogChild> {
+        let owned = if self.recent_ids.is_empty() {
+            self.compute_recent_ids()
+        } else {
+            Vec::new()
+        };
+        let ids: &[String] = if owned.is_empty() {
+            &self.recent_ids
+        } else {
+            &owned
+        };
+        ids.iter()
+            .filter_map(|id| {
+                let it = self.items.get(id)?;
+                let mut clone = it.clone();
+                clone.object_id = format!("{VIDEO_RECENT_ID}${id}");
+                clone.parent_id = VIDEO_RECENT_ID.to_string();
+                Some(CatalogChild::Item(clone))
+            })
+            .collect()
+    }
+
+    fn compute_recent_ids(&self) -> Vec<String> {
         let mut items: Vec<&MediaItem> = self
             .items
             .values()
@@ -825,7 +906,7 @@ impl Catalog {
                 .then_with(|| a.object_id.cmp(&b.object_id))
         });
         let mut seen: HashMap<(u64, u64), ()> = HashMap::new();
-        let mut unique = Vec::new();
+        let mut ids = Vec::new();
         for it in items {
             let key = if it.inode != 0 {
                 (it.device, it.inode)
@@ -836,20 +917,17 @@ impl Catalog {
                 continue;
             }
             seen.insert(key, ());
-            unique.push(it);
-            if unique.len() == RECENT_MAX {
+            ids.push(it.object_id.clone());
+            if ids.len() == RECENT_MAX {
                 break;
             }
         }
-        unique
-            .into_iter()
-            .map(|it| {
-                let mut clone = it.clone();
-                clone.object_id = format!("{VIDEO_RECENT_ID}${}", it.object_id);
-                clone.parent_id = VIDEO_RECENT_ID.to_string();
-                CatalogChild::Item(clone)
-            })
-            .collect()
+        ids
+    }
+
+    fn rebuild_recent_index(&mut self) {
+        self.recent_ids = self.compute_recent_ids();
+        self.recent_count = self.recent_ids.len() as u32;
     }
 
     pub fn metadata(&self, id: &str) -> Option<CatalogChild> {
@@ -915,6 +993,7 @@ impl Catalog {
             self.link_child(&vparent, &vobj);
             self.items.insert(vobj, clone);
         }
+        self.rebuild_recent_index();
     }
 
     fn mirror_video_dir_ancestors(&mut self, browse_folder_id: &str) {
@@ -965,9 +1044,9 @@ pub struct ScanConfig {
     pub media_dirs: Vec<PathBuf>,
     pub exclude_dirs: Vec<String>,
     pub exclude_files: Vec<String>,
-    /// MiniDLNA `media_dir=V,…` filter. Default = all (AVP).
+    /// dialect `media_dir=V,…` filter. Default = all (AVP).
     pub types: MediaTypes,
-    /// MiniDLNA `files.db`. None = in-memory SQLite (tests).
+    /// dialect `files.db`. None = in-memory SQLite (tests).
     pub db_path: Option<PathBuf>,
 }
 
@@ -984,10 +1063,9 @@ pub fn path_is_live_file(path: &Path) -> bool {
 
 /// If `stored` is missing, rebase it onto a configured media root.
 ///
-/// Host scans often persist the realpath (`/storage/z2-5x20tb/video/…`)
-/// while the container only mounts that tree at `/storage/video`. Match
-/// the media-root directory name in `stored` and try the remainder under
-/// each configured root.
+/// Host scans often persist a realpath while the container only mounts
+/// that tree at a media root. Match the media-root directory name in
+/// `stored` and try the remainder under each configured root.
 pub fn rebase_media_path(stored: &Path, roots: &[PathBuf]) -> PathBuf {
     if stored.as_os_str().is_empty() {
         return stored.to_path_buf();
@@ -1010,7 +1088,7 @@ pub fn rebase_media_path(stored: &Path, roots: &[PathBuf]) -> PathBuf {
 }
 
 /// Relative path after the media-root directory name (`video` in
-/// `/storage/video` and `/storage/z2-5x20tb/video`).
+/// `/storage/video` and `/mnt/pool/video`).
 pub fn media_rel_key(path: &Path, roots: &[PathBuf]) -> String {
     for root in roots {
         if let Some(key) = root.file_name() {
@@ -1064,7 +1142,7 @@ fn open_library(cfg: &ScanConfig) -> Option<LibraryDb> {
 }
 
 /// Drop DETAILS/OBJECTS for `path`, matching host-realpath vs container-mount
-/// prefixes (`/storage/z2-…/video/…` vs `/storage/video/…`).
+/// prefixes (e.g. `/mnt/pool/video/…` vs `/storage/video/…`).
 pub fn forget_path(cfg: &ScanConfig, path: &Path) -> usize {
     forget_matching(cfg, path, false)
 }
@@ -1081,7 +1159,7 @@ fn forget_matching(cfg: &ScanConfig, path: &Path, tree: bool) -> usize {
     };
     let rows = db.all_detail_stats().unwrap_or_default();
     let mut n = 0usize;
-    for (p, _, _, _) in rows {
+    for (p, _, _, _, _, _) in rows {
         let hit = if tree {
             path_is_under_watched(&p, path, &cfg.media_dirs)
         } else {
@@ -1098,6 +1176,13 @@ pub fn path_is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
+}
+
+fn cmp_ignore_ascii_case(a: &str, b: &str) -> std::cmp::Ordering {
+    a.as_bytes()
+        .iter()
+        .map(|c| c.to_ascii_lowercase())
+        .cmp(b.as_bytes().iter().map(|c| c.to_ascii_lowercase()))
 }
 
 fn file_mtime_unix(meta: &std::fs::Metadata) -> i64 {
@@ -1122,7 +1207,7 @@ pub(crate) fn path_excluded(path: &Path, name: &str, cfg: &ScanConfig) -> bool {
     false
 }
 
-/// MiniDLNA `exclude_dir`: a path component (`incomplete`) or a suffix
+/// dialect `exclude_dir`: a path component (`incomplete`) or a suffix
 /// (`video/incomplete`). Never walk or index those trees.
 fn dir_exclude_matches(path: &Path, name: &str, rule: &str) -> bool {
     let rule = rule.trim_matches('/');
@@ -1185,21 +1270,173 @@ fn captions_for(file: &Path) -> Vec<Caption> {
     caps
 }
 
-pub(crate) fn probe_for(file: &Path, ext: &str) -> SourceProbe {
+/// Cheap HDR guess from a title or path. Browse uses this so a folder
+/// listing never waits on ffprobe of an 80 GiB remux.
+pub fn guess_hdr_from_name(name: &str) -> Option<&'static str> {
+    let n = name.to_ascii_lowercase();
+    if n.contains("dv-p7")
+        || n.contains("dvp7")
+        || n.contains("dvhe.07")
+        || n.contains("profile-7")
+        || n.contains("profile.7")
+    {
+        return Some("dv-p7");
+    }
+    if n.contains("dv-p8")
+        || n.contains("dvp8")
+        || n.contains("dvhe.08")
+        || n.contains("profile-8")
+        || n.contains("profile.8")
+    {
+        return Some("dv-p8");
+    }
+    let web = n.contains("web-dl") || n.contains("webdl") || n.contains("webrip");
+    if web {
+        return None;
+    }
+    let dv = n.contains("dovi")
+        || n.contains("dolby vision")
+        || n.contains("dolbyvision")
+        || n.contains(".dv.")
+        || n.contains(".dv-")
+        || n.contains("-dv-")
+        || n.contains("-dv.")
+        || n.contains(" hdr.dv")
+        || n.contains(".hdr.dv")
+        || n.contains(" hdr dv")
+        || n.contains(" remux dv")
+        || n.contains("bdremux dv")
+        || n.contains(" bdremux.dv")
+        || n.contains(" dv.hevc")
+        || n.contains(".dv.hevc");
+    let remux = n.contains("bdremux")
+        || n.contains("bd remux")
+        || n.contains("blu-ray remux")
+        || n.contains("bluray remux")
+        || n.contains("uhd remux")
+        || n.contains("uhdremux");
+    if dv && remux {
+        return Some("dv-p7");
+    }
+    None
+}
+
+pub fn probe_toml_exists(file: &Path) -> bool {
     let named = PathBuf::from(format!("{}.probe.toml", file.display()));
     let stem = file.with_extension("probe.toml");
-    for c in [named, stem] {
-        if let Ok(text) = std::fs::read_to_string(&c) {
-            return parse_probe_toml(&text);
-        }
-    }
+    named.is_file() || stem.is_file()
+}
+
+/// Filename / sidecar-free probe. Catalog load must not open a
+/// `.probe.toml` next to every video (that was 2 failed opens × N files).
+pub fn probe_from_name(title: &str, path: &Path, ext: &str) -> SourceProbe {
     let mut p = SourceProbe::default();
     p.container = match ext {
         "mp4" | "m4v" => "mp4".into(),
         "avi" => "avi".into(),
         _ => "mkv".into(),
     };
+    if let Some(hdr) = guess_hdr_from_name(title).or_else(|| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(guess_hdr_from_name)
+    }) {
+        p.hdr = hdr.to_string();
+    }
     p
+}
+
+/// ffprobe codec / Dolby Vision profile. Used when no sidecar exists.
+pub fn probe_stream_identity(path: &Path) -> Option<SourceProbe> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-probesize",
+            "8000000",
+            "-analyzeduration",
+            "4000000",
+            "-show_entries",
+            "stream=codec_type,codec_name,color_transfer:stream_side_data=dv_profile",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut video = String::new();
+    let mut audio = String::new();
+    let mut color_transfer = String::new();
+    let mut dv_profile: Option<i32> = None;
+    let mut last_type = "";
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        match k {
+            "codec_type" => last_type = v.trim(),
+            "codec_name" => {
+                let name = v.trim();
+                if last_type == "video" && video.is_empty() {
+                    video = name.to_string();
+                } else if last_type == "audio" && audio.is_empty() {
+                    audio = name.to_string();
+                }
+            }
+            "color_transfer" => {
+                if last_type == "video" && color_transfer.is_empty() {
+                    color_transfer = v.trim().to_string();
+                }
+            }
+            "dv_profile" => {
+                if dv_profile.is_none() {
+                    dv_profile = v.trim().parse().ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    if video.is_empty() && audio.is_empty() && dv_profile.is_none() {
+        return None;
+    }
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("mkv");
+    let mut p = SourceProbe::default();
+    p.container = match ext {
+        "mp4" | "m4v" => "mp4".into(),
+        "avi" => "avi".into(),
+        _ => "mkv".into(),
+    };
+    p.video = match video.as_str() {
+        "h264" | "avc" => "h264".into(),
+        "mpeg2video" | "mpeg2" => "mpeg2".into(),
+        "" => p.video,
+        other => other.to_string(),
+    };
+    p.audio = match audio.as_str() {
+        "truehd" => "truehd".into(),
+        "ac3" => "ac3".into(),
+        "eac3" => "eac3".into(),
+        "aac" => "aac".into(),
+        "dts" | "dca" => "dts".into(),
+        "" => p.audio,
+        other => other.to_string(),
+    };
+    p.hdr = match dv_profile {
+        Some(7) => "dv-p7".into(),
+        Some(8) => "dv-p8".into(),
+        Some(5) => "dv-p5".into(),
+        Some(_) => "dv".into(),
+        None if color_transfer == "smpte2084" => "hdr10".into(),
+        None => "sdr".into(),
+    };
+    Some(p)
 }
 
 fn nfo_for(file: &Path) -> Option<String> {
@@ -1319,6 +1556,12 @@ pub(crate) fn library_write_guard() -> std::sync::MutexGuard<'static, ()> {
 /// List files on disk (skip `exclude_dir` / junk), compare to DETAILS, apply
 /// only adds/changes/deletes. Does not wipe OBJECTS or rewrite unchanged rows.
 pub fn monitor(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta) {
+    monitor_dirty(cfg, &[])
+}
+
+/// Like [`monitor`], but restat `dirty` paths (inotify CLOSE_WRITE / move
+/// targets) so SIZE/TIMESTAMP stay current without stating the whole tree.
+pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, ScanDelta) {
     let _write = library_write_guard();
     let db = match &cfg.db_path {
         Some(p) => LibraryDb::open(p).expect("open files.db"),
@@ -1330,25 +1573,25 @@ pub fn monitor(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta) {
     for (p, st) in &listed {
         listed_by_rel.insert(media_rel_key(Path::new(p), &cfg.media_dirs), st);
     }
-    let mut in_db_by_rel: HashMap<String, Vec<(String, i64, i64, i64)>> = HashMap::new();
-    for (p, id, sz, ts) in &db_rows {
+    let dirty_rels: HashSet<String> = dirty
+        .iter()
+        .map(|p| media_rel_key(p, &cfg.media_dirs))
+        .collect();
+    let mut in_db_by_rel: HashMap<String, Vec<(String, i64, i64, i64, i64, i64)>> = HashMap::new();
+    for (p, id, sz, ts, dev, ino) in &db_rows {
         in_db_by_rel
             .entry(media_rel_key(Path::new(p), &cfg.media_dirs))
             .or_default()
-            .push((p.clone(), *id, *sz, *ts));
+            .push((p.clone(), *id, *sz, *ts, *dev, *ino));
     }
     let _ = db.seed_virtual_containers();
     let _ = db.begin();
     let mut added = 0usize;
     let mut removed = 0usize;
     let mut changed = 0usize;
-    for (path, _, _, _) in &db_rows {
-        let name = Path::new(path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+    for (path, ..) in &db_rows {
         let key = media_rel_key(Path::new(path), &cfg.media_dirs);
-        if path_excluded(Path::new(path), name, cfg) || !listed_by_rel.contains_key(&key) {
+        if path_is_unwanted(Path::new(path), cfg) || !listed_by_rel.contains_key(&key) {
             if db.remove_path_and_symlink_aliases(path).unwrap_or(0) > 0 {
                 removed += 1;
             }
@@ -1363,16 +1606,16 @@ pub fn monitor(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta) {
         let listed_path = listed_by_rel[key].path.to_string_lossy();
         let keep = rows
             .iter()
-            .find(|(p, _, _, _)| p.as_str() == listed_path)
+            .find(|(p, ..)| p.as_str() == listed_path)
             .or_else(|| {
                 rows.iter()
-                    .find(|(p, _, _, _)| path_is_live_file(Path::new(p)))
+                    .find(|(p, ..)| path_is_live_file(Path::new(p)))
             })
-            .map(|(p, _, _, _)| p.clone());
+            .map(|(p, ..)| p.clone());
         let Some(keep) = keep else {
             continue;
         };
-        for (p, id, _, _) in rows {
+        for (p, id, ..) in rows {
             if p == &keep {
                 continue;
             }
@@ -1385,32 +1628,35 @@ pub fn monitor(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta) {
         let key = media_rel_key(Path::new(path_s), &cfg.media_dirs);
         let existing = in_db_by_rel.get(&key).and_then(|v| {
             v.iter()
-                .find(|(p, _, _, _)| p == path_s)
+                .find(|(p, ..)| p == path_s)
                 .or_else(|| v.first())
         });
         match existing {
-            Some((_, id, sz, ts)) if *sz == st.size && *ts == st.mtime => {
-                // Leave unchanged rows alone. Re-running attach_objects
-                // on a genre-alias path canonicalizes into the original
-                // folder and steals that title's OBJECTS.
-                let _ = id;
-            }
-            Some((db_path, id, _, _)) => {
-                if !file_is_viable(&st.path) {
-                    let _ = db.remove_path_and_symlink_aliases(db_path);
-                    removed += 1;
-                } else {
-                    let _ = db.update_detail_stat(*id, st.size, st.mtime);
+            Some((db_path, id, sz, ts, dev, ino)) => {
+                if dirty_rels.contains(&key) {
+                    if let Some(meta) = std::fs::metadata(&st.path).ok().filter(|m| m.is_file()) {
+                        let size = meta.len() as i64;
+                        let mtime = file_mtime_unix(&meta);
+                        if size != *sz || mtime != *ts {
+                            if !file_is_viable(&st.path) {
+                                let _ = db.remove_path_and_symlink_aliases(db_path);
+                                removed += 1;
+                                continue;
+                            }
+                            let _ = db.update_detail_stat(*id, size, mtime);
+                            changed += 1;
+                        }
+                    }
+                }
+                if attach_listed_if_missing(&db, cfg, &st.path, *id, *dev, *ino) {
                     changed += 1;
                 }
             }
             None => {
                 // Rel-key miss is not "new": the row may already exist at
                 // this exact path (genre aliases) or under another prefix.
-                if let Some((_, sz, ts)) = db.find_detail_by_path(path_s).ok().flatten() {
-                    if sz == st.size && ts == st.mtime {
-                        continue;
-                    }
+                if db.find_detail_by_path(path_s).ok().flatten().is_some() {
+                    continue;
                 }
                 if let Some(folder_id) = ensure_folder_chain(&db, cfg, &st.path) {
                     if index_one_file(&db, cfg, &st.path, &folder_id) {
@@ -1449,8 +1695,41 @@ pub fn monitor(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta) {
 #[derive(Clone)]
 struct ListedFile {
     path: PathBuf,
-    size: i64,
-    mtime: i64,
+}
+
+fn attach_listed_if_missing(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    path: &Path,
+    detail_id: i64,
+    device: i64,
+    inode: i64,
+) -> bool {
+    let Some(folder_id) = ensure_folder_chain(db, cfg, path) else {
+        return false;
+    };
+    let title = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if title.is_empty() {
+        return false;
+    }
+    if db.folder_has_inode_named(&folder_id, device, inode, title) {
+        return false;
+    }
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let (_, class, _) = mime_and_class(name);
+    attach_objects(
+        db,
+        &folder_id,
+        detail_id,
+        title,
+        class,
+        device as u64,
+        inode as u64,
+    );
+    true
 }
 
 fn list_media_files(cfg: &ScanConfig) -> HashMap<String, ListedFile> {
@@ -1495,16 +1774,13 @@ fn list_into(
         if name.starts_with('.') {
             continue;
         }
-        let is_dir = ent
-            .file_type()
-            .map(|t| t.is_dir() || t.is_symlink())
-            .unwrap_or(false)
-            && path.is_dir();
+        let is_dir = match ent.file_type() {
+            Ok(t) if t.is_dir() => true,
+            Ok(t) if t.is_symlink() => path.is_dir(),
+            _ => false,
+        };
         if is_dir {
-            if is_junk_dir(&name)
-                || is_sample_or_trailer_dir(&name)
-                || path_excluded(&path, &name, cfg)
-            {
+            if is_skipped_dir(&name) || path_excluded(&path, &name, cfg) {
                 continue;
             }
             list_into(out, cfg, walk_stack, &path, &name);
@@ -1521,17 +1797,13 @@ fn list_into(
         {
             continue;
         }
-        let meta = match std::fs::metadata(&path) {
-            Ok(m) if m.is_file() => m,
-            _ => continue,
-        };
+        // Existence only. Stat the whole tree on every reconcile was
+        // tens of thousands of HDD/NAS syscalls and stalled Browse.
         let path_s = path.to_string_lossy().into_owned();
         out.insert(
             path_s,
             ListedFile {
                 path,
-                size: meta.len() as i64,
-                mtime: file_mtime_unix(&meta),
             },
         );
     }
@@ -1542,44 +1814,49 @@ fn list_into(
 
 pub(crate) fn ensure_folder_chain(db: &LibraryDb, cfg: &ScanConfig, file: &Path) -> Option<String> {
     let parent = file.parent()?;
-    for root in &cfg.media_dirs {
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-        // Prefer the walked path so a symlink directory tree (genres/…)
-        // keeps its own folders. Canonicalize only as a fallback.
-        let rel: PathBuf = if let Ok(r) = parent.strip_prefix(&root) {
-            r.to_path_buf()
-        } else if let Ok(canon) = std::fs::canonicalize(parent) {
-            match canon.strip_prefix(&root) {
-                Ok(r) => r.to_path_buf(),
-                Err(_) => continue,
-            }
-        } else {
-            continue;
-        };
-        let root_title = root
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("media");
-        if path_excluded(&root, root_title, cfg) {
-            continue;
-        }
-        let mut folder_id = folder_object_id(db, BROWSEDIR_ID, root_title);
-        for comp in rel.components() {
-            let name = comp.as_os_str().to_string_lossy();
-            if name.is_empty() || name == "." {
-                continue;
-            }
-            if is_junk_dir(&name)
-                || is_sample_or_trailer_dir(&name)
-                || path_excluded(parent, &name, cfg)
-            {
-                return None;
-            }
-            folder_id = folder_object_id(db, &folder_id, &name);
-        }
-        return Some(folder_id);
+    if cfg.media_dirs.is_empty() {
+        return None;
     }
-    None
+    // Walked path only. Do not canonicalize — that collapses a directory
+    // symlink (genres/BY_YEAR/2010/Movies/Despicable Me → kids/Movies/…)
+    // into the real folder and every alias lands in the same Browse list.
+    let rel = media_rel_key(parent, &cfg.media_dirs);
+    if rel == parent.to_string_lossy() {
+        return None;
+    }
+    let root_title = matching_root_title(parent, &cfg.media_dirs).unwrap_or("media");
+    if path_excluded(parent, root_title, cfg) {
+        return None;
+    }
+    let mut folder_id = folder_object_id(db, BROWSEDIR_ID, root_title);
+    for comp in Path::new(&rel).components() {
+        let name = comp.as_os_str().to_string_lossy();
+        if name.is_empty() || name == "." {
+            continue;
+        }
+        if is_skipped_dir(&name) || path_excluded(parent, &name, cfg) {
+            return None;
+        }
+        folder_id = folder_object_id(db, &folder_id, &name);
+    }
+    Some(folder_id)
+}
+
+fn matching_root_title<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a str> {
+    for root in roots {
+        if path.starts_with(root) {
+            return root.file_name().and_then(|s| s.to_str());
+        }
+        if let Some(key) = root.file_name() {
+            if path.components().any(|c| c.as_os_str() == key) {
+                return key.to_str();
+            }
+        }
+    }
+    roots
+        .first()
+        .and_then(|r| r.file_name())
+        .and_then(|s| s.to_str())
 }
 
 pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, folder_id: &str) -> bool {
@@ -1614,7 +1891,7 @@ pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, fold
         return true;
     }
 
-    // MiniDLNA clone_detail_for_path: symlink/hardlink of a known inode
+    // rustyDLNA clone_detail_for_path: symlink/hardlink of a known inode
     // reuses TITLE/DATE/MIME/DLNA_PN — no GetVideoMetadata / ffprobe.
     if let Ok(Some((src, src_ts, src_path))) = db.find_inode_source(dev as i64, ino as i64) {
         let src_key = media_rel_key(Path::new(&src_path), &cfg.media_dirs);
@@ -1692,6 +1969,9 @@ fn attach_objects(
     dev: u64,
     ino: u64,
 ) {
+    if db.folder_has_inode_named(folder_id, dev as i64, ino as i64, title) {
+        return;
+    }
     let object_id = match db.find_child_object(folder_id, title) {
         Some(oid) => match db.object_detail_id(&oid) {
             None => oid,
@@ -1738,21 +2018,16 @@ pub fn rebuild_objects(cfg: &ScanConfig) -> Catalog {
         Some(p) => LibraryDb::open(p).expect("open files.db"),
         None => return Catalog::new(),
     };
+    let _ = db.prune_missing_files();
+    let _ = db.prune_excluded_paths(cfg);
     let rows = db.all_detail_stats().unwrap_or_default();
     let _ = db.clear_objects();
     let _ = db.seed_virtual_containers();
     let _ = db.begin();
     let mut n = 0usize;
-    for (path, _, _, _) in &rows {
+    for (path, ..) in &rows {
         let p = Path::new(path);
-        if !path_is_live_file(p) {
-            continue;
-        }
-        let name = p
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if path_excluded(p, name, cfg) {
+        if !path_is_live_file(p) || path_is_unwanted(p, cfg) {
             continue;
         }
         if let Some(folder) = ensure_folder_chain(&db, cfg, p) {
@@ -1867,16 +2142,13 @@ fn walk_into_db(
         if name.starts_with('.') {
             continue;
         }
-        let is_dir = ent
-            .file_type()
-            .map(|t| t.is_dir() || t.is_symlink())
-            .unwrap_or(false)
-            && path.is_dir();
+        let is_dir = match ent.file_type() {
+            Ok(t) if t.is_dir() => true,
+            Ok(t) if t.is_symlink() => path.is_dir(),
+            _ => false,
+        };
         if is_dir {
-            if is_junk_dir(&name)
-                || is_sample_or_trailer_dir(&name)
-                || path_excluded(&path, &name, cfg)
-            {
+            if is_skipped_dir(&name) || path_excluded(&path, &name, cfg) {
                 continue;
             }
             let child = folder_object_id(db, &folder_id, &name);
@@ -1947,16 +2219,95 @@ mod tests {
     }
 
     #[test]
+    fn guess_hdr_from_name_disc_remux_vs_web() {
+        assert_eq!(
+            guess_hdr_from_name("01 - Despicable Me (2010) - 2160p UHD BluRay Remux"),
+            None,
+            "no DV token"
+        );
+        assert_eq!(
+            guess_hdr_from_name("04 - Despicable Me 4 (2024) - 2160p UHD BDRemux HDR DV"),
+            Some("dv-p7")
+        );
+        assert_eq!(
+            guess_hdr_from_name("Movie.2024.2160p.UHD.BDRemux.HDR.DV.HEVC"),
+            Some("dv-p7")
+        );
+        assert_eq!(
+            guess_hdr_from_name("Show.S01E01.2160p.WEB-DL.DDP5.1.DV.H.265"),
+            None,
+            "WEB-DL DoVi is usually P8"
+        );
+        assert_eq!(guess_hdr_from_name("clip.dv-p7.mkv"), Some("dv-p7"));
+        assert_eq!(guess_hdr_from_name("clip.dv-p8.mkv"), Some("dv-p8"));
+    }
+
+    #[test]
+    fn page_children_matches_children_of_slice() {
+        let mut cat = Catalog::new();
+        cat.add_container("64$1", BROWSEDIR_ID, "video", "container.storageFolder", true);
+        cat.link_child(BROWSEDIR_ID, "64$1");
+        for i in 0..20 {
+            let oid = format!("64$1${i:X}");
+            cat.items.insert(
+                oid.clone(),
+                MediaItem {
+                    object_id: oid.clone(),
+                    parent_id: "64$1".into(),
+                    detail_id: i + 1,
+                    title: format!("m{i:02}"),
+                    class: "item.videoItem".into(),
+                    date: "2024-01-01".into(),
+                    path: PathBuf::from(format!("/m/{i}.mkv")),
+                    mime: "video/x-matroska".into(),
+                    ext: "mkv".into(),
+                    size: 1000,
+                    mtime: 1,
+                    captions: vec![],
+                    probe: SourceProbe::default(),
+                    dlna_pn: None,
+                    ref_id: None,
+                    device: 1,
+                    inode: i as u64 + 1,
+                    duration: None,
+                    bitrate: None,
+                    resolution: None,
+                    channels: None,
+                    samplerate: None,
+                },
+            );
+            cat.link_child("64$1", &oid);
+        }
+        let all = cat.children_of("64$1").unwrap();
+        let (page, total) = cat.page_children("64$1", 5, 7).unwrap();
+        assert_eq!(total, all.len() as u32);
+        assert_eq!(page.len(), 7);
+        for (a, b) in page.iter().zip(all.iter().skip(5)) {
+            match (a, b) {
+                (CatalogChild::Item(x), CatalogChild::Item(y)) => {
+                    assert_eq!(x.object_id, y.object_id);
+                }
+                _ => panic!("expected items"),
+            }
+        }
+    }
+
+    #[test]
     fn skip_rules() {
         assert!(is_junk_dir("@eaDir"));
         assert!(is_sample_or_trailer_dir("sample"));
         assert!(!is_sample_or_trailer_dir("Sample"));
         assert!(is_unfinished_name("movie.mkv.part"));
         assert!(looks_like_sample_file("Movie-sample.mkv"));
+        assert!(is_disc_structure_dir("BDMV"));
+        assert!(is_disc_structure_dir("bdmv"));
+        assert!(is_disc_structure_dir("VIDEO_TS"));
+        assert!(is_skipped_dir("CERTIFICATE"));
+        assert!(!is_skipped_dir("Movies"));
     }
 
     #[test]
-    fn duration_str_matches_minidlna() {
+    fn duration_str_hms_millis() {
         assert_eq!(duration_str(0), "0:00:00.000");
         assert_eq!(duration_str(3_661_234), "1:01:01.234");
     }
@@ -2047,7 +2398,7 @@ mod tests {
         let db = LibraryDb::open(&dbp).unwrap();
         let o = db.find_detail_by_path(&orig.path.to_string_lossy()).unwrap().unwrap();
         let arow = db.find_detail_by_path(&alias.path.to_string_lossy()).unwrap().unwrap();
-        // MiniDLNA: one DETAILS row per path; same DEVICE+INODE.
+        // rustyDLNA: one DETAILS row per path; same DEVICE+INODE.
         assert_ne!(o.0, arow.0);
         let all_video: Vec<_> = cat
             .items
@@ -2476,7 +2827,7 @@ mod tests {
         let root = tmp.join("storage/video");
         let rel = PathBuf::from("shows/clip.mkv");
         write_fake_mkv(&root.join(&rel), 64);
-        let stored = tmp.join("storage/z2-5x20tb/video").join(&rel);
+        let stored = tmp.join("storage/pool/video").join(&rel);
         assert!(!stored.exists(), "stored realpath must be absent");
         let got = rebase_media_path(&stored, &[root.clone()]);
         assert_eq!(got, root.join(&rel));
@@ -2506,21 +2857,120 @@ mod tests {
         );
         assert_eq!(
             media_rel_key(
-                Path::new("/storage/z2-5x20tb/video/Show/ep.mkv"),
+                Path::new("/mnt/pool/video/Show/ep.mkv"),
                 &[root.clone()]
             ),
             "Show/ep.mkv"
         );
         assert!(paths_are_same_media(
-            "/storage/z2-5x20tb/video/Show/ep.mkv",
+            "/mnt/pool/video/Show/ep.mkv",
             Path::new("/storage/video/Show/ep.mkv"),
             &[root.clone()]
         ));
         assert!(path_is_under_watched(
-            "/storage/z2-5x20tb/video/Show/S01/ep.mkv",
+            "/mnt/pool/video/Show/S01/ep.mkv",
             Path::new("/storage/video/Show"),
             &[root]
         ));
+    }
+
+    fn container_named<'a>(cat: &'a Catalog, parent: &str, title: &str) -> Option<&'a str> {
+        let c = cat.containers.get(parent)?;
+        c.children.iter().find_map(|ch| {
+            let cc = cat.containers.get(ch)?;
+            (cc.title == title).then_some(ch.as_str())
+        })
+    }
+
+    fn item_titles(cat: &Catalog, parent: &str) -> Vec<String> {
+        let Some(c) = cat.containers.get(parent) else {
+            return Vec::new();
+        };
+        let mut t: Vec<String> = c
+            .children
+            .iter()
+            .filter_map(|ch| cat.items.get(ch).map(|i| i.title.clone()))
+            .collect();
+        t.sort();
+        t
+    }
+
+    #[test]
+    fn dir_symlink_does_not_duplicate_real_folder() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-dirlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("video");
+        std::fs::create_dir_all(root.join("kids/Movies/Despicable Me")).unwrap();
+        write_fake_mkv(
+            &root.join("kids/Movies/Despicable Me/01 - Despicable Me.mkv"),
+            64,
+        );
+        write_fake_mkv(
+            &root.join("kids/Movies/Despicable Me/02 - Despicable Me 2.mkv"),
+            64,
+        );
+        std::fs::create_dir_all(root.join("genres/BY_YEAR/2010/Movies")).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("kids/Movies/Despicable Me"),
+            root.join("genres/BY_YEAR/2010/Movies/Despicable Me"),
+        )
+        .unwrap();
+        let cfg = ScanConfig {
+            media_dirs: vec![root.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let cat = scan(&cfg);
+        let kids = container_named(&cat, BROWSEDIR_ID, "video")
+            .and_then(|id| container_named(&cat, id, "kids"))
+            .and_then(|id| container_named(&cat, id, "Movies"))
+            .and_then(|id| container_named(&cat, id, "Despicable Me"))
+            .expect("kids/Movies/Despicable Me");
+        let year = container_named(&cat, BROWSEDIR_ID, "video")
+            .and_then(|id| container_named(&cat, id, "genres"))
+            .and_then(|id| container_named(&cat, id, "BY_YEAR"))
+            .and_then(|id| container_named(&cat, id, "2010"))
+            .and_then(|id| container_named(&cat, id, "Movies"))
+            .and_then(|id| container_named(&cat, id, "Despicable Me"))
+            .expect("BY_YEAR/2010/Movies/Despicable Me");
+        assert_ne!(kids, year, "symlink dir must keep its own folder id");
+        assert_eq!(
+            item_titles(&cat, kids),
+            vec![
+                "01 - Despicable Me".to_string(),
+                "02 - Despicable Me 2".to_string()
+            ]
+        );
+        assert_eq!(
+            item_titles(&cat, year),
+            vec![
+                "01 - Despicable Me".to_string(),
+                "02 - Despicable Me 2".to_string()
+            ]
+        );
+
+        let rebuilt = rebuild_objects(&cfg);
+        let kids = container_named(&rebuilt, BROWSEDIR_ID, "video")
+            .and_then(|id| container_named(&rebuilt, id, "kids"))
+            .and_then(|id| container_named(&rebuilt, id, "Movies"))
+            .and_then(|id| container_named(&rebuilt, id, "Despicable Me"))
+            .expect("rebuilt kids folder");
+        assert_eq!(
+            item_titles(&rebuilt, kids).len(),
+            2,
+            "rebuild must not dump year-alias clones into kids/: {:?}",
+            item_titles(&rebuilt, kids)
+        );
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        assert!(
+            !db.folders_have_duplicate_inodes(),
+            "no inode+title twice in one folder"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -2597,7 +3047,7 @@ mod tests {
             .all_detail_stats()
             .unwrap()
             .into_iter()
-            .filter(|(p, _, _, _)| p.ends_with("ep.mkv"))
+            .filter(|(p, ..)| p.ends_with("ep.mkv"))
             .count();
         assert_eq!(left, 0);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2867,6 +3317,178 @@ mod tests {
                     && i.parent_id == folder
             }),
             "alias should live under the genre folder"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn disc_structure_is_not_indexed() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-bdmv-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("movie/BDMV/STREAM")).unwrap();
+        write_fake_mkv(&tmp.join("movie/title.mkv"), 64);
+        write_fake_mkv(&tmp.join("movie/BDMV/STREAM/00001.m2ts"), 64);
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let cat = scan(&cfg);
+        assert!(cat.items.values().any(|i| i.title == "title"));
+        assert!(
+            !cat.items
+                .values()
+                .any(|i| i.path.to_string_lossy().contains("BDMV")),
+            "BDMV streams must not be catalogued"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn monitor_readds_real_path_kept_only_as_dir_symlink_alias() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-realias-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("kids/Movies/The Incredibles")).unwrap();
+        std::fs::create_dir_all(tmp.join("genres/BY_YEAR/2004/Movies")).unwrap();
+        let real = tmp.join("kids/Movies/The Incredibles/02 - Incredibles 2.mkv");
+        write_fake_mkv(&real, 64);
+        std::os::unix::fs::symlink(
+            tmp.join("kids/Movies/The Incredibles"),
+            tmp.join("genres/BY_YEAR/2004/Movies/The Incredibles"),
+        )
+        .unwrap();
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let _ = scan(&cfg);
+        let n = forget_path(&cfg, &real);
+        assert!(n >= 1, "real path row must drop; live alias stays: {n}");
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        let after_forget = db.all_detail_stats().unwrap();
+        assert!(
+            after_forget
+                .iter()
+                .any(|(p, ..)| p.contains("genres/BY_YEAR")),
+            "dir-symlink alias must survive deleting the real path: {after_forget:?}"
+        );
+        assert!(
+            !after_forget
+                .iter()
+                .any(|(p, ..)| p.ends_with("kids/Movies/The Incredibles/02 - Incredibles 2.mkv")),
+            "real path must be gone before monitor: {after_forget:?}"
+        );
+        drop(db);
+        let (some, d) = monitor(&cfg);
+        let _ = some;
+        assert!(d.added >= 1, "monitor must reindex the live real path: {d:?}");
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        let rows = db.all_detail_stats().unwrap();
+        assert!(
+            rows.iter()
+                .any(|(p, ..)| p.ends_with("kids/Movies/The Incredibles/02 - Incredibles 2.mkv")),
+            "real path back in DETAILS: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|(p, ..)| p.contains("genres/BY_YEAR") && p.ends_with("02 - Incredibles 2.mkv")),
+            "alias path must stay: {rows:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn monitor_rename_updates_real_path_and_dir_symlink_alias() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-renalias-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("action/Jason Bourne")).unwrap();
+        std::fs::create_dir_all(tmp.join("genres/BY_YEAR/2004/Movies")).unwrap();
+        let old = tmp.join("action/Jason Bourne/old.mkv");
+        write_fake_mkv(&old, 64);
+        std::os::unix::fs::symlink(
+            tmp.join("action/Jason Bourne"),
+            tmp.join("genres/BY_YEAR/2004/Movies/Jason Bourne"),
+        )
+        .unwrap();
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let c1 = scan(&cfg);
+        assert!(c1.items.values().any(|i| i.path.ends_with("action/Jason Bourne/old.mkv")));
+        assert!(c1
+            .items
+            .values()
+            .any(|i| i.path.to_string_lossy().contains("genres/BY_YEAR") && i.path.ends_with("old.mkv")));
+        let new = tmp.join("action/Jason Bourne/02 - The Bourne Supremacy.mkv");
+        std::fs::rename(&old, &new).unwrap();
+        let (c2, d) = rescan(&cfg, &c1);
+        assert!(d.removed >= 1, "old name must leave: {d:?}");
+        assert!(d.added >= 1, "new name must be indexed: {d:?}");
+        assert!(
+            c2.items
+                .values()
+                .any(|i| i.path.ends_with("action/Jason Bourne/02 - The Bourne Supremacy.mkv")),
+            "real folder must list the new name"
+        );
+        assert!(
+            c2.items.values().any(|i| {
+                let p = i.path.to_string_lossy();
+                p.contains("genres/BY_YEAR") && p.ends_with("02 - The Bourne Supremacy.mkv")
+            }),
+            "dir-symlink alias must list the new name"
+        );
+        assert!(
+            !c2.items.values().any(|i| i.path.ends_with("old.mkv")),
+            "old name must be gone from every alias"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rebuild_objects_drops_missing_details() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-rebuild-miss-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("video")).unwrap();
+        let keep = tmp.join("video/keep.mkv");
+        let gone = tmp.join("video/gone.mkv");
+        write_fake_mkv(&keep, 64);
+        write_fake_mkv(&gone, 64);
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let _ = scan(&cfg);
+        std::fs::remove_file(&gone).unwrap();
+        let _ = rebuild_objects(&cfg);
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        let rows = db.all_detail_stats().unwrap();
+        assert!(
+            rows.iter().any(|(p, ..)| p.ends_with("keep.mkv")),
+            "live file stays"
+        );
+        assert!(
+            !rows.iter().any(|(p, ..)| p.ends_with("gone.mkv")),
+            "missing file must leave DETAILS, not just OBJECTS: {rows:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

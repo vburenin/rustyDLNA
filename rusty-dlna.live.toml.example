@@ -1,0 +1,36 @@
+# Copy to rusty-dlna.live.toml (gitignored) and point
+# RUSTY_DLNA_CONF at it from .env.
+friendly_name = "rustyDLNA"
+media_dir = ["V,/storage/video"]
+exclude_dir = ["incomplete"]
+root_container = "V"
+listen_ip = "0.0.0.0"
+# LAN address written into SSDP LOCATION and description URLs.
+advertise_ip = "192.168.1.10"
+cache_dir = "/var/cache/rusty-dlna"
+db_dir = "/var/cache/rusty-dlna"
+notify_interval = 180
+rescan_secs = 30
+# Generate a stable uuid so clients do not see a new device every rebuild.
+# uuid = "uuid:xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx"
+
+[transcode]
+enable = true
+encoder = "libx264"
+max_jobs = 1
+
+# [[remap]]
+# name = "crkey-dvp7"
+# client = "CrKey"
+# hdr = "dv-p7"
+# action = "remux-p8"
+# encoder = "copy"
+# audio_out = "to-aac"
+#
+# [[remap]]
+# name = "kodi-dvp7"
+# client = "Kodi"
+# hdr = "dv-p7"
+# action = "remux-p8"
+# encoder = "copy"
+# audio_out = "to-aac"

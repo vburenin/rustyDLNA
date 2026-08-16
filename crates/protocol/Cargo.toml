@@ -3,7 +3,7 @@ name = "rusty-dlna-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "MiniDLNA-compatible DLNA/UPnP dialect: paths, clients, dates, object IDs"
+description = "DLNA/UPnP dialect: paths, clients, dates, object IDs"
 
 [dependencies]
 bitflags.workspace = true

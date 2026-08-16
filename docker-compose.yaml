@@ -2,7 +2,7 @@
 # reaches LAN clients such as Kodi. Bridge/NAT will not advertise correctly.
 #
 # This file is the *live* daemon. Tests stay in docker-compose.test.yaml
-# (bridge, no ports, no host network). Do not name this container minidlna.
+# (bridge, no ports, no host network). Container name is rusty-dlna.
 #
 # Copy docker-compose.override.yaml.example to docker-compose.override.yaml
 # and/or copy .env.example to .env. Compose merges both; do not commit them.
@@ -20,12 +20,10 @@ services:
       LC_ALL: C.UTF-8
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
-      # Config media_dir is V,/storage/video (same as MiniDLNA).
+      # media_dir inside the container is V,/storage/video.
       - ${RUSTY_DLNA_MEDIA:-./media}:/storage/video:ro
-      # Inherited files.db rows store the host realpath after symlink
-      # resolve (/storage/z2-5x20tb/video/...). Bind that path onto
-      # itself so GET /MediaItems/ can open them. Set RUSTY_DLNA_MEDIA_AT
-      # to the real directory; default is a no-op /storage/video bind.
+      # Optional same-path bind when files.db stored a host realpath
+      # different from media_dir. Set RUSTY_DLNA_MEDIA_AT in .env.
       - ${RUSTY_DLNA_MEDIA_AT:-/storage/video}:${RUSTY_DLNA_MEDIA_AT:-/storage/video}:ro
       - ${RUSTY_DLNA_CACHE:-./data/cache}:/var/cache/rusty-dlna
       - ${RUSTY_DLNA_CONF:-./rusty-dlna.toml}:/etc/rusty-dlna.toml:ro

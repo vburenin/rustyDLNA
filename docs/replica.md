@@ -1,4 +1,4 @@
-# MiniDLNA / ReadyMedia 1.3.3-kodi — protocol replica notes
+# rustyDLNA — protocol notes
 
 This document is a **wire-level description of this tree**, not a generic UPnP
 textbook and not a second implementation. A replica that wants to be mistaken
@@ -6,20 +6,17 @@ for this daemon must emit the same bytes on SSDP, description XML, SOAP/DIDL,
 GENA, and HTTP media. Internals (SQLite schema, inotify, scan) appear only
 where they define object IDs or DIDL fields.
 
-Identity (`src/upnpglobalvars.h`, `src/upnphttp.h`):
+Identity:
 
 | Symbol | Value |
 |---|---|
-| `MINIDLNA_VERSION` | `1.3.3` |
-| `MINIDLNA_VARIANT` | `kodi` |
-| `MINIDLNA_VERSION_STRING` | `1.3.3-kodi` |
-| `SERVER_NAME` | `MiniDLNA` (or `ReadyDLNA` if `NETGEAR`) |
-| `MINIDLNA_SERVER_STRING` | `OS_VERSION " DLNADOC/1.50 UPnP/1.0 " SERVER_NAME "/" MINIDLNA_VERSION_STRING` |
+| `SERVER_NAME` | `rustyDLNA` |
+| `SERVER_VERSION` | crate version (`CARGO_PKG_VERSION`) |
+| `Server:` | `{os} DLNADOC/1.50 UPnP/1.0 rustyDLNA/{version}` |
 
-Example `Server:` header: `6.8.0-136-generic DLNADOC/1.50 UPnP/1.0 MiniDLNA/1.3.3-kodi`
-(`OS_VERSION` is baked at configure time from the build host kernel).
+Example `Server:` header: `Linux DLNADOC/1.50 UPnP/1.0 rustyDLNA/0.1.0`.
 
-Default listen port is **8200** (`runtime_vars.port` in `src/minidlna.c`).
+Default listen port is **8200** (`runtime_vars.port` in `src/server`).
 Default SSDP announce interval is **895** seconds (conf sample says 900; the
 binary default is 895). UUID string is `uuidvalue[] = "uuid:........"` 42
 chars (`src/upnpglobalvars.c`).
@@ -83,7 +80,7 @@ NOTIFY * HTTP/1.1\r\n
 HOST:239.255.255.250:1900\r\n
 CACHE-CONTROL:max-age={lifetime}\r\n
 LOCATION:http://{iface-ip}:{port}/rootDesc.xml\r\n
-SERVER: {MINIDLNA_SERVER_STRING}\r\n
+SERVER: {RUSTY_DLNA_SERVER_STRING}\r\n
 NT:{st}\r\n
 USN:{usn}\r\n
 NTS:ssdp:alive\r\n
@@ -144,7 +141,7 @@ DATE: {IMF-fixdate GMT}\r\n
 ST: {st}\r\n
 USN: {usn}\r\n
 EXT:\r\n
-SERVER: {MINIDLNA_SERVER_STRING}\r\n
+SERVER: {RUSTY_DLNA_SERVER_STRING}\r\n
 LOCATION: http://{host}:{port}/rootDesc.xml\r\n
 Content-Length: 0\r\n
 \r\n
@@ -173,7 +170,7 @@ during that fetch, not from M-SEARCH.
 
 ## 2. HTTP surface
 
-Source: `src/upnphttp.c`, `src/minidlnapath.h`, `src/httpersist.h`.
+Source: `src/upnphttp.c`, `src/path table`, `src/httpersist.h`.
 
 TCP port = `runtime_vars.port` (default 8200). Methods: `GET`, `HEAD`,
 `POST`, `SUBSCRIBE`, `UNSUBSCRIBE`. Anything else is **501**.
@@ -287,7 +284,7 @@ HTTP/1.1 {code} {msg}\r\n
 Content-Type: text/xml; charset="utf-8"\r\n
 Connection: {keep-alive|close}\r\n
 Content-Length: {n}\r\n
-Server: {MINIDLNA_SERVER_STRING}\r\n
+Server: {RUSTY_DLNA_SERVER_STRING}\r\n
 Date: {IMF-fixdate GMT}\r\n
 EXT:\r\n
 \r\n
@@ -300,7 +297,7 @@ HTML errors set `Content-Type: text/html`. Subscribe adds
 
 ## 3. Device and service description
 
-Source: `src/upnpdescgen.c`, `src/minidlnapath.h`.
+Source: `src/upnpdescgen.c`, `src/path table`.
 
 Root XML starts with `<?xml version="1.0"?>\r\n` then
 `<root xmlns="urn:schemas-upnp-org:device-1-0">`.
@@ -313,8 +310,8 @@ Device fields:
 | `friendlyName` | `friendly_name` (config / `getfriendlyname`) |
 | `manufacturer` | `ROOTDEV_MANUFACTURER` (`Justin Maggard` unless NETGEAR) |
 | `manufacturerURL` | `http://www.netgear.com/` |
-| `modelDescription` | `MiniDLNA on ` + `OS_NAME` |
-| `modelName` | `modelname` (default `Windows Media Connect compatible (MiniDLNA)`) |
+| `modelDescription` | `rustyDLNA on ` + `OS_NAME` |
+| `modelName` | `modelname` (default `Windows Media Connect compatible (rustyDLNA)`) |
 | `modelNumber` | `modelnumber` |
 | `modelURL` | `OS_URL` |
 | `serialNumber` | `serialnumber` |
@@ -778,7 +775,7 @@ After looking up `PATH, MIME, DLNA_PN`:
 HTTP/1.1 {200|206} OK\r\n
 Connection: close\r\n
 Date: …\r\n
-Server: {MINIDLNA_SERVER_STRING}\r\n
+Server: {RUSTY_DLNA_SERVER_STRING}\r\n
 EXT:\r\n
 realTimeInfo.dlna.org: DLNA.ORG_TLAG=*\r\n
 transferMode.dlna.org: {Streaming|Interactive|Background}\r\n
@@ -1211,7 +1208,7 @@ exactly those bytes. This is protocol-correct for *this* server.
 
 | Topic | File |
 |---|---|
-| Paths / control / event URLs | `src/minidlnapath.h` |
+| Paths / control / event URLs | `src/path table` |
 | Version, FLAGS, `RESOURCE_PROTOCOL_INFO_VALUES` | `src/upnpglobalvars.h` |
 | SSDP | `src/minissdp.c` |
 | HTTP parse, dispatch, media | `src/upnphttp.c` |

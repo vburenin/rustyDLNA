@@ -12,7 +12,7 @@ ok() { echo "OK: $*"; }
 
 # Test compose must never request host networking or live ports.
 # docker-compose.yaml (live daemon) *does* use host network — that is
-# the MiniDLNA-shaped production stack, not this check.
+# the production stack, not this check.
 if grep -nE '^[^#]*network_mode:[[:space:]]*host' docker-compose.test.yaml 2>/dev/null; then
 	fail "test compose requests network_mode: host"
 fi

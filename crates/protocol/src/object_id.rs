@@ -47,7 +47,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roots_match_minidlna() {
+    fn roots_match_dialect() {
         assert_eq!(BROWSEDIR_ID, "64");
         assert_eq!(MUSIC_ID, "1");
         assert_eq!(VIDEO_ID, "2");

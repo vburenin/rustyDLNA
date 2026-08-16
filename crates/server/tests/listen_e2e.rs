@@ -231,21 +231,16 @@ fn one_run(http: u16, ssdp: u16) {
             .collect::<String>()
             .parse()
             .unwrap_or(0);
-        if tid > 0 && Command::new("ffmpeg").arg("-version").status().is_ok() {
-            let (st, hdr, body) = raw_http(
+        if tid > 0 {
+            let (st, hdr, _body) = raw_http(
                 http,
                 &format!("GET /Transcode/{tid}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nUser-Agent: CrKey/1.54\r\nConnection: close\r\n\r\n"),
             );
-            if st == 200 && !body.is_empty() {
-                assert!(hdr.to_ascii_lowercase().contains("accept-ranges: bytes"));
-                let mid = body.len() / 2;
-                let end = (mid + 15).min(body.len() - 1);
-                let (st2, _, slice) = raw_http(
-                    http,
-                    &format!("GET /Transcode/{tid}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nUser-Agent: CrKey/1.54\r\nRange: bytes={mid}-{end}\r\nConnection: close\r\n\r\n"),
+            if st == 200 {
+                assert!(
+                    hdr.contains("DLNA.ORG_CI=1") || hdr.contains("dlna.org_ci=1"),
+                    "remux must set CI=1: {hdr}"
                 );
-                assert_eq!(st2, 206);
-                assert_eq!(slice, body[mid..=end]);
             }
         }
     }

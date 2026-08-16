@@ -17,7 +17,9 @@ pub use desc::{
     gen_root_desc, minimal_scpd, scpd_connection_manager, scpd_content_directory, scpd_registrar,
     RootDescOpts, DEVICE_TYPE,
 };
-pub use range::{parse_byte_range, range_len, read_file_range, ByteRange, RangeError};
+pub use range::{
+    parse_byte_range, parse_open_range, range_len, read_file_range, ByteRange, RangeError,
+};
 pub use request::{header_block_complete, HttpRequest, ParseError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,7 +46,7 @@ pub enum HttpRoute {
 
 pub fn route(method: &str, path: &str) -> HttpRoute {
     if method.eq_ignore_ascii_case("POST") {
-        // MiniDLNA ignores the POST target and keys only off SOAPAction.
+        // The dialect ignores the POST target and keys only off SOAPAction.
         return HttpRoute::Soap;
     }
     if method.eq_ignore_ascii_case("SUBSCRIBE") || method.eq_ignore_ascii_case("UNSUBSCRIBE") {
@@ -78,7 +80,7 @@ pub fn route(method: &str, path: &str) -> HttpRoute {
     }
 }
 
-/// Media GET never persists (MiniDLNA forks + Connection: close).
+/// Media GET never persists (the dialect forks + Connection: close).
 pub fn persist_for_route(
     route: HttpRoute,
     httpver: Option<&str>,
@@ -94,7 +96,7 @@ pub fn persist_for_route(
     http_should_persist(httpver, conn_close, conn_keep)
 }
 
-/// Host must be dotted IPv4 (MiniDLNA DNS-rebinding check).
+/// Host must be dotted IPv4 (dialect DNS-rebinding check).
 pub fn valid_host_header(host: &str) -> bool {
     let (name, port) = match host.split_once(':') {
         Some((h, p)) => (h, Some(p)),
@@ -188,6 +190,19 @@ pub struct HttpResponse {
     /// When set, `body` is empty and the accept loop streams this file range
     /// (inclusive). Used so an 80 GiB remux is never slurp'd into RAM.
     pub file_range: Option<(std::path::PathBuf, u64, u64)>,
+    /// When set, accept loop starts/attaches a background remux and streams
+    /// the growing (or finished) dest. Probe disconnect must not kill ffmpeg.
+    pub remux_job: Option<RemuxJobSpec>,
+}
+
+/// One `/Transcode/{id}` serve: ffmpeg writes `dest` (via `args`) in the
+/// background; every concurrent GET shares that job.
+#[derive(Clone, Debug)]
+pub struct RemuxJobSpec {
+    pub detail_id: i64,
+    pub src: std::path::PathBuf,
+    pub dest: std::path::PathBuf,
+    pub args: Vec<String>,
 }
 
 impl HttpResponse {
@@ -199,6 +214,7 @@ impl HttpResponse {
             body: Vec::new(),
             persist: false,
             file_range: None,
+            remux_job: None,
         }
     }
 
@@ -307,6 +323,21 @@ pub fn media_response(
     );
     r.body = body;
     let _ = (server, date);
+    r
+}
+
+/// Live remux: fragmented MP4 on a pipe. No `Content-Length`, no byte
+/// seek — the player starts as soon as the first fragment is ready.
+pub fn live_transcode_response(mime: &str) -> HttpResponse {
+    let mut r = HttpResponse::new(200, "OK");
+    r.persist = false;
+    r.set("realTimeInfo.dlna.org", "DLNA.ORG_TLAG=*");
+    r.set("transferMode.dlna.org", "Streaming");
+    r.set("Content-Type", mime);
+    r.set(
+        "contentFeatures.dlna.org",
+        dlna_org_features(None, "00", 1, mime),
+    );
     r
 }
 

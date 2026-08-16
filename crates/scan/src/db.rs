@@ -1,7 +1,7 @@
-//! MiniDLNA-compatible SQLite store (`scanner_sqlite.h`).
+//! rustyDLNA-compatible SQLite store (`scanner_sqlite.h`).
 //!
 //! Tables: OBJECTS, DETAILS, ALBUM_ART, CAPTIONS, BOOKMARKS, PLAYLISTS,
-//! SETTINGS. WAL. On-disk file is `{db_dir}/files.db` (same name MiniDLNA uses).
+//! SETTINGS. WAL. On-disk file is `{db_dir}/files.db` (same name The dialect uses).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,10 +18,10 @@ use rusty_dlna_protocol::object_id::{
 };
 
 use crate::{
-    path_excluded, path_is_live_file, Caption, Catalog, Container, MediaItem, ScanConfig,
+    path_is_live_file, path_is_unwanted, Caption, Catalog, Container, MediaItem, ScanConfig,
 };
 
-/// MiniDLNA schema from `/home/vlad/workspace/minidlna/src/scanner_sqlite.h`.
+/// rustyDLNA schema from `SQLite schema`.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS OBJECTS (
   ID INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,7 +146,7 @@ impl LibraryDb {
         Ok(())
     }
 
-    /// MiniDLNA `find_detail_by_inode` + TIMESTAMP so aliases can reuse
+    /// dialect `find_detail_by_inode` + TIMESTAMP so aliases can reuse
     /// metadata without re-probing when the original is still current.
     pub fn find_inode_source(
         &self,
@@ -172,7 +172,7 @@ impl LibraryDb {
             .optional()
     }
 
-    /// MiniDLNA `clone_detail_for_path`: new DETAILS row, copied codec/date
+    /// dialect `clone_detail_for_path`: new DETAILS row, copied codec/date
     /// columns, new PATH/SIZE/TIMESTAMP/DEVICE/INODE.
     pub fn clone_detail_for_path(
         &self,
@@ -212,9 +212,9 @@ impl LibraryDb {
         Ok(id)
     }
 
-    pub fn all_detail_stats(&self) -> rusqlite::Result<Vec<(String, i64, i64, i64)>> {
+    pub fn all_detail_stats(&self) -> rusqlite::Result<Vec<(String, i64, i64, i64, i64, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT PATH, ID, SIZE, TIMESTAMP FROM DETAILS WHERE PATH IS NOT NULL AND MIME IS NOT NULL",
+            "SELECT PATH, ID, SIZE, TIMESTAMP, DEVICE, INODE FROM DETAILS WHERE PATH IS NOT NULL AND MIME IS NOT NULL",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -222,6 +222,8 @@ impl LibraryDb {
                 r.get::<_, i64>(1)?,
                 r.get::<_, Option<i64>>(2)?.unwrap_or(0),
                 r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                r.get::<_, Option<i64>>(5)?.unwrap_or(0),
             ))
         })?;
         let mut out = Vec::new();
@@ -470,11 +472,7 @@ impl LibraryDb {
         }
         let mut n = 0;
         for p in paths {
-            let name = std::path::Path::new(&p)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            if path_excluded(std::path::Path::new(&p), name, cfg) {
+            if path_is_unwanted(std::path::Path::new(&p), cfg) {
                 n += self.remove_path_and_symlink_aliases(&p)?;
             }
         }
@@ -610,6 +608,48 @@ impl LibraryDb {
         Ok(())
     }
 
+    /// True when this folder already lists `name` for this inode (a
+    /// directory-symlink alias of the same file).
+    pub fn folder_has_inode_named(
+        &self,
+        parent_id: &str,
+        device: i64,
+        inode: i64,
+        name: &str,
+    ) -> bool {
+        if inode == 0 {
+            return false;
+        }
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM OBJECTS o
+                 JOIN DETAILS d ON d.ID = o.DETAIL_ID
+                 WHERE o.PARENT_ID = ?1 AND d.DEVICE = ?2 AND d.INODE = ?3
+                   AND o.NAME = ?4",
+                params![parent_id, device, inode, name],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok()
+            .is_some_and(|n| n > 0)
+    }
+
+    /// Same inode+title listed more than once in one folder.
+    pub fn folders_have_duplicate_inodes(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM OBJECTS o
+                   JOIN DETAILS d ON d.ID = o.DETAIL_ID
+                   WHERE o.DETAIL_ID IS NOT NULL AND d.INODE != 0
+                   GROUP BY o.PARENT_ID, d.DEVICE, d.INODE, o.NAME
+                   HAVING COUNT(*) > 1
+                 )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false)
+    }
+
     pub fn find_child_object(&self, parent_id: &str, name: &str) -> Option<String> {
         self.conn
             .query_row(
@@ -739,16 +779,18 @@ impl LibraryDb {
                 let path = PathBuf::from(path.unwrap_or_default());
                 let mime_s = mime.unwrap_or_else(|| "video/x-matroska".into());
                 let ext = mime_to_ext(&mime_s);
+                let title = name.unwrap_or_else(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("item")
+                        .to_string()
+                });
+                let probe = crate::probe_from_name(&title, &path, ext);
                 let item = MediaItem {
                     object_id: oid.clone(),
                     parent_id: parent.clone(),
                     detail_id: did,
-                    title: name.unwrap_or_else(|| {
-                        path.file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("item")
-                            .to_string()
-                    }),
+                    title,
                     class,
                     date: date.unwrap_or_default(),
                     path: path.clone(),
@@ -757,7 +799,7 @@ impl LibraryDb {
                     size: size.unwrap_or(0) as u64,
                     mtime: ts.unwrap_or(0),
                     captions: caps_by.get(&did).cloned().unwrap_or_default(),
-                    probe: crate::probe_for(&path, ext),
+                    probe,
                     dlna_pn: pn,
                     ref_id,
                     device: device.unwrap_or(0) as u64,

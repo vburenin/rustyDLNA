@@ -10,7 +10,7 @@ use tracing::info;
 #[derive(Parser, Debug)]
 #[command(
     name = "rusty-dlna",
-    about = "Multithreaded DLNA server (MiniDLNA dialect)"
+    about = "Multithreaded DLNA server"
 )]
 struct Args {
     /// Config file (TOML). Living-room paths belong in a gitignored local file.
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         listen = %app.listen_ip,
         advertise = %app.advertise_ip,
         name = %app.cfg.friendly_name,
-        items = app.catalog.lock().map(|c| c.items.len()).unwrap_or(0),
+        items = app.catalog.read().map(|c| c.items.len()).unwrap_or(0),
         remaps = app.remaps.len(),
         "rustyDLNA starting (scan in background)"
     );

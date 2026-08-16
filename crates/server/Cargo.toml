@@ -3,7 +3,7 @@ name = "rusty-dlna"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Multithreaded DLNA media server (MiniDLNA dialect + live transcode)"
+description = "Multithreaded DLNA media server"
 
 [lib]
 name = "rusty_dlna"

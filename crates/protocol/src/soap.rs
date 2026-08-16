@@ -69,8 +69,8 @@ mod tests {
     }
 
     #[test]
-    fn prefix_match_like_minidlna() {
-        // MiniDLNA uses strncmp; BrowseDirectChildren would hit Browse.
+    fn prefix_match_is_strncmp() {
+        // The dialect uses strncmp; BrowseDirectChildren would hit Browse.
         assert_eq!(
             soap_action_method("urn:x#BrowseDirectChildren"),
             Some("Browse")

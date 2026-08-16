@@ -263,7 +263,7 @@ pub fn decide_ua(ua: &str, src: &SourceMedia, remaps: &[RemapRule]) -> Transcode
     decide_for(profile, Some(ua), src, remaps)
 }
 
-fn decide_for(
+pub fn decide_for(
     client: &ClientProfile,
     raw_ua: Option<&str>,
     src: &SourceMedia,
@@ -377,14 +377,72 @@ pub fn ffmpeg_live_args(src_path: &str, plan: &TranscodePlan) -> Vec<String> {
         AudioAction::ToAc3 => a.extend(["-c:a".into(), "ac3".into(), "-b:a".into(), "640k".into()]),
         AudioAction::ToAac => a.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "256k".into()]),
     }
-    a.extend([
+    a.extend(live_frag_tail("pipe:1"));
+    a
+}
+
+/// ffmpeg argv that writes a **growing** fragmented MP4. First fragment is
+/// playable; the rest is filled in the background. Not `+faststart`.
+pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) -> Vec<String> {
+    let mut a = vec![
+        "ffmpeg".into(),
+        "-hide_banner".into(),
+        "-nostats".into(),
+        "-y".into(),
+        "-i".into(),
+        src_path.into(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        "0:a:0?".into(),
+    ];
+    match plan.action {
+        RecodeAction::Original => {}
+        RecodeAction::RemuxP8 | RecodeAction::AudioAc3 => {
+            a.extend(["-c:v".into(), plan.video_encoder.clone()]);
+        }
+        RecodeAction::Hdr10 => {
+            a.extend([
+                "-vf".into(),
+                "format=p010le".into(),
+                "-c:v".into(),
+                plan.video_encoder.clone(),
+                "-profile:v".into(),
+                "main10".into(),
+                "-pix_fmt".into(),
+                "p010le".into(),
+                "-color_primaries".into(),
+                "bt2020".into(),
+                "-color_trc".into(),
+                "smpte2084".into(),
+                "-colorspace".into(),
+                "bt2020nc".into(),
+                "-tag:v".into(),
+                "hvc1".into(),
+            ]);
+        }
+    }
+    match plan.audio {
+        AudioAction::Copy => a.extend(["-c:a".into(), "copy".into()]),
+        AudioAction::ToAc3 => a.extend(["-c:a".into(), "ac3".into(), "-b:a".into(), "640k".into()]),
+        AudioAction::ToAac => a.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "256k".into()]),
+    }
+    a.extend(live_frag_tail(dst_path));
+    a
+}
+
+fn live_frag_tail(out: &str) -> Vec<String> {
+    vec![
+        "-flush_packets".into(),
+        "1".into(),
+        "-frag_duration".into(),
+        "1000000".into(),
         "-f".into(),
         "mp4".into(),
         "-movflags".into(),
         "frag_keyframe+empty_moov+default_base_moof".into(),
-        "pipe:1".into(),
-    ]);
-    a
+        out.into(),
+    ]
 }
 
 /// ffmpeg argv that writes a **finished file** (remux/hdr10 cache).
@@ -493,6 +551,29 @@ impl JobGate {
     pub fn in_use(&self) -> usize {
         self.cur.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Increment without a lifetime-bound permit (background remux thread).
+    pub fn try_add(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        loop {
+            let c = self.cur.load(Ordering::SeqCst);
+            if c >= self.max {
+                return false;
+            }
+            if self
+                .cur
+                .compare_exchange(c, c + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    pub fn release(&self) {
+        self.cur
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Drop for JobPermit<'_> {
@@ -511,6 +592,13 @@ pub fn cache_dest(cache_dir: &std::path::Path, detail_id: i64, action: RecodeAct
         RecodeAction::Original => "orig",
     };
     cache_dir.join(format!("{detail_id}-{tag}.mp4"))
+}
+
+/// In-progress remux. Only rename to `cache_dest` when ffmpeg exits 0.
+pub fn cache_part(dest: &std::path::Path) -> std::path::PathBuf {
+    let mut p = dest.as_os_str().to_os_string();
+    p.push(".part");
+    std::path::PathBuf::from(p)
 }
 
 /// Run ffmpeg CLI to a cache file. Returns the dest path. Existing non-empty
@@ -776,7 +864,152 @@ action = "audio-ac3"
         assert!(args.last().unwrap().ends_with("1-hdr10.mp4"));
         let live = ffmpeg_live_args("/media/movie.mkv", &p);
         assert!(live.contains(&"pipe:1".into()));
+        assert!(live.contains(&"-flush_packets".into()));
+        assert!(live.contains(&"-frag_duration".into()));
+        assert!(live
+            .iter()
+            .any(|s| s.contains("frag_keyframe+empty_moov+default_base_moof")));
         assert!(!live.iter().any(|s| s.contains("faststart")));
+        let grow = ffmpeg_grow_args("/media/movie.mkv", "/cache/1-hdr10.mp4.part", &p);
+        assert!(grow.contains(&"/cache/1-hdr10.mp4.part".into()));
+        assert!(!grow.iter().any(|s| s == "pipe:1"));
+        assert!(!grow.iter().any(|s| s.contains("faststart")));
+        assert!(grow.iter().any(|s| s.contains("frag_keyframe")));
+    }
+
+    #[test]
+    fn live_pipe_emits_ftyp_before_process_exits() {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            eprintln!("skip live pipe (no ffmpeg)");
+            return;
+        }
+        let src = std::env::temp_dir().join(format!("rdlna-live-{}.mkv", std::process::id()));
+        let mk = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=6:size=160x90:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=6",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                src.to_str().unwrap(),
+            ])
+            .status();
+        if !mk.map(|s| s.success()).unwrap_or(false) {
+            let _ = std::fs::remove_file(&src);
+            eprintln!("skip live pipe (could not make fixture)");
+            return;
+        }
+        let plan = TranscodePlan {
+            decision: Decision::Recode,
+            action: RecodeAction::RemuxP8,
+            video_encoder: "copy".into(),
+            audio: AudioAction::ToAac,
+            container: "mp4",
+            ..TranscodePlan::default()
+        };
+        let args = ffmpeg_live_args(&src.to_string_lossy(), &plan);
+        let mut child = Command::new(&args[0])
+            .args(&args[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn live ffmpeg");
+        let mut stdout = child.stdout.take().expect("stdout");
+        let mut buf = [0u8; 32];
+        let n = stdout.read(&mut buf).expect("first fragment");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&src);
+        assert!(n >= 8, "expected fMP4 bytes, got {n}");
+        assert_eq!(&buf[4..8], b"ftyp", "first box must be ftyp, got {buf:x?}");
+    }
+
+    #[test]
+    fn grow_file_emits_ftyp_before_process_exits() {
+        use std::process::{Command, Stdio};
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            eprintln!("skip grow file (no ffmpeg)");
+            return;
+        }
+        let src = std::env::temp_dir().join(format!("rdlna-grow-src-{}.mkv", std::process::id()));
+        let dest = std::env::temp_dir().join(format!("rdlna-grow-dst-{}.mp4.part", std::process::id()));
+        let mk = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=6:size=160x90:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=6",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                src.to_str().unwrap(),
+            ])
+            .status();
+        if !mk.map(|s| s.success()).unwrap_or(false) {
+            let _ = std::fs::remove_file(&src);
+            eprintln!("skip grow file (could not make fixture)");
+            return;
+        }
+        let plan = TranscodePlan {
+            decision: Decision::Recode,
+            action: RecodeAction::RemuxP8,
+            video_encoder: "copy".into(),
+            audio: AudioAction::ToAac,
+            container: "mp4",
+            ..TranscodePlan::default()
+        };
+        let args = ffmpeg_grow_args(&src.to_string_lossy(), &dest.to_string_lossy(), &plan);
+        let mut child = Command::new(&args[0])
+            .args(&args[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn grow ffmpeg");
+        let t0 = std::time::Instant::now();
+        let mut got = Vec::new();
+        while t0.elapsed() < std::time::Duration::from_secs(5) {
+            if let Ok(b) = std::fs::read(&dest) {
+                if b.len() >= 8 {
+                    got = b;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dest);
+        assert!(got.len() >= 8, "expected growing fMP4 bytes");
+        assert_eq!(&got[4..8], b"ftyp", "first box must be ftyp");
     }
 
     #[test]

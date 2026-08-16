@@ -1,6 +1,5 @@
-//! Watch media dirs and apply add/remove after a short settle window.
-//! A flood or `Q_OVERFLOW` becomes one `monitor()` walk instead of
-//! per-file work.
+//! Watch media dirs. After a short settle window every burst becomes
+//! one `monitor()` walk so directory-symlink aliases stay in sync.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
@@ -12,9 +11,9 @@ use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 
 use crate::db::LibraryDb;
 use crate::{
-    ensure_folder_chain, forget_path, forget_tree, index_one_file, is_album_art_name,
-    is_caption_name, is_junk_dir, is_sample_or_trailer_dir, is_unfinished_name,
-    looks_like_sample_file, path_excluded, Catalog, ScanConfig, ScanDelta,
+    is_album_art_name, is_caption_name, is_skipped_dir, is_unfinished_name,
+    looks_like_sample_file, monitor_dirty, path_excluded, rebuild_objects, Catalog, ScanConfig,
+    ScanDelta,
 };
 
 const MASK: WatchMask = WatchMask::CREATE
@@ -25,7 +24,9 @@ const MASK: WatchMask = WatchMask::CREATE
 
 /// Wait this long after the first event in a burst before applying.
 const SETTLE: Duration = Duration::from_secs(5);
-/// More unique paths than this (or a queue overflow) → one tree reconcile.
+/// Burst size that used to force a tree walk. Every burst reconciles now;
+/// kept so tests still describe the old overflow threshold.
+#[allow(dead_code)]
 const RECONCILE_AFTER: usize = 64;
 
 pub fn repair_objects_if_needed(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta) {
@@ -34,9 +35,23 @@ pub fn repair_objects_if_needed(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta
         None => return (None, ScanDelta::default()),
     };
     let missing = db.details_missing_objects().unwrap_or(0);
-    if missing > 0 {
-        tracing::info!(target: "rusty_dlna", missing, "DETAILS have no OBJECTS; repairing aliases");
-        return crate::monitor(cfg);
+    let dupes = db.folders_have_duplicate_inodes();
+    if missing > 0 || dupes {
+        tracing::info!(
+            target: "rusty_dlna",
+            missing,
+            dupes,
+            "repairing object tree"
+        );
+        let next = rebuild_objects(cfg);
+        return (
+            Some(next),
+            ScanDelta {
+                added: 0,
+                removed: 0,
+                changed: 1,
+            },
+        );
     }
     (None, ScanDelta::default())
 }
@@ -114,7 +129,7 @@ fn collect_events<'a>(
         if ev.mask.contains(EventMask::ISDIR)
             && ev.mask.intersects(EventMask::CREATE | EventMask::MOVED_TO)
         {
-            if excluded || is_junk_dir(&name) || is_sample_or_trailer_dir(&name) {
+            if excluded || is_skipped_dir(&name) {
                 continue;
             }
             batch.add_dir(path);
@@ -142,7 +157,7 @@ fn collect_events<'a>(
             || (ev.mask.contains(EventMask::CREATE) && path_is_link_or_dir(&path))
         {
             if path.is_dir() {
-                if !is_junk_dir(&name) && !is_sample_or_trailer_dir(&name) {
+                if !is_skipped_dir(&name) {
                     batch.add_dir(path);
                 }
             } else {
@@ -159,72 +174,29 @@ fn apply_batch(
     batch: PendingBatch,
     on_change: &mut impl FnMut(Catalog, ScanDelta),
 ) {
-    let reconcile = batch.should_reconcile();
+    // Incremental add/remove only sees the event path. A rename under a
+    // real folder leaves directory-symlink aliases (genres/BY_YEAR/…)
+    // stale. One tree reconcile is the source of truth.
     tracing::info!(
         target: "rusty_dlna",
         added = batch.add_files.len(),
         removed = batch.remove_files.len() + batch.remove_trees.len(),
         dirs = batch.add_dirs.len(),
         overflow = batch.overflow,
-        mode = if reconcile { "reconcile" } else { "incremental" },
+        mode = "reconcile",
         "inotify settled"
     );
 
-    if reconcile {
-        for dir in &batch.add_dirs {
-            add_tree_watches(ino, wds, cfg, dir);
-        }
-        for dir in &batch.remove_trees {
-            wds.retain(|_, p| !p.starts_with(dir));
-        }
-        match crate::monitor(cfg) {
-            (Some(cat), delta) => on_change(cat, delta),
-            _ => {}
-        }
-        return;
+    for dir in &batch.add_dirs {
+        add_tree_watches(ino, wds, cfg, dir);
     }
-
-    let mut added = 0usize;
-    let mut removed = 0usize;
     for dir in &batch.remove_trees {
-        removed += forget_tree(cfg, dir);
         wds.retain(|_, p| !p.starts_with(dir));
     }
-    for path in &batch.remove_files {
-        if batch
-            .remove_trees
-            .iter()
-            .any(|dir| path.starts_with(dir))
-        {
-            continue;
-        }
-        removed += forget_path(cfg, path);
-    }
-    for dir in &batch.add_dirs {
-        added += insert_directory(ino, wds, cfg, dir);
-    }
-    for path in &batch.add_files {
-        if add_one(cfg, path) {
-            added += 1;
-        }
-    }
-    if added + removed == 0 {
-        return;
-    }
-    if let Some(dbp) = &cfg.db_path {
-        if let Ok(db) = LibraryDb::open(dbp) {
-            removed += db.prune_empty_folders().unwrap_or(0);
-            if let Ok(cat) = db.load_catalog() {
-                on_change(
-                    cat,
-                    ScanDelta {
-                        added,
-                        removed,
-                        changed: 0,
-                    },
-                );
-            }
-        }
+    let dirty: Vec<PathBuf> = batch.add_files.iter().cloned().collect();
+    match monitor_dirty(cfg, &dirty) {
+        (Some(cat), delta) => on_change(cat, delta),
+        _ => {}
     }
 }
 
@@ -246,10 +218,12 @@ impl PendingBatch {
             && self.remove_trees.is_empty()
     }
 
+    #[allow(dead_code)]
     fn unique_paths(&self) -> usize {
         self.add_files.len() + self.remove_files.len() + self.remove_trees.len() + self.add_dirs.len()
     }
 
+    #[allow(dead_code)]
     fn should_reconcile(&self) -> bool {
         self.overflow || self.unique_paths() >= RECONCILE_AFTER
     }
@@ -315,7 +289,7 @@ fn add_tree_watches(
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    if path_excluded(dir, name, cfg) || is_junk_dir(name) || is_sample_or_trailer_dir(name) {
+    if path_excluded(dir, name, cfg) || is_skipped_dir(name) {
         return;
     }
     if let Ok(wd) = ino.watches().add(dir, MASK) {
@@ -331,7 +305,7 @@ fn add_tree_watches(
         if n.starts_with('.') {
             continue;
         }
-        if path_excluded(&path, &n, cfg) || is_junk_dir(&n) || is_sample_or_trailer_dir(&n) {
+        if path_excluded(&path, &n, cfg) || is_skipped_dir(&n) {
             continue;
         }
         if ent.file_type().map(|t| t.is_dir() || t.is_symlink()).unwrap_or(false) && path.is_dir()
@@ -339,55 +313,6 @@ fn add_tree_watches(
             add_tree_watches(ino, wds, cfg, &path);
         }
     }
-}
-
-fn insert_directory(
-    ino: &mut Inotify,
-    wds: &mut HashMap<WatchDescriptor, PathBuf>,
-    cfg: &ScanConfig,
-    dir: &Path,
-) -> usize {
-    let name = dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    if path_excluded(dir, name, cfg) {
-        return 0;
-    }
-    add_tree_watches(ino, wds, cfg, dir);
-    let mut n = 0;
-    let rd = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
-    for ent in rd.filter_map(|e| e.ok()) {
-        let path = ent.path();
-        let nm = ent.file_name().to_string_lossy().into_owned();
-        if nm.starts_with('.') || path_excluded(&path, &nm, cfg) {
-            continue;
-        }
-        if path.is_dir() {
-            n += insert_directory(ino, wds, cfg, &path);
-        } else if add_one(cfg, &path) {
-            n += 1;
-        }
-    }
-    n
-}
-
-fn add_one(cfg: &ScanConfig, path: &Path) -> bool {
-    let _write = crate::library_write_guard();
-    let db = match &cfg.db_path {
-        Some(p) => match LibraryDb::open(p) {
-            Ok(d) => d,
-            Err(_) => return false,
-        },
-        None => return false,
-    };
-    let Some(folder) = ensure_folder_chain(&db, cfg, path) else {
-        return false;
-    };
-    index_one_file(&db, cfg, path, &folder)
 }
 
 fn raise_watch_limit(want: u32) {

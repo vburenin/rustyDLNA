@@ -1,4 +1,4 @@
-//! `Range: bytes=` as MiniDLNA understands it.
+//! `Range: bytes=` as the dialect understands it.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteRange {
@@ -60,6 +60,32 @@ pub fn parse_byte_range(value: &str, size: u64) -> Result<Option<ByteRange>, Ran
     Ok(Some(ByteRange { start, end }))
 }
 
+/// Range when the total size is not known yet (growing remux).
+/// `end = None` means “from start to whatever is produced.”
+pub fn parse_open_range(value: &str) -> Result<(u64, Option<u64>), RangeError> {
+    let v = value.trim();
+    let Some(spec) = v
+        .strip_prefix("bytes=")
+        .or_else(|| v.strip_prefix("BYTES="))
+    else {
+        return Err(RangeError::Invalid);
+    };
+    let spec = spec.trim();
+    if spec.is_empty() || spec.contains(',') || spec.starts_with('-') {
+        return Err(RangeError::Invalid);
+    }
+    let (a, b) = spec.split_once('-').ok_or(RangeError::Invalid)?;
+    let start: u64 = a.parse().map_err(|_| RangeError::Invalid)?;
+    if b.is_empty() {
+        return Ok((start, None));
+    }
+    let end: u64 = b.parse().map_err(|_| RangeError::Invalid)?;
+    if end < start {
+        return Err(RangeError::Invalid);
+    }
+    Ok((start, Some(end)))
+}
+
 pub fn range_len(r: ByteRange) -> u64 {
     r.end.saturating_sub(r.start).saturating_add(1)
 }
@@ -103,5 +129,8 @@ mod tests {
             parse_byte_range("bytes=50-10", 1000),
             Err(RangeError::Invalid)
         );
+        assert_eq!(parse_open_range("bytes=0-1").unwrap(), (0, Some(1)));
+        assert_eq!(parse_open_range("bytes=100-").unwrap(), (100, None));
+        assert_eq!(parse_open_range("bytes=50-10"), Err(RangeError::Invalid));
     }
 }

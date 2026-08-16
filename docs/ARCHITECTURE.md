@@ -1,6 +1,6 @@
 # Architecture
 
-MiniDLNA is a select loop plus `fork` per media GET. That is a sound
+A classic select-loop file server plus `fork` per media GET is a sound
 **file server**. It is the wrong shape for a RAM window, an encoder, and
 kill-on-disconnect.
 
@@ -14,7 +14,7 @@ rustyDLNA keeps the dialect in `replica.md` and changes the process.
                     │    client cache (by IPv4 + MAC)     │
                     │           │                         │
                     │           ├─ original file ──► ranged file read
-                    │           └─ remux/transcode ──► ffmpeg → cache file → Range
+                    │           └─ remux/transcode ──► ffmpeg live fMP4 pipe
                     └─────────────────────────────────────┘
 ```
 
@@ -24,9 +24,9 @@ rustyDLNA keeps the dialect in `replica.md` and changes the process.
 |---|---|---|
 | SSDP announce + M-SEARCH | async UDP | cheap, periodic |
 | SOAP Browse/Search | async, one DB pool | shared library |
-| Description / art / captions | async, Keep-Alive | MiniDLNA persist rule |
+| Description / art / captions | async, Keep-Alive | persist rule |
 | Original `/MediaItems/` | file Range | large `Range` reads; **Connection: close** |
-| Transcode | ffmpeg → cache file, cap `max_jobs` | NVENC / CPU; `Drop` kills the job; GET is Range on the dest |
+| Transcode | ffmpeg live fMP4 pipe, cap `max_jobs` | first fragment immediately; disconnect kills ffmpeg |
 | Scan / inotify | background task | must not stall Browse |
 
 Do **not** `fork` the HTTP server to serve a file. Isolation is a
@@ -41,40 +41,37 @@ SQLite handle and the cache maps.
 - `transcode` — `decide(client, source)` then ffmpeg argv.
 - `server` — config, runtime, wiring.
 
-A client profile is resolved **once** per TCP peer (MiniDLNA’s 25-slot
+A client profile is resolved **once** per TCP peer (25-slot
 cache, 1 hour, do not overwrite a specific type with generic
 `DLNADOC/1.50`). SOAP and media GET must see the same profile so DIDL
 and HTTP MIME lies match.
 
 ## DIDL and transcode
 
-Two `<res>` rows only when the client is `NEED_SAFE_VIDEO` **and**
-`decide` says `Transcode`:
+Two `<res>` rows when `decide` says `Recode` (remap match):
 
-1. Optional: original, listed **second** (some clients pick the first).
-2. Transcode URL first, `DLNA.ORG_CI=1`, `OP=01` (file cache), mime
+1. Transcode URL first, `DLNA.ORG_CI=1`, `OP=00` (live pipe), mime
    `video/mp4`.
+2. Original listed **second** as a fallback.
 
-Kodi (`FLAG_DLNA`, no `NEED_SAFE_VIDEO`) sees **only** the original, same
-as MiniDLNA. Never transcode “because it is MKV”.
+No remap row → original only. Never remux “because it is MKV”.
 
-Toshiba / Sony extra `CI=1` rows in MiniDLNA are **lies** (same file).
+Toshiba / Sony extra `CI=1` rows in the dialect are **lies** (same file).
 rustyDLNA should not invent real transcodes for those unless a profile
 says the client cannot play the source.
 
 ## Seek
 
-Original files: `Accept-Ranges: bytes`, `DLNA.ORG_OP=01`, same as MiniDLNA.
+Original files: `Accept-Ranges: bytes`, `DLNA.ORG_OP=01`, same as the dialect.
 
-Remux / transcode **serve path** is a finished cache file, so Range is
-the same as original (`OP=01`, honest `Content-Length`). A live ffmpeg
-pipe is not the HTTP path; do not advertise `OP=00` for today’s
-`/Transcode/` URLs.
+Remux / transcode **serve path** is a live fragmented-MP4 pipe
+(`OP=00`, no `Content-Length`). Do not wait for a finished cache file
+before the first byte.
 
 ## Database
 
 SQLite (or later) with WAL. Object IDs stay `64` / `1` / `2` / `$` hex.
-Inode reuse and multi-caption (MiniDLNA DB v13) belong in `scan`, not in
+Inode reuse and multi-caption (rustyDLNA DB v13) belong in `scan`, not in
 the HTTP crate.
 
 ## What we refuse to port as-is

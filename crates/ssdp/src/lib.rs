@@ -13,7 +13,7 @@ fn usn(uuid: &str, st: &str, index: usize) -> String {
     }
 }
 
-/// Unsolicited NOTIFY (MiniDLNA uses no space after `HOST:`, `NT:`, …).
+/// Unsolicited NOTIFY (The dialect uses no space after `HOST:`, `NT:`, …).
 pub fn notify_alive(
     uuid: &str,
     host: &str,
@@ -91,7 +91,7 @@ pub fn man_is_discover(man: &str) -> bool {
     man.trim() == rusty_dlna_protocol::ssdp::MAN_DISCOVER
 }
 
-/// Parsed M-SEARCH. MiniDLNA requires HTTP/1.1, a non-empty ST, MAN exactly
+/// Parsed M-SEARCH. The dialect requires HTTP/1.1, a non-empty ST, MAN exactly
 /// `"ssdp:discover"`, and MX as an integer >= 0.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MSearch {

@@ -4,7 +4,6 @@
 # Do not add:
 #   network_mode: host
 #   ports: ["8200:...", "1900:..."]
-#   container_name: minidlna
 name: rusty-dlna-test
 
 services:

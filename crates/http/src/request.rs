@@ -30,15 +30,15 @@ impl HttpRequest {
     }
 
     pub fn conn_close(&self) -> bool {
-        self.header("Connection")
-            .is_some_and(|v| v.to_ascii_lowercase().split(',').any(|t| t.trim() == "close"))
+        self.header("Connection").is_some_and(|v| {
+            v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close"))
+        })
     }
 
     pub fn conn_keep(&self) -> bool {
         self.header("Connection").is_some_and(|v| {
-            v.to_ascii_lowercase()
-                .split(',')
-                .any(|t| t.trim() == "keep-alive")
+            v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("keep-alive"))
         })
     }
 
