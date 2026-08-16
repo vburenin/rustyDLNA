@@ -1235,15 +1235,22 @@ pub fn load_existing(cfg: &ScanConfig) -> Catalog {
         Ok((n, cat))
     }) {
         Ok((n, cat)) if !cat.items.is_empty() || !cat.containers.is_empty() => {
-            eprintln!(
-                "rusty-dlna load: {n} DETAILS rows from {}",
-                path.display()
+            tracing::info!(
+                target: "rusty_dlna",
+                details = n,
+                path = %path.display(),
+                "library loaded"
             );
             cat
         }
         Ok(_) => Catalog::new(),
         Err(e) => {
-            eprintln!("rusty-dlna load {}: {e}", path.display());
+            tracing::warn!(
+                target: "rusty_dlna",
+                path = %path.display(),
+                error = %e,
+                "library load failed"
+            );
             Catalog::new()
         }
     }
@@ -1295,7 +1302,12 @@ fn scan_inner(cfg: &ScanConfig, rebuild: bool) -> Catalog {
     let _ = db.prune_excluded_paths(cfg);
     let _ = db.prune_empty_folders();
     let n = db.detail_count().unwrap_or(0);
-    eprintln!("rusty-dlna scan: {n} DETAILS rows in {}", db.path.display());
+    tracing::info!(
+        target: "rusty_dlna",
+        details = n,
+        path = %db.path.display(),
+        "scan complete"
+    );
     db.load_catalog().unwrap_or_else(|_| Catalog::new())
 }
 
@@ -1419,9 +1431,14 @@ pub fn monitor(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta) {
         return (None, delta);
     }
     let n = db.detail_count().unwrap_or(0);
-    eprintln!(
-        "rusty-dlna monitor: +{added} -{removed} ~{changed} ({n} DETAILS) {}",
-        db.path.display()
+    tracing::info!(
+        target: "rusty_dlna",
+        added,
+        removed,
+        changed,
+        details = n,
+        path = %db.path.display(),
+        "library monitor"
     );
     (
         db.load_catalog().ok(),
@@ -1746,7 +1763,7 @@ pub fn rebuild_objects(cfg: &ScanConfig) -> Catalog {
     }
     let _ = db.commit();
     let _ = db.prune_empty_folders();
-    eprintln!("rusty-dlna rebuild-objects: {n} files");
+    tracing::info!(target: "rusty_dlna", files = n, "objects rebuilt");
     db.load_catalog().unwrap_or_else(|_| Catalog::new())
 }
 
@@ -1896,7 +1913,7 @@ fn walk_into_db(
         if index_one_file(db, cfg, &path, &folder_id) {
             *indexed += 1;
             if *indexed % 100 == 0 {
-                eprintln!("rusty-dlna scan: indexed {indexed} files");
+                tracing::info!(target: "rusty_dlna", indexed, "scan progress");
             }
         }
     }

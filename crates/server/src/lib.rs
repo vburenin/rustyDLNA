@@ -982,7 +982,6 @@ fn spawn_library_watch(app: Arc<App>) {
                 .unwrap_or(true);
             if empty {
                 tracing::info!("empty library; full scan from disk");
-                eprintln!("rusty-dlna: empty library, full scan");
                 let next = scan(&cfg);
                 let items = next.items.len();
                 *app.catalog.lock().expect("catalog") = next;

@@ -483,9 +483,11 @@ name = "rusty-dlna-scan"
 version = "0.1.0"
 dependencies = [
  "inotify",
+ "libc",
  "rusqlite",
  "rusty-dlna-protocol",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

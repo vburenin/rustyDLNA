@@ -9,4 +9,6 @@ description = "Library scan, inode reuse, NFO, and object IDs"
 rusty-dlna-protocol.workspace = true
 thiserror.workspace = true
 rusqlite.workspace = true
+tracing.workspace = true
 inotify = "0.11"
+libc = "0.2"
