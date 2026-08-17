@@ -4,8 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub mod db;
+pub mod probe;
 pub mod watch;
 pub use db::{mime_to_ext, LibraryDb};
+pub use probe::{probe_media, MediaProbe};
 pub use watch::{repair_objects_if_needed, run_inotify};
 
 use rusty_dlna_protocol::object_id::{
@@ -456,6 +458,24 @@ pub fn write_fake_mkv(path: &Path, size: usize) {
     std::fs::write(path, data).expect("write fake mkv");
 }
 
+/// ISO BMFF with `ftyp` + `mdat` and no `moov` — libav reports "moov atom not found".
+pub fn write_incomplete_mp4(path: &Path, size: usize) {
+    if let Some(p) = path.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    let n = size.max(28);
+    let mut data = vec![0u8; n];
+    data[0..4].copy_from_slice(&20u32.to_be_bytes());
+    data[4..8].copy_from_slice(b"ftyp");
+    data[8..12].copy_from_slice(b"isom");
+    data[12..16].copy_from_slice(&0u32.to_be_bytes());
+    data[16..20].copy_from_slice(b"isom");
+    let mdat = (n as u32 - 20).to_be_bytes();
+    data[20..24].copy_from_slice(&mdat);
+    data[24..28].copy_from_slice(b"mdat");
+    std::fs::write(path, data).expect("write incomplete mp4");
+}
+
 fn mime_and_class(name: &str) -> (&'static str, &'static str, &'static str) {
     let l = name.to_ascii_lowercase();
     if l.ends_with(".mkv") {
@@ -509,10 +529,10 @@ pub struct SourceProbe {
 impl Default for SourceProbe {
     fn default() -> Self {
         Self {
-            container: "mkv".into(),
-            video: "hevc".into(),
-            hdr: "sdr".into(),
-            audio: "aac".into(),
+            container: String::new(),
+            video: String::new(),
+            hdr: String::new(),
+            audio: String::new(),
             width: 0,
             height: 0,
         }
@@ -596,6 +616,8 @@ pub struct AvMeta {
     pub resolution: Option<String>,
     pub channels: Option<i64>,
     pub samplerate: Option<i64>,
+    /// Embedded subtitle codecs, comma-separated (`dvd_subtitle,mov_text`).
+    pub subs: Option<String>,
 }
 
 /// dialect `GetVideoMetadata` / lav: duration, bitrate/8, WxH, audio.
@@ -947,7 +969,39 @@ impl Catalog {
         if let Some(c) = self.containers.get(id) {
             return Some(CatalogChild::Container(c.clone()));
         }
-        self.items.get(id).cloned().map(CatalogChild::Item)
+        if let Some(it) = self.items.get(id) {
+            return Some(CatalogChild::Item(it.clone()));
+        }
+        // Infuse / libupnp caches ObjectID. After a rebuild the Browse
+        // Folders id may have changed; All Video is `2$8$` + detail hex
+        // and some clients send the bare DETAILS.ID.
+        self.metadata_by_detail(id)
+    }
+
+    fn metadata_by_detail(&self, id: &str) -> Option<CatalogChild> {
+        let did = if let Some(hex) = id
+            .strip_prefix(VIDEO_ALL_ID)
+            .and_then(|s| s.strip_prefix('$'))
+            .filter(|s| !s.is_empty() && !s.contains('$'))
+        {
+            i64::from_str_radix(hex, 16).ok()?
+        } else if id.bytes().all(|b| b.is_ascii_digit()) {
+            let n: i64 = id.parse().ok()?;
+            // `0`/`1`/`2`/`3`/`64` are virtual containers, never DETAILS.ID.
+            if matches!(n, 0 | 1 | 2 | 3 | 64) {
+                return None;
+            }
+            n
+        } else {
+            return None;
+        };
+        let it = self.get_item_by_detail(did)?.clone();
+        let mut it = it;
+        if id.starts_with(VIDEO_ALL_ID) {
+            it.object_id = id.to_string();
+            it.parent_id = VIDEO_ALL_ID.to_string();
+        }
+        Some(CatalogChild::Item(it))
     }
 
     /// Mirror Browse Folders video files into `2$15` so Video/Folders works
@@ -1294,6 +1348,10 @@ pub fn guess_hdr_from_name(name: &str) -> Option<&'static str> {
     if web {
         return None;
     }
+    // Hybrid remuxes are usually single-layer P8 / HDR10+ dual, not BL+EL P7.
+    if n.contains("hybrid") {
+        return None;
+    }
     let dv = n.contains("dovi")
         || n.contains("dolby vision")
         || n.contains("dolbyvision")
@@ -1327,23 +1385,222 @@ pub fn probe_toml_exists(file: &Path) -> bool {
     named.is_file() || stem.is_file()
 }
 
-/// Filename / sidecar-free probe. Catalog load must not open a
-/// `.probe.toml` next to every video (that was 2 failed opens × N files).
-pub fn probe_from_name(title: &str, path: &Path, ext: &str) -> SourceProbe {
-    let mut p = SourceProbe::default();
-    p.container = match ext {
-        "mp4" | "m4v" => "mp4".into(),
-        "avi" => "avi".into(),
-        _ => "mkv".into(),
+/// First codec when VIDEO/AUDIO store extra tracks as `aac,ac3`.
+pub fn primary_codec(s: &str) -> &str {
+    s.split(',').map(str::trim).find(|p| !p.is_empty()).unwrap_or("")
+}
+
+/// `1920x800` / `1920X800` from DETAILS.RESOLUTION.
+pub fn parse_resolution(s: Option<&str>) -> (u32, u32) {
+    let Some(raw) = s.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (0, 0);
     };
-    if let Some(hdr) = guess_hdr_from_name(title).or_else(|| {
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .and_then(guess_hdr_from_name)
-    }) {
-        p.hdr = hdr.to_string();
+    let Some((w, h)) = raw.split_once('x').or_else(|| raw.split_once('X')) else {
+        return (0, 0);
+    };
+    (w.trim().parse().unwrap_or(0), h.trim().parse().unwrap_or(0))
+}
+
+/// DLNA PN from stored stream identity. Matroska stays empty (dialect).
+pub fn dlna_pn_from_probe(
+    container: &str,
+    video: &str,
+    audio: &str,
+    _hdr: &str,
+    width: u32,
+    height: u32,
+) -> Option<String> {
+    let video = primary_codec(video);
+    let audio = primary_codec(audio);
+    if video.is_empty() {
+        return None;
     }
-    p
+    let hd = height >= 720 || width >= 1280;
+    match container {
+        "mkv" => None,
+        "mp4" => match video {
+            "h264" => Some(
+                if hd {
+                    if matches!(audio, "ac3" | "eac3") {
+                        "AVC_MP4_MP_HD_AC3"
+                    } else {
+                        "AVC_MP4_MP_HD_AAC_MULT5"
+                    }
+                } else if matches!(audio, "ac3" | "eac3") {
+                    "AVC_MP4_MP_SD_AC3"
+                } else {
+                    "AVC_MP4_MP_SD_AAC_MULT5"
+                }
+                .into(),
+            ),
+            "hevc" => Some(
+                if hd {
+                    if matches!(audio, "ac3" | "eac3") {
+                        "HEVC_MP4_BL_Main10_L5_HD1080_AC3"
+                    } else {
+                        "HEVC_MP4_BL_Main10_L5_HD1080_AAC"
+                    }
+                } else {
+                    "HEVC_MP4_BL_Main10_L4_HD720_AAC"
+                }
+                .into(),
+            ),
+            "mpeg4" => Some("MPEG4_P2_MP4_ASP_AAC".into()),
+            "mpeg2" => Some("MPEG_PS_PAL".into()),
+            _ => None,
+        },
+        "avi" => match video {
+            "mpeg4" | "other" => Some("MPEG4_P2_AVI_ASP_L5_SO".into()),
+            "h264" => Some(
+                if hd {
+                    "AVC_MP4_MP_HD_AAC_MULT5"
+                } else {
+                    "AVC_MP4_MP_SD_AAC_MULT5"
+                }
+                .into(),
+            ),
+            _ => None,
+        },
+        "mpeg-ts" | "ts" => match video {
+            "h264" => Some(
+                if hd {
+                    "AVC_TS_MP_HD_AC3_ISO"
+                } else {
+                    "AVC_TS_MP_SD_AC3_ISO"
+                }
+                .into(),
+            ),
+            "mpeg2" | "mpeg4" => Some(
+                if hd {
+                    "MPEG_TS_HD_NA_ISO"
+                } else {
+                    "MPEG_TS_SD_NA_ISO"
+                }
+                .into(),
+            ),
+            "hevc" => Some("HEVC_TS_HD_EU_ISO".into()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Container from DETAILS (or extension). HDR/codecs stay empty when unset —
+/// a failed probe must not look like hevc/sdr. Extra tracks stay as `aac,ac3`.
+pub fn probe_from_stored(
+    ext: &str,
+    container: Option<&str>,
+    video: Option<&str>,
+    audio: Option<&str>,
+    hdr: Option<&str>,
+    resolution: Option<&str>,
+) -> SourceProbe {
+    let container = match container.filter(|s| !s.is_empty()) {
+        Some(c) => c.to_string(),
+        None => match ext {
+            "mp4" | "m4v" => "mp4".into(),
+            "avi" => "avi".into(),
+            "ts" | "m2ts" | "mts" => "ts".into(),
+            _ => "mkv".into(),
+        },
+    };
+    let mut video = video.filter(|s| !s.is_empty()).unwrap_or("").to_string();
+    if video == "other" && (container == "avi" || ext == "avi") {
+        video = "mpeg4".into();
+    }
+    let (width, height) = parse_resolution(resolution);
+    SourceProbe {
+        container,
+        video,
+        audio: audio.filter(|s| !s.is_empty()).unwrap_or("").to_string(),
+        hdr: hdr.filter(|s| !s.is_empty()).unwrap_or("").to_string(),
+        width,
+        height,
+    }
+}
+
+pub fn apply_probe_to_detail(db: &LibraryDb, id: i64, got: &MediaProbe) {
+    let mut got = got.clone();
+    if got.probe.hdr.is_empty() {
+        got.probe.hdr = "sdr".into();
+    }
+    let _ = db.update_detail_stream(
+        id,
+        got.av.duration.as_deref(),
+        got.av.bitrate,
+        got.av.resolution.as_deref(),
+        got.av.channels,
+        got.av.samplerate,
+        Some(got.probe.container.as_str()).filter(|s| !s.is_empty()),
+        Some(got.probe.video.as_str()).filter(|s| !s.is_empty()),
+        Some(got.probe.audio.as_str()).filter(|s| !s.is_empty()),
+        Some(got.probe.hdr.as_str()),
+    );
+    let pn = dlna_pn_from_probe(
+        &got.probe.container,
+        &got.probe.video,
+        &got.probe.audio,
+        &got.probe.hdr,
+        got.probe.width,
+        got.probe.height,
+    );
+    let _ = db.update_detail_dlna_pn(id, pn.as_deref());
+    let _ = db.copy_stream_to_inode_aliases(id);
+}
+
+/// Probe `path` and persist. Libav `None` still applies a `.probe.toml`
+/// sidecar. With neither, stream columns stay unset so a later size change
+/// can retry (growing MP4 with no moov yet).
+fn persist_probe(db: &LibraryDb, path: &Path, id: i64) -> bool {
+    if let Some(mut got) = probe_media(path) {
+        merge_sidecar(path, &mut got.probe);
+        apply_probe_to_detail(db, id, &got);
+        return true;
+    }
+    let mut probe = SourceProbe::default();
+    merge_sidecar(path, &mut probe);
+    if probe.hdr.is_empty() && probe.video.is_empty() && probe.audio.is_empty() {
+        let _ = db.clear_detail_stream(id);
+        return false;
+    }
+    apply_probe_to_detail(
+        db,
+        id,
+        &MediaProbe {
+            probe,
+            av: AvMeta::default(),
+        },
+    );
+    true
+}
+
+fn merge_sidecar(path: &Path, probe: &mut SourceProbe) {
+    let named = PathBuf::from(format!("{}.probe.toml", path.display()));
+    let stem = path.with_extension("probe.toml");
+    for c in [named, stem] {
+        if let Ok(text) = std::fs::read_to_string(&c) {
+            let s = parse_probe_toml(&text);
+            if !s.container.is_empty() {
+                probe.container = s.container;
+            }
+            if !s.video.is_empty() {
+                probe.video = s.video;
+            }
+            if !s.audio.is_empty() {
+                probe.audio = s.audio;
+            }
+            if !s.hdr.is_empty() {
+                probe.hdr = s.hdr;
+            }
+            if s.width > 0 {
+                probe.width = s.width;
+            }
+            if s.height > 0 {
+                probe.height = s.height;
+            }
+            return;
+        }
+    }
 }
 
 /// ffprobe codec / Dolby Vision profile. Used when no sidecar exists.
@@ -1559,6 +1816,21 @@ pub fn monitor(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta) {
     monitor_dirty(cfg, &[])
 }
 
+fn log_library_file(path: impl AsRef<Path>, action: &'static str, message: &'static str) {
+    let path = path.as_ref();
+    let file = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    tracing::info!(
+        target: "rusty_dlna",
+        file,
+        action,
+        path = %path.display(),
+        "{message}"
+    );
+}
+
 /// Like [`monitor`], but restat `dirty` paths (inotify CLOSE_WRITE / move
 /// targets) so SIZE/TIMESTAMP stay current without stating the whole tree.
 pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, ScanDelta) {
@@ -1585,6 +1857,15 @@ pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, S
             .push((p.clone(), *id, *sz, *ts, *dev, *ino));
     }
     let _ = db.seed_virtual_containers();
+    let need_probe: HashSet<(i64, i64)> = db
+        .inodes_needing_stream_probe()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    // Periodic `monitor()` (empty dirty) restats every listed row so a
+    // replaced file (new inode / new size) cannot stay frozen. Inotify
+    // passes only restat dirty + incomplete paths.
+    let restat_all = dirty.is_empty();
     let _ = db.begin();
     let mut added = 0usize;
     let mut removed = 0usize;
@@ -1593,6 +1874,7 @@ pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, S
         let key = media_rel_key(Path::new(path), &cfg.media_dirs);
         if path_is_unwanted(Path::new(path), cfg) || !listed_by_rel.contains_key(&key) {
             if db.remove_path_and_symlink_aliases(path).unwrap_or(0) > 0 {
+                log_library_file(path, "removed", "library file removed");
                 removed += 1;
             }
         }
@@ -1620,6 +1902,7 @@ pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, S
                 continue;
             }
             if db.remove_detail_id(*id).is_ok() {
+                log_library_file(p, "removed", "library duplicate path dropped");
                 removed += 1;
             }
         }
@@ -1633,22 +1916,63 @@ pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, S
         });
         match existing {
             Some((db_path, id, sz, ts, dev, ino)) => {
-                if dirty_rels.contains(&key) {
+                let incomplete = need_probe.contains(&(*dev, *ino));
+                let mut live_dev = *dev;
+                let mut live_ino = *ino;
+                if restat_all || dirty_rels.contains(&key) || incomplete {
                     if let Some(meta) = std::fs::metadata(&st.path).ok().filter(|m| m.is_file()) {
                         let size = meta.len() as i64;
                         let mtime = file_mtime_unix(&meta);
-                        if size != *sz || mtime != *ts {
-                            if !file_is_viable(&st.path) {
+                        let (new_dev, new_ino) = inode_key(&meta);
+                        live_dev = new_dev as i64;
+                        live_ino = new_ino as i64;
+                        let grew = size != *sz
+                            || mtime != *ts
+                            || live_dev != *dev
+                            || live_ino != *ino;
+                        if grew || incomplete {
+                            if grew && !file_is_viable(&st.path) {
                                 let _ = db.remove_path_and_symlink_aliases(db_path);
+                                log_library_file(&st.path, "removed", "library file removed");
                                 removed += 1;
                                 continue;
                             }
-                            let _ = db.update_detail_stat(*id, size, mtime);
-                            changed += 1;
+                            if grew {
+                                tracing::info!(
+                                    target: "rusty_dlna",
+                                    file = st.path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+                                    action = "updated",
+                                    path = %st.path.display(),
+                                    old_size = *sz,
+                                    size,
+                                    old_inode = *ino,
+                                    inode = live_ino,
+                                    "file updated"
+                                );
+                                let _ = db.update_detail_stat(
+                                    *id, size, mtime, live_dev, live_ino,
+                                );
+                            }
+                            let probed = apply_or_reuse_probe(&db, &st.path, *id, live_dev, live_ino);
+                            if grew {
+                                refresh_replaced_inode_aliases(
+                                    &db,
+                                    *dev,
+                                    *ino,
+                                    *id,
+                                    live_dev,
+                                    live_ino,
+                                    size,
+                                    mtime,
+                                );
+                            }
+                            if probed || grew {
+                                changed += 1;
+                            }
                         }
                     }
                 }
-                if attach_listed_if_missing(&db, cfg, &st.path, *id, *dev, *ino) {
+                if attach_listed_if_missing(&db, cfg, &st.path, *id, live_dev, live_ino) {
                     changed += 1;
                 }
             }
@@ -1660,6 +1984,7 @@ pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, S
                 }
                 if let Some(folder_id) = ensure_folder_chain(&db, cfg, &st.path) {
                     if index_one_file(&db, cfg, &st.path, &folder_id) {
+                        log_library_file(&st.path, "added", "library file added");
                         added += 1;
                     }
                 }
@@ -1695,6 +2020,61 @@ pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, S
 #[derive(Clone)]
 struct ListedFile {
     path: PathBuf,
+}
+
+fn apply_or_reuse_probe(db: &LibraryDb, path: &Path, id: i64, device: i64, inode: i64) -> bool {
+    if let Ok(Some(src)) = db.find_inode_probe_source(device, inode, id) {
+        return db.copy_stream_from(src, id).is_ok();
+    }
+    persist_probe(db, path, id)
+}
+
+/// When a path is replaced (new inode), sibling DETAILS rows that still
+/// name the old inode are restatted. Those that now resolve to the new
+/// file get the new SIZE/INODE and a copied probe — no second libav.
+fn refresh_replaced_inode_aliases(
+    db: &LibraryDb,
+    old_dev: i64,
+    old_ino: i64,
+    src_id: i64,
+    new_dev: i64,
+    new_ino: i64,
+    size: i64,
+    mtime: i64,
+) {
+    if old_ino == 0 || (old_dev == new_dev && old_ino == new_ino) {
+        return;
+    }
+    let Ok(siblings) = db.details_with_inode(old_dev, old_ino) else {
+        return;
+    };
+    for (sid, spath) in siblings {
+        if sid == src_id {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&spath) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let (d, i) = inode_key(&meta);
+        if d as i64 != new_dev || i as i64 != new_ino {
+            continue;
+        }
+        let _ = db.update_detail_stat(sid, size, mtime, new_dev, new_ino);
+        let _ = db.copy_stream_from(src_id, sid);
+        tracing::info!(
+            target: "rusty_dlna",
+            file = Path::new(&spath).file_name().and_then(|s| s.to_str()).unwrap_or(""),
+            action = "updated",
+            path = %spath,
+            old_inode = old_ino,
+            inode = new_ino,
+            size,
+            "library alias updated"
+        );
+    }
 }
 
 fn attach_listed_if_missing(
@@ -1883,9 +2263,37 @@ pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, fold
         .unwrap_or(&name)
         .to_string();
 
-    if let Some((id, old_sz, old_ts)) = db.find_detail_by_path(&path_s).ok().flatten() {
-        if old_sz != size || old_ts != mtime {
-            let _ = db.update_detail_stat(id, size, mtime);
+    if let Some((id, old_sz, old_ts, old_dev, old_ino)) =
+        db.find_detail_by_path(&path_s).ok().flatten()
+    {
+        if old_sz != size
+            || old_ts != mtime
+            || old_dev != dev as i64
+            || old_ino != ino as i64
+        {
+            tracing::info!(
+                target: "rusty_dlna",
+                file = name.as_str(),
+                action = "updated",
+                path = %path.display(),
+                old_size = old_sz,
+                size,
+                old_inode = old_ino,
+                inode = ino,
+                "file updated"
+            );
+            let _ = db.update_detail_stat(id, size, mtime, dev as i64, ino as i64);
+            let _ = apply_or_reuse_probe(db, path, id, dev as i64, ino as i64);
+            refresh_replaced_inode_aliases(
+                db,
+                old_dev,
+                old_ino,
+                id,
+                dev as i64,
+                ino as i64,
+                size,
+                mtime,
+            );
         }
         attach_objects(db, folder_id, id, &title, class, dev, ino);
         return true;
@@ -1898,9 +2306,16 @@ pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, fold
         let new_key = media_rel_key(path, &cfg.media_dirs);
         // Host realpath vs container mount of the same file — not a new alias.
         if !src_key.is_empty() && src_key == new_key {
-            if let Some((_, old_sz, old_ts)) = db.find_detail_by_path(&src_path).ok().flatten() {
-                if old_sz != size || old_ts != mtime {
-                    let _ = db.update_detail_stat(src, size, mtime);
+            if let Some((_, old_sz, old_ts, old_dev, old_ino)) =
+                db.find_detail_by_path(&src_path).ok().flatten()
+            {
+                if old_sz != size
+                    || old_ts != mtime
+                    || old_dev != dev as i64
+                    || old_ino != ino as i64
+                {
+                    let _ = db.update_detail_stat(src, size, mtime, dev as i64, ino as i64);
+                    let _ = apply_or_reuse_probe(db, path, src, dev as i64, ino as i64);
                 }
             }
             attach_objects(db, folder_id, src, &title, class, dev, ino);
@@ -1935,16 +2350,7 @@ pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, fold
     };
     let caps = captions_for(path);
     let _ = db.replace_captions(detail, &caps);
-    if let Some(av) = probe_av_meta(path) {
-        let _ = db.update_detail_av_meta(
-            detail,
-            av.duration.as_deref(),
-            av.bitrate,
-            av.resolution.as_deref(),
-            av.channels,
-            av.samplerate,
-        );
-    }
+    let _ = persist_probe(db, path, detail);
     attach_objects(db, folder_id, detail, &title, class, dev, ino);
     true
 }
@@ -2021,9 +2427,24 @@ pub fn rebuild_objects(cfg: &ScanConfig) -> Catalog {
     let _ = db.prune_missing_files();
     let _ = db.prune_excluded_paths(cfg);
     let rows = db.all_detail_stats().unwrap_or_default();
+    let saved = db.snapshot_objects().unwrap_or_default();
+    let live_details: HashSet<i64> = rows.iter().map(|(_, id, ..)| *id).collect();
     let _ = db.clear_objects();
     let _ = db.seed_virtual_containers();
     let _ = db.begin();
+    // Put the old IDs back first so Infuse cached ObjectIDs still Browse.
+    // Folders before items so find_child_object(parent, name) hits.
+    let (folders, items): (Vec<_>, Vec<_>) = saved
+        .into_iter()
+        .partition(|r| r.detail_id.is_none());
+    for row in folders {
+        let _ = db.restore_object(&row);
+    }
+    for row in items {
+        if row.detail_id.is_some_and(|d| live_details.contains(&d)) {
+            let _ = db.restore_object(&row);
+        }
+    }
     let mut n = 0usize;
     for (path, ..) in &rows {
         let p = Path::new(path);
@@ -2176,9 +2597,13 @@ fn walk_into_db(
         let existing = db.find_detail_by_path(&path_s).ok().flatten();
         let size = meta.len() as i64;
         let mtime = file_mtime_unix(&meta);
-        let unchanged = existing
-            .as_ref()
-            .is_some_and(|(_, old_sz, old_ts)| *old_sz == size && *old_ts == mtime);
+        let (dev, ino) = inode_key(&meta);
+        let unchanged = existing.as_ref().is_some_and(|(_, old_sz, old_ts, old_dev, old_ino)| {
+            *old_sz == size
+                && *old_ts == mtime
+                && *old_dev == dev as i64
+                && *old_ino == ino as i64
+        });
         if unchanged && !rebuild {
             continue;
         }
@@ -2237,6 +2662,11 @@ mod tests {
             guess_hdr_from_name("Show.S01E01.2160p.WEB-DL.DDP5.1.DV.H.265"),
             None,
             "WEB-DL DoVi is usually P8"
+        );
+        assert_eq!(
+            guess_hdr_from_name("02 - Frozen II (2019) - 2160p UHD BDRemux Hybrid DoVi"),
+            None,
+            "Hybrid DoVi remux is usually P8"
         );
         assert_eq!(guess_hdr_from_name("clip.dv-p7.mkv"), Some("dv-p7"));
         assert_eq!(guess_hdr_from_name("clip.dv-p8.mkv"), Some("dv-p8"));
@@ -3489,6 +3919,308 @@ mod tests {
         assert!(
             !rows.iter().any(|(p, ..)| p.ends_with("gone.mkv")),
             "missing file must leave DETAILS, not just OBJECTS: {rows:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rebuild_objects_keeps_browse_folder_ids() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-rebuild-ids-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("video")).unwrap();
+        write_fake_mkv(&tmp.join("video/keep.mkv"), 64);
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let first = scan(&cfg);
+        let before: Vec<String> = first
+            .items
+            .values()
+            .filter(|i| i.path.ends_with("keep.mkv"))
+            .map(|i| i.object_id.clone())
+            .collect();
+        assert!(!before.is_empty(), "scan must index keep.mkv");
+        let _ = rebuild_objects(&cfg);
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        let after = db.load_catalog().unwrap();
+        for id in &before {
+            assert!(
+                after.items.contains_key(id) || after.containers.contains_key(id),
+                "rebuild must keep ObjectID {id} (Infuse caches it)"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn probe_from_stored_uses_resolution_and_keeps_empty() {
+        let p = probe_from_stored(
+            "mkv",
+            Some("mkv"),
+            Some("hevc"),
+            Some("truehd,ac3"),
+            Some("dv-p8"),
+            Some("3840x2160"),
+        );
+        assert_eq!(p.width, 3840);
+        assert_eq!(p.height, 2160);
+        assert_eq!(p.audio, "truehd,ac3");
+        assert_eq!(primary_codec(&p.audio), "truehd");
+        let empty = probe_from_stored("mkv", None, None, None, None, None);
+        assert!(empty.video.is_empty() && empty.hdr.is_empty() && empty.audio.is_empty());
+        assert_eq!(empty.width, 0);
+        assert_eq!(empty.container, "mkv");
+    }
+
+    #[test]
+    fn probe_from_stored_avi_other_is_mpeg4() {
+        let p = probe_from_stored("avi", Some("avi"), Some("other"), Some("ac3"), Some("sdr"), Some("720x480"));
+        assert_eq!(p.video, "mpeg4");
+        assert_eq!(p.width, 720);
+        assert_eq!(p.height, 480);
+        assert_eq!(
+            dlna_pn_from_probe(&p.container, &p.video, &p.audio, &p.hdr, p.width, p.height)
+                .as_deref(),
+            Some("MPEG4_P2_AVI_ASP_L5_SO")
+        );
+    }
+
+    #[test]
+    fn dlna_pn_mkv_hevc_stays_empty_mp4_is_written() {
+        assert_eq!(
+            dlna_pn_from_probe("mkv", "hevc", "truehd", "dv-p8", 3840, 2160),
+            None
+        );
+        assert_eq!(
+            dlna_pn_from_probe("mp4", "h264", "aac", "sdr", 1920, 1080).as_deref(),
+            Some("AVC_MP4_MP_HD_AAC_MULT5")
+        );
+        assert_eq!(
+            dlna_pn_from_probe("mp4", "hevc", "eac3", "dv-p8", 3840, 2160).as_deref(),
+            Some("HEVC_MP4_BL_Main10_L5_HD1080_AC3")
+        );
+    }
+
+    #[test]
+    fn apply_probe_writes_dlna_pn_and_multi_audio() {
+        let db = LibraryDb::open_memory().unwrap();
+        let id = db
+            .insert_detail("/tmp/clip.mp4", 10, 1, "clip", "2024-01-01", "video/mp4", 1, 1, None)
+            .unwrap();
+        let got = MediaProbe {
+            probe: SourceProbe {
+                container: "mp4".into(),
+                video: "h264".into(),
+                hdr: "sdr".into(),
+                audio: "aac,ac3".into(),
+                width: 1920,
+                height: 800,
+            },
+            av: AvMeta {
+                duration: Some("1:00:00.000".into()),
+                resolution: Some("1920x800".into()),
+                channels: Some(2),
+                samplerate: Some(48000),
+                ..AvMeta::default()
+            },
+        };
+        apply_probe_to_detail(&db, id, &got);
+        db.upsert_object("64$1$1", "64$1", "item.videoItem", Some(id), "clip", None)
+            .unwrap();
+        let cat = db.load_catalog().unwrap();
+        let it = cat
+            .items
+            .values()
+            .find(|i| i.detail_id == id)
+            .expect("item");
+        assert_eq!(it.probe.audio, "aac,ac3");
+        assert_eq!(it.probe.width, 1920);
+        assert_eq!(it.probe.height, 800);
+        assert_eq!(it.dlna_pn.as_deref(), Some("AVC_MP4_MP_HD_AAC_MULT5"));
+    }
+
+    #[test]
+    fn sidecar_applies_when_libav_fails() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-sidecar-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("video")).unwrap();
+        let p = tmp.join("video/dvp7.mp4");
+        write_incomplete_mp4(&p, 64 * 1024);
+        std::fs::write(
+            tmp.join("video/dvp7.probe.toml"),
+            "container = \"mkv\"\nvideo = \"hevc\"\nhdr = \"dv-p7\"\naudio = \"truehd\"\n",
+        )
+        .unwrap();
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let cat = scan(&cfg);
+        let it = cat
+            .items
+            .values()
+            .find(|i| i.path.ends_with("dvp7.mp4"))
+            .expect("indexed");
+        assert_eq!(it.probe.hdr, "dv-p7", "{it:?}");
+        assert_eq!(it.probe.video, "hevc");
+        assert_eq!(it.probe.audio, "truehd");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn backfill_rewrites_avi_other_and_pn() {
+        let db = LibraryDb::open_memory().unwrap();
+        let id = db
+            .insert_detail(
+                "/media/clip.avi",
+                10,
+                1,
+                "clip",
+                "2024-01-01",
+                "video/x-msvideo",
+                1,
+                2,
+                None,
+            )
+            .unwrap();
+        db.update_detail_stream(
+            id,
+            Some("0:01:00.000"),
+            None,
+            Some("720x480"),
+            Some(2),
+            Some(48000),
+            Some("avi"),
+            Some("other"),
+            Some("ac3"),
+            Some("sdr"),
+        )
+        .unwrap();
+        let n = db.backfill_derived_stream_fields().unwrap();
+        assert!(n >= 1, "expected derived rewrite, n={n}");
+        db.upsert_object("64$1$1", "64$1", "item.videoItem", Some(id), "clip", None)
+            .unwrap();
+        let cat = db.load_catalog().unwrap();
+        let it = cat.items.values().find(|i| i.detail_id == id).unwrap();
+        assert_eq!(it.probe.video, "mpeg4");
+        assert_eq!(it.probe.width, 720);
+        assert_eq!(it.dlna_pn.as_deref(), Some("MPEG4_P2_AVI_ASP_L5_SO"));
+    }
+
+    #[test]
+    fn monitor_updates_replaced_file_and_relinked_aliases() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-inode-replace-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("video")).unwrap();
+        let a = tmp.join("video/orig.mp4");
+        let b = tmp.join("video/alias.mp4");
+        write_incomplete_mp4(&a, 64 * 1024);
+        std::fs::hard_link(&a, &b).unwrap();
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let _ = scan(&cfg);
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        let (_, sz_a, _, _, ino_a) = db
+            .find_detail_by_path(&a.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let (_, _sz_b, _, _, ino_b) = db
+            .find_detail_by_path(&b.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(sz_a, 64 * 1024);
+        assert_eq!(ino_a, ino_b);
+
+        std::fs::remove_file(&a).unwrap();
+        write_incomplete_mp4(&a, 256 * 1024);
+        let (_, d) = monitor(&cfg);
+        assert!(d.changed >= 1, "replace must count as a change: {d:?}");
+        let (_, sz_a2, _, _, ino_a2) = db
+            .find_detail_by_path(&a.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let (_, sz_b2, _, _, ino_b2) = db
+            .find_detail_by_path(&b.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(sz_a2, 256 * 1024, "replaced path must get new size");
+        assert_ne!(ino_a2, ino_a, "replaced path must get new inode");
+        assert_eq!(sz_b2, 64 * 1024, "untouched hardlink stays on old file");
+        assert_eq!(ino_b2, ino_b);
+
+        std::fs::remove_file(&b).unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        let (_, d2) = monitor(&cfg);
+        assert!(d2.changed >= 1, "relink must update alias: {d2:?}");
+        let (_, sz_b3, _, _, ino_b3) = db
+            .find_detail_by_path(&b.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(sz_b3, 256 * 1024);
+        assert_eq!(ino_b3, ino_a2);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn failed_probe_retries_after_size_change() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-reprobe-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("video")).unwrap();
+        let p = tmp.join("video/growing.mp4");
+        write_incomplete_mp4(&p, 64 * 1024);
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let c1 = scan(&cfg);
+        let it = c1
+            .items
+            .values()
+            .find(|i| i.path.ends_with("growing.mp4"))
+            .expect("indexed while incomplete");
+        assert!(
+            it.probe.hdr.is_empty() && it.duration.is_none(),
+            "failed probe must not store fake sdr: {it:?}"
+        );
+        write_fake_mkv(&p, 0);
+        let (c2, d) = rescan(&cfg, &c1);
+        assert!(
+            d.changed >= 1 || c2.items.values().any(|i| {
+                i.path.ends_with("growing.mp4") && i.duration.is_some()
+            }),
+            "size change must re-probe: {d:?}"
+        );
+        let it2 = c2
+            .items
+            .values()
+            .find(|i| i.path.ends_with("growing.mp4"))
+            .expect("still indexed");
+        assert!(
+            it2.duration.is_some() && !it2.probe.hdr.is_empty(),
+            "finished file must get stream metadata: {it2:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

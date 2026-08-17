@@ -21,6 +21,16 @@ use crate::{
     path_is_live_file, path_is_unwanted, Caption, Catalog, Container, MediaItem, ScanConfig,
 };
 
+#[derive(Clone, Debug)]
+pub struct ObjectSnap {
+    pub object_id: String,
+    pub parent_id: String,
+    pub class: String,
+    pub detail_id: Option<i64>,
+    pub name: Option<String>,
+    pub ref_id: Option<String>,
+}
+
 /// rustyDLNA schema from `SQLite schema`.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS OBJECTS (
@@ -105,6 +115,7 @@ impl LibraryDb {
         conn.busy_timeout(std::time::Duration::from_secs(15))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=OFF;")?;
         conn.execute_batch(SCHEMA)?;
+        migrate_stream_columns(&conn)?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
@@ -114,6 +125,7 @@ impl LibraryDb {
     pub fn open_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate_stream_columns(&conn)?;
         Ok(Self {
             conn,
             path: PathBuf::from(":memory:"),
@@ -188,11 +200,11 @@ impl LibraryDb {
                (PATH, SIZE, TIMESTAMP, TITLE, DURATION, BITRATE, SAMPLERATE,
                 CREATOR, ARTIST, ALBUM, GENRE, COMMENT, CHANNELS, DISC, TRACK,
                 DATE, RESOLUTION, THUMBNAIL, ALBUM_ART, ROTATION, DLNA_PN, MIME,
-                DEVICE, INODE)
+                DEVICE, INODE, CONTAINER, VIDEO, AUDIO, HDR)
              SELECT ?1, ?2, ?3, TITLE, DURATION, BITRATE, SAMPLERATE,
                 CREATOR, ARTIST, ALBUM, GENRE, COMMENT, CHANNELS, DISC, TRACK,
                 DATE, RESOLUTION, THUMBNAIL, ALBUM_ART, ROTATION, DLNA_PN, MIME,
-                ?4, ?5
+                ?4, ?5, CONTAINER, VIDEO, AUDIO, HDR
              FROM DETAILS WHERE ID = ?6",
             params![path, size, mtime, device, inode, src_id],
         )?;
@@ -233,14 +245,83 @@ impl LibraryDb {
         Ok(out)
     }
 
-    pub fn find_detail_by_path(&self, path: &str) -> rusqlite::Result<Option<(i64, i64, i64)>> {
+    pub fn find_detail_by_path(
+        &self,
+        path: &str,
+    ) -> rusqlite::Result<Option<(i64, i64, i64, i64, i64)>> {
         self.conn
             .query_row(
-                "SELECT ID, SIZE, TIMESTAMP FROM DETAILS WHERE PATH = ?1 LIMIT 1",
+                "SELECT ID, SIZE, TIMESTAMP,
+                        COALESCE(DEVICE, 0), COALESCE(INODE, 0)
+                 FROM DETAILS WHERE PATH = ?1 LIMIT 1",
                 [path],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()
+    }
+
+    pub fn details_with_inode(
+        &self,
+        device: i64,
+        inode: i64,
+    ) -> rusqlite::Result<Vec<(i64, String)>> {
+        if inode == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT ID, PATH FROM DETAILS
+             WHERE DEVICE = ?1 AND INODE = ?2 AND MIME IS NOT NULL AND PATH IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![device, inode], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn find_inode_probe_source(
+        &self,
+        device: i64,
+        inode: i64,
+        not_id: i64,
+    ) -> rusqlite::Result<Option<i64>> {
+        if inode == 0 {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT ID FROM DETAILS
+                 WHERE DEVICE = ?1 AND INODE = ?2 AND ID != ?3
+                   AND MIME IS NOT NULL
+                   AND HDR IS NOT NULL AND HDR != ''
+                 LIMIT 1",
+                params![device, inode, not_id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    pub fn copy_stream_from(&self, src: i64, dest: i64) -> rusqlite::Result<()> {
+        if src == dest {
+            return Ok(());
+        }
+        self.conn.execute(
+            "UPDATE DETAILS SET
+                 DURATION = (SELECT DURATION FROM DETAILS WHERE ID = ?1),
+                 BITRATE = (SELECT BITRATE FROM DETAILS WHERE ID = ?1),
+                 RESOLUTION = (SELECT RESOLUTION FROM DETAILS WHERE ID = ?1),
+                 CHANNELS = (SELECT CHANNELS FROM DETAILS WHERE ID = ?1),
+                 SAMPLERATE = (SELECT SAMPLERATE FROM DETAILS WHERE ID = ?1),
+                 CONTAINER = (SELECT CONTAINER FROM DETAILS WHERE ID = ?1),
+                 VIDEO = (SELECT VIDEO FROM DETAILS WHERE ID = ?1),
+                 AUDIO = (SELECT AUDIO FROM DETAILS WHERE ID = ?1),
+                 HDR = (SELECT HDR FROM DETAILS WHERE ID = ?1),
+                 DLNA_PN = (SELECT DLNA_PN FROM DETAILS WHERE ID = ?1)
+             WHERE ID = ?2",
+            params![src, dest],
+        )?;
+        Ok(())
     }
 
     pub fn insert_detail(
@@ -272,19 +353,81 @@ impl LibraryDb {
         channels: Option<i64>,
         samplerate: Option<i64>,
     ) -> rusqlite::Result<()> {
+        self.update_detail_stream(
+            id,
+            duration,
+            bitrate,
+            resolution,
+            channels,
+            samplerate,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn update_detail_stream(
+        &self,
+        id: i64,
+        duration: Option<&str>,
+        bitrate: Option<i64>,
+        resolution: Option<&str>,
+        channels: Option<i64>,
+        samplerate: Option<i64>,
+        container: Option<&str>,
+        video: Option<&str>,
+        audio: Option<&str>,
+        hdr: Option<&str>,
+    ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE DETAILS SET DURATION = ?1, BITRATE = ?2, RESOLUTION = ?3,
-                 CHANNELS = ?4, SAMPLERATE = ?5 WHERE ID = ?6",
-            params![duration, bitrate, resolution, channels, samplerate, id],
+            "UPDATE DETAILS SET DURATION = COALESCE(?1, DURATION),
+                 BITRATE = COALESCE(?2, BITRATE),
+                 RESOLUTION = COALESCE(?3, RESOLUTION),
+                 CHANNELS = COALESCE(?4, CHANNELS),
+                 SAMPLERATE = COALESCE(?5, SAMPLERATE),
+                 CONTAINER = COALESCE(?6, CONTAINER),
+                 VIDEO = COALESCE(?7, VIDEO),
+                 AUDIO = COALESCE(?8, AUDIO),
+                 HDR = COALESCE(?9, HDR)
+             WHERE ID = ?10",
+            params![
+                duration, bitrate, resolution, channels, samplerate, container, video, audio, hdr,
+                id
+            ],
         )?;
         Ok(())
     }
 
-    pub fn details_missing_av_meta(&self) -> rusqlite::Result<Vec<(i64, String)>> {
+    pub fn copy_stream_to_inode_aliases(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET
+                 DURATION = (SELECT DURATION FROM DETAILS WHERE ID = ?1),
+                 BITRATE = (SELECT BITRATE FROM DETAILS WHERE ID = ?1),
+                 RESOLUTION = (SELECT RESOLUTION FROM DETAILS WHERE ID = ?1),
+                 CHANNELS = (SELECT CHANNELS FROM DETAILS WHERE ID = ?1),
+                 SAMPLERATE = (SELECT SAMPLERATE FROM DETAILS WHERE ID = ?1),
+                 CONTAINER = (SELECT CONTAINER FROM DETAILS WHERE ID = ?1),
+                 VIDEO = (SELECT VIDEO FROM DETAILS WHERE ID = ?1),
+                 AUDIO = (SELECT AUDIO FROM DETAILS WHERE ID = ?1),
+                 HDR = (SELECT HDR FROM DETAILS WHERE ID = ?1),
+                 DLNA_PN = (SELECT DLNA_PN FROM DETAILS WHERE ID = ?1)
+             WHERE DEVICE = (SELECT DEVICE FROM DETAILS WHERE ID = ?1)
+               AND INODE = (SELECT INODE FROM DETAILS WHERE ID = ?1)
+               AND INODE != 0
+               AND ID != ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn details_missing_stream_meta(&self) -> rusqlite::Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT ID, PATH FROM DETAILS
+            "SELECT MIN(ID), MIN(PATH) FROM DETAILS
              WHERE MIME IS NOT NULL AND PATH IS NOT NULL
-               AND (DURATION IS NULL OR DURATION = '')",
+               AND (HDR IS NULL OR HDR = ''
+                    OR DURATION IS NULL OR DURATION = '')
+             GROUP BY DEVICE, INODE",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let mut out = Vec::new();
@@ -294,10 +437,130 @@ impl LibraryDb {
         Ok(out)
     }
 
-    pub fn update_detail_stat(&self, id: i64, size: i64, timestamp: i64) -> rusqlite::Result<()> {
+    /// Inodes whose last probe failed or never ran (no HDR/duration).
+    pub fn inodes_needing_stream_probe(&self) -> rusqlite::Result<Vec<(i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT DEVICE, INODE FROM DETAILS
+             WHERE MIME IS NOT NULL AND INODE != 0
+               AND (HDR IS NULL OR HDR = ''
+                    OR DURATION IS NULL OR DURATION = '')",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn clear_detail_stream(&self, id: i64) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE DETAILS SET SIZE = ?1, TIMESTAMP = ?2 WHERE ID = ?3",
-            params![size, timestamp, id],
+            "UPDATE DETAILS SET DURATION = NULL, BITRATE = NULL, RESOLUTION = NULL,
+                 CHANNELS = NULL, SAMPLERATE = NULL,
+                 CONTAINER = NULL, VIDEO = NULL, AUDIO = NULL, HDR = NULL,
+                 DLNA_PN = NULL
+             WHERE ID = ?1",
+            [id],
+        )?;
+        let _ = self.copy_stream_to_inode_aliases(id);
+        Ok(())
+    }
+
+    pub fn details_missing_av_meta(&self) -> rusqlite::Result<Vec<(i64, String)>> {
+        self.details_missing_stream_meta()
+    }
+
+    pub fn update_detail_dlna_pn(&self, id: i64, pn: Option<&str>) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET DLNA_PN = ?1 WHERE ID = ?2",
+            params![pn, id],
+        )?;
+        Ok(())
+    }
+
+    /// Derive DLNA_PN and rewrite leftover `VIDEO=other` AVI rows from
+    /// already-stored stream columns. No libav.
+    pub fn backfill_derived_stream_fields(&self) -> rusqlite::Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ID, PATH, MIME, CONTAINER, VIDEO, AUDIO, HDR, RESOLUTION, DLNA_PN
+             FROM DETAILS WHERE MIME IS NOT NULL AND PATH IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
+            ))
+        })?;
+        let mut pending = Vec::new();
+        for row in rows {
+            pending.push(row?);
+        }
+        drop(stmt);
+        let mut n = 0usize;
+        for (id, path, mime, container, video, audio, hdr, resolution, pn) in pending {
+            let ext = mime_to_ext(&mime);
+            let ext = if ext == "dat" {
+                Path::new(&path)
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(ext)
+            } else {
+                ext
+            };
+            let probe = crate::probe_from_stored(
+                ext,
+                container.as_deref(),
+                video.as_deref(),
+                audio.as_deref(),
+                hdr.as_deref(),
+                resolution.as_deref(),
+            );
+            if probe.video != video.as_deref().unwrap_or("") && !probe.video.is_empty() {
+                self.conn.execute(
+                    "UPDATE DETAILS SET VIDEO = ?1 WHERE ID = ?2",
+                    params![probe.video.as_str(), id],
+                )?;
+                n += 1;
+            }
+            if probe.hdr.is_empty() && probe.video.is_empty() {
+                continue;
+            }
+            let want = crate::dlna_pn_from_probe(
+                &probe.container,
+                &probe.video,
+                &probe.audio,
+                &probe.hdr,
+                probe.width,
+                probe.height,
+            );
+            let have = pn.filter(|s| !s.is_empty());
+            if have.as_deref() != want.as_deref() {
+                self.update_detail_dlna_pn(id, want.as_deref())?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    pub fn update_detail_stat(
+        &self,
+        id: i64,
+        size: i64,
+        timestamp: i64,
+        device: i64,
+        inode: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET SIZE = ?1, TIMESTAMP = ?2, DEVICE = ?3, INODE = ?4
+             WHERE ID = ?5",
+            params![size, timestamp, device, inode, id],
         )?;
         Ok(())
     }
@@ -379,6 +642,44 @@ impl LibraryDb {
             )
             .ok()
             .is_some()
+    }
+
+    /// All OBJECTS rows except virtual roots. Used so `rebuild_objects`
+    /// can put the same IDs back — Infuse/libupnp caches ObjectID.
+    pub fn snapshot_objects(&self) -> rusqlite::Result<Vec<ObjectSnap>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID, NAME, REF_ID FROM OBJECTS",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ObjectSnap {
+                object_id: r.get(0)?,
+                parent_id: r.get(1)?,
+                class: r.get(2)?,
+                detail_id: r.get(3)?,
+                name: r.get(4)?,
+                ref_id: r.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let row = row?;
+            if is_virtual_container(&row.object_id) {
+                continue;
+            }
+            out.push(row);
+        }
+        Ok(out)
+    }
+
+    pub fn restore_object(&self, row: &ObjectSnap) -> rusqlite::Result<()> {
+        self.upsert_object(
+            &row.object_id,
+            &row.parent_id,
+            &row.class,
+            row.detail_id,
+            row.name.as_deref().unwrap_or(""),
+            row.ref_id.as_deref(),
+        )
     }
 
     pub fn object_detail_id(&self, object_id: &str) -> Option<i64> {
@@ -727,7 +1028,7 @@ impl LibraryDb {
                 "SELECT o.OBJECT_ID, o.PARENT_ID, o.CLASS, o.NAME, o.DETAIL_ID, o.REF_ID,
                         d.PATH, d.SIZE, d.TIMESTAMP, d.DATE, d.MIME, d.DLNA_PN,
                         d.DEVICE, d.INODE, d.DURATION, d.BITRATE, d.RESOLUTION,
-                        d.CHANNELS, d.SAMPLERATE
+                        d.CHANNELS, d.SAMPLERATE, d.CONTAINER, d.VIDEO, d.AUDIO, d.HDR
                  FROM OBJECTS o JOIN DETAILS d ON o.DETAIL_ID = d.ID
                  WHERE o.DETAIL_ID IS NOT NULL",
             )?;
@@ -752,6 +1053,10 @@ impl LibraryDb {
                     r.get::<_, Option<String>>(16)?,
                     r.get::<_, Option<i64>>(17)?,
                     r.get::<_, Option<i64>>(18)?,
+                    r.get::<_, Option<String>>(19)?,
+                    r.get::<_, Option<String>>(20)?,
+                    r.get::<_, Option<String>>(21)?,
+                    r.get::<_, Option<String>>(22)?,
                 ))
             })?;
             for row in rows {
@@ -775,6 +1080,10 @@ impl LibraryDb {
                     resolution,
                     channels,
                     samplerate,
+                    container,
+                    video,
+                    audio,
+                    hdr,
                 ) = row?;
                 let path = PathBuf::from(path.unwrap_or_default());
                 let mime_s = mime.unwrap_or_else(|| "video/x-matroska".into());
@@ -785,7 +1094,24 @@ impl LibraryDb {
                         .unwrap_or("item")
                         .to_string()
                 });
-                let probe = crate::probe_from_name(&title, &path, ext);
+                let probe = crate::probe_from_stored(
+                    ext,
+                    container.as_deref(),
+                    video.as_deref(),
+                    audio.as_deref(),
+                    hdr.as_deref(),
+                    resolution.as_deref(),
+                );
+                let dlna_pn = pn.filter(|s| !s.is_empty()).or_else(|| {
+                    crate::dlna_pn_from_probe(
+                        &probe.container,
+                        &probe.video,
+                        &probe.audio,
+                        &probe.hdr,
+                        probe.width,
+                        probe.height,
+                    )
+                });
                 let item = MediaItem {
                     object_id: oid.clone(),
                     parent_id: parent.clone(),
@@ -800,7 +1126,7 @@ impl LibraryDb {
                     mtime: ts.unwrap_or(0),
                     captions: caps_by.get(&did).cloned().unwrap_or_default(),
                     probe,
-                    dlna_pn: pn,
+                    dlna_pn,
                     ref_id,
                     device: device.unwrap_or(0) as u64,
                     inode: inode.unwrap_or(0) as u64,
@@ -864,6 +1190,35 @@ fn is_virtual_container(id: &str) -> bool {
             | SAMSUNG_VIDEO
             | SAMSUNG_IMAGE
     )
+}
+
+fn migrate_stream_columns(conn: &Connection) -> rusqlite::Result<()> {
+    for col in ["CONTAINER", "VIDEO", "AUDIO", "HDR"] {
+        let sql = format!("ALTER TABLE DETAILS ADD COLUMN {col} TEXT");
+        let _ = conn.execute(&sql, []);
+    }
+    let rev: i64 = conn
+        .query_row(
+            "SELECT VALUE FROM SETTINGS WHERE KEY = 'stream_probe_rev' LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if rev < 3 {
+        // Re-read with libav (rev 3). Earlier revs used a hand-rolled parser.
+        let _ = conn.execute(
+            "UPDATE DETAILS SET HDR = NULL, VIDEO = NULL, AUDIO = NULL, CONTAINER = NULL",
+            [],
+        );
+        let _ = conn.execute("DELETE FROM SETTINGS WHERE KEY = 'stream_probe_rev'", []);
+        let _ = conn.execute(
+            "INSERT INTO SETTINGS (KEY, VALUE) VALUES ('stream_probe_rev', '3')",
+            [],
+        );
+    }
+    Ok(())
 }
 
 pub fn mime_to_ext(mime: &str) -> &'static str {

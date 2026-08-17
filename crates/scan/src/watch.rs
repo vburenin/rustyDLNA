@@ -22,6 +22,175 @@ const MASK: WatchMask = WatchMask::CREATE
     .union(WatchMask::MOVED_FROM)
     .union(WatchMask::MOVED_TO);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileEventKind {
+    Created,
+    Updated,
+    Deleted,
+    MovedFrom,
+    MovedTo,
+    DirCreated,
+    DirRemoved,
+    DirMovedFrom,
+    DirMovedTo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileEvent {
+    path: PathBuf,
+    cookie: u32,
+    kind: FileEventKind,
+}
+
+impl FileEventKind {
+    fn from_mask(mask: EventMask) -> Option<Self> {
+        let dir = mask.contains(EventMask::ISDIR);
+        if mask.contains(EventMask::MOVED_FROM) {
+            return Some(if dir {
+                Self::DirMovedFrom
+            } else {
+                Self::MovedFrom
+            });
+        }
+        if mask.contains(EventMask::MOVED_TO) {
+            return Some(if dir { Self::DirMovedTo } else { Self::MovedTo });
+        }
+        if mask.contains(EventMask::DELETE) {
+            return Some(if dir { Self::DirRemoved } else { Self::Deleted });
+        }
+        if mask.contains(EventMask::CREATE) {
+            return Some(if dir { Self::DirCreated } else { Self::Created });
+        }
+        if mask.contains(EventMask::CLOSE_WRITE) {
+            return Some(Self::Updated);
+        }
+        None
+    }
+
+    fn action(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+            Self::Deleted => "deleted",
+            Self::MovedFrom => "moved_away",
+            Self::MovedTo => "moved_in",
+            Self::DirCreated => "dir_created",
+            Self::DirRemoved => "dir_removed",
+            Self::DirMovedFrom => "dir_moved_away",
+            Self::DirMovedTo => "dir_moved_in",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Created => "file created",
+            Self::Updated => "file updated",
+            Self::Deleted => "file deleted",
+            Self::MovedFrom => "file moved away",
+            Self::MovedTo => "file moved in",
+            Self::DirCreated => "directory created",
+            Self::DirRemoved => "directory removed",
+            Self::DirMovedFrom => "directory moved away",
+            Self::DirMovedTo => "directory moved in",
+        }
+    }
+}
+
+/// Pair MOVED_FROM + MOVED_TO by cookie so a rename is one relocate.
+fn classify_file_events(events: &[FileEvent]) -> Vec<ClassifiedEvent> {
+    let mut from: HashMap<u32, &FileEvent> = HashMap::new();
+    let mut to: HashMap<u32, &FileEvent> = HashMap::new();
+    for ev in events {
+        match ev.kind {
+            FileEventKind::MovedFrom | FileEventKind::DirMovedFrom if ev.cookie != 0 => {
+                from.insert(ev.cookie, ev);
+            }
+            FileEventKind::MovedTo | FileEventKind::DirMovedTo if ev.cookie != 0 => {
+                to.insert(ev.cookie, ev);
+            }
+            _ => {}
+        }
+    }
+    let mut paired: HashSet<u32> = HashSet::new();
+    let mut out = Vec::with_capacity(events.len());
+    for (cookie, src) in &from {
+        let Some(dst) = to.get(cookie) else {
+            continue;
+        };
+        paired.insert(*cookie);
+        let dir = matches!(
+            src.kind,
+            FileEventKind::DirMovedFrom | FileEventKind::DirMovedTo
+        ) || matches!(dst.kind, FileEventKind::DirMovedTo);
+        out.push(ClassifiedEvent {
+            action: if dir {
+                "dir_relocated"
+            } else {
+                "relocated"
+            },
+            message: if dir {
+                "directory relocated"
+            } else {
+                "file relocated"
+            },
+            path: dst.path.clone(),
+            from: Some(src.path.clone()),
+            to: Some(dst.path.clone()),
+        });
+    }
+    for ev in events {
+        if ev.cookie != 0 && paired.contains(&ev.cookie) {
+            continue;
+        }
+        out.push(ClassifiedEvent {
+            action: ev.kind.action(),
+            message: ev.kind.message(),
+            path: ev.path.clone(),
+            from: None,
+            to: None,
+        });
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClassifiedEvent {
+    action: &'static str,
+    message: &'static str,
+    path: PathBuf,
+    from: Option<PathBuf>,
+    to: Option<PathBuf>,
+}
+
+fn log_file_events(events: &[FileEvent]) {
+    for ev in classify_file_events(events) {
+        let file = ev
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        match (&ev.from, &ev.to) {
+            (Some(from), Some(to)) => tracing::info!(
+                target: "rusty_dlna",
+                file,
+                action = ev.action,
+                from = %from.display(),
+                to = %to.display(),
+                "{}",
+                ev.message
+            ),
+            _ => tracing::info!(
+                target: "rusty_dlna",
+                file,
+                action = ev.action,
+                path = %ev.path.display(),
+                "{}",
+                ev.message
+            ),
+        }
+    }
+}
+
 /// Wait this long after the first event in a burst before applying.
 const SETTLE: Duration = Duration::from_secs(5);
 /// Burst size that used to force a tree walk. Every burst reconciles now;
@@ -126,19 +295,25 @@ fn collect_events<'a>(
         let Some(dir) = wds.get(&ev.wd) else { continue };
         let path = dir.join(name.as_ref());
         let excluded = path_excluded(&path, &name, cfg);
+        let kind = FileEventKind::from_mask(ev.mask);
         if ev.mask.contains(EventMask::ISDIR)
             && ev.mask.intersects(EventMask::CREATE | EventMask::MOVED_TO)
         {
             if excluded || is_skipped_dir(&name) {
                 continue;
             }
+            batch.note(path.clone(), ev.cookie, kind);
             batch.add_dir(path);
             continue;
         }
         if ev.mask.intersects(EventMask::DELETE | EventMask::MOVED_FROM) {
             if ev.mask.contains(EventMask::ISDIR) {
+                batch.note(path.clone(), ev.cookie, kind);
                 batch.remove_tree(path);
             } else {
+                if !is_sidecar_name(&name) {
+                    batch.note(path.clone(), ev.cookie, kind);
+                }
                 batch.remove_file(path);
             }
             continue;
@@ -146,21 +321,24 @@ fn collect_events<'a>(
         if excluded
             || is_unfinished_name(&name)
             || looks_like_sample_file(&name)
-            || is_caption_name(&name)
-            || name.ends_with(".nfo")
-            || name.ends_with(".probe.toml")
-            || is_album_art_name(&name)
+            || is_sidecar_name(&name)
         {
             continue;
         }
-        if ev.mask.intersects(EventMask::CLOSE_WRITE | EventMask::MOVED_TO)
-            || (ev.mask.contains(EventMask::CREATE) && path_is_link_or_dir(&path))
-        {
+        let apply = ev.mask.intersects(EventMask::CLOSE_WRITE | EventMask::MOVED_TO)
+            || (ev.mask.contains(EventMask::CREATE) && path_is_link_or_dir(&path));
+        if ev.mask.contains(EventMask::CREATE) && !apply {
+            // Regular-file CREATE is indexed on CLOSE_WRITE; still log it.
+            batch.note(path.clone(), ev.cookie, kind);
+        }
+        if apply {
             if path.is_dir() {
                 if !is_skipped_dir(&name) {
+                    batch.note(path.clone(), ev.cookie, kind);
                     batch.add_dir(path);
                 }
             } else {
+                batch.note(path.clone(), ev.cookie, kind);
                 batch.add_file(path);
             }
         }
@@ -177,11 +355,13 @@ fn apply_batch(
     // Incremental add/remove only sees the event path. A rename under a
     // real folder leaves directory-symlink aliases (genres/BY_YEAR/…)
     // stale. One tree reconcile is the source of truth.
+    log_file_events(&batch.events);
     tracing::info!(
         target: "rusty_dlna",
         added = batch.add_files.len(),
         removed = batch.remove_files.len() + batch.remove_trees.len(),
         dirs = batch.add_dirs.len(),
+        events = batch.events.len(),
         overflow = batch.overflow,
         mode = "reconcile",
         "inotify settled"
@@ -200,6 +380,13 @@ fn apply_batch(
     }
 }
 
+fn is_sidecar_name(name: &str) -> bool {
+    is_caption_name(name)
+        || name.ends_with(".nfo")
+        || name.ends_with(".probe.toml")
+        || is_album_art_name(name)
+}
+
 #[derive(Default, Debug)]
 struct PendingBatch {
     overflow: bool,
@@ -207,6 +394,7 @@ struct PendingBatch {
     add_dirs: Vec<PathBuf>,
     remove_files: HashSet<PathBuf>,
     remove_trees: Vec<PathBuf>,
+    events: Vec<FileEvent>,
 }
 
 impl PendingBatch {
@@ -251,6 +439,13 @@ impl PendingBatch {
         if !self.remove_trees.iter().any(|p| p == &path) {
             self.remove_trees.push(path);
         }
+    }
+
+    fn note(&mut self, path: PathBuf, cookie: u32, kind: Option<FileEventKind>) {
+        let Some(kind) = kind else {
+            return;
+        };
+        self.events.push(FileEvent { path, cookie, kind });
     }
 }
 
@@ -370,6 +565,51 @@ mod tests {
         assert!(b.remove_files.is_empty());
         assert!(b.add_files.is_empty());
         assert_eq!(b.remove_trees, [PathBuf::from("/v/genres")]);
+    }
+
+    #[test]
+    fn rename_pair_is_one_relocate() {
+        let events = [
+            FileEvent {
+                path: PathBuf::from("/v/old.mkv"),
+                cookie: 7,
+                kind: FileEventKind::MovedFrom,
+            },
+            FileEvent {
+                path: PathBuf::from("/v/new.mkv"),
+                cookie: 7,
+                kind: FileEventKind::MovedTo,
+            },
+        ];
+        let got = classify_file_events(&events);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].action, "relocated");
+        assert_eq!(got[0].from.as_deref(), Some(Path::new("/v/old.mkv")));
+        assert_eq!(got[0].to.as_deref(), Some(Path::new("/v/new.mkv")));
+    }
+
+    #[test]
+    fn unpaired_move_and_delete_stay_separate() {
+        let events = [
+            FileEvent {
+                path: PathBuf::from("/v/gone.mkv"),
+                cookie: 1,
+                kind: FileEventKind::MovedFrom,
+            },
+            FileEvent {
+                path: PathBuf::from("/v/dead.mkv"),
+                cookie: 0,
+                kind: FileEventKind::Deleted,
+            },
+            FileEvent {
+                path: PathBuf::from("/v/wrote.mkv"),
+                cookie: 0,
+                kind: FileEventKind::Updated,
+            },
+        ];
+        let got = classify_file_events(&events);
+        let actions: Vec<_> = got.iter().map(|e| e.action).collect();
+        assert_eq!(actions, ["moved_away", "deleted", "updated"]);
     }
 
     #[test]

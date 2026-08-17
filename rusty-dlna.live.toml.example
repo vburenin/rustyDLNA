@@ -17,7 +17,7 @@ rescan_secs = 30
 [transcode]
 enable = true
 encoder = "libx264"
-max_jobs = 1
+max_jobs = 16
 
 # [[remap]]
 # name = "crkey-dvp7"

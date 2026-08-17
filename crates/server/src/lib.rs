@@ -26,16 +26,15 @@ use rusty_dlna_protocol::{
     ClientKind, ClientProfile, CLIENTS,
 };
 use rusty_dlna_scan::{
-    caption_http_mime, collect_media_dirs, load_existing, monitor, probe_av_meta,
-    guess_hdr_from_name, probe_stream_identity, probe_toml_exists, repair_objects_if_needed,
-    run_inotify, scan,
-    Catalog, CatalogChild, LibraryDb, MediaItem, ScanConfig, ScanDelta, SourceProbe,
+    caption_http_mime, collect_media_dirs, load_existing, monitor, repair_objects_if_needed,
+    run_inotify, scan, Catalog, CatalogChild, LibraryDb, MediaItem, ScanConfig, ScanDelta,
+    SourceProbe,
 };
 
 pub use rusty_dlna_scan::ensure_pattern_fixture;
 use rusty_dlna_soap::{
     build_browse, dispatch_simple, magic_object_id, parse_soap_call, soap_fault, DidlObject,
-    DidlRes, SoapOutcome,
+    DidlRes, SoapCall, SoapOutcome,
 };
 use rusty_dlna_ssdp::{msearch_replies, parse_msearch};
 use rusty_dlna_transcode::{
@@ -138,7 +137,7 @@ fn default_encoder() -> String {
     "libx264".into()
 }
 fn default_jobs() -> u32 {
-    2
+    16
 }
 
 pub fn load_config(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
@@ -176,7 +175,6 @@ pub struct App {
     pub update_id: AtomicU32,
     pub bookmarks: Mutex<HashMap<String, i64>>,
     pub jobs: JobGate,
-    probe_cache: Mutex<HashMap<i64, SourceProbe>>,
     remuxes: Mutex<HashMap<i64, Arc<remux::RemuxJob>>>,
 }
 
@@ -184,51 +182,6 @@ struct DidlSnap {
     child: CatalogChild,
     child_count: Option<u32>,
     child_container_count: Option<u32>,
-}
-
-fn probe_cache_path(cache_dir: &Path, detail_id: i64) -> PathBuf {
-    cache_dir.join("probe").join(format!("{detail_id}.toml"))
-}
-
-fn cached_probe_exists(cache_dir: &Path, detail_id: i64) -> bool {
-    probe_cache_path(cache_dir, detail_id).is_file()
-}
-
-fn load_probe_cache_dir(cache_dir: &Path) -> HashMap<i64, SourceProbe> {
-    let dir = cache_dir.join("probe");
-    let rd = match std::fs::read_dir(&dir) {
-        Ok(r) => r,
-        Err(_) => return HashMap::new(),
-    };
-    let mut out = HashMap::new();
-    for ent in rd.filter_map(|e| e.ok()) {
-        let name = ent.file_name();
-        let s = name.to_string_lossy();
-        let Some(id_s) = s.strip_suffix(".toml") else {
-            continue;
-        };
-        let Ok(id) = id_s.parse::<i64>() else {
-            continue;
-        };
-        if let Ok(text) = std::fs::read_to_string(ent.path()) {
-            out.insert(id, rusty_dlna_scan::parse_probe_toml(&text));
-        }
-    }
-    out
-}
-
-fn save_cached_probe(cache_dir: &Path, detail_id: i64, p: &SourceProbe) {
-    let path = probe_cache_path(cache_dir, detail_id);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(
-        path,
-        format!(
-            "container = \"{}\"\nvideo = \"{}\"\nhdr = \"{}\"\naudio = \"{}\"\nwidth = {}\nheight = {}\n",
-            p.container, p.video, p.hdr, p.audio, p.width, p.height
-        ),
-    );
 }
 
 impl App {
@@ -294,7 +247,6 @@ impl App {
             });
         let notify_interval = cfg.notify_interval.unwrap_or(895);
         let max_jobs = cfg.transcode.max_jobs.max(1) as usize;
-        let probe_cache = load_probe_cache_dir(&cache_dir);
         Self {
             cfg,
             catalog: RwLock::new(catalog),
@@ -311,7 +263,6 @@ impl App {
             update_id: AtomicU32::new(1),
             bookmarks: Mutex::new(HashMap::new()),
             jobs: JobGate::new(max_jobs),
-            probe_cache: Mutex::new(probe_cache),
             remuxes: Mutex::new(HashMap::new()),
         }
     }
@@ -408,7 +359,7 @@ impl App {
         if method.eq_ignore_ascii_case("HEAD") {
             resp.body.clear();
         }
-        if resp.status >= 400 {
+        if resp.status >= 400 && r != HttpRoute::Soap {
             tracing::error!(
                 status = resp.status,
                 method = %method,
@@ -496,7 +447,12 @@ impl App {
         let call = parse_soap_call(action, &body);
         let client = self.identify(req);
         if call.method.is_none() {
-            return fault_resp(soap_fault(401, "Invalid Action"), persist);
+            return soap_fault_logged(
+                SoapOutcome::fault401(),
+                persist,
+                &call,
+                req.user_agent().unwrap_or("-"),
+            );
         }
         if call.method == Some("X_SetBookmark") {
             let mut bookmarks = self.bookmarks.lock().expect("bookmarks");
@@ -508,7 +464,7 @@ impl App {
                 self.cfg.root_container.as_deref(),
                 Some(&mut bookmarks),
             ) {
-                return soap_to_http(out, persist);
+                return soap_outcome_http(out, persist, &call, req.user_agent().unwrap_or("-"));
             }
         } else if let Some(out) = dispatch_simple(
             &call,
@@ -518,19 +474,34 @@ impl App {
             self.cfg.root_container.as_deref(),
             None,
         ) {
-            return soap_to_http(out, persist);
+            return soap_outcome_http(out, persist, &call, req.user_agent().unwrap_or("-"));
         }
         let is_search = call.method == Some("Search");
         if !is_search {
             // Browse
             let Some(oid_raw) = call.object_id.as_deref() else {
-                return soap_to_http(SoapOutcome::fault402(), persist);
+                return soap_fault_logged(
+                    SoapOutcome::fault402(),
+                    persist,
+                    &call,
+                    req.user_agent().unwrap_or("-"),
+                );
             };
             let Some(flag) = call.browse_flag.as_deref() else {
-                return soap_to_http(SoapOutcome::fault402(), persist);
+                return soap_fault_logged(
+                    SoapOutcome::fault402(),
+                    persist,
+                    &call,
+                    req.user_agent().unwrap_or("-"),
+                );
             };
             if call.starting_index < 0 || call.requested_count < 0 {
-                return soap_to_http(SoapOutcome::fault402(), persist);
+                return soap_fault_logged(
+                    SoapOutcome::fault402(),
+                    persist,
+                    &call,
+                    req.user_agent().unwrap_or("-"),
+                );
             }
             let mut oid = magic_object_id(oid_raw, client);
             if oid == rusty_dlna_protocol::object_id::ROOT_ID {
@@ -548,7 +519,12 @@ impl App {
                 }
             }
             if flag != "BrowseDirectChildren" && flag != "BrowseMetadata" {
-                return soap_to_http(SoapOutcome::fault402(), persist);
+                return soap_fault_logged(
+                    SoapOutcome::fault402(),
+                    persist,
+                    &call,
+                    req.user_agent().unwrap_or("-"),
+                );
             }
             let remapped_root = flag == "BrowseDirectChildren" && oid != oid_raw;
             let ua = req.user_agent();
@@ -563,12 +539,26 @@ impl App {
                 let (page, total) = if flag == "BrowseMetadata" {
                     match cat.metadata(&oid) {
                         Some(ch) => (vec![ch], 1u32),
-                        None => return soap_to_http(SoapOutcome::fault701(), persist),
+                        None => {
+                            return soap_fault_logged(
+                                SoapOutcome::fault701(),
+                                persist,
+                                &call,
+                                req.user_agent().unwrap_or("-"),
+                            );
+                        }
                     }
                 } else {
                     match cat.page_children(&oid, start, take) {
                         Some(v) => v,
-                        None => return soap_to_http(SoapOutcome::fault701(), persist),
+                        None => {
+                            return soap_fault_logged(
+                                SoapOutcome::fault701(),
+                                persist,
+                                &call,
+                                req.user_agent().unwrap_or("-"),
+                            );
+                        }
                     }
                 };
                 let slice: Vec<_> = page
@@ -736,45 +726,9 @@ impl App {
         }
     }
 
-    /// Browse/Search: never ffprobe and never touch the disk.
+    /// Browse and GET /Transcode: DETAILS row only. No ffprobe, no cache toml.
     fn browse_probe(&self, it: &MediaItem) -> SourceProbe {
-        if let Ok(cache) = self.probe_cache.lock() {
-            if let Some(p) = cache.get(&it.detail_id) {
-                return p.clone();
-            }
-        }
-        let mut p = it.probe.clone();
-        if p.hdr == "sdr" {
-            if let Some(hdr) = guess_hdr_from_name(&it.title).or_else(|| {
-                it.path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(guess_hdr_from_name)
-            }) {
-                p.hdr = hdr.to_string();
-            }
-        }
-        p
-    }
-
-    /// GET /Transcode only: may ffprobe once, then persist.
-    fn resolved_probe(&self, it: &MediaItem) -> SourceProbe {
-        let quick = self.browse_probe(it);
-        if probe_toml_exists(&it.path) || cached_probe_exists(&self.cache_dir, it.detail_id) {
-            return quick;
-        }
-        if let Ok(cache) = self.probe_cache.lock() {
-            if cache.contains_key(&it.detail_id) {
-                return quick;
-            }
-        }
-        let live = rusty_dlna_scan::rebase_media_path(&it.path, &self.scan_cfg.media_dirs);
-        let probed = probe_stream_identity(&live).unwrap_or(quick);
-        if let Ok(mut cache) = self.probe_cache.lock() {
-            cache.insert(it.detail_id, probed.clone());
-        }
-        save_cached_probe(&self.cache_dir, it.detail_id, &probed);
-        probed
+        it.probe.clone()
     }
 
     fn item_resources(&self, it: &MediaItem, client: &ClientProfile, ua: Option<&str>) -> Vec<DidlRes> {
@@ -886,7 +840,7 @@ impl App {
         };
         let client = self.identify(req);
         if transcode {
-            let probe = self.resolved_probe(&item);
+            let probe = self.browse_probe(&item);
             let src = probe_to_source(
                 &probe.container,
                 &probe.video,
@@ -897,14 +851,15 @@ impl App {
             );
             let plan = decide_for(client, req.user_agent(), &src, &self.remaps);
             if plan.decision != Decision::Recode {
+                // Same DETAILS row as Browse. Serve original instead of 404
+                // if a client still has a leftover /Transcode/ URL.
                 tracing::info!(
                     title = %item.title,
                     hdr = %probe.hdr,
                     ua = req.user_agent().unwrap_or("-"),
-                    "transcode GET rejected"
+                    "transcode GET serves original"
                 );
-                return HttpResponse::html(404, "Not Found", "no remap");
-            }
+            } else {
             let src_path = rusty_dlna_scan::rebase_media_path(&item.path, &self.scan_cfg.media_dirs);
             if !src_path.is_file() {
                 tracing::error!(path = %src_path.display(), title = %item.title, "media missing");
@@ -934,6 +889,7 @@ impl App {
                 ),
             });
             return r;
+            }
         }
         let (path, mime, pn, ci) = (
             item.path.clone(),
@@ -1050,6 +1006,52 @@ fn soap_to_http(out: SoapOutcome, persist: bool) -> HttpResponse {
             r
         }
     }
+}
+
+fn soap_outcome_http(
+    out: SoapOutcome,
+    persist: bool,
+    call: &SoapCall,
+    ua: &str,
+) -> HttpResponse {
+    if matches!(out, SoapOutcome::Fault { .. }) {
+        return soap_fault_logged(out, persist, call, ua);
+    }
+    soap_to_http(out, persist)
+}
+
+/// UPnP SOAP faults are HTTP 500. 701 is a client holding a stale
+/// ObjectID (Infuse caches them) — not a server failure.
+fn soap_fault_logged(
+    out: SoapOutcome,
+    persist: bool,
+    call: &SoapCall,
+    ua: &str,
+) -> HttpResponse {
+    if let SoapOutcome::Fault { code, desc, .. } = &out {
+        if *code == 701 {
+            tracing::debug!(
+                ua,
+                method = call.method.unwrap_or("-"),
+                oid = call.object_id.as_deref().unwrap_or("-"),
+                flag = call.browse_flag.as_deref().unwrap_or("-"),
+                code,
+                desc = *desc,
+                "SOAP no such object"
+            );
+        } else {
+            tracing::warn!(
+                ua,
+                method = call.method.unwrap_or("-"),
+                oid = call.object_id.as_deref().unwrap_or("-"),
+                flag = call.browse_flag.as_deref().unwrap_or("-"),
+                code,
+                desc = *desc,
+                "SOAP fault"
+            );
+        }
+    }
+    soap_to_http(out, persist)
 }
 
 fn fault_resp(xml: String, persist: bool) -> HttpResponse {
@@ -1233,41 +1235,45 @@ fn fill_missing_av_meta(app: &App) {
     let Ok(db) = LibraryDb::open(&dbp) else {
         return;
     };
-    let rows = db.details_missing_av_meta().unwrap_or_default();
-    if rows.is_empty() {
-        return;
-    }
-    tracing::info!(n = rows.len(), "filling missing duration/bitrate/resolution");
+    let rows = db.details_missing_stream_meta().unwrap_or_default();
     let mut filled = 0usize;
-    for (id, path) in rows {
-        if path.contains("/incomplete/") {
-            continue;
-        }
-        let Some(av) = probe_av_meta(std::path::Path::new(&path)) else {
-            continue;
-        };
-        let _ = db.update_detail_av_meta(
-            id,
-            av.duration.as_deref(),
-            av.bitrate,
-            av.resolution.as_deref(),
-            av.channels,
-            av.samplerate,
-        );
-        if let Ok(mut cat) = app.catalog.write() {
-            for it in cat.items.values_mut() {
-                if it.detail_id == id {
-                    it.duration = av.duration.clone();
-                    it.bitrate = av.bitrate;
-                    it.resolution = av.resolution.clone();
-                    it.channels = av.channels;
-                    it.samplerate = av.samplerate;
-                }
+    if !rows.is_empty() {
+        tracing::info!(n = rows.len(), "filling missing stream metadata from files");
+        let mut seen = std::collections::HashSet::new();
+        for (id, path) in rows {
+            if path.contains("/incomplete/") {
+                continue;
+            }
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let live = rusty_dlna_scan::rebase_media_path(
+                std::path::Path::new(&path),
+                &app.scan_cfg.media_dirs,
+            );
+            let Some(got) = rusty_dlna_scan::probe_media(&live) else {
+                continue;
+            };
+            rusty_dlna_scan::apply_probe_to_detail(&db, id, &got);
+            filled += 1;
+            if filled % 200 == 0 {
+                tracing::info!(filled, "stream metadata progress");
             }
         }
-        filled += 1;
+        tracing::info!(filled, "stream metadata fill done");
     }
-    tracing::info!(filled, "av metadata fill done");
+    let derived = db.backfill_derived_stream_fields().unwrap_or_else(|e| {
+        tracing::warn!(%e, "derived stream backfill failed");
+        0
+    });
+    if derived > 0 {
+        tracing::info!(n = derived, "backfilled DLNA_PN / mpeg4 from stored stream columns");
+    }
+    if filled > 0 || derived > 0 {
+        if let Ok(next) = db.load_catalog() {
+            *app.catalog.write().expect("catalog") = next;
+        }
+    }
 }
 
 fn bind_udp_reuse(addr: SocketAddrV4) -> std::io::Result<socket2::Socket> {
@@ -1895,6 +1901,28 @@ audio_out = "to-aac"
     }
 
     #[test]
+    fn transcode_get_without_remap_serves_original() {
+        let app = testdata_app();
+        let movie = app
+            .catalog
+            .read()
+            .unwrap()
+            .items
+            .values()
+            .find(|i| i.title == "movie")
+            .cloned()
+            .expect("movie fixture");
+        let id = movie.detail_id;
+        let expect = std::fs::read(&movie.path).unwrap();
+        let r = app.handle(&req(&format!(
+            "GET /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Kodi/21.0\r\n\r\n"
+        )));
+        assert_eq!(r.status, 200, "must not 404 a guessed remux URL");
+        assert!(r.remux_job.is_none(), "SDR original is not remuxed");
+        assert_eq!(r.body, expect);
+    }
+
+    #[test]
     fn crkey_dvp7_remap_first_kodi_original() {
         let app = testdata_app();
         let (_, kodi) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
@@ -2114,7 +2142,8 @@ audio_out = "to-aac"
         let miss = kodi_orig.handle(&req(&format!(
             "GET /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Kodi/21.0\r\n\r\n"
         )));
-        assert_eq!(miss.status, 404);
+        assert_eq!(miss.status, 200, "no remap → original, not 404");
+        assert!(miss.remux_job.is_none());
     }
 
     #[test]
@@ -2225,6 +2254,36 @@ audio_out = "to-aac"
             app.handle(&req)
         };
         assert_eq!(r701.persist, soap_fault_persist(SoapOutcome::fault701()));
+    }
+
+    #[test]
+    fn browse_metadata_accepts_detail_id_and_all_video_hex() {
+        let app = testdata_app();
+        let movie = app
+            .catalog
+            .read()
+            .unwrap()
+            .items
+            .values()
+            .find(|i| i.title == "movie" || i.path.ends_with("movie.mkv"))
+            .cloned()
+            .expect("movie fixture");
+        let did = movie.detail_id;
+        let all_video = format!("2$8${did:X}");
+        let (st, xml) = soap_browse(
+            &app,
+            &all_video,
+            "BrowseMetadata",
+            "Darwin/25.6.0, UPnP/1.0, Portable SDK for UPnP devices/1.14.13",
+        );
+        assert_eq!(st, 200, "{xml}");
+        assert!(xml.contains("/MediaItems/"), "{xml}");
+        // Bare DETAILS.ID only when it cannot be a virtual container (`0`/`1`/`2`/`3`/`64`).
+        if did > 64 {
+            let (st2, xml2) = soap_browse(&app, &did.to_string(), "BrowseMetadata", "Kodi/21.0");
+            assert_eq!(st2, 200, "{xml2}");
+            assert!(xml2.contains("/MediaItems/"), "{xml2}");
+        }
     }
 
     #[test]

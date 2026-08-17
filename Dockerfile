@@ -4,6 +4,18 @@
 
 FROM rust:bookworm AS build
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config \
+        clang \
+        libavformat-dev \
+        libavcodec-dev \
+        libavutil-dev \
+        libavfilter-dev \
+        libavdevice-dev \
+        libswscale-dev \
+        libswresample-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates

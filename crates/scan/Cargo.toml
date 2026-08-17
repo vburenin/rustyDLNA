@@ -12,3 +12,5 @@ rusqlite.workspace = true
 tracing.workspace = true
 inotify = "0.11"
 libc = "0.2"
+ffmpeg-next = "8.1"
+ffmpeg-sys-next = "8.1"

@@ -35,6 +35,7 @@ pub enum VideoCodec {
     Hevc,
     H264,
     Mpeg2,
+    Mpeg4,
     Other,
 }
 
@@ -56,6 +57,8 @@ pub enum HdrKind {
     DolbyVisionProfile5,
     #[serde(alias = "dv")]
     DolbyVisionOther,
+    /// No successful probe yet. Remaps must not fire.
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -269,6 +272,9 @@ pub fn decide_for(
     src: &SourceMedia,
     remaps: &[RemapRule],
 ) -> TranscodePlan {
+    if src.hdr == HdrKind::Unknown {
+        return TranscodePlan::default();
+    }
     let Some(rule) = remaps.iter().find(|r| r.matches_ua(client, raw_ua, src)) else {
         return TranscodePlan::default();
     };
@@ -637,18 +643,28 @@ pub fn ensure_cached_file(
     Ok(dest.to_path_buf())
 }
 
+fn first_codec(s: &str) -> &str {
+    s.split(',').map(str::trim).find(|p| !p.is_empty()).unwrap_or("")
+}
+
 pub fn probe_to_source(container: &str, video: &str, hdr: &str, audio: &str, w: u32, h: u32) -> SourceMedia {
+    let video = first_codec(video);
+    let audio = first_codec(audio);
+    let hdr = first_codec(hdr);
     SourceMedia {
         container: match container {
             "mp4" => Container::Mp4,
             "avi" => Container::Avi,
             "mpeg-ts" | "ts" => Container::MpegTs,
+            "" => Container::Other,
             _ => Container::Mkv,
         },
         video_codec: match video {
             "h264" | "avc" => VideoCodec::H264,
             "mpeg2" => VideoCodec::Mpeg2,
-            _ => VideoCodec::Hevc,
+            "mpeg4" | "msmpeg4v3" | "xvid" | "divx" => VideoCodec::Mpeg4,
+            "hevc" | "h265" => VideoCodec::Hevc,
+            _ => VideoCodec::Other,
         },
         hdr: match hdr {
             "dv-p7" | "dvhe.07" | "profile-7" => HdrKind::DolbyVisionProfile7,
@@ -656,7 +672,8 @@ pub fn probe_to_source(container: &str, video: &str, hdr: &str, audio: &str, w: 
             "dv-p5" | "dvhe.05" => HdrKind::DolbyVisionProfile5,
             "hdr10" => HdrKind::Hdr10,
             "dv" => HdrKind::DolbyVisionOther,
-            _ => HdrKind::Sdr,
+            "sdr" => HdrKind::Sdr,
+            _ => HdrKind::Unknown,
         },
         audio: match audio {
             "truehd" | "atmos" => AudioCodec::TrueHd,
@@ -774,6 +791,43 @@ action = "hdr10"
         let cast = identify_user_agent("CrKey/1").unwrap();
         let p = decide(cast, &p7_truehd(), &remaps);
         assert_eq!(p.action, RecodeAction::RemuxP8);
+    }
+
+    #[test]
+    fn mpeg4_is_not_hevc() {
+        let s = probe_to_source("avi", "mpeg4", "sdr", "ac3", 720, 480);
+        assert_eq!(s.video_codec, VideoCodec::Mpeg4);
+        assert_eq!(s.hdr, HdrKind::Sdr);
+        assert_eq!(s.container, Container::Avi);
+    }
+
+    #[test]
+    fn extra_tracks_use_first_codec() {
+        let s = probe_to_source("mp4", "h264", "sdr", "aac,ac3", 1920, 1080);
+        assert_eq!(s.video_codec, VideoCodec::H264);
+        assert_eq!(s.audio, AudioCodec::Aac);
+        assert_eq!(s.width, 1920);
+        assert_eq!(s.height, 1080);
+    }
+
+    #[test]
+    fn empty_probe_is_unknown_not_hevc_sdr() {
+        let s = probe_to_source("", "", "", "", 0, 0);
+        assert_eq!(s.video_codec, VideoCodec::Other);
+        assert_eq!(s.hdr, HdrKind::Unknown);
+        assert_eq!(s.audio, AudioCodec::Other);
+        let remaps = parse_remaps_toml(
+            r#"
+[[remap]]
+client = "kodi"
+hdr = "sdr"
+action = "hdr10"
+"#,
+        )
+        .unwrap();
+        let kodi = identify_user_agent("Kodi/21.0").unwrap();
+        let p = decide(kodi, &s, &remaps);
+        assert_eq!(p.decision, Decision::ServeOriginal);
     }
 
     #[test]
