@@ -139,6 +139,9 @@ unsafe fn probe_avformat(url: *const libc::c_char) -> Option<MediaProbe> {
         match (*par).codec_type {
             t if t == sys::AVMediaType::AVMEDIA_TYPE_VIDEO => {
                 let name = map_video((*par).codec_id);
+                if out.av.creator.is_none() && is_divx_tag((*par).codec_tag) {
+                    out.av.creator = Some("DiVX".into());
+                }
                 push_unique(&mut videos, name);
                 if out.probe.width == 0 {
                     let w = (*par).width as u32;
@@ -246,14 +249,35 @@ fn dv_profile_in_bytes(buf: &[u8]) -> Option<u8> {
     None
 }
 
+fn is_divx_tag(tag: u32) -> bool {
+    // little-endian fourcc
+    let b = tag.to_le_bytes();
+    matches!(&b, b"DIVX" | b"DX50" | b"XVID" | b"divx" | b"dx50" | b"xvid")
+}
+
 fn map_format(name: &str) -> String {
-    if name.contains("mp4") || name.contains("mov") || name.contains("ismv") {
-        "mp4".into()
-    } else if name.contains("avi") {
-        "avi".into()
-    } else {
-        "mkv".into()
+    if name.starts_with("matroska") {
+        return "mkv".into();
     }
+    if name.contains("mp4") || name.contains("mov") || name.contains("ismv") {
+        return "mp4".into();
+    }
+    if name.contains("avi") {
+        return "avi".into();
+    }
+    if name.contains("mpegts") {
+        return "mpeg-ts".into();
+    }
+    if name.contains("mpeg") || name.contains("vob") || name.contains("svcd") {
+        return "mpeg".into();
+    }
+    if name.contains("flv") {
+        return "flv".into();
+    }
+    if name.contains("asf") || name.contains("wmv") {
+        return "asf".into();
+    }
+    "mkv".into()
 }
 
 fn push_unique(out: &mut Vec<String>, name: String) {
@@ -302,6 +326,107 @@ fn map_audio(id: sys::AVCodecID) -> String {
         AV_CODEC_ID_MP3 => "mp3".into(),
         _ => "other".into(),
     }
+}
+
+/// Stream index of the first `AV_DISPOSITION_ATTACHED_PIC`, if any.
+pub fn attached_pic_stream(path: &Path) -> Option<i32> {
+    init_libav();
+    let path_c = std::ffi::CString::new(path.to_string_lossy().as_ref()).ok()?;
+    unsafe {
+        let mut ctx: *mut sys::AVFormatContext = ptr::null_mut();
+        if sys::avformat_open_input(&mut ctx, path_c.as_ptr(), ptr::null_mut(), ptr::null_mut()) < 0
+            || ctx.is_null()
+        {
+            return None;
+        }
+        let _ = sys::avformat_find_stream_info(ctx, ptr::null_mut());
+        let nb = (*ctx).nb_streams as isize;
+        let mut found = None;
+        for i in 0..nb {
+            let st = *(*ctx).streams.add(i as usize);
+            if st.is_null() {
+                continue;
+            }
+            if (*st).disposition & sys::AV_DISPOSITION_ATTACHED_PIC != 0 {
+                found = Some(i as i32);
+                break;
+            }
+        }
+        sys::avformat_close_input(&mut ctx);
+        found
+    }
+}
+
+/// Decode attached cover art to JPEG. `dest` must end in `.jpg`.
+pub fn extract_attached_pic(src: &Path, dest: &Path) -> bool {
+    let Some(idx) = attached_pic_stream(src) else {
+        return false;
+    };
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+        ])
+        .arg(src)
+        .args(["-map", &format!("0:{idx}"), "-frames:v", "1", "-an"])
+        .arg(dest)
+        .status()
+        .map(|s| s.success() && dest.is_file())
+        .unwrap_or(false)
+}
+
+/// One-shot poster when there is no sidecar and no attached pic.
+/// Scale `src` to at most `w`×`h` JPEG at `dest` (`/Resized/`).
+pub fn scale_jpeg(src: &Path, dest: &Path, w: u32, h: u32) -> bool {
+    if w == 0 || h == 0 {
+        return false;
+    }
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let vf = format!("scale={w}:{h}:force_original_aspect_ratio=decrease");
+    std::process::Command::new("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(src)
+        .args(["-frames:v", "1", "-vf", &vf, "-an"])
+        .arg(dest)
+        .status()
+        .map(|s| s.success() && dest.is_file())
+        .unwrap_or(false)
+}
+
+pub fn generate_video_thumb(src: &Path, dest: &Path) -> bool {
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            "1",
+            "-i",
+        ])
+        .arg(src)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=320:-2",
+            "-an",
+        ])
+        .arg(dest)
+        .status()
+        .map(|s| s.success() && dest.is_file())
+        .unwrap_or(false)
 }
 
 unsafe fn c_str(p: *const libc::c_char) -> &'static str {

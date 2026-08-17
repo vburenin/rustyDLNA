@@ -50,13 +50,21 @@ pub fn gen_root_desc(opts: &RootDescOpts) -> String {
             friendly.push_str(": 1");
         }
     }
-    let extra = if opts.samsung_dcm10 {
-        concat!(
-            "<sec:ProductCap>smi,DCM10,getMediaInfo.sec,getCaptionInfo.sec</sec:ProductCap>",
-            "<sec:X_ProductCap>smi,DCM10,getMediaInfo.sec,getCaptionInfo.sec</sec:X_ProductCap>"
+    let (mfr_url, model_url, extra) = if opts.samsung_dcm10 {
+        (
+            "",
+            "",
+            concat!(
+                "<sec:ProductCap>smi,DCM10,getMediaInfo.sec,getCaptionInfo.sec</sec:ProductCap>",
+                "<sec:X_ProductCap>smi,DCM10,getMediaInfo.sec,getCaptionInfo.sec</sec:X_ProductCap>"
+            ),
         )
     } else {
-        ""
+        (
+            "<manufacturerURL>http://www.netgear.com/</manufacturerURL>",
+            "<modelURL>http://www.netgear.com/</modelURL>",
+            "",
+        )
     };
     let presentation = opts
         .presentation_url
@@ -71,11 +79,11 @@ pub fn gen_root_desc(opts: &RootDescOpts) -> String {
          <deviceType>{DEVICE_TYPE}</deviceType>\
          <friendlyName>{friendly}</friendlyName>\
          <manufacturer>{man}</manufacturer>\
-         <manufacturerURL>http://www.netgear.com/</manufacturerURL>\
+         {mfr_url}\
          <modelDescription>{md}</modelDescription>\
          <modelName>{mn}</modelName>\
          <modelNumber>{model_number}</modelNumber>\
-         <modelURL>http://www.netgear.com/</modelURL>\
+         {model_url}\
          <serialNumber>{sn}</serialNumber>\
          <UDN>{udn}</UDN>\
          <dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC>\

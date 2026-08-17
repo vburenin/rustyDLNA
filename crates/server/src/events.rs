@@ -191,12 +191,26 @@ fn parse_http_callback(url: &str) -> Option<CallbackUrl> {
         return None;
     }
     let ip: Ipv4Addr = host.parse().ok()?;
-    let path = if path.is_empty() {
-        "/".into()
-    } else {
-        path.to_string()
-    };
+    let path = sanitize_callback_path(path)?;
     Some(CallbackUrl { ip, port, path })
+}
+
+/// Origin-form path only: leading `/`, printable ASCII, no CTL / space /
+/// backslash. Stops `NOTIFY {path}` header injection via a lone LF in Callback.
+fn sanitize_callback_path(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return Some("/".into());
+    }
+    if !path.starts_with('/') || path.len() > 1024 {
+        return None;
+    }
+    if !path
+        .bytes()
+        .all(|b| (0x21..=0x7e).contains(&b) && b != b'\\')
+    {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 pub fn peer_ipv4(peer: SocketAddr) -> Option<Ipv4Addr> {
@@ -274,5 +288,27 @@ pub fn notify_content_dir(hub: &Mutex<EventHub>, update_id: u32) {
     let body = propertyset(EventService::ContentDir, update_id);
     for job in jobs {
         spawn_notify(job, body.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_callback_accepts_plain_ipv4() {
+        let cb = parse_callback("<http://192.0.2.50:1234/evt>").expect("ok");
+        assert_eq!(cb.ip, Ipv4Addr::new(192, 0, 2, 50));
+        assert_eq!(cb.port, 1234);
+        assert_eq!(cb.path, "/evt");
+    }
+
+    #[test]
+    fn parse_callback_rejects_header_injection() {
+        assert!(parse_callback("<http://192.0.2.50:1234/evt\nHost: pwn>").is_none());
+        assert!(parse_callback("<http://192.0.2.50:1234/evt\r\nX: 1>").is_none());
+        assert!(parse_callback("<http://192.0.2.50:1234/foo bar>").is_none());
+        assert!(parse_callback("<http://192.0.2.50:1234/foo\\bar>").is_none());
+        assert!(parse_callback("<http://192.0.2.50:1234>").is_some());
     }
 }

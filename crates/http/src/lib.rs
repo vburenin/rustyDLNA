@@ -96,6 +96,13 @@ pub fn persist_for_route(
     http_should_persist(httpver, conn_close, conn_keep)
 }
 
+/// Incoming request body cap (SOAP / GENA). Media GET has no body.
+pub const MAX_HTTP_BODY: usize = 256 * 1024 * 1024;
+
+pub fn http_body_too_large(len: usize) -> bool {
+    len > MAX_HTTP_BODY
+}
+
 /// Host must be dotted IPv4 (dialect DNS-rebinding check).
 pub fn valid_host_header(host: &str) -> bool {
     let (name, port) = match host.split_once(':') {
@@ -120,6 +127,70 @@ pub fn timeseek_without_range(req: &HttpRequest) -> bool {
     let seek = req.header("TimeSeekRange.dlna.org").is_some()
         || req.header("PlaySpeed.dlna.org").is_some();
     seek && req.header("Range").is_none()
+}
+
+/// `getcontentFeatures.dlna.org` / `getAvailableSeekRange.dlna.org` must be `1`.
+pub fn dlna_get_header_invalid(req: &HttpRequest) -> bool {
+    for name in ["getcontentFeatures.dlna.org", "getAvailableSeekRange.dlna.org"] {
+        if let Some(v) = req.header(name) {
+            if v.trim() != "1" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn wants_content_language(req: &HttpRequest) -> bool {
+    req.header("Accept-Language").is_some()
+}
+
+pub fn is_chunked(req: &HttpRequest) -> bool {
+    req.header("Transfer-Encoding")
+        .is_some_and(|v| v.to_ascii_lowercase().split(',').any(|t| t.trim() == "chunked"))
+}
+
+pub fn dlna_strict(req: &HttpRequest) -> bool {
+    req.header("uctt.upnp.org").is_some()
+}
+
+/// `realTimeInfo` + `Interactive` → 400 (DLNA).
+pub fn realtime_interactive_invalid(req: &HttpRequest) -> bool {
+    req.header("realTimeInfo.dlna.org").is_some()
+        && req
+            .header("transferMode.dlna.org")
+            .is_some_and(|v| v.eq_ignore_ascii_case("Interactive"))
+}
+
+/// `transferMode: Streaming` on an image → 406.
+pub fn streaming_on_image(req: &HttpRequest, mime: &str) -> bool {
+    mime.starts_with("image/")
+        && req
+            .header("transferMode.dlna.org")
+            .is_some_and(|v| v.eq_ignore_ascii_case("Streaming"))
+}
+
+/// `Interactive` on a non-image `/MediaItems/` object → 406, except Samsung
+/// unless `uctt.upnp.org` is set.
+pub fn interactive_on_non_image(
+    req: &HttpRequest,
+    mime: &str,
+    samsung: bool,
+    strict: bool,
+) -> bool {
+    if mime.starts_with("image/") {
+        return false;
+    }
+    if !req
+        .header("transferMode.dlna.org")
+        .is_some_and(|v| v.eq_ignore_ascii_case("Interactive"))
+    {
+        return false;
+    }
+    if samsung && !strict {
+        return false;
+    }
+    true
 }
 
 /// IMF-fixdate GMT (`Date:` header).
@@ -203,6 +274,9 @@ pub struct RemuxJobSpec {
     pub src: std::path::PathBuf,
     pub dest: std::path::PathBuf,
     pub args: Vec<String>,
+    /// Try `dovi_tool` P8.1 convert first; `args` is the hdr10 fallback.
+    pub remux_p8: bool,
+    pub audio_index: usize,
 }
 
 impl HttpResponse {
@@ -400,6 +474,14 @@ mod tests {
     }
 
     #[test]
+    fn request_body_cap_is_256_mib() {
+        assert_eq!(MAX_HTTP_BODY, 256 * 1024 * 1024);
+        assert!(!http_body_too_large(0));
+        assert!(!http_body_too_large(MAX_HTTP_BODY));
+        assert!(http_body_too_large(MAX_HTTP_BODY + 1));
+    }
+
+    #[test]
     fn caption_info_sec_header_helper() {
         let req = HttpRequest::parse_headers(
             "GET /MediaItems/9.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\ngetCaptionInfo.sec: 1\r\n\r\n",
@@ -417,5 +499,45 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some(url.as_str())
         );
+    }
+
+    #[test]
+    fn getcontentfeatures_must_be_one() {
+        let bad = HttpRequest::parse_headers(
+            "GET /MediaItems/1.mkv HTTP/1.1\r\nHost: 127.0.0.1\r\ngetcontentFeatures.dlna.org: 0\r\n\r\n",
+        )
+        .unwrap();
+        assert!(dlna_get_header_invalid(&bad));
+        let ok = HttpRequest::parse_headers(
+            "GET /MediaItems/1.mkv HTTP/1.1\r\nHost: 127.0.0.1\r\ngetcontentFeatures.dlna.org: 1\r\n\r\n",
+        )
+        .unwrap();
+        assert!(!dlna_get_header_invalid(&ok));
+        let seek = HttpRequest::parse_headers(
+            "GET /MediaItems/1.mkv HTTP/1.1\r\nHost: 127.0.0.1\r\ngetAvailableSeekRange.dlna.org: 2\r\n\r\n",
+        )
+        .unwrap();
+        assert!(dlna_get_header_invalid(&seek));
+    }
+
+    #[test]
+    fn interactive_on_non_image_except_samsung() {
+        let req = HttpRequest::parse_headers(
+            "GET /MediaItems/1.mkv HTTP/1.1\r\nHost: 127.0.0.1\r\ntransferMode.dlna.org: Interactive\r\n\r\n",
+        )
+        .unwrap();
+        assert!(interactive_on_non_image(&req, "video/x-matroska", false, false));
+        assert!(!interactive_on_non_image(&req, "video/x-matroska", true, false));
+        assert!(interactive_on_non_image(&req, "video/x-matroska", true, true));
+        assert!(!interactive_on_non_image(&req, "image/jpeg", false, false));
+    }
+
+    #[test]
+    fn skip_dlna_pn_omits_pn_from_content_features() {
+        let with_pn = dlna_org_features(Some("AVC_MP4_MP_SD_AC3"), "01", 0, "video/mp4");
+        assert!(with_pn.contains("DLNA.ORG_PN=AVC_MP4_MP_SD_AC3"), "{with_pn}");
+        let skip = protocol_info("video/mp4", Some("AVC_MP4_MP_SD_AC3"), true, true, 0);
+        assert!(!skip.contains("DLNA.ORG_PN="), "{skip}");
+        assert!(skip.contains("DLNA.ORG_OP=01"), "{skip}");
     }
 }

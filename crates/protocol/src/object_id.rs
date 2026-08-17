@@ -24,7 +24,7 @@ pub const VIDEO_PLIST_ID: &str = "2$10";
 pub const VIDEO_DIR_ID: &str = "2$15";
 pub const VIDEO_RATING_ID: &str = "2$200";
 pub const VIDEO_RECENT_ID: &str = "2$FF0";
-/// Recently Added lists the newest unique videos. No time window.
+/// Recently Added lists the newest unique items. No time window.
 pub const RECENT_MAX: usize = 200;
 
 pub const IMAGE_ID: &str = "3";

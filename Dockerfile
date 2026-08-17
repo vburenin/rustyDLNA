@@ -21,7 +21,8 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 
 RUN cargo build --release -p rusty-dlna \
-    && strip target/release/rusty-dlna
+    && strip target/release/rusty-dlna \
+    && (cargo install --locked dovi_tool --root /opt/dovi || mkdir -p /opt/dovi/bin)
 
 FROM debian:bookworm-slim
 
@@ -40,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/target/release/rusty-dlna /usr/local/bin/rusty-dlna
+COPY --from=build /opt/dovi/bin/ /usr/local/bin/
 COPY rusty-dlna.toml /etc/rusty-dlna.toml
 
 # HTTP descriptions/SOAP/media. SSDP is UDP/1900 (host network at run time).

@@ -167,6 +167,8 @@ pub struct TranscodePlan {
     pub video_encoder: String,
     pub audio: AudioAction,
     pub container: &'static str,
+    /// `0:a:{n}` among audio streams. Prefer a lossy track when known.
+    pub audio_index: usize,
 }
 
 impl Default for TranscodePlan {
@@ -180,8 +182,55 @@ impl Default for TranscodePlan {
             video_encoder: "copy".into(),
             audio: AudioAction::Copy,
             container: "original",
+            audio_index: 0,
         }
     }
+}
+
+/// First `aac`/`ac3`/`eac3`/`mp3` in a comma-separated probe list, else 0.
+pub fn pick_audio_index(audio_csv: &str) -> usize {
+    audio_csv
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .position(|c| matches!(c, "aac" | "ac3" | "eac3" | "mp3"))
+        .unwrap_or(0)
+}
+
+fn audio_map_arg(plan: &TranscodePlan) -> String {
+    format!("0:a:{}?", plan.audio_index)
+}
+
+fn hdr10_encode_args(plan: &TranscodePlan) -> Vec<String> {
+    let x264 = plan.video_encoder.contains("x264");
+    let mut a = vec![
+        "-vf".into(),
+        if x264 {
+            "format=yuv420p10le".into()
+        } else {
+            "format=p010le".into()
+        },
+        "-c:v".into(),
+        plan.video_encoder.clone(),
+        "-profile:v".into(),
+        if x264 { "high10".into() } else { "main10".into() },
+        "-pix_fmt".into(),
+        if x264 {
+            "yuv420p10le".into()
+        } else {
+            "p010le".into()
+        },
+        "-color_primaries".into(),
+        "bt2020".into(),
+        "-color_trc".into(),
+        "smpte2084".into(),
+        "-colorspace".into(),
+        "bt2020nc".into(),
+    ];
+    if !x264 {
+        a.extend(["-tag:v".into(), "hvc1".into()]);
+    }
+    a
 }
 
 /// Does `want` name this software? Tokens are UA fragments (`CrKey`,
@@ -296,6 +345,7 @@ fn plan_from_rule(rule: &RemapRule, src: &SourceMedia) -> TranscodePlan {
             video_encoder: rule.encoder.clone().unwrap_or_else(|| "copy".into()),
             audio: rule.audio_out.unwrap_or(AudioAction::Copy),
             container: "mp4",
+            audio_index: 0,
         },
         RecodeAction::Hdr10 => TranscodePlan {
             decision: Decision::Recode,
@@ -316,6 +366,7 @@ fn plan_from_rule(rule: &RemapRule, src: &SourceMedia) -> TranscodePlan {
                 AudioAction::ToAc3
             }),
             container: "mp4",
+            audio_index: 0,
         },
         RecodeAction::AudioAc3 => TranscodePlan {
             decision: Decision::Recode,
@@ -326,6 +377,7 @@ fn plan_from_rule(rule: &RemapRule, src: &SourceMedia) -> TranscodePlan {
             video_encoder: rule.encoder.clone().unwrap_or_else(|| "copy".into()),
             audio: rule.audio_out.unwrap_or(AudioAction::ToAc3),
             container: "original",
+            audio_index: 0,
         },
     }
 }
@@ -350,7 +402,7 @@ pub fn ffmpeg_live_args(src_path: &str, plan: &TranscodePlan) -> Vec<String> {
         "-map".into(),
         "0:v:0".into(),
         "-map".into(),
-        "0:a:0?".into(),
+        audio_map_arg(plan),
     ];
     match plan.action {
         RecodeAction::Original => {}
@@ -358,24 +410,7 @@ pub fn ffmpeg_live_args(src_path: &str, plan: &TranscodePlan) -> Vec<String> {
             a.extend(["-c:v".into(), plan.video_encoder.clone()]);
         }
         RecodeAction::Hdr10 => {
-            a.extend([
-                "-vf".into(),
-                "format=p010le".into(),
-                "-c:v".into(),
-                plan.video_encoder.clone(),
-                "-profile:v".into(),
-                "main10".into(),
-                "-pix_fmt".into(),
-                "p010le".into(),
-                "-color_primaries".into(),
-                "bt2020".into(),
-                "-color_trc".into(),
-                "smpte2084".into(),
-                "-colorspace".into(),
-                "bt2020nc".into(),
-                "-tag:v".into(),
-                "hvc1".into(),
-            ]);
+            a.extend(hdr10_encode_args(plan));
         }
     }
     match plan.audio {
@@ -400,7 +435,7 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
         "-map".into(),
         "0:v:0".into(),
         "-map".into(),
-        "0:a:0?".into(),
+        audio_map_arg(plan),
     ];
     match plan.action {
         RecodeAction::Original => {}
@@ -408,24 +443,7 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
             a.extend(["-c:v".into(), plan.video_encoder.clone()]);
         }
         RecodeAction::Hdr10 => {
-            a.extend([
-                "-vf".into(),
-                "format=p010le".into(),
-                "-c:v".into(),
-                plan.video_encoder.clone(),
-                "-profile:v".into(),
-                "main10".into(),
-                "-pix_fmt".into(),
-                "p010le".into(),
-                "-color_primaries".into(),
-                "bt2020".into(),
-                "-color_trc".into(),
-                "smpte2084".into(),
-                "-colorspace".into(),
-                "bt2020nc".into(),
-                "-tag:v".into(),
-                "hvc1".into(),
-            ]);
+            a.extend(hdr10_encode_args(plan));
         }
     }
     match plan.audio {
@@ -464,7 +482,7 @@ pub fn ffmpeg_file_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
         "-map".into(),
         "0:v:0".into(),
         "-map".into(),
-        "0:a:0?".into(),
+        audio_map_arg(plan),
     ];
     match plan.action {
         RecodeAction::Original => {}
@@ -472,24 +490,7 @@ pub fn ffmpeg_file_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
             a.extend(["-c:v".into(), plan.video_encoder.clone()]);
         }
         RecodeAction::Hdr10 => {
-            a.extend([
-                "-vf".into(),
-                "format=p010le".into(),
-                "-c:v".into(),
-                plan.video_encoder.clone(),
-                "-profile:v".into(),
-                "main10".into(),
-                "-pix_fmt".into(),
-                "p010le".into(),
-                "-color_primaries".into(),
-                "bt2020".into(),
-                "-color_trc".into(),
-                "smpte2084".into(),
-                "-colorspace".into(),
-                "bt2020nc".into(),
-                "-tag:v".into(),
-                "hvc1".into(),
-            ]);
+            a.extend(hdr10_encode_args(plan));
         }
     }
     match plan.audio {
@@ -605,6 +606,182 @@ pub fn cache_part(dest: &std::path::Path) -> std::path::PathBuf {
     let mut p = dest.as_os_str().to_os_string();
     p.push(".part");
     std::path::PathBuf::from(p)
+}
+
+pub fn cache_stamp_path(dest: &std::path::Path) -> std::path::PathBuf {
+    let mut p = dest.as_os_str().to_os_string();
+    p.push(".src");
+    std::path::PathBuf::from(p)
+}
+
+fn src_stamp(src: &std::path::Path) -> Option<String> {
+    let m = std::fs::metadata(src).ok()?;
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(format!("{}:{}", mtime, m.len()))
+}
+
+pub fn write_cache_stamp(dest: &std::path::Path, src: &std::path::Path) {
+    if let Some(s) = src_stamp(src) {
+        let _ = std::fs::write(cache_stamp_path(dest), s);
+    }
+}
+
+pub fn cache_is_fresh(dest: &std::path::Path, src: &std::path::Path) -> bool {
+    let Ok(meta) = dest.metadata() else {
+        return false;
+    };
+    if meta.len() == 0 {
+        return false;
+    }
+    let Some(want) = src_stamp(src) else {
+        return true;
+    };
+    std::fs::read_to_string(cache_stamp_path(dest))
+        .ok()
+        .is_some_and(|have| have.trim() == want)
+}
+
+pub fn dovi_tool_path() -> Option<std::path::PathBuf> {
+    let p = std::env::var_os("DOVI_TOOL").map(std::path::PathBuf::from);
+    if let Some(p) = p {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join("dovi_tool");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// HDR10 encode used when `dovi_tool` is missing or convert fails.
+pub fn hdr10_fallback_plan(from: &TranscodePlan) -> TranscodePlan {
+    TranscodePlan {
+        decision: Decision::Recode,
+        action: RecodeAction::Hdr10,
+        rule: from.rule.clone(),
+        keep_hdr10: true,
+        drop_dolby_vision: true,
+        video_encoder: if from.video_encoder == "copy" {
+            "libx264".into()
+        } else {
+            from.video_encoder.clone()
+        },
+        audio: match from.audio {
+            AudioAction::Copy => AudioAction::ToAac,
+            other => other,
+        },
+        container: "mp4",
+        audio_index: from.audio_index,
+    }
+}
+
+fn run_cmd(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("empty command".into());
+    }
+    let out = std::process::Command::new(&args[0])
+        .args(&args[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("spawn {}: {e}", args[0]))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let tail = if err.len() > 800 {
+            &err[err.len() - 800..]
+        } else {
+            &err
+        };
+        return Err(format!("{}: {tail}", args[0]));
+    }
+    Ok(())
+}
+
+/// BL + P8.1 RPU via `dovi_tool -m 2 convert --discard`. Writes `dest_part`.
+pub fn run_remux_p8(
+    src: &std::path::Path,
+    dest_part: &std::path::Path,
+    plan: &TranscodePlan,
+) -> Result<(), String> {
+    let dovi = dovi_tool_path().ok_or_else(|| "dovi_tool not on PATH".to_string())?;
+    if let Some(parent) = dest_part.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let hevc = dest_part.with_extension("hevc");
+    let p8 = dest_part.with_extension("p8.hevc");
+    let _ = std::fs::remove_file(&hevc);
+    let _ = std::fs::remove_file(&p8);
+    let extract = vec![
+        "ffmpeg".into(),
+        "-hide_banner".into(),
+        "-nostats".into(),
+        "-y".into(),
+        "-i".into(),
+        src.to_string_lossy().into_owned(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-c:v".into(),
+        "copy".into(),
+        "-bsf:v".into(),
+        "hevc_mp4toannexb".into(),
+        "-an".into(),
+        "-f".into(),
+        "hevc".into(),
+        hevc.to_string_lossy().into_owned(),
+    ];
+    let convert = vec![
+        dovi.to_string_lossy().into_owned(),
+        "-m".into(),
+        "2".into(),
+        "convert".into(),
+        "--discard".into(),
+        hevc.to_string_lossy().into_owned(),
+        "-o".into(),
+        p8.to_string_lossy().into_owned(),
+    ];
+    let mut mux = vec![
+        "ffmpeg".into(),
+        "-hide_banner".into(),
+        "-nostats".into(),
+        "-y".into(),
+        "-fflags".into(),
+        "+genpts".into(),
+        "-i".into(),
+        p8.to_string_lossy().into_owned(),
+        "-i".into(),
+        src.to_string_lossy().into_owned(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        format!("1:a:{}?", plan.audio_index),
+        "-c:v".into(),
+        "copy".into(),
+        "-tag:v".into(),
+        "hvc1".into(),
+    ];
+    match plan.audio {
+        AudioAction::Copy => mux.extend(["-c:a".into(), "copy".into()]),
+        AudioAction::ToAc3 => mux.extend(["-c:a".into(), "ac3".into(), "-b:a".into(), "640k".into()]),
+        AudioAction::ToAac => mux.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "256k".into()]),
+    }
+    mux.extend(live_frag_tail(&dest_part.to_string_lossy()));
+    let result = run_cmd(&extract)
+        .and_then(|_| run_cmd(&convert))
+        .and_then(|_| run_cmd(&mux));
+    let _ = std::fs::remove_file(&hevc);
+    let _ = std::fs::remove_file(&p8);
+    result
 }
 
 /// Run ffmpeg CLI to a cache file. Returns the dest path. Existing non-empty
@@ -1096,5 +1273,69 @@ action = "audio-ac3"
             let state = st.split_whitespace().nth(2).unwrap_or("");
             assert_eq!(state, "Z", "child should be dead after Drop, stat={st}");
         }
+    }
+
+    #[test]
+    fn remux_p8_pipeline_and_audio_pick() {
+        assert_eq!(pick_audio_index("truehd,ac3,aac"), 1);
+        assert_eq!(pick_audio_index("aac"), 0);
+        assert_eq!(pick_audio_index("truehd,dts"), 0);
+        let mut plan = TranscodePlan {
+            decision: Decision::Recode,
+            action: RecodeAction::RemuxP8,
+            video_encoder: "copy".into(),
+            audio: AudioAction::ToAac,
+            container: "mp4",
+            audio_index: 1,
+            ..TranscodePlan::default()
+        };
+        let grow = ffmpeg_grow_args("/media/movie.mkv", "/cache/1.part", &plan);
+        assert!(grow.iter().any(|s| s == "0:a:1?"), "{grow:?}");
+        let fb = hdr10_fallback_plan(&plan);
+        assert_eq!(fb.action, RecodeAction::Hdr10);
+        assert_ne!(fb.video_encoder, "copy");
+        assert_eq!(fb.audio_index, 1);
+        plan.audio_index = pick_audio_index("truehd,eac3");
+        assert_eq!(plan.audio_index, 1);
+        let x264 = hdr10_fallback_plan(&plan);
+        let args = ffmpeg_grow_args("/m.mkv", "/o.part", &x264);
+        assert!(args.iter().any(|s| s == "high10"), "{args:?}");
+        assert!(!args.iter().any(|s| s == "main10"), "{args:?}");
+    }
+
+    #[test]
+    fn remux_p8_falls_back_without_dovi() {
+        if dovi_tool_path().is_some() {
+            eprintln!("dovi_tool present; skip missing-binary path");
+            return;
+        }
+        let src = std::env::temp_dir().join(format!("rdlna-nodovi-{}.mkv", std::process::id()));
+        let dest = std::env::temp_dir().join(format!("rdlna-nodovi-{}.mp4.part", std::process::id()));
+        let _ = std::fs::write(&src, b"not-hevc");
+        let plan = TranscodePlan {
+            action: RecodeAction::RemuxP8,
+            video_encoder: "copy".into(),
+            ..TranscodePlan::default()
+        };
+        let err = run_remux_p8(&src, &dest, &plan).unwrap_err();
+        assert!(err.contains("dovi_tool"), "{err}");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn cache_stamp_invalidates_on_source_change() {
+        let tmp = std::env::temp_dir().join(format!("rdlna-stamp-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let src = tmp.join("src.mkv");
+        let dest = tmp.join("1-remux.mp4");
+        std::fs::write(&src, b"aaaa").unwrap();
+        std::fs::write(&dest, b"cached").unwrap();
+        write_cache_stamp(&dest, &src);
+        assert!(cache_is_fresh(&dest, &src));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&src, b"bbbbbbbb").unwrap();
+        assert!(!cache_is_fresh(&dest, &src), "size/mtime change must bust cache");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

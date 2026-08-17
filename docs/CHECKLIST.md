@@ -311,6 +311,93 @@ Phase 9 is done. rustyDLNA is the LAN daemon. Tests stay on 18200/11900.
 
 ---
 
+## Phase 19 — Video Series (`2$E`) + Genre (`2$9`)
+
+NFO already has `showtitle` / `season` / `episode` / `genre`. Flattening
+into `Show - Episode` stays for All Video. Virtual trees are aliases of
+the same `DETAIL_ID`.
+
+- [x] Seed `2$E` Series and `2$9` Genre under Video
+- [x] Store `showtitle` in `DETAILS.ALBUM`; episode title is `TITLE` with
+      `{show} - ` stripped under Series
+- [x] Series → optional `Season N` / `Specials` → episode `REF_ID`
+- [x] Genre splits `"Drama / Crime"` into two folders
+- [x] Movies (no `showtitle`) stay out of Series; still join Genre
+- [x] Re-NFO / inode clone rewrites aliases; empty season/show/genre
+      folders prune (roots stay)
+
+**Verify**
+
+```bash
+cargo test -p rusty-dlna-scan series_and_genre_trees_from_nfo
+cargo test -p rusty-dlna --lib browse_series_seasons_and_genre
+```
+
+**Prove** `RUSTY_DLNA_HTTP_PORT=18200 RUSTY_DLNA_SSDP_PORT=11900 cargo test -p rusty-dlna --test listen_e2e series_genre_and_remux_e2e`
+
+---
+
+## Phase 20 — `remux-p8` actually remuxes
+
+`-c:v copy` is not Profile 8.1. Convert RPU with `dovi_tool -m 2 convert
+--discard` when present; otherwise fall back to the `hdr10` encode.
+
+- [x] Pipeline: annex-B HEVC → `dovi_tool` P8.1 → fMP4 (copy video)
+- [x] Map a lossy audio track (`aac`/`ac3`/`eac3`) instead of `0:a:0`
+- [x] Missing `dovi_tool` or convert failure → `hdr10` fallback (log error)
+- [x] Cache stamp (`mtime`+`size`); source replace rebuilds dest
+
+**Verify**
+
+```bash
+cargo test -p rusty-dlna-transcode remux_p8_pipeline_and_audio_pick
+cargo test -p rusty-dlna-transcode remux_p8_falls_back_without_dovi
+cargo test -p rusty-dlna-transcode cache_stamp_invalidates_on_source_change
+```
+
+---
+
+## Phase 21 — Remux seek / first-play contract
+
+File-cache, not a live pipe. Document and lock it.
+
+| State | Headers | Seek |
+|---|---|---|
+| Growing `.part` | `OP=00`, no `Content-Length` | small Range probe only |
+| Finished dest | `OP=01`, `Accept-Ranges`, `Content-Length` | byte Range 206 |
+| Source newer than stamp | rebuild | same as growing |
+
+- [x] Finished remux Range 206
+- [x] First GET still returns headers before ffmpeg exits
+- [x] Stale dest is deleted and rebuilt
+- [x] `docs/TRANSCODE.md` matches this table (no “live pipe” claim)
+
+**Verify**
+
+```bash
+cargo test -p rusty-dlna --lib remux_finished_range_and_stale_rebuild
+cargo test -p rusty-dlna --lib transcode_get_is_live_pipe_not_full_file
+```
+
+---
+
+## Phase 22 — Art when there is no sidecar
+
+Priority: sidecar → embedded attached pic → one-shot thumbnail.
+
+- [x] Extract `AV_DISPOSITION_ATTACHED_PIC` to `cache/art/{sha1}.jpg`
+- [x] Else `ffmpeg -ss 1 -frames:v 1` thumbnail (fail closed)
+- [x] Sidecar still wins; `/Thumbnails/` and `/Resized/` stay 404
+
+**Verify**
+
+```bash
+cargo test -p rusty-dlna-scan art_embedded_and_thumbnail_fallback
+cargo test -p rusty-dlna --lib album_art_get_and_didl
+```
+
+---
+
 ## Commands cheat sheet
 
 ```bash

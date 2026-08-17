@@ -61,11 +61,23 @@ Empty `[[remap]]` list → every client, including Cast, gets the remux.
 - Copy mastering display / MaxCLL when present (`-mastering_display`,
   `-max_cll`) so tone-map matches the disc.
 
-## Serve path: background growing fMP4
+## Serve path: background growing fMP4 (file cache)
 
-`GET /Transcode/{id}` starts **one** ffmpeg job per title that writes a
-fragmented MP4 (`.part`, then rename). The first ~16 KiB (`ftyp` +
-init) is enough to start playback. The rest fills in behind the client.
+This is **not** a live ffmpeg stdout pipe. `GET /Transcode/{id}` starts
+**one** job per title that writes a fragmented MP4 (`.part`, then
+rename). The first ~16 KiB (`ftyp` + init) is enough to start playback.
+The rest fills in behind the client.
+
+| State | `DLNA.ORG_OP` | Seek |
+|---|---|---|
+| Growing `.part` | `00` (no `Content-Length`) | small Range probe only |
+| Finished dest | `01` + `Accept-Ranges` + `Content-Length` | byte Range 206 |
+| Source `mtime`/`size` ≠ stamp | dest deleted, job restarts | same as growing |
+
+`remux-p8` runs `dovi_tool -m 2 convert --discard` (BL + P8.1 RPU) when
+the binary is on `PATH`. If it is missing or the convert fails, the job
+falls back to the `hdr10` encode. First audio map prefers `aac` / `ac3`
+/ `eac3` over TrueHD / DTS.
 
 Kodi opens several GETs at once. They **attach** to the same job. A
 probe disconnect does **not** kill ffmpeg.

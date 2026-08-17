@@ -444,13 +444,57 @@ pub fn identify_friendly_name(name: &str) -> Option<&'static ClientProfile> {
     first_match(MatchKind::FriendlyName, name)
 }
 
+/// MiniDLNA `SearchClientCache` / table walk: first row whose *own*
+/// header matches wins. A generic `DLNADOC/1.50` UA must not hide Sony
+/// BDP `X-AV-Client-Info: mv="2.0"` sitting above it.
+pub fn identify_request(
+    ua: Option<&str>,
+    x_av: Option<&str>,
+    friendly: Option<&str>,
+    model: Option<&str>,
+) -> Option<&'static ClientProfile> {
+    CLIENTS.iter().find(|c| {
+        let Some(needle) = c.match_str else {
+            return false;
+        };
+        let hay = match c.match_kind {
+            MatchKind::None => return false,
+            MatchKind::UserAgent => ua,
+            MatchKind::XAvClientInfo => x_av,
+            MatchKind::FriendlyName | MatchKind::FriendlyNameSsdp => friendly,
+            MatchKind::ModelName => model,
+        };
+        hay.is_some_and(|h| h.contains(needle))
+    })
+}
+
 /// Samsung `video/x-matroska` → `video/x-mkv` (`strcpy(mime+8, "mkv")`).
 pub fn remap_mime(profile: &ClientProfile, mime: &str) -> String {
+    remap_mime_full(profile, mime, None, None)
+}
+
+/// Full MIME rewrite including creator (PS3 DiVX) and TS PN (FreeBox).
+pub fn remap_mime_full(
+    profile: &ClientProfile,
+    mime: &str,
+    creator: Option<&str>,
+    dlna_pn: Option<&str>,
+) -> String {
     if profile.flags.contains(ClientFlags::SAMSUNG) && mime == "video/x-matroska" {
         return "video/x-mkv".into();
     }
+    if profile.kind == ClientKind::SamsungSeriesA && mime == "video/x-msvideo" {
+        return "video/mpeg".into();
+    }
     if profile.kind == ClientKind::SonyBdp && (mime == "video/x-matroska" || mime == "video/mpeg") {
         return "video/divx".into();
+    }
+    if profile.flags.contains(ClientFlags::MIME_AVI_DIVX) && mime == "video/x-msvideo" {
+        return if creator.is_some_and(|c| c.eq_ignore_ascii_case("DiVX")) {
+            "video/divx".into()
+        } else {
+            "video/avi".into()
+        };
     }
     if profile.flags.contains(ClientFlags::MIME_AVI_AVI) && mime == "video/x-msvideo" {
         return "video/avi".into();
@@ -461,12 +505,50 @@ pub fn remap_mime(profile: &ClientProfile, mime: &str) -> String {
     if profile.flags.contains(ClientFlags::MIME_WAV_WAV) && mime == "audio/x-wav" {
         return "audio/wav".into();
     }
+    if profile.kind == ClientKind::FreeBox
+        && dlna_pn.is_some_and(|p| p.starts_with("MPEG_TS") || p.starts_with("AVC_TS"))
+    {
+        return "video/mp2t".into();
+    }
+    if !profile.flags.contains(ClientFlags::DLNA) && mime == "video/vnd.dlna.mpeg-tts" {
+        return "video/mpeg".into();
+    }
     mime.to_string()
+}
+
+pub fn identify_model_name(name: &str) -> Option<&'static ClientProfile> {
+    first_match(MatchKind::ModelName, name)
+}
+
+pub fn identify_friendly_name_ssdp(name: &str) -> Option<&'static ClientProfile> {
+    first_match(MatchKind::FriendlyNameSsdp, name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_order_beats_generic_ua() {
+        let p = identify_request(
+            Some("UPnP/1.0 DLNADOC/1.50"),
+            Some(r#"av="5.0"; cn="Sony Corporation"; mv="2.0""#),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(p.kind, ClientKind::SonyBdp);
+        let kodi = identify_request(
+            Some("Kodi/21.0 DLNADOC/1.50"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(kodi.kind, ClientKind::Kodi);
+        let generic = identify_request(Some("DLNADOC/1.50"), None, None, None).unwrap();
+        assert_eq!(generic.kind, ClientKind::StandardDlna150);
+    }
 
     #[test]
     fn kodi_from_ua() {
@@ -511,5 +593,69 @@ mod tests {
     fn samsung_mkv_mime() {
         let c = identify_user_agent("SEC_HHP_[TV]x").unwrap();
         assert_eq!(remap_mime(c, "video/x-matroska"), "video/x-mkv");
+    }
+
+    #[test]
+    fn remap_mime_full_series_a_avi_divx_freebox_mpeg_tts() {
+        let series_a = identify_user_agent("SamsungWiselinkPro").unwrap();
+        assert_eq!(series_a.kind, ClientKind::SamsungSeriesA);
+        assert_eq!(
+            remap_mime_full(series_a, "video/x-msvideo", None, None),
+            "video/mpeg"
+        );
+        assert_eq!(
+            remap_mime_full(series_a, "video/x-matroska", None, None),
+            "video/x-mkv"
+        );
+
+        let ps3 = identify_user_agent("PLAYSTATION 3").unwrap();
+        assert!(ps3.flags.contains(ClientFlags::MIME_AVI_DIVX));
+        assert_eq!(
+            remap_mime_full(ps3, "video/x-msvideo", Some("DiVX"), None),
+            "video/divx"
+        );
+        assert_eq!(
+            remap_mime_full(ps3, "video/x-msvideo", None, None),
+            "video/avi"
+        );
+
+        let fbx = identify_user_agent("fbxupnpav/1.0").unwrap();
+        assert_eq!(fbx.kind, ClientKind::FreeBox);
+        assert_eq!(
+            remap_mime_full(fbx, "video/mpeg", None, Some("MPEG_TS_SD_NA")),
+            "video/mp2t"
+        );
+        assert_eq!(
+            remap_mime_full(fbx, "video/mpeg", None, Some("AVC_TS_MP_HD_AC3")),
+            "video/mp2t"
+        );
+        assert_eq!(
+            remap_mime_full(fbx, "video/mpeg", None, Some("MPEG_PS_NTSC")),
+            "video/mpeg"
+        );
+
+        let bdp = identify_x_av_client_info(r#"av="5.0"; mv="2.0""#).unwrap();
+        assert_eq!(bdp.kind, ClientKind::SonyBdp);
+        assert_eq!(
+            remap_mime_full(bdp, "video/x-matroska", None, None),
+            "video/divx"
+        );
+        assert_eq!(
+            remap_mime_full(bdp, "video/mpeg", None, None),
+            "video/divx"
+        );
+
+        let generic = identify_user_agent("UPnP/1.0").unwrap();
+        assert!(!generic.flags.contains(ClientFlags::DLNA));
+        assert_eq!(
+            remap_mime_full(generic, "video/vnd.dlna.mpeg-tts", None, None),
+            "video/mpeg"
+        );
+        let dlna = identify_user_agent("DLNADOC/1.50").unwrap();
+        assert!(dlna.flags.contains(ClientFlags::DLNA));
+        assert_eq!(
+            remap_mime_full(dlna, "video/vnd.dlna.mpeg-tts", None, None),
+            "video/vnd.dlna.mpeg-tts"
+        );
     }
 }

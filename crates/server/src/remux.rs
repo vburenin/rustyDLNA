@@ -10,7 +10,9 @@ use rusty_dlna_http::{
     live_transcode_response, media_response, now_imf_date, parse_byte_range, parse_open_range,
     HttpRequest, HttpResponse, RangeError, RemuxJobSpec,
 };
-use rusty_dlna_transcode::cache_part;
+use rusty_dlna_transcode::{
+    cache_is_fresh, cache_part, run_remux_p8, write_cache_stamp, RecodeAction, TranscodePlan,
+};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::App;
@@ -22,8 +24,9 @@ const POLL: Duration = Duration::from_millis(50);
 pub struct RemuxJob {
     pub dest: PathBuf,
     pub part: PathBuf,
-    failed: Mutex<Option<String>>,
-    done: AtomicBool,
+    pub(crate) failed: Mutex<Option<String>>,
+    pub(crate) done: AtomicBool,
+    pub(crate) silent_prepass: AtomicBool,
 }
 
 impl RemuxJob {
@@ -39,10 +42,41 @@ fn spawn_ffmpeg(app: Arc<App>, spec: RemuxJobSpec, job: Arc<RemuxJob>) {
     let spawned = std::thread::Builder::new()
         .name(format!("remux-{}", spec.detail_id))
         .spawn(move || {
-            let args = spec.args;
-            let dest = spec.dest;
+            let dest = spec.dest.clone();
             let part = job.part.clone();
             let id = spec.detail_id;
+            write_cache_stamp(&dest, &spec.src);
+            if spec.remux_p8 {
+                let p8 = TranscodePlan {
+                    action: RecodeAction::RemuxP8,
+                    video_encoder: "copy".into(),
+                    audio: rusty_dlna_transcode::AudioAction::ToAac,
+                    audio_index: spec.audio_index,
+                    container: "mp4",
+                    ..TranscodePlan::default()
+                };
+                tracing::info!(id, dest = %dest.display(), "remux-p8 dovi_tool start");
+                job.silent_prepass.store(true, Ordering::SeqCst);
+                let p8_result = run_remux_p8(&spec.src, &part, &p8);
+                job.silent_prepass.store(false, Ordering::SeqCst);
+                match p8_result {
+                    Ok(()) => {
+                        finalize_remux(&job, id, &dest, &part);
+                        if !job.done.load(Ordering::SeqCst) {
+                            if let Ok(mut map) = app.remuxes.lock() {
+                                map.remove(&id);
+                            }
+                        }
+                        app.jobs.release();
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!(id, dest = %dest.display(), "{e}; falling back to hdr10");
+                        let _ = std::fs::remove_file(&part);
+                    }
+                }
+            }
+            let args = spec.args;
             tracing::info!(id, dest = %dest.display(), "remux job start");
             let mut cmd = std::process::Command::new(&args[0]);
             cmd.args(&args[1..]);
@@ -52,24 +86,7 @@ fn spawn_ffmpeg(app: Arc<App>, spec: RemuxJobSpec, job: Arc<RemuxJob>) {
             let result = cmd.output();
             match result {
                 Ok(out) if out.status.success() => {
-                    let n = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-                    if n == 0 {
-                        let msg = "ffmpeg produced empty remux".to_string();
-                        tracing::error!(id, dest = %dest.display(), "{msg}");
-                        if let Ok(mut g) = job.failed.lock() {
-                            *g = Some(msg);
-                        }
-                        let _ = std::fs::remove_file(&part);
-                    } else if let Err(e) = std::fs::rename(&part, &dest) {
-                        let msg = format!("remux rename: {e}");
-                        tracing::error!(id, dest = %dest.display(), "{msg}");
-                        if let Ok(mut g) = job.failed.lock() {
-                            *g = Some(msg);
-                        }
-                    } else {
-                        tracing::info!(id, dest = %dest.display(), bytes = n, "remux job done");
-                        job.done.store(true, Ordering::SeqCst);
-                    }
+                    finalize_remux(&job, id, &dest, &part);
                 }
                 Ok(out) => {
                     let err = String::from_utf8_lossy(&out.stderr);
@@ -109,6 +126,29 @@ fn spawn_ffmpeg(app: Arc<App>, spec: RemuxJobSpec, job: Arc<RemuxJob>) {
     }
 }
 
+fn finalize_remux(job: &RemuxJob, id: i64, dest: &Path, part: &Path) {
+    let n = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+    if n == 0 {
+        let msg = "ffmpeg produced empty remux".to_string();
+        tracing::error!(id, dest = %dest.display(), "{msg}");
+        if let Ok(mut g) = job.failed.lock() {
+            *g = Some(msg);
+        }
+        let _ = std::fs::remove_file(part);
+        return;
+    }
+    if let Err(e) = std::fs::rename(part, dest) {
+        let msg = format!("remux rename: {e}");
+        tracing::error!(id, dest = %dest.display(), "{msg}");
+        if let Ok(mut g) = job.failed.lock() {
+            *g = Some(msg);
+        }
+        return;
+    }
+    tracing::info!(id, dest = %dest.display(), bytes = n, "remux job done");
+    job.done.store(true, Ordering::SeqCst);
+}
+
 fn tail_str(s: &str, max: usize) -> String {
     let t = s.trim();
     if t.len() <= max {
@@ -119,19 +159,24 @@ fn tail_str(s: &str, max: usize) -> String {
 
 /// Start or attach. `started` is true when this call launched ffmpeg.
 pub fn attach(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String> {
-    if spec.dest.is_file()
-        && spec
-            .dest
-            .metadata()
-            .map(|m| m.len() > 0)
-            .unwrap_or(false)
-    {
+    if cache_is_fresh(&spec.dest, &spec.src) {
         return Ok(Arc::new(RemuxJob {
             dest: spec.dest.clone(),
             part: cache_part(&spec.dest),
             failed: Mutex::new(None),
             done: AtomicBool::new(true),
+            silent_prepass: AtomicBool::new(false),
         }));
+    }
+    if spec.dest.is_file() {
+        tracing::info!(
+            id = spec.detail_id,
+            dest = %spec.dest.display(),
+            "stale remux cache, rebuilding"
+        );
+        let _ = std::fs::remove_file(&spec.dest);
+        let _ = std::fs::remove_file(cache_part(&spec.dest));
+        let _ = std::fs::remove_file(rusty_dlna_transcode::cache_stamp_path(&spec.dest));
     }
     let mut map = app.remuxes.lock().expect("remuxes");
     if let Some(j) = map.get(&spec.detail_id) {
@@ -159,6 +204,7 @@ pub fn attach(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String
         part: part.clone(),
         failed: Mutex::new(None),
         done: AtomicBool::new(false),
+        silent_prepass: AtomicBool::new(false),
     });
     map.insert(spec.detail_id, job.clone());
     drop(map);
@@ -167,11 +213,8 @@ pub fn attach(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String
 }
 
 pub async fn wait_ready(job: &RemuxJob) -> Result<PathBuf, String> {
-    let t0 = Instant::now();
+    let mut deadline = Instant::now() + FIRST_WAIT;
     loop {
-        if let Some(e) = job.err() {
-            return Err(e);
-        }
         if job.dest.is_file()
             && job.dest.metadata().map(|m| m.len() > 0).unwrap_or(false)
         {
@@ -182,7 +225,12 @@ pub async fn wait_ready(job: &RemuxJob) -> Result<PathBuf, String> {
         {
             return Ok(job.part.clone());
         }
-        if t0.elapsed() > FIRST_WAIT {
+        if let Some(e) = job.err() {
+            return Err(e);
+        }
+        if job.silent_prepass.load(Ordering::SeqCst) {
+            deadline = Instant::now() + FIRST_WAIT;
+        } else if Instant::now() > deadline {
             return Err(format!(
                 "remux produced no data in {}s",
                 FIRST_WAIT.as_secs()
@@ -455,4 +503,51 @@ async fn stream_growing(
         tracing::error!(dest = %path.display(), "remux stream sent 0 bytes");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_ready_extends_during_silent_prepass() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-wait-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dest = tmp.join("out.mp4");
+        let part = tmp.join("out.mp4.part");
+        let job = Arc::new(RemuxJob {
+            dest: dest.clone(),
+            part,
+            failed: Mutex::new(None),
+            done: AtomicBool::new(false),
+            silent_prepass: AtomicBool::new(true),
+        });
+        assert!(!dest.exists());
+        let writer = {
+            let dest = dest.clone();
+            let job = job.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                std::fs::write(&dest, vec![0u8; FIRST_BYTES as usize]).unwrap();
+                job.silent_prepass.store(false, Ordering::SeqCst);
+                job.done.store(true, Ordering::SeqCst);
+            })
+        };
+        let t0 = Instant::now();
+        let got = tokio::time::timeout(Duration::from_secs(2), wait_ready(&job))
+            .await
+            .expect("wait_ready must return during silent prepass, not after FIRST_WAIT")
+            .expect("wait_ready");
+        assert_eq!(got, dest);
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        writer.await.unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

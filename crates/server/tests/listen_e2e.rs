@@ -78,9 +78,103 @@ fn wait_http(port: u16) {
     panic!("server did not bind 127.0.0.1:{port}");
 }
 
+fn browse_inner(oid: &str, flag: &str) -> String {
+    format!(
+        r#"<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>{oid}</ObjectID><BrowseFlag>{flag}</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse>"#
+    )
+}
+
+fn wait_media_items(http: u16, ua: &str, oid: &str) -> String {
+    let inner = browse_inner(oid, "BrowseDirectChildren");
+    let mut last = String::new();
+    for _ in 0..40 {
+        let (_, body) = soap(
+            http,
+            ua,
+            "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+            &inner,
+        );
+        if body.contains("/MediaItems/") {
+            return body;
+        }
+        last = body;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    last
+}
+
+/// Movie title's `/MediaItems/{id}` — same parse as `one_run`.
+fn movie_media_id(items: &str) -> i64 {
+    let movie_at = items
+        .find("Fixture Movie")
+        .or_else(|| items.find("movie"))
+        .expect("movie title");
+    let after = &items[movie_at..];
+    let url_start = after.find("/MediaItems/").expect("movie res");
+    let rest = &after[url_start..];
+    let end = rest.find("&lt;").or_else(|| rest.find('<')).unwrap_or(rest.len());
+    let path = rest[..end].split(".mkv").next().unwrap();
+    path.trim_start_matches("/MediaItems/")
+        .parse()
+        .expect("id")
+}
+
+fn feature_has_id(xml: &str, id: &str) -> bool {
+    xml.contains(&format!("id=&quot;{id}&quot;")) || xml.contains(&format!("id=\"{id}\""))
+}
+
+fn hdr_has(hdr: &str, needle: &str) -> bool {
+    hdr.to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
+}
+
+fn status_row_count(body: &str, label: &str) -> Option<u32> {
+    let marker = format!("<tr><td>{label}</td><td>");
+    let rest = body.split(&marker).nth(1)?;
+    rest.split("</td>").next()?.parse().ok()
+}
+
+fn parse_album_art_url(didl: &str) -> Option<(i64, i64)> {
+    let idx = didl.find("/AlbumArt/")?;
+    let rest = &didl[idx + "/AlbumArt/".len()..];
+    let art: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let art_id = art.parse().ok()?;
+    let after = rest.get(art.len()..)?;
+    let after = after.strip_prefix('-')?;
+    let det: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let detail_id = det.parse().ok()?;
+    Some((art_id, detail_id))
+}
+
 fn ensure_fixtures() {
     let lib = workspace().join("testdata/library");
     rusty_dlna::ensure_pattern_fixture(&lib);
+    rusty_dlna::ensure_show_fixture(&lib);
+    let music = lib.join("music");
+    let _ = std::fs::create_dir_all(&music);
+    let song = music.join("song.mp3");
+    if !song.exists() {
+        let _ = std::fs::write(&song, b"ID3fake");
+    }
+    let song_nfo = music.join("song.nfo");
+    if !song_nfo.exists() {
+        let _ = std::fs::write(
+            &song_nfo,
+            "<musicvideo><title>Fixture Track</title><genre>Jazz</genre><studio>Fixture Band</studio></musicvideo>\n",
+        );
+    }
+    let pictures = lib.join("pictures");
+    let _ = std::fs::create_dir_all(&pictures);
+    let shot = pictures.join("shot.jpg");
+    if !shot.exists() {
+        let _ = std::fs::write(
+            &shot,
+            [
+                0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01,
+                0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
+            ],
+        );
+    }
     let dvp7 = lib.join("video/dvp7.mkv");
     if !dvp7.exists() || dvp7.metadata().map(|m| m.len() < 200).unwrap_or(true) {
         if let Ok(st) = Command::new("ffmpeg")
@@ -245,24 +339,15 @@ fn one_run(http: u16, ssdp: u16) {
     assert_eq!(b2, expect[64..128]);
 
     // Phase 10 /AlbumArt/ + Phase 16 /status on the live test listener
-    if let Some(art_at) = items.find("/AlbumArt/") {
-        let rest = &items[art_at + "/AlbumArt/".len()..];
-        let art_id: i64 = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse()
-            .unwrap_or(0);
-        if art_id > 0 {
-            let (st, hdr, body) = raw_http(
-                http,
-                &format!("GET /AlbumArt/{art_id}-{id}.jpg HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"),
-            );
-            assert_eq!(st, 200, "album art GET {hdr}");
-            assert!(hdr.to_ascii_lowercase().contains("image/jpeg"));
-            assert!(body.len() >= 3 && body[0] == 0xff && body[1] == 0xd8);
-        }
-    }
+    let (art_id, art_detail) = parse_album_art_url(&items).expect("parse /AlbumArt/");
+    assert!(art_id > 0, "album art id");
+    let (st, hdr, body) = raw_http(
+        http,
+        &format!("GET /AlbumArt/{art_id}-{art_detail}.jpg HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200, "album art GET {hdr}");
+    assert!(hdr.to_ascii_lowercase().contains("image/jpeg"));
+    assert!(body.len() >= 3 && body[0] == 0xff && body[1] == 0xd8);
     let (st, _hdr, status_body) = raw_http(
         http,
         &format!("GET /status HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"),
@@ -270,14 +355,8 @@ fn one_run(http: u16, ssdp: u16) {
     assert_eq!(st, 200);
     let status_txt = String::from_utf8_lossy(&status_body);
     assert!(status_txt.contains("Video"), "{status_txt}");
-    assert!(
-        status_txt.contains("<td>1</td>")
-            || status_txt.contains("<td>2</td>")
-            || status_txt.contains("<td>3</td>")
-            || status_txt.contains("<td>4</td>")
-            || status_txt.chars().any(|c| c.is_ascii_digit() && c != '0'),
-        "status video count: {status_txt}"
-    );
+    let video_n = status_row_count(&status_txt, "Video").expect("Video row");
+    assert!(video_n >= 1, "status video count {video_n}: {status_txt}");
 
     // CrKey remap DIDL
     let (_, cr) = soap(
@@ -289,27 +368,32 @@ fn one_run(http: u16, ssdp: u16) {
     assert!(cr.contains("/Transcode/"), "CrKey DIDL missing remap {cr}");
     assert!(cr.contains("DLNA.ORG_CI=1"));
 
-    if let Some(tpos) = cr.find("/Transcode/") {
-        let rest = &cr[tpos + "/Transcode/".len()..];
-        let tid: i64 = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse()
-            .unwrap_or(0);
-        if tid > 0 {
-            let (st, hdr, _body) = raw_http(
-                http,
-                &format!("GET /Transcode/{tid}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nUser-Agent: CrKey/1.54\r\nConnection: close\r\n\r\n"),
-            );
-            if st == 200 {
-                assert!(
-                    hdr.contains("DLNA.ORG_CI=1") || hdr.contains("dlna.org_ci=1"),
-                    "remux must set CI=1: {hdr}"
-                );
-            }
-        }
-    }
+    let tpos = cr.find("/Transcode/").expect("CrKey DIDL missing remap");
+    let rest = &cr[tpos + "/Transcode/".len()..];
+    let tid: i64 = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .expect("transcode id");
+    assert!(tid > 0, "transcode id");
+    let (st, hdr, _body) = raw_http(
+        http,
+        &format!("GET /Transcode/{tid}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nUser-Agent: CrKey/1.54\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200, "remux GET {st} {hdr}");
+    assert!(
+        hdr.contains("DLNA.ORG_CI=1") || hdr.to_ascii_lowercase().contains("dlna.org_ci=1"),
+        "remux must set CI=1: {hdr}"
+    );
+    assert!(
+        hdr.to_ascii_lowercase().contains("video/mp4"),
+        "remux Content-Type: {hdr}"
+    );
+    assert!(
+        hdr.contains("DLNA.ORG_OP=00") || hdr.contains("DLNA.ORG_OP=01"),
+        "remux OP: {hdr}"
+    );
 
     // SSDP M-SEARCH
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -340,6 +424,35 @@ fn one_run(http: u16, ssdp: u16) {
     sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
     let rejected = sock.recv_from(&mut buf).is_err();
     assert!(rejected, "bad MAN must not reply");
+}
+
+#[test]
+fn request_body_cap_and_soap_host() {
+    let Some((http, ssdp)) = env_ports() else {
+        eprintln!("skip body-cap e2e (RUSTY_DLNA_HTTP_PORT unset)");
+        return;
+    };
+    let http = http.saturating_add(3);
+    let ssdp = ssdp.saturating_add(3);
+    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(http, ssdp));
+    let _srv = spawn_bin(http, ssdp);
+
+    let over = 256 * 1024 * 1024 + 1;
+    let (st, hdr, _) = raw_http(
+        http,
+        &format!(
+            "POST /ctl/ContentDir HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nContent-Length: {over}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert_eq!(st, 413, "oversized Content-Length must 413: {hdr}");
+
+    let (st, hdr, _) = raw_http(
+        http,
+        &format!(
+            "POST /ctl/ContentDir HTTP/1.1\r\nHost: attacker.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert_eq!(st, 400, "SOAP hostname Host must 400: {hdr}");
 }
 
 #[test]
@@ -392,4 +505,511 @@ fn ssdp_byebye_on_drop() {
         "byebye on drop: got={got} last={last}"
     );
     assert!(!saw_location, "byebye must omit LOCATION: {last}");
+}
+
+#[test]
+fn series_genre_and_remux_e2e() {
+    let Some((http, ssdp)) = env_ports() else {
+        eprintln!("skip series/remux e2e (RUSTY_DLNA_HTTP_PORT unset)");
+        return;
+    };
+    let http = http.saturating_add(2);
+    let ssdp = ssdp.saturating_add(2);
+    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(http, ssdp));
+    let _srv = spawn_bin(http, ssdp);
+
+    let inner_v = r#"<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse>"#;
+    let (st, video) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+        inner_v,
+    );
+    assert_eq!(st, 200);
+    assert!(video.contains("Series"), "{video}");
+    assert!(video.contains("Genre"), "{video}");
+
+    let mut series = String::new();
+    for _ in 0..40 {
+        let inner = r#"<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2$E</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse>"#;
+        let (_, body) = soap(
+            http,
+            "Kodi/21.0",
+            "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+            inner,
+        );
+        if body.contains("The Show") {
+            series = body;
+            break;
+        }
+        series = body;
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(series.contains("The Show"), "Series Browse: {series}");
+
+    let inner_g = r#"<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2$9</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse>"#;
+    let (st, genres) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+        inner_g,
+    );
+    assert_eq!(st, 200);
+    assert!(
+        genres.contains("Drama") || genres.contains("Crime"),
+        "Genre Browse: {genres}"
+    );
+
+    let inner8 = r#"<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse>"#;
+    let (_, cr) = soap(
+        http,
+        "CrKey/1.54.384650 DLNADOC/1.50",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+        inner8,
+    );
+    assert!(cr.contains("/Transcode/"), "CrKey DIDL {cr}");
+    let tpos = cr.find("/Transcode/").expect("CrKey DIDL missing remap");
+    let rest = &cr[tpos + "/Transcode/".len()..];
+    let tid: i64 = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .expect("transcode id");
+    assert!(tid > 0, "transcode id");
+    let (st, hdr, _body) = raw_http(
+        http,
+        &format!("GET /Transcode/{tid}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nUser-Agent: CrKey/1.54\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200, "transcode status {st} {hdr}");
+    assert!(
+        hdr.contains("DLNA.ORG_CI=1") || hdr.to_ascii_lowercase().contains("dlna.org_ci=1"),
+        "{hdr}"
+    );
+    if hdr.contains("DLNA.ORG_OP=01") {
+        assert!(hdr.to_ascii_lowercase().contains("accept-ranges"));
+        let (st2, hdr2, body2) = raw_http(
+            http,
+            &format!("GET /Transcode/{tid}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nUser-Agent: CrKey/1.54\r\nRange: bytes=0-15\r\nConnection: close\r\n\r\n"),
+        );
+        assert_eq!(st2, 206, "{hdr2}");
+        assert_eq!(body2.len(), 16);
+    }
+}
+
+#[test]
+fn replica_dialect_e2e() {
+    let Some((http, ssdp)) = env_ports() else {
+        eprintln!("skip dialect e2e (RUSTY_DLNA_HTTP_PORT unset)");
+        return;
+    };
+    // +4: beside twice (base), byebye (+1), series/remux (+2), body-cap (+3).
+    let http = http.saturating_add(4);
+    let ssdp = ssdp.saturating_add(4);
+    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(http, ssdp));
+    let _srv = spawn_bin(http, ssdp);
+
+    // 1. Kodi rootDesc: MediaServer + rustyDLNA Server token
+    let (st, hdr, body) = raw_http(
+        http,
+        &format!("GET /rootDesc.xml HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nUser-Agent: Kodi/21.0\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200, "kodi rootDesc {hdr}");
+    let kodi_desc = String::from_utf8_lossy(&body);
+    assert!(kodi_desc.contains("MediaServer:1"), "{kodi_desc}");
+    assert!(
+        hdr_has(&hdr, "rustyDLNA/") || hdr.contains("rustyDLNA"),
+        "Server token: {hdr}"
+    );
+
+    // 2. Xbox rootDesc: modelNumber 1 and friendlyName contains `: 1`
+    let (st, hdr, body) = raw_http(
+        http,
+        &format!("GET /rootDesc.xml HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nUser-Agent: Xbox/360\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200, "xbox rootDesc {hdr}");
+    let xbox_desc = String::from_utf8_lossy(&body);
+    assert!(
+        xbox_desc.contains("<modelNumber>1</modelNumber>"),
+        "{xbox_desc}"
+    );
+    let friendly = xbox_desc
+        .split("<friendlyName>")
+        .nth(1)
+        .and_then(|s| s.split("</friendlyName>").next())
+        .unwrap_or("");
+    assert!(
+        friendly.contains(": 1"),
+        "friendlyName must contain : 1 inside the tag: {xbox_desc}"
+    );
+
+    // 3. Samsung TV rootDesc: ProductCap / X_ProductCap (URL slots replaced)
+    let (st, hdr, body) = raw_http(
+        http,
+        &format!("GET /rootDesc.xml HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nUser-Agent: DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200, "samsung rootDesc {hdr}");
+    let tv_desc = String::from_utf8_lossy(&body);
+    const DCM10_CAP: &str = "smi,DCM10,getMediaInfo.sec,getCaptionInfo.sec";
+    for tag in ["ProductCap", "X_ProductCap"] {
+        let open = format!("<{tag}>");
+        let open_sec = format!("<sec:{tag}>");
+        let close = format!("</{tag}>");
+        let close_sec = format!("</sec:{tag}>");
+        let inner = tv_desc
+            .split(&open_sec)
+            .nth(1)
+            .or_else(|| tv_desc.split(&open).nth(1))
+            .and_then(|s| {
+                s.split(&close_sec)
+                    .next()
+                    .or_else(|| s.split(&close).next())
+            })
+            .unwrap_or("");
+        assert!(
+            inner.contains(DCM10_CAP),
+            "{tag} must contain {DCM10_CAP}: {tv_desc}"
+        );
+    }
+
+    // 4. BrowseMetadata ObjectID=0: upnp:searchClass audio/image/video
+    let (st, meta) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+        &browse_inner("0", "BrowseMetadata"),
+    );
+    assert_eq!(st, 200, "BrowseMetadata 0: {meta}");
+    assert!(meta.contains("searchClass"), "{meta}");
+    assert!(meta.contains("audioItem"), "{meta}");
+    assert!(meta.contains("imageItem"), "{meta}");
+    assert!(meta.contains("videoItem"), "{meta}");
+
+    // 5. Browse 2: av:mediaClass V + video tree children
+    let (st, video) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+        &browse_inner("2", "BrowseDirectChildren"),
+    );
+    assert_eq!(st, 200, "Browse 2: {video}");
+    assert!(video.contains("av:mediaClass"), "mediaClass tag: {video}");
+    assert!(
+        video.contains(">V<")
+            || video.contains(">V&lt;")
+            || video.contains("&gt;V&lt;")
+            || video.contains("&gt;V<"),
+        "av:mediaClass must be V: {video}"
+    );
+    for title in [
+        "Actor",
+        "All Video",
+        "Folders",
+        "Genre",
+        "Recently Added",
+        "Series",
+    ] {
+        assert!(video.contains(title), "Browse 2 missing {title}: {video}");
+    }
+
+    // 6. Browse 8 Xbox/ UA == Browse 2$8 video-all items (PFS magic id)
+    let items = wait_media_items(http, "Kodi/21.0", "2$8");
+    assert!(items.contains("/MediaItems/"), "Browse 2$8: {items}");
+    let id = movie_media_id(&items);
+    let (st, xbox8) = soap(
+        http,
+        "Xbox/360",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+        &browse_inner("8", "BrowseDirectChildren"),
+    );
+    assert_eq!(st, 200, "Browse 8 Xbox: {xbox8}");
+    assert!(
+        xbox8.contains(&format!("/MediaItems/{id}")),
+        "PFS Browse 8 must list same video-all id {id} as 2$8: {xbox8}"
+    );
+    assert!(
+        xbox8.contains("Fixture Movie"),
+        "Xbox Browse 8 missing Fixture Movie: {xbox8}"
+    );
+
+    // 7. X_GetFeatureList SEC_HHP_[TV] — ids A/V/I
+    let (st, tv_fl) = soap(
+        http,
+        "DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#X_GetFeatureList",
+        r#"<u:X_GetFeatureList xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"></u:X_GetFeatureList>"#,
+    );
+    assert_eq!(st, 200, "TV FeatureList: {tv_fl}");
+    assert!(feature_has_id(&tv_fl, "A"), "{tv_fl}");
+    assert!(feature_has_id(&tv_fl, "V"), "{tv_fl}");
+    assert!(feature_has_id(&tv_fl, "I"), "{tv_fl}");
+
+    // 8. X_GetFeatureList SEC_HHP_[PC] — ids 1/2/3, not A/V/I
+    let (st, pc_fl) = soap(
+        http,
+        "DLNADOC/1.50 SEC_HHP_[PC]LPC001/1.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#X_GetFeatureList",
+        r#"<u:X_GetFeatureList xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"></u:X_GetFeatureList>"#,
+    );
+    assert_eq!(st, 200, "PC FeatureList: {pc_fl}");
+    assert!(feature_has_id(&pc_fl, "1"), "{pc_fl}");
+    assert!(feature_has_id(&pc_fl, "2"), "{pc_fl}");
+    assert!(feature_has_id(&pc_fl, "3"), "{pc_fl}");
+    assert!(!feature_has_id(&pc_fl, "A"), "PC must not use A: {pc_fl}");
+    assert!(!feature_has_id(&pc_fl, "V"), "PC must not use V: {pc_fl}");
+    assert!(!feature_has_id(&pc_fl, "I"), "PC must not use I: {pc_fl}");
+
+    // 9. QueryStateVariable ConnectionStatus / missing / unknown
+    let (st, qsv) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:control-1-0#QueryStateVariable",
+        r#"<u:QueryStateVariable xmlns:u="urn:schemas-upnp-org:control-1-0"><varName>ConnectionStatus</varName></u:QueryStateVariable>"#,
+    );
+    assert_eq!(st, 200, "{qsv}");
+    assert!(qsv.contains("<return>Connected</return>"), "{qsv}");
+    let (st, qsv402) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:control-1-0#QueryStateVariable",
+        r#"<u:QueryStateVariable xmlns:u="urn:schemas-upnp-org:control-1-0"></u:QueryStateVariable>"#,
+    );
+    assert_eq!(st, 500, "missing varName: {qsv402}");
+    assert!(qsv402.contains("<errorCode>402</errorCode>"), "{qsv402}");
+    let (st, qsv404) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:control-1-0#QueryStateVariable",
+        r#"<u:QueryStateVariable xmlns:u="urn:schemas-upnp-org:control-1-0"><varName>NoSuchVar</varName></u:QueryStateVariable>"#,
+    );
+    assert_eq!(st, 500, "unknown var: {qsv404}");
+    assert!(qsv404.contains("<errorCode>404</errorCode>"), "{qsv404}");
+
+    // 10. GetProtocolInfo Source includes JPEG_TN and video/x-matroska
+    let (st, proto) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:service:ConnectionManager:1#GetProtocolInfo",
+        r#"<u:GetProtocolInfo xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1"></u:GetProtocolInfo>"#,
+    );
+    assert_eq!(st, 200, "{proto}");
+    assert!(proto.contains("JPEG_TN"), "{proto}");
+    assert!(proto.contains("video/x-matroska"), "{proto}");
+
+    // 11. X_SetBookmark no-such-object → HTTP 500 + 701
+    let (st, bm) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#X_SetBookmark",
+        r#"<u:X_SetBookmark xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>no-such-object</ObjectID><PosSecond>1</PosSecond></u:X_SetBookmark>"#,
+    );
+    assert_eq!(st, 500, "SetBookmark missing object: {bm}");
+    assert!(bm.contains("<errorCode>701</errorCode>"), "{bm}");
+
+    // 11b. Samsung Q CONVERT_MS: SOAP ms in, DIDL lastPlaybackPosition + BM= ms out.
+    // `{id}` is DETAILS.ID from the movie /MediaItems/ URL; BrowseMetadata accepts it.
+    let q = "SEC_HHP_[TV] Samsung Q";
+    let (st, setq) = soap(
+        http,
+        q,
+        "urn:schemas-upnp-org:service:ContentDirectory:1#X_SetBookmark",
+        &format!(
+            r#"<u:X_SetBookmark xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>{id}</ObjectID><PosSecond>120000</PosSecond></u:X_SetBookmark>"#
+        ),
+    );
+    assert_eq!(st, 200, "Samsung Q SetBookmark: {setq}");
+    assert!(setq.contains("X_SetBookmarkResponse"), "{setq}");
+    let (st, qmeta) = soap(
+        http,
+        q,
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+        &browse_inner(&id.to_string(), "BrowseMetadata"),
+    );
+    assert_eq!(st, 200, "Samsung Q BrowseMetadata: {qmeta}");
+    assert!(
+        qmeta.contains("&lt;upnp:lastPlaybackPosition&gt;120000&lt;/upnp:lastPlaybackPosition&gt;")
+            || qmeta.contains("<upnp:lastPlaybackPosition>120000</upnp:lastPlaybackPosition>"),
+        "lastPlaybackPosition 120000: {qmeta}"
+    );
+    assert!(
+        qmeta.contains("BM=120000"),
+        "sec:dcmInfo BM= must be converted ms: {qmeta}"
+    );
+    let (st, kodi_bm) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+        &browse_inner(&id.to_string(), "BrowseMetadata"),
+    );
+    assert_eq!(st, 200, "{kodi_bm}");
+    assert!(
+        kodi_bm.contains("&lt;upnp:lastPlaybackPosition&gt;120&lt;/upnp:lastPlaybackPosition&gt;")
+            || kodi_bm.contains("<upnp:lastPlaybackPosition>120</upnp:lastPlaybackPosition>"),
+        "Kodi lastPlaybackPosition 120: {kodi_bm}"
+    );
+    assert!(
+        !kodi_bm.contains("BM=120000"),
+        "Kodi must not see CONVERT_MS milliseconds: {kodi_bm}"
+    );
+
+    // 12. Search StartingIndex=-1 → 402
+    let (st, search402) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Search",
+        r#"<u:Search xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ContainerID>0</ContainerID><SearchCriteria></SearchCriteria><Filter>*</Filter><StartingIndex>-1</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Search>"#,
+    );
+    assert_eq!(st, 500, "Search -1: {search402}");
+    assert!(
+        search402.contains("<errorCode>402</errorCode>"),
+        "{search402}"
+    );
+
+    // 13. Samsung GET remaps Content-Type to video/x-mkv
+    let (st, hdr, _) = raw_http(
+        http,
+        &format!("GET /MediaItems/{id}.mkv HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nUser-Agent: DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200, "samsung GET {hdr}");
+    assert!(hdr_has(&hdr, "video/x-mkv"), "samsung mime: {hdr}");
+
+    // 14. getcontentFeatures.dlna.org: 0 → 400
+    let (st, hdr, _) = raw_http(
+        http,
+        &format!("GET /rootDesc.xml HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\ngetcontentFeatures.dlna.org: 0\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 400, "getcontentFeatures 0: {hdr}");
+
+    // 15. transferMode Interactive on video (Kodi) → 406
+    let (st, hdr, _) = raw_http(
+        http,
+        &format!("GET /MediaItems/{id}.mkv HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nUser-Agent: Kodi/21.0\r\ntransferMode.dlna.org: Interactive\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 406, "Interactive video: {hdr}");
+
+    // 16. Accept-Language: en → Content-Language: en
+    let (st, hdr, _) = raw_http(
+        http,
+        &format!("GET /rootDesc.xml HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nAccept-Language: en\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200, "{hdr}");
+    assert!(hdr_has(&hdr, "content-language: en"), "{hdr}");
+
+    // 17. Icons: 200 + matching magic
+    let (st, _hdr, png) = raw_http(
+        http,
+        &format!("GET /icons/sm.png HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200);
+    assert!(
+        png.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+        "png magic: {:02x?}",
+        &png[..png.len().min(8)]
+    );
+    let (st, _hdr, jpg) = raw_http(
+        http,
+        &format!("GET /icons/sm.jpg HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200);
+    assert!(
+        jpg.len() >= 3 && jpg[0] == 0xff && jpg[1] == 0xd8,
+        "jpeg magic: {:02x?}",
+        &jpg[..jpg.len().min(8)]
+    );
+
+    // 18. Thumbnails for movie with poster — 200 jpeg
+    let (st, hdr, thumb) = raw_http(
+        http,
+        &format!("GET /Thumbnails/{id}.jpg HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200, "thumbnail must be 200 for movie poster: {hdr}");
+    assert!(hdr_has(&hdr, "image/jpeg"), "thumbnail content-type: {hdr}");
+    assert!(
+        thumb.len() >= 2 && thumb[0] == 0xff && thumb[1] == 0xd8,
+        "thumbnail jpeg magic: {:02x?}",
+        &thumb[..thumb.len().min(8)]
+    );
+    let (st, hdr, resized) = raw_http(
+        http,
+        &format!("GET /Resized/{id}.jpg?width=160,height=160 HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200, "resized GET: {hdr}");
+    assert!(hdr_has(&hdr, "content-type: image/jpeg"), "{hdr}");
+    assert!(hdr_has(&hdr, "transferMode.dlna.org: Interactive"), "{hdr}");
+    assert!(
+        hdr.contains("DLNA.ORG_PN=JPEG_TN") && hdr.contains("DLNA.ORG_CI=1"),
+        "resized contentFeatures: {hdr}"
+    );
+    assert!(
+        resized.len() >= 2 && resized[0] == 0xff && resized[1] == 0xd8,
+        "resized jpeg magic"
+    );
+
+    // 19. Browse 1 / 1$4 / 3 — music and image trees exist
+    let (st, music) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+        &browse_inner("1", "BrowseDirectChildren"),
+    );
+    assert_eq!(st, 200, "Browse 1: {music}");
+    assert!(music.contains("All Music"), "Browse 1 missing All Music: {music}");
+    let (st, tracks) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+        &browse_inner("1$4", "BrowseDirectChildren"),
+    );
+    assert_eq!(st, 200, "Browse 1$4: {tracks}");
+    assert!(
+        tracks.contains("Fixture Track"),
+        "Browse 1$4 missing Fixture Track: {tracks}"
+    );
+    let (st, pics) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+        &browse_inner("3", "BrowseDirectChildren"),
+    );
+    assert_eq!(st, 200, "Browse 3: {pics}");
+    assert!(
+        pics.contains("All Pictures"),
+        "Browse 3 missing All Pictures: {pics}"
+    );
+
+    // 20. Inbound NOTIFY MediaRenderer + Allegro-Software-RomPlug — server stays up
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let notify = format!(
+        "NOTIFY * HTTP/1.1\r\n\
+         HOST:239.255.255.250:1900\r\n\
+         NT:urn:schemas-upnp-org:device:MediaRenderer:1\r\n\
+         NTS:ssdp:alive\r\n\
+         LOCATION:http://127.0.0.1:{http}/rootDesc.xml\r\n\
+         SERVER: Allegro-Software-RomPlug/1.0\r\n\
+         \r\n"
+    );
+    sock.send_to(notify.as_bytes(), ("127.0.0.1", ssdp))
+        .expect("send notify");
+    let mut last_st = 0;
+    let mut last_hdr = String::new();
+    let mut ok = false;
+    for _ in 0..10 {
+        let (st, hdr, _) = raw_http(
+            http,
+            &format!("GET /status HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"),
+        );
+        last_st = st;
+        last_hdr = hdr;
+        if st == 200 {
+            ok = true;
+        } else {
+            ok = false;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        ok && last_st == 200,
+        "status after renderer NOTIFY must stay 200 for ~500ms: {last_st} {last_hdr}"
+    );
 }

@@ -17,6 +17,10 @@ pub struct NfoMeta {
     pub disc: Option<i64>,
     pub track: Option<i64>,
     pub date: Option<String>,
+    /// `showtitle` (or inherited `tvshow` title). Stored as `DETAILS.ALBUM`.
+    pub showtitle: Option<String>,
+    /// Raw episode/movie `<title>` before the `Show - ` prefix.
+    pub episode_title: Option<String>,
 }
 
 impl NfoMeta {
@@ -29,7 +33,32 @@ impl NfoMeta {
             && self.disc.is_none()
             && self.track.is_none()
             && self.date.is_none()
+            && self.showtitle.is_none()
+            && self.episode_title.is_none()
     }
+}
+
+/// Split MiniDLNA-style joined genres (`Drama / Crime`).
+pub fn split_genres(genre: &str) -> Vec<String> {
+    genre
+        .split(" / ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Episode label under Series: strip `{show} - ` when present.
+pub fn episode_display_title(title: &str, showtitle: Option<&str>) -> String {
+    if let Some(show) = showtitle {
+        let prefix = format!("{show} - ");
+        if let Some(rest) = title.strip_prefix(&prefix) {
+            if !rest.is_empty() {
+                return rest.to_string();
+            }
+        }
+    }
+    title.to_string()
 }
 
 pub fn nfo_too_large(len: u64) -> bool {
@@ -97,8 +126,10 @@ impl NfoParts {
             .director
             .or(self.credits)
             .or_else(|| self.studio.clone());
-        let artist = self.studio.or(self.showtitle);
+        let artist = self.studio.clone().or(self.showtitle.clone());
         NfoMeta {
+            episode_title: self.title.clone(),
+            showtitle: self.showtitle,
             title,
             comment: self.plot,
             genre,

@@ -4,13 +4,17 @@ mod filter;
 mod search;
 mod sort;
 
-use rusty_dlna_protocol::object_id::{BROWSEDIR_ID, IMAGE_ID, MUSIC_ID, ROOT_ID, VIDEO_ID};
+use rusty_dlna_protocol::object_id::{
+    BROWSEDIR_ID, IMAGE_ALL_ID, IMAGE_CAMERA_ID, IMAGE_DATE_ID, IMAGE_DIR_ID, IMAGE_ID,
+    MUSIC_ALBUM_ID, MUSIC_ALL_ID, MUSIC_ARTIST_ID, MUSIC_DIR_ID, MUSIC_GENRE_ID, MUSIC_ID,
+    MUSIC_PLIST_ID, ROOT_ID, VIDEO_ALL_ID, VIDEO_DIR_ID, VIDEO_ID,
+};
 use rusty_dlna_protocol::soap::{
     soap_action_method, CONNECTIONMANAGER_TYPE, CONTENTDIRECTORY_TYPE, MS_REGISTRAR_TYPE,
     SEARCH_CAPS, SORT_CAPS,
 };
 use rusty_dlna_protocol::w3c_normalize_date;
-use rusty_dlna_protocol::{ClientFlags, ClientProfile};
+use rusty_dlna_protocol::{ClientFlags, ClientKind, ClientProfile};
 
 pub use filter::{didl_xmlns, parse_filter, FilterBits};
 pub use search::{parse_search_criteria, row_matches, SearchClause, SearchRow};
@@ -241,6 +245,12 @@ pub struct DidlObject {
     pub playback_count: Option<i64>,
     /// Samsung `sec:dcmInfo` (`CREATIONDATE=0,FOLDER={title},BM={sec}`).
     pub dcm_info: Option<String>,
+    /// Virtual-view alias (`REF_ID`).
+    pub ref_id: Option<String>,
+    /// BrowseMetadata of `0`: `upnp:searchClass includeDerived="1"`.
+    pub search_classes: Vec<String>,
+    /// Sony `av:mediaClass` — `M` / `V` / `P`.
+    pub av_media_class: Option<char>,
 }
 
 pub fn emit_didl_object(o: &DidlObject, bits: &FilterBits) -> String {
@@ -251,6 +261,9 @@ pub fn emit_didl_object(o: &DidlObject, bits: &FilterBits) -> String {
             xml_escape(&o.parent_id),
             if o.restricted { "1" } else { "0" }
         );
+        if let Some(r) = o.ref_id.as_deref().filter(|v| !v.is_empty()) {
+            s.push_str(&format!(" refID=\"{}\"", xml_escape(r)));
+        }
         if let Some(sc) = o.searchable {
             s.push_str(&format!(" searchable=\"{}\"", if sc { "1" } else { "0" }));
         }
@@ -272,16 +285,32 @@ pub fn emit_didl_object(o: &DidlObject, bits: &FilterBits) -> String {
         if o.class.contains("storageFolder") {
             s.push_str("<upnp:storageUsed>-1</upnp:storageUsed>");
         }
+        for sc in &o.search_classes {
+            s.push_str("<upnp:searchClass includeDerived=\"1\">");
+            s.push_str(&xml_escape(sc));
+            s.push_str("</upnp:searchClass>");
+        }
+        if let Some(c) = o.av_media_class {
+            s.push_str(
+                "<av:mediaClass xmlns:av=\"urn:schemas-sony-com:av\">",
+            );
+            s.push(c);
+            s.push_str("</av:mediaClass>");
+        }
         emit_album_art_uri(&mut s, o);
         s.push_str("</container>");
         s
     } else {
         let mut s = format!(
-            "<item id=\"{}\" parentID=\"{}\" restricted=\"{}\">",
+            "<item id=\"{}\" parentID=\"{}\" restricted=\"{}\"",
             xml_escape(&o.id),
             xml_escape(&o.parent_id),
             if o.restricted { "1" } else { "0" }
         );
+        if let Some(r) = o.ref_id.as_deref().filter(|v| !v.is_empty()) {
+            s.push_str(&format!(" refID=\"{}\"", xml_escape(r)));
+        }
+        s.push('>');
         s.push_str(&format!(
             "<dc:title>{}</dc:title><upnp:class>object.{}</upnp:class>",
             xml_escape(&o.title),
@@ -440,6 +469,7 @@ pub struct SoapCall {
     pub current_tag_value: Option<String>,
     pub new_tag_value: Option<String>,
     pub sort_criteria: Option<String>,
+    pub var_name: Option<String>,
 }
 
 pub fn parse_soap_call(action: &str, body: &str) -> SoapCall {
@@ -463,6 +493,7 @@ pub fn parse_soap_call(action: &str, body: &str) -> SoapCall {
         current_tag_value: xml_tag_text(body, "CurrentTagValue"),
         new_tag_value: xml_tag_text(body, "NewTagValue"),
         sort_criteria: xml_tag_text(body, "SortCriteria"),
+        var_name: xml_tag_text(body, "varName"),
     }
 }
 
@@ -510,6 +541,103 @@ impl SoapOutcome {
             persist: false,
         }
     }
+    pub fn fault404() -> Self {
+        Self::Fault {
+            http: 500,
+            code: 404,
+            desc: "Invalid Var",
+            persist: false,
+        }
+    }
+}
+
+/// Title hacks from `callback()` in `upnpsoap.c`.
+pub fn apply_title_hack(title: &str, ext: &str, client: &ClientProfile, has_captions: bool) -> String {
+    match client.kind {
+        ClientKind::Lg | ClientKind::LgNetCast if has_captions => format!("{title}."),
+        ClientKind::AsusOPlay if has_captions => {
+            title.chars().take(23).collect()
+        }
+        ClientKind::HyundaiTv => format!("{title}.{ext}"),
+        _ => title.to_string(),
+    }
+}
+
+/// Toshiba / Sony BDP / Bravia extra `<res>` rows that still point at the original file.
+pub fn extra_ci1_protocol_infos(
+    kind: ClientKind,
+    mime: &str,
+    pn: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    match kind {
+        ClientKind::ToshibaTv => {
+            if let Some(pn) = pn {
+                if pn.starts_with("MPEG_TS_HD_NA")
+                    || pn.starts_with("MPEG_TS_SD_NA")
+                    || pn.starts_with("AVC_TS_MP_HD_AC3")
+                    || pn.starts_with("AVC_TS_HP_HD_AC3")
+                {
+                    out.push((
+                        mime.to_string(),
+                        "DLNA.ORG_PN=MPEG_PS_NTSC;DLNA.ORG_OP=01;DLNA.ORG_CI=1".into(),
+                    ));
+                }
+            }
+        }
+        ClientKind::SonyBdp => {
+            if let Some(pn) = pn {
+                if pn.starts_with("AVC_TS") || pn.starts_with("MPEG_TS") {
+                    if !pn.starts_with("MPEG_TS_SD_NA") {
+                        out.push((
+                            mime.to_string(),
+                            "DLNA.ORG_PN=MPEG_TS_SD_NA;DLNA.ORG_OP=01;DLNA.ORG_CI=1".into(),
+                        ));
+                    }
+                    if !pn.starts_with("MPEG_TS_SD_EU") {
+                        out.push((
+                            mime.to_string(),
+                            "DLNA.ORG_PN=MPEG_TS_SD_EU;DLNA.ORG_OP=01;DLNA.ORG_CI=1".into(),
+                        ));
+                    }
+                    return out;
+                }
+            }
+            let rest = mime.strip_prefix("video/").unwrap_or(mime);
+            if pn.is_some_and(|p| p.starts_with("AVC_MP4") || p.starts_with("MPEG4_P2_MP4"))
+                || matches!(rest, "x-matroska" | "x-mkv" | "x-msvideo" | "mpeg")
+            {
+                if !pn.is_some_and(|p| p.starts_with("MPEG_PS_NTSC")) {
+                    out.push((
+                        "video/avi".into(),
+                        "DLNA.ORG_PN=MPEG_PS_NTSC;DLNA.ORG_OP=01;DLNA.ORG_CI=1".into(),
+                    ));
+                }
+                if !pn.is_some_and(|p| p.starts_with("MPEG_PS_PAL")) {
+                    out.push((
+                        "video/avi".into(),
+                        "DLNA.ORG_PN=MPEG_PS_PAL;DLNA.ORG_OP=01;DLNA.ORG_CI=1".into(),
+                    ));
+                }
+            }
+        }
+        ClientKind::SonyBravia => {
+            if let Some(pn) = pn {
+                if pn.starts_with("AVC_TS_MP_SD_AC3")
+                    || pn.starts_with("AVC_TS_MP_HD_AC3")
+                    || pn.starts_with("AVC_TS_HP_HD_AC3")
+                {
+                    let suffix = if pn.len() > 16 { &pn[16..] } else { "" };
+                    out.push((
+                        mime.to_string(),
+                        format!("DLNA.ORG_PN=AVC_TS_HD_50_AC3{suffix}"),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// dialect `X_SetBookmark`: CONVERT_MS divides by 1000; values < 30 store as 0.
@@ -604,29 +732,34 @@ pub fn empty_cd_response(method: &str) -> String {
     ok_tag(method, CONTENTDIRECTORY_TYPE, "")
 }
 
-pub fn feature_list_ids(client: &ClientProfile, root_container: Option<&str>) -> [&'static str; 3] {
-    if let Some(rc) = root_container {
+pub fn feature_list_ids(client: &ClientProfile, root_container: Option<&str>) -> [String; 3] {
+    let rc = root_container.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(rc) = rc {
         if rc != BROWSEDIR_ID && rc != "64" {
-            // single container override — caller maps; default below
+            let one = match rc {
+                "V" | "v" | "2" => VIDEO_ID,
+                "A" | "1" => MUSIC_ID,
+                "I" | "3" => IMAGE_ID,
+                other => other,
+            };
+            return [one.into(), one.into(), one.into()];
         }
     }
     if client.flags.contains(ClientFlags::SAMSUNG_DCM10)
-        && root_container.map(|s| s == BROWSEDIR_ID || s == "64" || s.is_empty()) != Some(false)
-        && root_container != Some("2")
-        && root_container != Some("1")
+        && rc.map(|s| s == BROWSEDIR_ID || s == "64").unwrap_or(true)
     {
-        if root_container == Some(BROWSEDIR_ID) || root_container == Some("64") {
-            return ["1$14", "2$15", "3$16"];
+        if rc == Some(BROWSEDIR_ID) || rc == Some("64") {
+            return ["1$14".into(), "2$15".into(), "3$16".into()];
         }
-        return ["A", "V", "I"];
+        return ["A".into(), "V".into(), "I".into()];
     }
-    if root_container == Some(BROWSEDIR_ID) || root_container == Some("64") {
-        return ["1$14", "2$15", "3$16"];
+    if rc == Some(BROWSEDIR_ID) || rc == Some("64") {
+        return ["1$14".into(), "2$15".into(), "3$16".into()];
     }
-    [MUSIC_ID, VIDEO_ID, IMAGE_ID]
+    [MUSIC_ID.into(), VIDEO_ID.into(), IMAGE_ID.into()]
 }
 
-pub fn feature_list_xml(ids: [&str; 3]) -> String {
+pub fn feature_list_xml(ids: [impl AsRef<str>; 3]) -> String {
     format!(
         "<Features xmlns=\"urn:schemas-upnp-org:av:avs\" \
          xmlns:sec=\"http://www.sec.co.kr/dlna\">\
@@ -635,18 +768,108 @@ pub fn feature_list_xml(ids: [&str; 3]) -> String {
          <container id=\"{}\" type=\"object.item.videoItem\"/>\
          <container id=\"{}\" type=\"object.item.imageItem\"/>\
          </Feature></Features>",
-        ids[0], ids[1], ids[2]
+        ids[0].as_ref(),
+        ids[1].as_ref(),
+        ids[2].as_ref()
     )
 }
 
+/// MiniDLNA `RESOURCE_PROTOCOL_INFO_VALUES` (`upnpglobalvars.h`).
 pub const PROTOCOL_INFO_SOURCE: &str = concat!(
+    "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_TN,",
+    "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_SM,",
+    "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_MED,",
+    "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_LRG,",
+    "http-get:*:video/mpeg:DLNA.ORG_PN=AVC_TS_HD_50_AC3_ISO,",
+    "http-get:*:video/mpeg:DLNA.ORG_PN=AVC_TS_HD_60_AC3_ISO,",
+    "http-get:*:video/mpeg:DLNA.ORG_PN=AVC_TS_HP_HD_AC3_ISO,",
+    "http-get:*:video/mpeg:DLNA.ORG_PN=AVC_TS_MP_HD_AAC_MULT5_ISO,",
+    "http-get:*:video/mpeg:DLNA.ORG_PN=AVC_TS_MP_HD_AC3_ISO,",
+    "http-get:*:video/mpeg:DLNA.ORG_PN=AVC_TS_MP_HD_MPEG1_L3_ISO,",
+    "http-get:*:video/mpeg:DLNA.ORG_PN=AVC_TS_MP_SD_AAC_MULT5_ISO,",
+    "http-get:*:video/mpeg:DLNA.ORG_PN=AVC_TS_MP_SD_AC3_ISO,",
+    "http-get:*:video/mpeg:DLNA.ORG_PN=AVC_TS_MP_SD_MPEG1_L3_ISO,",
     "http-get:*:video/mpeg:DLNA.ORG_PN=MPEG_PS_NTSC,",
     "http-get:*:video/mpeg:DLNA.ORG_PN=MPEG_PS_PAL,",
+    "http-get:*:video/mpeg:DLNA.ORG_PN=MPEG_TS_HD_NA_ISO,",
+    "http-get:*:video/mpeg:DLNA.ORG_PN=MPEG_TS_SD_NA_ISO,",
+    "http-get:*:video/mpeg:DLNA.ORG_PN=MPEG_TS_SD_EU_ISO,",
+    "http-get:*:video/mpeg:DLNA.ORG_PN=MPEG1,",
+    "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_MP_SD_AAC_MULT5,",
+    "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_MP_SD_AC3,",
+    "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_BL_CIF15_AAC_520,",
+    "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_BL_CIF30_AAC_940,",
+    "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_BL_L31_HD_AAC,",
+    "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_BL_L32_HD_AAC,",
+    "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_BL_L3L_SD_AAC,",
+    "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_HP_HD_AAC,",
+    "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_MP_HD_1080i_AAC,",
+    "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_MP_HD_720p_AAC,",
+    "http-get:*:video/mp4:DLNA.ORG_PN=MPEG4_P2_MP4_ASP_AAC,",
+    "http-get:*:video/mp4:DLNA.ORG_PN=MPEG4_P2_MP4_SP_VGA_AAC,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_HD_50_AC3,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_HD_50_AC3_T,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_HD_60_AC3,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_HD_60_AC3_T,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_HP_HD_AC3_T,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_MP_HD_AAC_MULT5,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_MP_HD_AAC_MULT5_T,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_MP_HD_AC3,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_MP_HD_AC3_T,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_MP_HD_MPEG1_L3,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_MP_HD_MPEG1_L3_T,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_MP_SD_AAC_MULT5,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_MP_SD_AAC_MULT5_T,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_MP_SD_AC3,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_MP_SD_AC3_T,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_MP_SD_MPEG1_L3,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=AVC_TS_MP_SD_MPEG1_L3_T,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=MPEG_TS_HD_NA,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=MPEG_TS_HD_NA_T,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=MPEG_TS_SD_EU,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=MPEG_TS_SD_EU_T,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=MPEG_TS_SD_NA,",
+    "http-get:*:video/vnd.dlna.mpeg-tts:DLNA.ORG_PN=MPEG_TS_SD_NA_T,",
+    "http-get:*:video/x-ms-wmv:DLNA.ORG_PN=WMVSPLL_BASE,",
+    "http-get:*:video/x-ms-wmv:DLNA.ORG_PN=WMVSPML_BASE,",
+    "http-get:*:video/x-ms-wmv:DLNA.ORG_PN=WMVSPML_MP3,",
+    "http-get:*:video/x-ms-wmv:DLNA.ORG_PN=WMVMED_BASE,",
+    "http-get:*:video/x-ms-wmv:DLNA.ORG_PN=WMVMED_FULL,",
+    "http-get:*:video/x-ms-wmv:DLNA.ORG_PN=WMVMED_PRO,",
+    "http-get:*:video/x-ms-wmv:DLNA.ORG_PN=WMVHIGH_FULL,",
+    "http-get:*:video/x-ms-wmv:DLNA.ORG_PN=WMVHIGH_PRO,",
+    "http-get:*:video/3gpp:DLNA.ORG_PN=MPEG4_P2_3GPP_SP_L0B_AAC,",
+    "http-get:*:video/3gpp:DLNA.ORG_PN=MPEG4_P2_3GPP_SP_L0B_AMR,",
+    "http-get:*:audio/mpeg:DLNA.ORG_PN=MP3,",
+    "http-get:*:audio/x-ms-wma:DLNA.ORG_PN=WMABASE,",
+    "http-get:*:audio/x-ms-wma:DLNA.ORG_PN=WMAFULL,",
+    "http-get:*:audio/x-ms-wma:DLNA.ORG_PN=WMAPRO,",
+    "http-get:*:audio/x-ms-wma:DLNA.ORG_PN=WMALSL,",
+    "http-get:*:audio/x-ms-wma:DLNA.ORG_PN=WMALSL_MULT5,",
+    "http-get:*:audio/mp4:DLNA.ORG_PN=AAC_ISO_320,",
+    "http-get:*:audio/3gpp:DLNA.ORG_PN=AAC_ISO_320,",
+    "http-get:*:audio/mp4:DLNA.ORG_PN=AAC_ISO,",
+    "http-get:*:audio/mp4:DLNA.ORG_PN=AAC_MULT5_ISO,",
+    "http-get:*:audio/L16;rate=44100;channels=2:DLNA.ORG_PN=LPCM,",
+    "http-get:*:image/jpeg:*,",
+    "http-get:*:video/avi:*,",
+    "http-get:*:video/divx:*,",
     "http-get:*:video/x-matroska:*,",
+    "http-get:*:video/mpeg:*,",
     "http-get:*:video/mp4:*,",
-    "http-get:*:video/x-mkv:*,",
-    "http-get:*:audio/mpeg:*,",
-    "http-get:*:image/jpeg:*"
+    "http-get:*:video/x-ms-wmv:*,",
+    "http-get:*:video/x-msvideo:*,",
+    "http-get:*:video/x-flv:*,",
+    "http-get:*:video/x-tivo-mpeg:*,",
+    "http-get:*:video/quicktime:*,",
+    "http-get:*:audio/mp4:*,",
+    "http-get:*:audio/x-wav:*,",
+    "http-get:*:audio/x-flac:*,",
+    "http-get:*:audio/x-dsd:*,",
+    "http-get:*:application/ogg:*",
+    "http-get:*:application/vnd.rn-realmedia:*",
+    "http-get:*:application/vnd.rn-realmedia-vbr:*",
+    "http-get:*:video/webm:*"
 );
 
 fn ok_tag(method: &str, xmlns: &str, inner: &str) -> String {
@@ -724,7 +947,15 @@ pub fn dispatch_simple(
                 &format!("<FeatureList>{}</FeatureList>", xml_escape(&feat)),
             )))
         }
-        "QueryStateVariable" => Some(SoapOutcome::Ok(ok_tag(method, CONTENTDIRECTORY_TYPE, ""))),
+        "QueryStateVariable" => match call.var_name.as_deref() {
+            None => Some(SoapOutcome::fault402()),
+            Some("ConnectionStatus") => Some(SoapOutcome::Ok(ok_tag(
+                method,
+                "urn:schemas-upnp-org:control-1-0",
+                "<return>Connected</return>",
+            ))),
+            Some(_) => Some(SoapOutcome::fault404()),
+        },
         // Persist via the server catalog / `BOOKMARKS` path.
         "X_SetBookmark" | "UpdateObject" | "Browse" | "Search" => None,
         _ => Some(SoapOutcome::fault401()),
@@ -748,6 +979,11 @@ pub fn build_browse(
 }
 
 pub fn magic_object_id(id: &str, client: &ClientProfile) -> String {
+    if client.flags.contains(ClientFlags::MS_PFS) {
+        if let Some(real) = rewrite_pfs_child(id) {
+            return real;
+        }
+    }
     if client.flags.contains(ClientFlags::SAMSUNG_DCM10) {
         return match id {
             "A" => MUSIC_ID.to_string(),
@@ -760,6 +996,34 @@ pub fn magic_object_id(id: &str, client: &ClientProfile) -> String {
         return MUSIC_ID.to_string();
     }
     id.to_string()
+}
+
+/// Rewrite PFS short ids (`8` → `2$8`, `8$HEX` → `2$8$HEX`).
+pub fn rewrite_pfs_child(id: &str) -> Option<String> {
+    const MAP: &[(&str, &str)] = &[
+        ("D2", IMAGE_CAMERA_ID),
+        ("14", MUSIC_DIR_ID),
+        ("15", VIDEO_DIR_ID),
+        ("16", IMAGE_DIR_ID),
+        ("4", MUSIC_ALL_ID),
+        ("5", MUSIC_GENRE_ID),
+        ("6", MUSIC_ARTIST_ID),
+        ("7", MUSIC_ALBUM_ID),
+        ("8", VIDEO_ALL_ID),
+        ("B", IMAGE_ALL_ID),
+        ("C", IMAGE_DATE_ID),
+        ("F", MUSIC_PLIST_ID),
+    ];
+    for (short, real) in MAP {
+        if id == *short {
+            return Some((*real).to_string());
+        }
+        let prefix = format!("{short}$");
+        if let Some(tail) = id.strip_prefix(&prefix) {
+            return Some(format!("{real}${tail}"));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -816,9 +1080,15 @@ mod tests {
     #[test]
     fn dcm10_feature_ids_are_avi() {
         let tv = rusty_dlna_protocol::identify_user_agent("SEC_HHP_[TV]UE40D7000/1.0").unwrap();
-        assert_eq!(feature_list_ids(tv, None), ["A", "V", "I"]);
+        assert_eq!(
+            feature_list_ids(tv, None),
+            ["A".to_string(), "V".to_string(), "I".to_string()]
+        );
         let pc = rusty_dlna_protocol::identify_user_agent("SEC_HHP_[PC]LPC001/1.0").unwrap();
-        assert_eq!(feature_list_ids(pc, None), ["1", "2", "3"]);
+        assert_eq!(
+            feature_list_ids(pc, None),
+            ["1".to_string(), "2".to_string(), "3".to_string()]
+        );
         assert!(!pc.flags.contains(ClientFlags::SAMSUNG_DCM10));
     }
 
@@ -852,6 +1122,9 @@ mod tests {
                 last_playback_position: None,
                 playback_count: None,
                 dcm_info: None,
+                ref_id: None,
+                search_classes: vec![],
+                av_media_class: None,
             },
             &FilterBits::standard(),
         );
@@ -989,6 +1262,9 @@ mod tests {
             last_playback_position: Some(120),
             playback_count: Some(3),
             dcm_info: Some("CREATIONDATE=0,FOLDER=movie,BM=120".into()),
+            ref_id: None,
+            search_classes: vec![],
+            av_media_class: None,
         };
         let star = parse_filter(Some("*"), false);
         let kodi = emit_didl_object(&obj, &star);
@@ -1010,5 +1286,235 @@ mod tests {
         assert!(pv.contains("pv:subtitleFileUri=\"http://127.0.0.1:18200/Captions/9.srt\""));
         assert!(!pv.contains("sec:CaptionInfoEx"));
         assert!(!pv.contains("<dc:date>"));
+    }
+
+    fn dummy_item(ref_id: Option<&str>, search: Vec<String>) -> DidlObject {
+        DidlObject {
+            id: "2$9$1".into(),
+            parent_id: "2$9".into(),
+            title: "alias".into(),
+            class: "item.videoItem".into(),
+            date: None,
+            restricted: true,
+            searchable: None,
+            child_count: None,
+            child_container_count: None,
+            is_container: false,
+            resources: vec![],
+            album_art_uri: None,
+            album_art_profile: false,
+            creator: None,
+            description: None,
+            artist: None,
+            actor: None,
+            album: None,
+            genre: None,
+            track: None,
+            season: None,
+            episode: None,
+            captions: vec![],
+            last_playback_position: None,
+            playback_count: None,
+            dcm_info: None,
+            ref_id: ref_id.map(str::to_string),
+            search_classes: search,
+            av_media_class: None,
+        }
+    }
+
+    #[test]
+    fn pfs_xbox_eight_rewrites_to_video_all() {
+        let xbox = rusty_dlna_protocol::identify_user_agent("Xbox/360").unwrap();
+        assert!(xbox.flags.contains(ClientFlags::MS_PFS));
+        assert_eq!(rewrite_pfs_child("8").as_deref(), Some("2$8"));
+        assert_eq!(rewrite_pfs_child("8$ABC").as_deref(), Some("2$8$ABC"));
+        assert_eq!(magic_object_id("8", xbox), "2$8");
+        let kodi = rusty_dlna_protocol::identify_user_agent("Kodi/21.0").unwrap();
+        assert_eq!(magic_object_id("8", kodi), "8");
+    }
+
+    #[test]
+    fn feature_list_dcm10_avi_and_non64_collapse() {
+        let tv = rusty_dlna_protocol::identify_user_agent("SEC_HHP_[TV]UE40D7000/1.0").unwrap();
+        assert_eq!(
+            feature_list_ids(tv, None),
+            ["A".to_string(), "V".to_string(), "I".to_string()]
+        );
+        let collapsed = feature_list_ids(tv, Some("V"));
+        assert_eq!(collapsed[0], collapsed[1]);
+        assert_eq!(collapsed[1], collapsed[2]);
+        assert!(
+            collapsed[0] == "2" || collapsed[0] == "V",
+            "non-64 root_container collapses FeatureList: {collapsed:?}"
+        );
+        assert_eq!(
+            feature_list_ids(tv, Some("64")),
+            ["1$14".to_string(), "2$15".to_string(), "3$16".to_string()]
+        );
+        let generic = rusty_dlna_protocol::identify_user_agent("DLNADOC/1.50").unwrap();
+        let gen = feature_list_ids(generic, Some("V"));
+        assert_eq!(gen[0], gen[1]);
+        assert_eq!(gen[1], gen[2]);
+    }
+
+    #[test]
+    fn extra_ci1_protocol_infos_toshiba_sony_bdp_bravia() {
+        let toshiba = extra_ci1_protocol_infos(
+            ClientKind::ToshibaTv,
+            "video/mpeg",
+            Some("MPEG_TS_HD_NA"),
+        );
+        assert!(
+            toshiba.iter().any(|(_, info)| {
+                info.contains("DLNA.ORG_PN=MPEG_PS_NTSC") && info.contains("DLNA.ORG_CI=1")
+            }),
+            "{toshiba:?}"
+        );
+        let none = extra_ci1_protocol_infos(ClientKind::ToshibaTv, "video/mpeg", Some("MPEG_PS_NTSC"));
+        assert!(none.is_empty(), "{none:?}");
+
+        let bdp_ts = extra_ci1_protocol_infos(
+            ClientKind::SonyBdp,
+            "video/mpeg",
+            Some("AVC_TS_MP_HD_AC3"),
+        );
+        assert!(
+            bdp_ts.iter().any(|(_, info)| info.contains("MPEG_TS_SD_NA")
+                && info.contains("DLNA.ORG_CI=1")),
+            "{bdp_ts:?}"
+        );
+        assert!(
+            bdp_ts.iter().any(|(_, info)| info.contains("MPEG_TS_SD_EU")
+                && info.contains("DLNA.ORG_CI=1")),
+            "{bdp_ts:?}"
+        );
+        let bdp_mkv = extra_ci1_protocol_infos(
+            ClientKind::SonyBdp,
+            "video/x-matroska",
+            None,
+        );
+        assert!(
+            bdp_mkv.iter().any(|(m, info)| {
+                m == "video/avi" && info.contains("MPEG_PS_NTSC") && info.contains("CI=1")
+            }),
+            "{bdp_mkv:?}"
+        );
+        assert!(
+            bdp_mkv.iter().any(|(m, info)| {
+                m == "video/avi" && info.contains("MPEG_PS_PAL") && info.contains("CI=1")
+            }),
+            "{bdp_mkv:?}"
+        );
+
+        let bravia = extra_ci1_protocol_infos(
+            ClientKind::SonyBravia,
+            "video/mpeg",
+            Some("AVC_TS_MP_HD_AC3_T"),
+        );
+        assert!(
+            bravia
+                .iter()
+                .any(|(_, info)| info.contains("DLNA.ORG_PN=AVC_TS_HD_50_AC3_T")),
+            "{bravia:?}"
+        );
+    }
+
+    #[test]
+    fn apply_title_hack_lg_asus_hyundai() {
+        let lg = rusty_dlna_protocol::identify_user_agent("LGE_DLNA_SDK/1.6.0").unwrap();
+        assert_eq!(apply_title_hack("Fixture", "mkv", lg, true), "Fixture.");
+        assert_eq!(apply_title_hack("Fixture", "mkv", lg, false), "Fixture");
+
+        let asus = rusty_dlna_protocol::identify_user_agent("O!Play Mini").unwrap();
+        let long = "012345678901234567890123456789";
+        assert_eq!(apply_title_hack(long, "mkv", asus, true), &long[..23]);
+        assert_eq!(apply_title_hack(long, "mkv", asus, false), long);
+
+        let hyundai = rusty_dlna_protocol::identify_friendly_name("HYUNDAITV").unwrap();
+        assert_eq!(
+            apply_title_hack("Fixture", "mkv", hyundai, false),
+            "Fixture.mkv"
+        );
+    }
+
+    #[test]
+    fn query_state_variable_connection_status_missing_unknown() {
+        let client = rusty_dlna_protocol::identify_user_agent("Kodi/21.0").unwrap();
+        let connected = parse_soap_call(
+            "urn:schemas-upnp-org:control-1-0#QueryStateVariable",
+            "<QueryStateVariable><varName>ConnectionStatus</varName></QueryStateVariable>",
+        );
+        match dispatch_simple(&connected, client, "uuid:x", 1, None) {
+            Some(SoapOutcome::Ok(xml)) => {
+                assert!(xml.contains("<return>Connected</return>"), "{xml}");
+            }
+            other => panic!("ConnectionStatus: {other:?}"),
+        }
+        let missing = parse_soap_call(
+            "urn:schemas-upnp-org:control-1-0#QueryStateVariable",
+            "<QueryStateVariable></QueryStateVariable>",
+        );
+        match dispatch_simple(&missing, client, "uuid:x", 1, None) {
+            Some(SoapOutcome::Fault { code: 402, .. }) => {}
+            other => panic!("missing varName: {other:?}"),
+        }
+        let unknown = parse_soap_call(
+            "urn:schemas-upnp-org:control-1-0#QueryStateVariable",
+            "<QueryStateVariable><varName>Nope</varName></QueryStateVariable>",
+        );
+        match dispatch_simple(&unknown, client, "uuid:x", 1, None) {
+            Some(SoapOutcome::Fault { code: 404, .. }) => {}
+            other => panic!("unknown var: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn didl_emits_search_class_and_refid() {
+        let root = DidlObject {
+            id: "0".into(),
+            parent_id: "-1".into(),
+            title: "root".into(),
+            class: "container.storageFolder".into(),
+            date: None,
+            restricted: true,
+            searchable: Some(true),
+            child_count: Some(3),
+            child_container_count: Some(3),
+            is_container: true,
+            resources: vec![],
+            album_art_uri: None,
+            album_art_profile: false,
+            creator: None,
+            description: None,
+            artist: None,
+            actor: None,
+            album: None,
+            genre: None,
+            track: None,
+            season: None,
+            episode: None,
+            captions: vec![],
+            last_playback_position: None,
+            playback_count: None,
+            dcm_info: None,
+            ref_id: None,
+            search_classes: vec![
+                "object.item.audioItem".into(),
+                "object.item.imageItem".into(),
+                "object.item.videoItem".into(),
+            ],
+            av_media_class: None,
+        };
+        let xml = emit_didl_object(&root, &FilterBits::standard());
+        assert!(
+            xml.contains("<upnp:searchClass includeDerived=\"1\">object.item.audioItem</upnp:searchClass>"),
+            "{xml}"
+        );
+        assert!(xml.contains("object.item.imageItem"), "{xml}");
+        assert!(xml.contains("object.item.videoItem"), "{xml}");
+
+        let alias = dummy_item(Some("64$1"), vec![]);
+        let xml = emit_didl_object(&alias, &FilterBits::standard());
+        assert!(xml.contains("refID=\"64$1\""), "{xml}");
     }
 }

@@ -208,6 +208,66 @@ pub fn msearch_jitter_ms_range(ssdp_all: bool) -> std::ops::RangeInclusive<u64> 
     }
 }
 
+/// Inbound renderer NOTIFY (`replica.md` §1). Only used to pre-fill the client cache.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InboundNotify {
+    pub location: String,
+    pub server: String,
+    pub nt: String,
+}
+
+pub fn parse_inbound_notify(packet: &str) -> Option<InboundNotify> {
+    let normalized = packet.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = normalized.split('\n');
+    let first = lines.next().unwrap_or("").to_ascii_uppercase();
+    if !first.starts_with("NOTIFY") {
+        return None;
+    }
+    let mut nts = None;
+    let mut nt = None;
+    let mut location = None;
+    let mut server = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim();
+        if key.eq_ignore_ascii_case("NTS") {
+            nts = Some(val.to_string());
+        } else if key.eq_ignore_ascii_case("NT") {
+            nt = Some(val.to_string());
+        } else if key.eq_ignore_ascii_case("LOCATION") {
+            location = Some(val.to_string());
+        } else if key.eq_ignore_ascii_case("SERVER") {
+            server = Some(val.to_string());
+        }
+    }
+    if nts.as_deref() != Some("ssdp:alive") {
+        return None;
+    }
+    let nt = nt?;
+    if !nt.starts_with("urn:schemas-upnp-org:device:MediaRenderer") {
+        return None;
+    }
+    let location = location.filter(|s| !s.is_empty())?;
+    let server = server.unwrap_or_default();
+    let sniff = server.contains("Allegro-Software-RomPlug")
+        || location.contains("SamsungMRDesc.xml")
+        || server.contains("DigiOn DiXiM");
+    if !sniff {
+        return None;
+    }
+    Some(InboundNotify {
+        location,
+        server,
+        nt,
+    })
+}
+
 pub fn jitter_ms(range: std::ops::RangeInclusive<u64>) -> u64 {
     let span = range.end().saturating_sub(*range.start()).saturating_add(1);
     let now = std::time::SystemTime::now()
@@ -316,5 +376,74 @@ mod tests {
         assert_eq!(replies.len(), 6);
         assert!(replies[0].contains("LOCATION: http://127.0.0.1:18200/rootDesc.xml"));
         assert!(replies[0].contains("max-age=1800"));
+    }
+
+    fn notify(server: &str, location: &str, nt: &str, nts: &str) -> String {
+        format!(
+            "NOTIFY * HTTP/1.1\r\nHOST:239.255.255.250:1900\r\nNTS:{nts}\r\nNT:{nt}\r\nLOCATION:{location}\r\nSERVER: {server}\r\n\r\n"
+        )
+    }
+
+    #[test]
+    fn parse_inbound_notify_roku_samsung_dixim_vs_ignore() {
+        let renderer = "urn:schemas-upnp-org:device:MediaRenderer:1";
+        let roku = parse_inbound_notify(&notify(
+            "Allegro-Software-RomPlug/1.0",
+            "http://192.0.2.10/desc.xml",
+            renderer,
+            "ssdp:alive",
+        ))
+        .expect("Roku");
+        assert_eq!(roku.location, "http://192.0.2.10/desc.xml");
+        assert!(roku.server.contains("Allegro-Software-RomPlug"));
+
+        let samsung = parse_inbound_notify(&notify(
+            "Linux UPnP/1.0 Samsung",
+            "http://192.0.2.11/SamsungMRDesc.xml",
+            renderer,
+            "ssdp:alive",
+        ))
+        .expect("Samsung");
+        assert!(samsung.location.contains("SamsungMRDesc.xml"));
+
+        let dixim = parse_inbound_notify(&notify(
+            "DigiOn DiXiM/1.0",
+            "http://192.0.2.12/desc.xml",
+            renderer,
+            "ssdp:alive",
+        ))
+        .expect("DiXiM");
+        assert!(dixim.server.contains("DigiOn DiXiM"));
+
+        assert!(
+            parse_inbound_notify(&notify(
+                "Kodi/21.0",
+                "http://192.0.2.13/desc.xml",
+                renderer,
+                "ssdp:alive",
+            ))
+            .is_none(),
+            "generic renderer must be ignored"
+        );
+        assert!(
+            parse_inbound_notify(&notify(
+                "Allegro-Software-RomPlug/1.0",
+                "http://192.0.2.10/desc.xml",
+                "urn:schemas-upnp-org:device:MediaServer:1",
+                "ssdp:alive",
+            ))
+            .is_none(),
+            "MediaServer NOTIFY must be ignored"
+        );
+        assert!(
+            parse_inbound_notify(&notify(
+                "Allegro-Software-RomPlug/1.0",
+                "http://192.0.2.10/desc.xml",
+                renderer,
+                "ssdp:byebye",
+            ))
+            .is_none(),
+            "byebye must be ignored"
+        );
     }
 }

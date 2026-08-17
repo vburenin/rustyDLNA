@@ -383,22 +383,33 @@ impl LibraryDb {
         Ok(())
     }
 
+    pub fn update_detail_creator_if_empty(&self, id: i64, creator: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET CREATOR = ?1
+             WHERE ID = ?2 AND (CREATOR IS NULL OR CREATOR = '')",
+            params![creator, id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_detail_nfo(&self, id: i64, nfo: &NfoMeta) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE DETAILS SET
                  TITLE = COALESCE(?1, TITLE),
                  CREATOR = ?2,
                  ARTIST = ?3,
-                 GENRE = ?4,
-                 COMMENT = ?5,
-                 DISC = ?6,
-                 TRACK = ?7,
-                 DATE = COALESCE(?8, DATE)
-             WHERE ID = ?9",
+                 ALBUM = ?4,
+                 GENRE = ?5,
+                 COMMENT = ?6,
+                 DISC = ?7,
+                 TRACK = ?8,
+                 DATE = COALESCE(?9, DATE)
+             WHERE ID = ?10",
             params![
                 nfo.title,
                 nfo.creator,
                 nfo.artist,
+                nfo.showtitle,
                 nfo.genre,
                 nfo.comment,
                 nfo.disc,
@@ -416,6 +427,7 @@ impl LibraryDb {
                  TITLE = (SELECT TITLE FROM DETAILS WHERE ID = ?1),
                  CREATOR = (SELECT CREATOR FROM DETAILS WHERE ID = ?1),
                  ARTIST = (SELECT ARTIST FROM DETAILS WHERE ID = ?1),
+                 ALBUM = (SELECT ALBUM FROM DETAILS WHERE ID = ?1),
                  GENRE = (SELECT GENRE FROM DETAILS WHERE ID = ?1),
                  COMMENT = (SELECT COMMENT FROM DETAILS WHERE ID = ?1),
                  DISC = (SELECT DISC FROM DETAILS WHERE ID = ?1),
@@ -788,6 +800,76 @@ impl LibraryDb {
         )
     }
 
+    /// `ALBUM`/`GENRE`/`DISC`/`TRACK`/`TITLE` used to hang Series/Genre aliases.
+    pub fn detail_group_fields(
+        &self,
+        id: i64,
+    ) -> rusqlite::Result<(Option<String>, Option<String>, Option<i64>, Option<i64>, Option<String>)>
+    {
+        self.conn.query_row(
+            "SELECT ALBUM, GENRE, DISC, TRACK, TITLE FROM DETAILS WHERE ID = ?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+    }
+
+    pub fn detail_tag_fields(
+        &self,
+        id: i64,
+    ) -> rusqlite::Result<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
+        self.conn.query_row(
+            "SELECT ARTIST, ALBUM, GENRE, CREATOR, DATE FROM DETAILS WHERE ID = ?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+    }
+
+    /// Browse Folders object for this detail (no `REF_ID`).
+    pub fn browse_object_for_detail(&self, detail: i64) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT OBJECT_ID FROM OBJECTS
+                 WHERE DETAIL_ID = ?1 AND REF_ID IS NULL
+                 ORDER BY length(OBJECT_ID) ASC LIMIT 1",
+                [detail],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
+    /// Drop Series/Genre item aliases for this detail so a re-NFO can move them.
+    pub fn delete_detail_under_root(&self, detail: i64, root: &str) -> rusqlite::Result<usize> {
+        let like = format!("{root}$%");
+        Ok(self.conn.execute(
+            "DELETE FROM OBJECTS WHERE DETAIL_ID = ?1 AND (
+                 PARENT_ID = ?2 OR PARENT_ID LIKE ?3 OR OBJECT_ID LIKE ?3
+             )",
+            params![detail, root, like],
+        )?)
+    }
+
     pub fn object_detail_id(&self, object_id: &str) -> Option<i64> {
         self.conn
             .query_row(
@@ -1035,8 +1117,30 @@ impl LibraryDb {
             (VIDEO_ALL_ID, VIDEO_ID, "container.storageFolder", "All Video"),
             (VIDEO_DIR_ID, VIDEO_ID, "container.storageFolder", "Folders"),
             (VIDEO_RECENT_ID, VIDEO_ID, "container.storageFolder", "Recently Added"),
+            (VIDEO_SERIES_ID, VIDEO_ID, "container.storageFolder", "Series"),
+            (VIDEO_GENRE_ID, VIDEO_ID, "container.storageFolder", "Genre"),
+            (VIDEO_ACTOR_ID, VIDEO_ID, "container.storageFolder", "Actor"),
+            (VIDEO_PLIST_ID, VIDEO_ID, "container.storageFolder", "Playlists"),
+            (VIDEO_RATING_ID, VIDEO_ID, "container.storageFolder", "Rating"),
             (MUSIC_ALL_ID, MUSIC_ID, "container.storageFolder", "All Music"),
+            (MUSIC_GENRE_ID, MUSIC_ID, "container.storageFolder", "Genre"),
+            (MUSIC_ARTIST_ID, MUSIC_ID, "container.storageFolder", "Artist"),
+            (MUSIC_ALBUM_ID, MUSIC_ID, "container.storageFolder", "Album"),
+            (MUSIC_DIR_ID, MUSIC_ID, "container.storageFolder", "Folders"),
+            (MUSIC_PLIST_ID, MUSIC_ID, "container.storageFolder", "Playlists"),
+            (MUSIC_CONTRIB_ARTIST_ID, MUSIC_ID, "container.storageFolder", "Contributing Artists"),
+            (MUSIC_ALBUM_ARTIST_ID, MUSIC_ID, "container.storageFolder", "Album Artist"),
+            (MUSIC_COMPOSER_ID, MUSIC_ID, "container.storageFolder", "Composer"),
+            (MUSIC_RATING_ID, MUSIC_ID, "container.storageFolder", "Rating"),
+            (MUSIC_RECENT_ID, MUSIC_ID, "container.storageFolder", "Recently Added"),
             (IMAGE_ALL_ID, IMAGE_ID, "container.storageFolder", "All Pictures"),
+            (IMAGE_DATE_ID, IMAGE_ID, "container.storageFolder", "Date Taken"),
+            (IMAGE_ALBUM_ID, IMAGE_ID, "container.storageFolder", "Album"),
+            (IMAGE_CAMERA_ID, IMAGE_ID, "container.storageFolder", "Camera"),
+            (IMAGE_DIR_ID, IMAGE_ID, "container.storageFolder", "Folders"),
+            (IMAGE_PLIST_ID, IMAGE_ID, "container.storageFolder", "Playlists"),
+            (IMAGE_RATING_ID, IMAGE_ID, "container.storageFolder", "Rating"),
+            (IMAGE_RECENT_ID, IMAGE_ID, "container.storageFolder", "Recently Added"),
         ];
         for (id, parent, class, name) in rows {
             self.upsert_object(id, parent, class, None, name, None)?;
@@ -1244,14 +1348,22 @@ impl LibraryDb {
                 let mime_s = mime.unwrap_or_else(|| "video/x-matroska".into());
                 let ext = mime_to_ext(&mime_s);
                 let nonempty = |s: Option<String>| s.filter(|v| !v.is_empty());
-                let title = nonempty(detail_title)
-                    .or_else(|| nonempty(name))
-                    .unwrap_or_else(|| {
-                        path.file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("item")
-                            .to_string()
-                    });
+                let under_series_or_genre = parent == VIDEO_SERIES_ID
+                    || parent.starts_with(&format!("{VIDEO_SERIES_ID}$"))
+                    || parent == VIDEO_GENRE_ID
+                    || parent.starts_with(&format!("{VIDEO_GENRE_ID}$"));
+                let title = if under_series_or_genre {
+                    nonempty(name.clone())
+                        .or_else(|| nonempty(detail_title.clone()))
+                } else {
+                    nonempty(detail_title.clone()).or_else(|| nonempty(name.clone()))
+                }
+                .unwrap_or_else(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("item")
+                        .to_string()
+                });
                 let probe = crate::probe_from_stored(
                     ext,
                     container.as_deref(),

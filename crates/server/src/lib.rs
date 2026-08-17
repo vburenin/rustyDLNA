@@ -8,11 +8,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use rusty_dlna_http::{
-    caption_info_sec_url, dlna_org_features, gen_root_desc, live_transcode_response,
-    media_response, now_imf_date, parse_byte_range, persist_for_route, protocol_info,
-    read_file_range, route, scpd_connection_manager, scpd_content_directory, scpd_registrar,
-    set_caption_info_sec, timeseek_without_range, valid_host_header, wants_caption_info_sec,
-    ByteRange, HttpRequest, HttpResponse, HttpRoute, RangeError, RemuxJobSpec, RootDescOpts,
+    caption_info_sec_url, dlna_get_header_invalid, dlna_org_features, dlna_strict,
+    gen_root_desc, interactive_on_non_image, is_chunked, live_transcode_response, media_response,
+    now_imf_date, parse_byte_range, persist_for_route, protocol_info, read_file_range,
+    realtime_interactive_invalid, route, scpd_connection_manager, scpd_content_directory,
+    scpd_registrar, set_caption_info_sec, streaming_on_image, timeseek_without_range,
+    valid_host_header, wants_caption_info_sec, wants_content_language, ByteRange, HttpRequest,
+    HttpResponse, HttpRoute, RangeError, RemuxJobSpec, RootDescOpts,
 };
 use rusty_dlna_protocol::isolation::collides_with_live_ports;
 use rusty_dlna_protocol::paths::{
@@ -23,8 +25,9 @@ use rusty_dlna_protocol::paths::{
 use rusty_dlna_protocol::server_header;
 use rusty_dlna_protocol::w3c_normalize_date;
 use rusty_dlna_protocol::{
-    identify_friendly_name, identify_user_agent, identify_x_av_client_info, remap_mime, ClientCache,
-    ClientFlags, ClientKind, ClientProfile, CLIENTS,
+    identify_friendly_name, identify_friendly_name_ssdp, identify_model_name, identify_request,
+    identify_user_agent, remap_mime_full, ClientCache, ClientFlags, ClientKind, ClientProfile,
+    CLIENTS,
 };
 use rusty_dlna_scan::{
     caption_http_mime, collect_media_dirs, load_existing, monitor, repair_objects_if_needed,
@@ -32,19 +35,21 @@ use rusty_dlna_scan::{
     SourceProbe,
 };
 
-pub use rusty_dlna_scan::ensure_pattern_fixture;
+pub use rusty_dlna_scan::{ensure_pattern_fixture, ensure_show_fixture};
 use rusty_dlna_soap::{
-    bookmark_seconds, build_browse, default_order, dispatch_simple, empty_cd_response,
-    magic_object_id, parse_filter, parse_search_criteria, parse_soap_call, parse_update_object_tags,
-    row_matches, soap_fault, sort_or_709, DefaultOrder, DidlCaption, DidlObject, DidlRes,
-    FilterBits, SearchRow, SoapCall, SoapOutcome, SortKey, SortSpec,
+    apply_title_hack, bookmark_seconds, build_browse, default_order, dispatch_simple,
+    empty_cd_response, extra_ci1_protocol_infos, magic_object_id, parse_filter,
+    parse_search_criteria, parse_soap_call, parse_update_object_tags, row_matches, soap_fault,
+    sort_or_709, DefaultOrder, DidlCaption, DidlObject, DidlRes, FilterBits, SearchRow, SoapCall,
+    SoapOutcome, SortKey, SortSpec,
 };
 use rusty_dlna_ssdp::{
-    jitter_ms, msearch_jitter_ms_range, msearch_replies, notify_byebye, parse_msearch,
-    ALIVE_DUP_DELAY_MS,
+    jitter_ms, msearch_jitter_ms_range, msearch_replies, notify_byebye, parse_inbound_notify,
+    parse_msearch, ALIVE_DUP_DELAY_MS,
 };
 use rusty_dlna_transcode::{
-    cache_dest, cache_part, decide_for, ffmpeg_grow_args, probe_to_source, Decision, JobGate,
+    cache_dest, cache_part, decide_for, ffmpeg_grow_args, hdr10_fallback_plan,
+    pick_audio_index, probe_to_source, Decision, JobGate, RecodeAction,
     RemapRule,
 };
 
@@ -298,11 +303,12 @@ impl App {
     }
 
     pub fn identify_peer(&self, req: &HttpRequest, peer: SocketAddr) -> &'static ClientProfile {
-        let specific = req
-            .user_agent()
-            .and_then(identify_user_agent)
-            .or_else(|| req.header("X-AV-Client-Info").and_then(identify_x_av_client_info))
-            .or_else(|| req.header("FriendlyName").and_then(identify_friendly_name));
+        let specific = identify_request(
+            req.user_agent(),
+            req.header("X-AV-Client-Info"),
+            req.header("FriendlyName"),
+            None,
+        );
         let ip = match peer {
             SocketAddr::V4(v) => *v.ip(),
             SocketAddr::V6(_) => Ipv4Addr::LOCALHOST,
@@ -342,18 +348,20 @@ impl App {
         {
             return HttpResponse::html(501, "Not Implemented", "unsupported method");
         }
-        if method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD") {
-            if req.version == "HTTP/1.1" && req.header("Host").is_none() {
-                return HttpResponse::html(400, "Bad Request", "DNS rebinding attack suspected");
-            }
-            if let Some(h) = req.header("Host") {
-                if !valid_host_header(h) {
-                    return HttpResponse::html(400, "Bad Request", "DNS rebinding attack suspected");
-                }
-            }
+        if let Some(r) = host_rebinding_reject(req) {
+            return r;
+        }
+        if rusty_dlna_http::http_body_too_large(req.body.len()) {
+            return HttpResponse::html(413, "Payload Too Large", "body too large");
         }
         if timeseek_without_range(req) {
             return HttpResponse::html(406, "Not Acceptable", "TimeSeek/PlaySpeed without Range");
+        }
+        if dlna_get_header_invalid(req) {
+            return HttpResponse::html(400, "Bad Request", "invalid DLNA get header");
+        }
+        if realtime_interactive_invalid(req) {
+            return HttpResponse::html(400, "Bad Request", "realTimeInfo+Interactive");
         }
         let r = route(&req.method, &req.path);
         let persist = persist_for_route(
@@ -390,14 +398,17 @@ impl App {
                 r.set("Content-Length", r.body.len());
                 r
             }
-            HttpRoute::Thumbnail | HttpRoute::Resized | HttpRoute::NotFound => {
-                HttpResponse::html(404, "Not Found", "not found")
-            }
+            HttpRoute::Thumbnail => self.thumbnail(req),
+            HttpRoute::Resized => self.resized(req),
+            HttpRoute::NotFound => HttpResponse::html(404, "Not Found", "not found"),
         };
         if r == HttpRoute::MediaItem || r == HttpRoute::Transcode || r == HttpRoute::Soap {
             resp.persist = false;
         } else {
-            resp.persist = persist;
+            resp.persist = persist && !is_chunked(req);
+        }
+        if wants_content_language(req) {
+            resp.set("Content-Language", "en");
         }
         if method.eq_ignore_ascii_case("HEAD") {
             resp.body.clear();
@@ -711,6 +722,14 @@ impl App {
             r.persist = false;
             return r;
         }
+        if call.starting_index < 0 || call.requested_count < 0 {
+            return soap_fault_logged(
+                SoapOutcome::fault402(),
+                persist,
+                &call,
+                req.user_agent().unwrap_or("-"),
+            );
+        }
         let ua = req.user_agent();
         let sort = match sort_or_709(call.sort_criteria.as_deref(), client) {
             Ok(s) => s,
@@ -725,7 +744,7 @@ impl App {
             Err(_) => Vec::new(),
         };
         let clauses = parse_search_criteria(call.search_criteria.as_deref());
-        let start = call.starting_index.max(0) as usize;
+        let start = call.starting_index as usize;
         let take = if call.requested_count == 0 {
             usize::MAX
         } else {
@@ -807,34 +826,54 @@ impl App {
         bits: &FilterBits,
     ) -> DidlObject {
         match snap.child {
-            CatalogChild::Container(c) => DidlObject {
-                id: c.object_id,
-                parent_id: c.parent_id,
-                title: c.title,
-                class: c.class,
-                date: None,
-                restricted: true,
-                searchable: Some(c.searchable),
-                child_count: snap.child_count,
-                child_container_count: snap.child_container_count,
-                is_container: true,
-                resources: vec![],
-                album_art_uri: None,
-                album_art_profile: false,
-                creator: None,
-                description: None,
-                artist: None,
-                actor: None,
-                album: None,
-                genre: None,
-                track: None,
-                season: None,
-                episode: None,
-                captions: vec![],
-                last_playback_position: None,
-                playback_count: None,
-                dcm_info: None,
-            },
+            CatalogChild::Container(c) => {
+                let av = match c.object_id.chars().next() {
+                    Some('1') => Some('M'),
+                    Some('2') => Some('V'),
+                    Some('3') => Some('P'),
+                    _ => None,
+                };
+                let search_classes = if c.object_id == rusty_dlna_protocol::object_id::ROOT_ID {
+                    vec![
+                        "object.item.audioItem".into(),
+                        "object.item.imageItem".into(),
+                        "object.item.videoItem".into(),
+                    ]
+                } else {
+                    vec![]
+                };
+                DidlObject {
+                    id: c.object_id,
+                    parent_id: c.parent_id,
+                    title: c.title,
+                    class: c.class,
+                    date: None,
+                    restricted: true,
+                    searchable: Some(c.searchable),
+                    child_count: snap.child_count,
+                    child_container_count: snap.child_container_count,
+                    is_container: true,
+                    resources: vec![],
+                    album_art_uri: None,
+                    album_art_profile: false,
+                    creator: None,
+                    description: None,
+                    artist: None,
+                    actor: None,
+                    album: None,
+                    genre: None,
+                    track: None,
+                    season: None,
+                    episode: None,
+                    captions: vec![],
+                    last_playback_position: None,
+                    playback_count: None,
+                    dcm_info: None,
+                    ref_id: None,
+                    search_classes,
+                    av_media_class: av,
+                }
+            }
             CatalogChild::Item(it) => {
                 let date = w3c_normalize_date(&it.date);
                 let art_url = (it.album_art > 0).then(|| {
@@ -857,24 +896,26 @@ impl App {
                     })
                     .collect();
                 let convert_ms = client.flags.contains(ClientFlags::CONVERT_MS);
-                let last_playback_position = (it.bookmark_sec > 0).then(|| {
-                    if convert_ms {
-                        it.bookmark_sec.saturating_mul(1000)
-                    } else {
-                        it.bookmark_sec
-                    }
-                });
+                let pos = if convert_ms {
+                    it.bookmark_sec.saturating_mul(1000)
+                } else {
+                    it.bookmark_sec
+                };
+                let last_playback_position = (it.bookmark_sec > 0).then_some(pos);
                 let playback_count = (it.watch_count > 0).then_some(it.watch_count);
                 let dcm_info = (bits.sec && it.bookmark_sec > 0).then(|| {
-                    format!(
-                        "CREATIONDATE=0,FOLDER={},BM={}",
-                        it.title, it.bookmark_sec
-                    )
+                    format!("CREATIONDATE=0,FOLDER={},BM={}", it.title, pos)
                 });
+                let title = apply_title_hack(
+                    &it.title,
+                    &it.ext,
+                    client,
+                    !it.captions.is_empty(),
+                );
                 DidlObject {
                     id: it.object_id.clone(),
                     parent_id: it.parent_id.clone(),
-                    title: it.title.clone(),
+                    title,
                     class: it.class.clone(),
                     date: Some(date),
                     restricted: true,
@@ -888,7 +929,7 @@ impl App {
                     creator: it.creator.clone(),
                     description: it.comment.clone(),
                     artist: it.artist.clone(),
-                    actor: None,
+                    actor: if video { it.artist.clone() } else { None },
                     album: it.album.clone(),
                     genre: it.genre.clone(),
                     track: if audio { it.track } else { None },
@@ -898,6 +939,9 @@ impl App {
                     last_playback_position,
                     playback_count,
                     dcm_info,
+                    ref_id: it.ref_id.clone(),
+                    search_classes: vec![],
+                    av_media_class: None,
                 }
             }
         }
@@ -913,11 +957,12 @@ impl App {
         let Some(oid) = call.object_id.as_deref().filter(|s| !s.is_empty()) else {
             return soap_fault_logged(SoapOutcome::fault402(), persist, call, ua);
         };
-        if let Some(detail_id) = self.resolve_detail_id(oid, client) {
-            let pos = call.pos_second.unwrap_or(0);
-            let sec = bookmark_seconds(pos, client.flags.contains(ClientFlags::CONVERT_MS));
-            self.persist_bookmark(detail_id, Some(sec), None);
-        }
+        let Some(detail_id) = self.resolve_detail_id(oid, client) else {
+            return soap_fault_logged(SoapOutcome::fault701(), persist, call, ua);
+        };
+        let pos = call.pos_second.unwrap_or(0);
+        let sec = bookmark_seconds(pos, client.flags.contains(ClientFlags::CONVERT_MS));
+        self.persist_bookmark(detail_id, Some(sec), None);
         soap_outcome_http(
             SoapOutcome::Ok(empty_cd_response("X_SetBookmark")),
             persist,
@@ -968,6 +1013,9 @@ impl App {
                 }
                 Some("A") | Some("1") => {
                     oid = rusty_dlna_protocol::object_id::MUSIC_ID.to_string();
+                }
+                Some("I") | Some("3") => {
+                    oid = rusty_dlna_protocol::object_id::IMAGE_ID.to_string();
                 }
                 Some("64") => {
                     oid = rusty_dlna_protocol::object_id::BROWSEDIR_ID.to_string();
@@ -1031,7 +1079,12 @@ impl App {
         ua: Option<&str>,
         bits: &FilterBits,
     ) -> Vec<DidlRes> {
-        let mime = remap_mime(client, &it.mime);
+        let mime = remap_mime_full(
+            client,
+            &it.mime,
+            it.creator.as_deref(),
+            it.dlna_pn.as_deref(),
+        );
         let orig_url = media_item_url(
             &self.advertise_ip,
             self.http_port,
@@ -1098,6 +1151,42 @@ impl App {
             vec![remap, orig]
         } else {
             let mut res = vec![orig];
+            if it.mime.starts_with("image/") {
+                let (srcw, srch) = parse_wh(it.resolution.as_deref());
+                let no_resize = client.flags.contains(ClientFlags::NO_RESIZE);
+                let resize_thumbs = client.flags.contains(ClientFlags::RESIZE_THUMBS);
+                if !no_resize {
+                    if srcw > 4096 || srch > 4096 {
+                        res.push(resized_didl(self, it, 4096, 4096, "JPEG_LRG"));
+                    }
+                    if srcw > 1024 || srch > 768 {
+                        res.push(resized_didl(self, it, 1024, 768, "JPEG_MED"));
+                    }
+                    if srcw > 640 || srch > 480 {
+                        res.push(resized_didl(self, it, 640, 480, "JPEG_SM"));
+                    }
+                }
+                if resize_thumbs {
+                    res.push(resized_didl(self, it, 160, 160, "JPEG_TN"));
+                } else {
+                    res.push(DidlRes {
+                        url: format!(
+                            "http://{}:{}/Thumbnails/{}.jpg",
+                            self.advertise_ip, self.http_port, it.detail_id
+                        ),
+                        protocol_info: "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_TN;DLNA.ORG_CI=1"
+                            .into(),
+                        size: None,
+                        duration: None,
+                        bitrate: None,
+                        resolution: None,
+                        sample_frequency: None,
+                        nr_audio_channels: None,
+                        pv_subtitle_type: None,
+                        pv_subtitle_uri: None,
+                    });
+                }
+            }
             if client.flags.contains(ClientFlags::CAPTION_RES) {
                 for cap in &it.captions {
                     let url = caption_indexed_url(
@@ -1133,6 +1222,33 @@ impl App {
                 ));
             }
         }
+        if plan.decision != Decision::Recode {
+            // Extra CI=1 rows inspect the stored mime/PN. Sony BDP HTTP remaps
+            // mkv/mpeg → divx after this, so do not pass the remapped type here.
+            for (emime, info) in extra_ci1_protocol_infos(
+                client.kind,
+                &it.mime,
+                it.dlna_pn.as_deref(),
+            ) {
+                res.push(DidlRes {
+                    url: media_item_url(
+                        &self.advertise_ip,
+                        self.http_port,
+                        it.detail_id,
+                        &it.ext,
+                    ),
+                    protocol_info: format!("http-get:*:{emime}:{info}"),
+                    size: Some(it.size),
+                    duration: it.duration.clone(),
+                    bitrate,
+                    resolution: it.resolution.clone(),
+                    sample_frequency: it.samplerate,
+                    nr_audio_channels: it.channels,
+                    pv_subtitle_type: None,
+                    pv_subtitle_uri: None,
+                });
+            }
+        }
         self.push_video_album_art(&mut res, it, client);
         res
     }
@@ -1144,13 +1260,14 @@ impl App {
         if client.flags.contains(ClientFlags::MS_PFS) {
             return;
         }
+        let url = album_art_url(
+            &self.advertise_ip,
+            self.http_port,
+            it.album_art,
+            it.detail_id,
+        );
         res.push(DidlRes {
-            url: album_art_url(
-                &self.advertise_ip,
-                self.http_port,
-                it.album_art,
-                it.detail_id,
-            ),
+            url: url.clone(),
             protocol_info: "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_TN".into(),
             size: None,
             duration: None,
@@ -1161,6 +1278,23 @@ impl App {
             pv_subtitle_type: None,
             pv_subtitle_uri: None,
         });
+        if client.kind == ClientKind::SamsungSeriesCde {
+            res.push(DidlRes {
+                url,
+                protocol_info: format!(
+                    "http-get:*:image/jpeg:{}",
+                    dlna_org_features(Some("JPEG_SM"), "01", 1, "image/jpeg")
+                ),
+                size: None,
+                duration: None,
+                bitrate: None,
+                resolution: Some("320x320".into()),
+                sample_frequency: None,
+                nr_audio_channels: None,
+                pv_subtitle_type: None,
+                pv_subtitle_uri: None,
+            });
+        }
     }
 
     fn media(&self, req: &HttpRequest, transcode: bool, peer: SocketAddr) -> HttpResponse {
@@ -1217,12 +1351,22 @@ impl App {
                 tracing::error!(path = %src_path.display(), title = %item.title, "media missing");
                 return HttpResponse::html(404, "Not Found", "missing file");
             }
+            let mut plan = plan;
+            plan.audio_index = pick_audio_index(&probe.audio);
             let dest = cache_dest(&self.cache_dir, item.detail_id, plan.action);
             let part = cache_part(&dest);
+            let remux_p8 = plan.action == RecodeAction::RemuxP8;
+            let grow_plan = if remux_p8 {
+                hdr10_fallback_plan(&plan)
+            } else {
+                plan.clone()
+            };
             tracing::info!(
                 title = %item.title,
                 hdr = %probe.hdr,
                 rule = plan.rule.as_deref().unwrap_or("-"),
+                remux_p8,
+                audio_index = plan.audio_index,
                 method = %req.method,
                 range = req.header("Range").unwrap_or("-"),
                 ua = req.user_agent().unwrap_or("-"),
@@ -1237,19 +1381,36 @@ impl App {
                 args: ffmpeg_grow_args(
                     &src_path.to_string_lossy(),
                     &part.to_string_lossy(),
-                    &plan,
+                    &grow_plan,
                 ),
+                remux_p8,
+                audio_index: plan.audio_index,
             });
             return r;
             }
         }
-        let (path, mime, pn, ci) = (
-            item.path.clone(),
-            remap_mime(client, &item.mime),
-            item.dlna_pn.clone(),
-            0u8,
+        let mime = remap_mime_full(
+            client,
+            &item.mime,
+            item.creator.as_deref(),
+            item.dlna_pn.as_deref(),
         );
-        let path = rusty_dlna_scan::rebase_media_path(&path, &self.scan_cfg.media_dirs);
+        let skip = client.flags.contains(ClientFlags::SKIP_DLNA_PN);
+        let pn = if skip { None } else { item.dlna_pn.clone() };
+        let ci = 0u8;
+        let path = rusty_dlna_scan::rebase_media_path(&item.path, &self.scan_cfg.media_dirs);
+        if path.exists() && !rusty_dlna_scan::path_is_under_roots(&path, &self.scan_cfg.media_dirs)
+        {
+            return HttpResponse::html(403, "Forbidden", "path escaped media dir");
+        }
+        let strict = dlna_strict(req);
+        let samsung = client.flags.contains(ClientFlags::SAMSUNG);
+        if streaming_on_image(req, &mime) {
+            return HttpResponse::html(406, "Not Acceptable", "Streaming not allowed on image");
+        }
+        if interactive_on_non_image(req, &mime, samsung, strict) {
+            return HttpResponse::html(406, "Not Acceptable", "Interactive not allowed");
+        }
         let size = match std::fs::metadata(&path) {
             Ok(m) => m.len(),
             Err(e) => {
@@ -1352,8 +1513,9 @@ impl App {
             return HttpResponse::html(404, "Not Found", "no such art");
         };
         let path = rusty_dlna_scan::rebase_media_path(&path, &self.scan_cfg.media_dirs);
-        let Ok(body) = std::fs::read(&path) else {
-            return HttpResponse::html(404, "Not Found", "art missing");
+        let body = match self.read_sidecar(&path) {
+            Ok(b) => b,
+            Err(r) => return r,
         };
         let mut r = HttpResponse::new(200, "OK");
         r.set("Content-Type", "image/jpeg");
@@ -1362,6 +1524,89 @@ impl App {
         r.set("Content-Length", body.len());
         r.body = body;
         r
+    }
+
+    fn thumbnail(&self, req: &HttpRequest) -> HttpResponse {
+        let rest = req
+            .path
+            .strip_prefix(rusty_dlna_protocol::paths::THUMBNAILS_PREFIX)
+            .unwrap_or("");
+        let Some(id) = rusty_dlna_protocol::paths::strtoll_prefix(rest) else {
+            return HttpResponse::html(404, "Not Found", "bad thumb id");
+        };
+        if req.header("Range").is_some() || streaming_on_image(req, "image/jpeg") {
+            return HttpResponse::html(406, "Not Acceptable", "Streaming/Range on image");
+        }
+        let Some(item) = self
+            .catalog
+            .read()
+            .expect("catalog")
+            .get_item_by_detail(id)
+            .cloned()
+        else {
+            return HttpResponse::html(404, "Not Found", "no item");
+        };
+        if item.album_art <= 0 {
+            return HttpResponse::html(404, "Not Found", "no thumbnail");
+        }
+        self.serve_album_art(item.album_art, req)
+    }
+
+    fn resized(&self, req: &HttpRequest) -> HttpResponse {
+        let rest = req
+            .path
+            .strip_prefix(rusty_dlna_protocol::paths::RESIZED_PREFIX)
+            .unwrap_or("");
+        let Some(id) = rusty_dlna_protocol::paths::strtoll_prefix(rest) else {
+            return HttpResponse::html(404, "Not Found", "bad resized id");
+        };
+        if req.header("Range").is_some() || streaming_on_image(req, "image/jpeg") {
+            return HttpResponse::html(406, "Not Acceptable", "Streaming/Range on image");
+        }
+        let (w, h) = parse_resize_query(&req.query);
+        let Some(item) = self
+            .catalog
+            .read()
+            .expect("catalog")
+            .get_item_by_detail(id)
+            .cloned()
+        else {
+            return HttpResponse::html(404, "Not Found", "no item");
+        };
+        let src = if item.mime.starts_with("image/") {
+            rusty_dlna_scan::rebase_media_path(&item.path, &self.scan_cfg.media_dirs)
+        } else if item.album_art > 0 {
+            let p = {
+                let cat = self.catalog.read().expect("catalog");
+                cat.album_art_paths.get(&item.album_art).cloned()
+            };
+            let Some(p) = p else {
+                return HttpResponse::html(404, "Not Found", "no art");
+            };
+            rusty_dlna_scan::rebase_media_path(&p, &self.scan_cfg.media_dirs)
+        } else {
+            return HttpResponse::html(404, "Not Found", "nothing to resize");
+        };
+        let dest = self.cache_dir.join(format!("resized-{id}-{w}x{h}.jpg"));
+        if !dest.is_file() && !rusty_dlna_scan::scale_jpeg(&src, &dest, w, h) {
+            return HttpResponse::html(404, "Not Found", "resize failed");
+        }
+        match std::fs::read(&dest) {
+            Ok(body) => {
+                let pn = jpeg_pn_for_size(w, h);
+                let mut r = HttpResponse::new(200, "OK");
+                r.set("Content-Type", "image/jpeg");
+                r.set("transferMode.dlna.org", "Interactive");
+                r.set(
+                    "contentFeatures.dlna.org",
+                    dlna_org_features(Some(pn), "01", 1, "image/jpeg"),
+                );
+                r.set("Content-Length", body.len());
+                r.body = body;
+                r
+            }
+            Err(_) => HttpResponse::html(404, "Not Found", "resize missing"),
+        }
     }
 
     fn caption(&self, req: &HttpRequest) -> HttpResponse {
@@ -1381,7 +1626,7 @@ impl App {
             return HttpResponse::html(404, "Not Found", "no caption");
         };
         let cap_path = rusty_dlna_scan::rebase_media_path(&cap.path, &self.scan_cfg.media_dirs);
-        match std::fs::read(&cap_path) {
+        match self.read_sidecar(&cap_path) {
             Ok(body) => {
                 let mut r = HttpResponse::new(200, "OK");
                 r.set("Content-Type", caption_http_mime(&cap.ext));
@@ -1389,8 +1634,47 @@ impl App {
                 r.body = body;
                 r
             }
-            Err(_) => HttpResponse::html(404, "Not Found", "caption missing"),
+            Err(r) => r,
         }
+    }
+
+    /// Art / captions: regular file under media_dir or cache_dir, size-capped.
+    fn read_sidecar(&self, path: &Path) -> Result<Vec<u8>, HttpResponse> {
+        let mut roots = self.scan_cfg.media_dirs.clone();
+        roots.push(self.cache_dir.clone());
+        if !rusty_dlna_scan::path_is_under_roots(path, &roots) {
+            return Err(HttpResponse::html(404, "Not Found", "sidecar escaped"));
+        }
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return Err(HttpResponse::html(404, "Not Found", "sidecar missing")),
+        };
+        if meta.len() > rusty_dlna_scan::MAX_SIDECAR_BYTES {
+            return Err(HttpResponse::html(413, "Payload Too Large", "sidecar too large"));
+        }
+        match std::fs::read(path) {
+            Ok(b) => Ok(b),
+            Err(_) => Err(HttpResponse::html(404, "Not Found", "sidecar missing")),
+        }
+    }
+}
+
+/// HTTP/1.1 requires a dotted-IPv4 Host on every method (SOAP / GENA included).
+/// Any present Host must pass the dialect rebinding check.
+fn host_rebinding_reject(req: &HttpRequest) -> Option<HttpResponse> {
+    let http11 = req.version.eq_ignore_ascii_case("HTTP/1.1");
+    match req.header("Host") {
+        None if http11 => Some(HttpResponse::html(
+            400,
+            "Bad Request",
+            "DNS rebinding attack suspected",
+        )),
+        Some(h) if !valid_host_header(h) => Some(HttpResponse::html(
+            400,
+            "Bad Request",
+            "DNS rebinding attack suspected",
+        )),
+        _ => None,
     }
 }
 
@@ -1601,6 +1885,125 @@ fn cmp_sort_key(a: &CatalogChild, b: &CatalogChild, key: SortKey) -> std::cmp::O
         SortKey::Album => cmp_ci(child_album(a), child_album(b)),
         SortKey::EpisodeNumber | SortKey::Track => child_track(a).cmp(&child_track(b)),
     }
+}
+
+fn sniff_renderer_location(url: &str, server: &str, app: &App) {
+    let Some((host, port, path)) = split_http_url(url) else {
+        return;
+    };
+    let Ok(ip) = host.parse::<Ipv4Addr>() else {
+        return;
+    };
+    let Ok(mut sock) = std::net::TcpStream::connect_timeout(
+        &SocketAddr::from((ip, port)),
+        std::time::Duration::from_millis(400),
+    ) else {
+        return;
+    };
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(600)));
+    let req = format!(
+        "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    );
+    use std::io::{Read, Write};
+    if sock.write_all(req.as_bytes()).is_err() {
+        return;
+    }
+    let mut buf = String::new();
+    let _ = sock.read_to_string(&mut buf);
+    let friendly = xml_tag_loose(&buf, "friendlyName");
+    let model = xml_tag_loose(&buf, "modelName");
+    let profile = friendly
+        .as_deref()
+        .and_then(identify_friendly_name_ssdp)
+        .or_else(|| friendly.as_deref().and_then(identify_friendly_name))
+        .or_else(|| model.as_deref().and_then(identify_model_name))
+        .or_else(|| identify_user_agent(server));
+    let Some(profile) = profile else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = app
+        .client_cache
+        .lock()
+        .expect("client cache")
+        .remember(ip, profile, None, now);
+}
+
+fn split_http_url(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.strip_prefix("http://")?;
+    let (auth, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match auth.rsplit_once(':') {
+        Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) => (h.to_string(), p.parse().ok()?),
+        _ => (auth.to_string(), 80u16),
+    };
+    Some((host, port, path.to_string()))
+}
+
+fn xml_tag_loose(hay: &str, tag: &str) -> Option<String> {
+    rusty_dlna_soap::xml_tag_text(hay, tag)
+}
+
+fn parse_wh(res: Option<&str>) -> (u32, u32) {
+    let Some(s) = res else {
+        return (0, 0);
+    };
+    let Some((w, h)) = s.split_once('x') else {
+        return (0, 0);
+    };
+    (w.parse().unwrap_or(0), h.parse().unwrap_or(0))
+}
+
+fn resized_didl(app: &App, it: &MediaItem, w: u32, h: u32, pn: &str) -> DidlRes {
+    DidlRes {
+        url: format!(
+            "http://{}:{}/Resized/{}.jpg?width={w},height={h}",
+            app.advertise_ip, app.http_port, it.detail_id
+        ),
+        protocol_info: format!(
+            "http-get:*:image/jpeg:{}",
+            dlna_org_features(Some(pn), "01", 1, "image/jpeg")
+        ),
+        size: None,
+        duration: None,
+        bitrate: None,
+        resolution: Some(format!("{w}x{h}")),
+        sample_frequency: None,
+        nr_audio_channels: None,
+        pv_subtitle_type: None,
+        pv_subtitle_uri: None,
+    }
+}
+
+fn jpeg_pn_for_size(w: u32, h: u32) -> &'static str {
+    if w <= 160 && h <= 160 {
+        "JPEG_TN"
+    } else if w <= 640 && h <= 480 {
+        "JPEG_SM"
+    } else if w <= 1024 && h <= 768 {
+        "JPEG_MED"
+    } else {
+        "JPEG_LRG"
+    }
+}
+
+fn parse_resize_query(query: &str) -> (u32, u32) {
+    let mut w = 160u32;
+    let mut h = 160u32;
+    for part in query.split([',', '&']) {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("width=") {
+            w = v.parse().unwrap_or(w).clamp(1, 4096);
+        } else if let Some(v) = part.strip_prefix("height=") {
+            h = v.parse().unwrap_or(h).clamp(1, 4096);
+        }
+    }
+    (w, h)
 }
 
 fn query_has_album_art(query: &str) -> bool {
@@ -2244,6 +2647,15 @@ async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
                     }
                 };
                 let text = String::from_utf8_lossy(&buf[..n]);
+                if let Some(n) = parse_inbound_notify(&text) {
+                    let app2 = Arc::clone(&app);
+                    let loc = n.location.clone();
+                    let server = n.server.clone();
+                    tokio::task::spawn_blocking(move || {
+                        sniff_renderer_location(&loc, &server, &app2);
+                    });
+                    continue;
+                }
                 let Ok(ms) = parse_msearch(&text) else { continue };
                 let date = now_imf_date();
                 let replies = msearch_replies(
@@ -2305,6 +2717,12 @@ async fn handle_conn(
         let head = std::str::from_utf8(&buf[..header_end])?;
         let mut req = HttpRequest::parse_headers(head).map_err(|e| format!("parse: {e:?}"))?;
         let need = req.content_length().unwrap_or(0);
+        if rusty_dlna_http::http_body_too_large(need) {
+            let resp = HttpResponse::html(413, "Payload Too Large", "body too large");
+            sock.write_all(&resp.bytes_wire(&app.server, &now_imf_date()))
+                .await?;
+            break;
+        }
         let mut body = buf[header_end..].to_vec();
         while body.len() < need {
             let n = sock.read(&mut tmp).await?;
@@ -2360,6 +2778,7 @@ pub(crate) async fn stream_file_range(
 mod tests {
     use super::*;
     use rusty_dlna_scan::{ensure_pattern_fixture, scan};
+    use rusty_dlna_soap::xml_tag_text;
 
     const TINY_JPEG: &[u8] = &[
         0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
@@ -2384,6 +2803,7 @@ mod tests {
         let root = workspace();
         let lib = root.join("testdata/library");
         ensure_pattern_fixture(&lib);
+        rusty_dlna_scan::ensure_show_fixture(&lib);
         let nfo = lib.join("video/movie.nfo");
         if !nfo.exists() {
             let _ = std::fs::create_dir_all(lib.join("video"));
@@ -2394,6 +2814,25 @@ mod tests {
         let poster = lib.join("video/movie-poster.jpg");
         if !poster.exists() {
             let _ = std::fs::write(&poster, TINY_JPEG);
+        }
+        let _ = std::fs::create_dir_all(lib.join("music"));
+        let song = lib.join("music/song.flac");
+        if !song.exists() {
+            let mut flac = b"fLaC".to_vec();
+            flac.extend_from_slice(&[0u8; 48]);
+            let _ = std::fs::write(&song, flac);
+        }
+        let song_nfo = lib.join("music/song.nfo");
+        if !song_nfo.exists() {
+            let _ = std::fs::write(
+                &song_nfo,
+                "<musicvideo><title>Fixture Track</title><genre>Jazz</genre><studio>Fixture Band</studio></musicvideo>\n",
+            );
+        }
+        let _ = std::fs::create_dir_all(lib.join("pictures"));
+        let pic = lib.join("pictures/shot.jpg");
+        if !pic.exists() {
+            let _ = std::fs::write(&pic, TINY_JPEG);
         }
         let dvp7 = lib.join("video/dvp7.mkv");
         if !dvp7.exists() {
@@ -2585,6 +3024,16 @@ audio_out = "to-aac"
         assert!(sid.starts_with("uuid:"), "{sid}");
         assert_eq!(resp_header(&r, "Timeout"), Some("Second-300"));
 
+        let inject = req(
+            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+             Host: 192.0.2.10:18200\r\n\
+             Callback: <http://192.0.2.50:1234/evt\nX-Injected: 1>\r\n\
+             NT: upnp:event\r\n\
+             Timeout: Second-300\r\n\
+             Content-Length: 0\r\n\r\n",
+        );
+        assert_eq!(app.handle_from(&inject, peer50).status, 412);
+
         let mismatch = req(
             "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
              Host: 192.0.2.10:18200\r\n\
@@ -2716,6 +3165,95 @@ audio_out = "to-aac"
             "GET /MediaItems/1.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nTimeSeekRange.dlna.org: npt=0-\r\n\r\n",
         );
         assert_eq!(app.handle(&ts).status, 406);
+
+        let soap_rebind = req(
+            "POST /ctl/ContentDir HTTP/1.1\r\nHost: attacker.example\r\nSOAPAction: \"urn:x#Browse\"\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(app.handle(&soap_rebind).status, 400);
+        let soap_no_host = req(
+            "POST /ctl/ContentDir HTTP/1.1\r\nSOAPAction: \"urn:x#Browse\"\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(app.handle(&soap_no_host).status, 400);
+        let sub_rebind = req(
+            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\nHost: localhost\r\nCallback: <http://127.0.0.1:9/e>\r\nNT: upnp:event\r\n\r\n",
+        );
+        assert_eq!(app.handle(&sub_rebind).status, 400);
+        let unsub_rebind = req(
+            "UNSUBSCRIBE /evt/ContentDir HTTP/1.1\r\nHost: evil.test\r\nSID: uuid:x\r\n\r\n",
+        );
+        assert_eq!(app.handle(&unsub_rebind).status, 400);
+    }
+
+    #[test]
+    fn sidecar_size_and_symlink_jail() {
+        let app = testdata_app();
+        let (art_id, detail_id) = {
+            let cat = app.catalog.read().expect("catalog");
+            let movie = cat
+                .items
+                .values()
+                .find(|i| i.path.ends_with("movie.mkv"))
+                .expect("movie");
+            (movie.album_art, movie.detail_id)
+        };
+        assert!(art_id > 0);
+
+        let outside = std::env::temp_dir().join(format!(
+            "rdlna-secret-{}-{}",
+            std::process::id(),
+            detail_id
+        ));
+        std::fs::write(&outside, b"not-a-poster").unwrap();
+        {
+            let mut cat = app.catalog.write().expect("catalog");
+            cat.album_art_paths.insert(art_id, outside.clone());
+        }
+        let escaped = app.handle(&req(&get(
+            &format!("/AlbumArt/{art_id}-{detail_id}.jpg"),
+            "Kodi/21.0",
+        )));
+        assert_eq!(escaped.status, 404, "path outside media/cache must 404");
+
+        let cache = app.cache_dir.clone();
+        let _ = std::fs::create_dir_all(&cache);
+        let big = cache.join(format!(
+            "rdlna-oversized-{}-{}.jpg",
+            std::process::id(),
+            detail_id
+        ));
+        {
+            let f = std::fs::File::create(&big).unwrap();
+            f.set_len(rusty_dlna_scan::MAX_SIDECAR_BYTES + 1).unwrap();
+        }
+        {
+            let mut cat = app.catalog.write().expect("catalog");
+            cat.album_art_paths.insert(art_id, big.clone());
+        }
+        let huge = app.handle(&req(&get(
+            &format!("/AlbumArt/{art_id}-{detail_id}.jpg"),
+            "Kodi/21.0",
+        )));
+        assert_eq!(huge.status, 413, "oversized sidecar must 413");
+
+        let link = cache.join(format!(
+            "rdlna-escape-{}-{}.jpg",
+            std::process::id(),
+            detail_id
+        ));
+        let _ = std::os::unix::fs::symlink(&outside, &link);
+        {
+            let mut cat = app.catalog.write().expect("catalog");
+            cat.album_art_paths.insert(art_id, link.clone());
+        }
+        let via_link = app.handle(&req(&get(
+            &format!("/AlbumArt/{art_id}-{detail_id}.jpg"),
+            "Kodi/21.0",
+        )));
+        assert_eq!(via_link.status, 404, "symlink out of tree must 404");
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_file(&big);
+        let _ = std::fs::remove_file(&link);
     }
 
     fn soap_action(app: &App, action: &str, inner: &str, ua: &str) -> (u16, String) {
@@ -2730,6 +3268,12 @@ audio_out = "to-aac"
         req.body = body.into_bytes();
         let r = app.handle(&req);
         (r.status, String::from_utf8_lossy(&r.body).into_owned())
+    }
+
+    fn status_row_count(body: &str, label: &str) -> Option<u32> {
+        let marker = format!("<tr><td>{label}</td><td>");
+        let rest = body.split(&marker).nth(1)?;
+        rest.split("</td>").next()?.parse().ok()
     }
 
     fn soap_browse(app: &App, oid: &str, flag: &str, ua: &str) -> (u16, String) {
@@ -2760,6 +3304,8 @@ audio_out = "to-aac"
         assert!(video.contains("All Video"), "{video}");
         assert!(video.contains("Recently Added"), "{video}");
         assert!(video.contains("Folders"), "{video}");
+        assert!(video.contains("Series"), "{video}");
+        assert!(video.contains("Genre"), "{video}");
         assert!(
             video.contains("id=\"2$8\"") || video.contains("id=&quot;2$8&quot;"),
             "{video}"
@@ -2821,6 +3367,58 @@ audio_out = "to-aac"
     }
 
     #[test]
+    fn browse_series_seasons_and_genre() {
+        let app = testdata_app();
+        let (st, series) = soap_browse(&app, "2$E", "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200);
+        assert!(
+            series.contains("The Show"),
+            "Series must list showtitle: {series}"
+        );
+        let show_id = {
+            let cat = app.catalog.read().unwrap();
+            cat.containers
+                .values()
+                .find(|c| c.parent_id == "2$E" && c.title == "The Show")
+                .map(|c| c.object_id.clone())
+                .expect("show container")
+        };
+        let (st, seasons) = soap_browse(&app, &show_id, "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200);
+        assert!(seasons.contains("Season 1"), "{seasons}");
+        let season_id = {
+            let cat = app.catalog.read().unwrap();
+            cat.containers
+                .values()
+                .find(|c| c.parent_id == show_id && c.title == "Season 1")
+                .map(|c| c.object_id.clone())
+                .expect("season 1")
+        };
+        let (st, eps) = soap_browse(&app, &season_id, "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200);
+        assert!(eps.contains("Pilot"), "episode title under season: {eps}");
+        assert!(eps.contains("/MediaItems/"), "{eps}");
+        assert!(
+            eps.contains("upnp:episodeSeason") || eps.contains("episodeSeason"),
+            "{eps}"
+        );
+        let (st, genres) = soap_browse(&app, "2$9", "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200);
+        assert!(genres.contains("Drama") || genres.contains("Crime"), "{genres}");
+        let drama_id = {
+            let cat = app.catalog.read().unwrap();
+            cat.containers
+                .values()
+                .find(|c| c.parent_id == "2$9" && (c.title == "Drama" || c.title == "Crime"))
+                .map(|c| c.object_id.clone())
+                .expect("genre folder")
+        };
+        let (st, items) = soap_browse(&app, &drama_id, "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200);
+        assert!(items.contains("The Show") || items.contains("Pilot"), "{items}");
+    }
+
+    #[test]
     fn album_art_get_and_didl() {
         let app = testdata_app();
         let (st, items) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
@@ -2876,8 +3474,41 @@ audio_out = "to-aac"
         );
         assert_eq!(app.handle(&req(&ranged)).status, 406);
 
-        assert_eq!(app.handle(&req(&get("/Thumbnails/1.jpg", "Kodi/21.0"))).status, 404);
-        assert_eq!(app.handle(&req(&get("/Resized/1.jpg", "Kodi/21.0"))).status, 404);
+        let thumb = app.handle(&req(&get(
+            &format!("/Thumbnails/{detail_id}.jpg"),
+            "Kodi/21.0",
+        )));
+        assert_eq!(thumb.status, 200, "native thumb uses album art");
+        assert_eq!(resp_header(&thumb, "Content-Type"), Some("image/jpeg"));
+        let ffmpeg_ok = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ffmpeg_ok {
+            eprintln!("skip /Resized/ GET (ffmpeg missing)");
+        } else {
+            let resized = app.handle(&req(&get(
+                &format!("/Resized/{detail_id}.jpg?width=160,height=160"),
+                "Kodi/21.0",
+            )));
+            assert_eq!(resized.status, 200, "resized GET");
+            assert_eq!(resp_header(&resized, "Content-Type"), Some("image/jpeg"));
+            assert_eq!(
+                resp_header(&resized, "transferMode.dlna.org"),
+                Some("Interactive")
+            );
+            assert!(
+                resized.body.len() >= 2 && resized.body[0] == 0xff && resized.body[1] == 0xd8,
+                "JPEG magic"
+            );
+            let feats = resp_header(&resized, "contentFeatures.dlna.org").unwrap_or("");
+            assert!(feats.contains("JPEG_TN"), "contentFeatures={feats}");
+            assert!(
+                feats.contains("DLNA.ORG_CI=1"),
+                "contentFeatures CI=1: {feats}"
+            );
+        }
 
         let xbox = app.handle(&req(&get(
             &format!("/MediaItems/{detail_id}.mkv?albumArt=true"),
@@ -2897,6 +3528,8 @@ audio_out = "to-aac"
         assert!(xml.contains("All Video"), "{xml}");
         assert!(xml.contains("Folders"), "{xml}");
         assert!(xml.contains("Recently Added"), "{xml}");
+        assert!(xml.contains("Series"), "{xml}");
+        assert!(xml.contains("Genre"), "{xml}");
         assert!(
             xml.contains("parentID=\"0\"") || xml.contains("parentID=&quot;0&quot;"),
             "remapped root advertises parentID=0: {xml}"
@@ -3049,16 +3682,10 @@ audio_out = "to-aac"
             "BrowseDirectChildren",
             "CrKey/1.54.384650 DLNADOC/1.50",
         );
-        // remapped res first: Transcode before MediaItems for that item
-        let pos_t = cr.find("/Transcode/");
-        let pos_m = cr.find("/MediaItems/");
-        assert!(pos_t.is_some(), "CrKey DIDL missing remap: {cr}");
-        // CI=1 on remap
+        let t = cr.find("/Transcode/").expect("CrKey DIDL missing remap");
+        let m = cr.find("/MediaItems/").expect("CrKey DIDL missing original");
+        assert!(t < m, "remux res must be listed first: {cr}");
         assert!(cr.contains("DLNA.ORG_CI=1"));
-        if let (Some(t), Some(m)) = (pos_t, pos_m) {
-            // overall MediaItems also exist for movie; just ensure Transcode exists
-            let _ = (t, m);
-        }
     }
 
     #[test]
@@ -3077,8 +3704,9 @@ audio_out = "to-aac"
         )
         .unwrap();
         let (_, kodi) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
-        let pos_t = kodi.find("/Transcode/");
-        assert!(pos_t.is_some(), "Kodi DIDL missing remap: {kodi}");
+        let t = kodi.find("/Transcode/").expect("Kodi DIDL missing remap");
+        let m = kodi.find("/MediaItems/").expect("Kodi DIDL missing original");
+        assert!(t < m, "remux res must be listed first: {kodi}");
         let (_, plat) = soap_browse(
             &app,
             "2$8",
@@ -3090,9 +3718,6 @@ audio_out = "to-aac"
             "Platinum UA must match Kodi remap: {plat}"
         );
         assert!(kodi.contains("DLNA.ORG_CI=1"));
-        if let (Some(t), Some(m)) = (pos_t, kodi.find("/MediaItems/")) {
-            assert!(t < m, "remux res must be listed first");
-        }
         let t0 = std::time::Instant::now();
         let (_, xml) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
         assert!(
@@ -3131,8 +3756,12 @@ audio_out = "to-aac"
         )));
         assert!(!String::from_utf8_lossy(&pc.body).contains("sec:ProductCap"));
         let pc_fl = feature_list(&app, "DLNADOC/1.50 SEC_HHP_[PC]LPC001/1.0");
-        assert!(!pc_fl.contains("id=&quot;A&quot;"));
-        assert!(pc_fl.contains("id=&quot;1&quot;") || pc_fl.contains("samsung.com_BASICVIEW"));
+        assert!(pc_fl.contains("id=&quot;1&quot;"), "{pc_fl}");
+        assert!(pc_fl.contains("id=&quot;2&quot;"), "{pc_fl}");
+        assert!(pc_fl.contains("id=&quot;3&quot;"), "{pc_fl}");
+        assert!(!pc_fl.contains("id=&quot;A&quot;"), "PC must not use A: {pc_fl}");
+        assert!(!pc_fl.contains("id=&quot;V&quot;"), "PC must not use V: {pc_fl}");
+        assert!(!pc_fl.contains("id=&quot;I&quot;"), "PC must not use I: {pc_fl}");
         let (_, pc_didl) = soap_browse(
             &app,
             "2$8",
@@ -3171,8 +3800,9 @@ audio_out = "to-aac"
         // CrKey: transcode res first on DV P7
         let (_, cr) = soap_browse(&app, "2$8", "BrowseDirectChildren", "CrKey/1.54 DLNADOC/1.50");
         let t = cr.find("/Transcode/").expect("crkey remap");
+        let m = cr.find("/MediaItems/").expect("crkey original");
+        assert!(t < m, "remux res must be listed first: {cr}");
         assert!(cr.contains("DLNA.ORG_CI=1"));
-        let _ = t;
 
         // Generic DLNADOC/1.50 is not NEED_SAFE_VIDEO
         let generic = identify_user_agent("DLNADOC/1.50 UPnP/1.0").unwrap();
@@ -3182,14 +3812,29 @@ audio_out = "to-aac"
     }
 
     fn movie_fixture(app: &App) -> rusty_dlna_scan::MediaItem {
-        app.catalog
-            .read()
-            .unwrap()
+        let cat = app.catalog.read().unwrap();
+        let any = cat
             .items
             .values()
             .find(|i| i.path.ends_with("movie.mkv"))
             .cloned()
-            .expect("movie.mkv fixture")
+            .expect("movie.mkv fixture");
+        cat.get_item_by_detail(any.detail_id)
+            .cloned()
+            .unwrap_or(any)
+    }
+
+    fn set_detail_dlna_pn(app: &App, detail_id: i64, pn: &str) {
+        let mut cat = app.catalog.write().expect("catalog");
+        let oid = cat
+            .by_detail
+            .get(&detail_id)
+            .cloned()
+            .expect("by_detail oid");
+        cat.items
+            .get_mut(&oid)
+            .expect("by_detail item")
+            .dlna_pn = Some(pn.into());
     }
 
     #[test]
@@ -3224,6 +3869,47 @@ audio_out = "to-aac"
             Some(120),
             "BOOKMARKS.SEC for detail {}",
             movie.detail_id
+        );
+    }
+
+    #[test]
+    fn samsung_q_bookmark_convert_ms_bm() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let q = "SEC_HHP_[TV] Samsung Q";
+        let (st, xml) = soap_action(
+            &app,
+            "X_SetBookmark",
+            &format!(
+                "<ObjectID>{}</ObjectID><PosSecond>120000</PosSecond>",
+                movie.object_id
+            ),
+            q,
+        );
+        assert_eq!(st, 200, "{xml}");
+
+        let (st, xml) = soap_browse(&app, &movie.object_id, "BrowseMetadata", q);
+        assert_eq!(st, 200, "{xml}");
+        assert!(
+            xml.contains("&lt;upnp:lastPlaybackPosition&gt;120000&lt;/upnp:lastPlaybackPosition&gt;")
+                || xml.contains("<upnp:lastPlaybackPosition>120000</upnp:lastPlaybackPosition>"),
+            "lastPlaybackPosition 120000 missing: {xml}"
+        );
+        assert!(
+            xml.contains("BM=120000"),
+            "dcmInfo BM=120000 missing: {xml}"
+        );
+
+        let (st, kodi) = soap_browse(&app, &movie.object_id, "BrowseMetadata", "Kodi/21.0");
+        assert_eq!(st, 200, "{kodi}");
+        assert!(
+            kodi.contains("&lt;upnp:lastPlaybackPosition&gt;120&lt;/upnp:lastPlaybackPosition&gt;")
+                || kodi.contains("<upnp:lastPlaybackPosition>120</upnp:lastPlaybackPosition>"),
+            "Kodi lastPlaybackPosition 120 missing: {kodi}"
+        );
+        assert!(
+            !kodi.contains("120000"),
+            "Kodi must keep stored seconds, not ms: {kodi}"
         );
     }
 
@@ -3497,6 +4183,7 @@ audio_out = "to-aac"
             rusty_dlna_transcode::RecodeAction::RemuxP8,
         );
         assert!(!dest.is_file(), "handle() must not wait for a finished cache");
+        assert!(spec.remux_p8, "dvp7 remux-p8 must attempt dovi convert");
 
         let kodi_orig = testdata_app();
         let miss = kodi_orig.handle(&req(&format!(
@@ -3504,6 +4191,93 @@ audio_out = "to-aac"
         )));
         assert_eq!(miss.status, 200, "no remap → original, not 404");
         assert!(miss.remux_job.is_none());
+    }
+
+    #[test]
+    fn remux_finished_range_and_stale_rebuild() {
+        use std::io::Read;
+        use std::sync::Arc;
+        let app = testdata_app();
+        let dvp7 = app
+            .catalog
+            .read()
+            .unwrap()
+            .items
+            .values()
+            .find(|i| i.title == "dvp7")
+            .cloned()
+            .expect("dvp7");
+        let live = rusty_dlna_scan::rebase_media_path(&dvp7.path, &app.scan_cfg.media_dirs);
+        let dest = rusty_dlna_transcode::cache_dest(
+            &app.cache_dir,
+            dvp7.detail_id,
+            rusty_dlna_transcode::RecodeAction::RemuxP8,
+        );
+        if let Some(p) = dest.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        let src = app.cache_dir.join("dvp7-stamp-src.mkv");
+        let _ = std::fs::copy(&live, &src);
+        let payload = b"0123456789abcdefFINISHED_REMUX_BYTES";
+        std::fs::write(&dest, payload).unwrap();
+        rusty_dlna_transcode::write_cache_stamp(&dest, &src);
+        assert!(rusty_dlna_transcode::cache_is_fresh(&dest, &src));
+
+        let spec = RemuxJobSpec {
+            detail_id: dvp7.detail_id,
+            src: src.clone(),
+            dest: dest.clone(),
+            args: vec!["ffmpeg".into(), "-version".into()],
+            remux_p8: true,
+            audio_index: 0,
+        };
+        let req = HttpRequest::parse_headers(
+            "GET /Transcode/1.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nRange: bytes=0-15\r\n\r\n",
+        )
+        .unwrap();
+        let app = Arc::new(app);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (hdr, body) = rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app2 = app.clone();
+            let spec2 = spec.clone();
+            let h = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                remux::serve_remux(&app2, &mut sock, &req, spec2).await.unwrap();
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            let mut buf = Vec::new();
+            let _ = c.read_to_end(&mut buf);
+            let _ = h.await;
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            let split = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(buf.len());
+            let body = if split + 4 <= buf.len() {
+                buf[split + 4..].to_vec()
+            } else {
+                Vec::new()
+            };
+            (text, body)
+        });
+        assert!(hdr.contains("206") || hdr.contains("HTTP/1.1 206"), "{hdr}");
+        assert!(
+            hdr.to_ascii_lowercase().contains("accept-ranges: bytes"),
+            "{hdr}"
+        );
+        assert!(hdr.contains("DLNA.ORG_OP=01"), "{hdr}");
+        assert_eq!(body, &payload[..16]);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&src, b"replaced-source-bytes-to-bust-stamp").unwrap();
+        assert!(
+            !rusty_dlna_transcode::cache_is_fresh(&dest, &src),
+            "replaced source must invalidate remux dest"
+        );
     }
 
     #[test]
@@ -3706,14 +4480,12 @@ audio_out = "to-aac"
         assert_eq!(r.status, 200);
         let body = String::from_utf8_lossy(&r.body);
         assert!(body.contains("Video"), "{body}");
-        assert!(
-            body.chars().any(|c| c.is_ascii_digit() && c != '0')
-                || body.contains("<td>1</td>")
-                || body.contains("<td>2</td>")
-                || body.contains("<td>3</td>")
-                || body.contains("<td>4</td>"),
-            "non-zero video count: {body}"
-        );
+        let video_n = status_row_count(&body, "Video").expect("Video row");
+        assert!(video_n >= 1, "Video count {video_n}: {body}");
+        let audio_n = status_row_count(&body, "Audio").expect("Audio row");
+        assert!(audio_n >= 1, "Audio count {audio_n}: {body}");
+        let image_n = status_row_count(&body, "Image").expect("Image row");
+        assert!(image_n >= 1, "Image count {image_n}: {body}");
         assert!(body.contains("refresh") || body.contains("Refresh") || body.contains("20"), "{body}");
         assert!(
             !body.contains("<H1>200 OK</H1>"),
@@ -3740,8 +4512,12 @@ audio_out = "to-aac"
         );
         assert_eq!(st, 200, "{xml}");
         assert!(
-            xml.contains("Fixture Movie") || xml.contains("/MediaItems/"),
-            "Search ContainerID=V must remap to video: {xml}"
+            xml.contains("Fixture Movie"),
+            "Search ContainerID=V must find Fixture Movie: {xml}"
+        );
+        assert!(
+            xml.contains("/MediaItems/"),
+            "Search ContainerID=V must list a media URL: {xml}"
         );
         let (st_img, img) = soap_action(
             &app,
@@ -3751,8 +4527,8 @@ audio_out = "to-aac"
         );
         assert_eq!(st_img, 200, "{img}");
         assert!(
-            !img.contains("Fixture Movie") && !img.contains("/MediaItems/"),
-            "Search ContainerID=I is images only: {img}"
+            !img.contains("Fixture Movie"),
+            "Search ContainerID=I must not return the video title: {img}"
         );
     }
 
@@ -3818,16 +4594,35 @@ audio_out = "to-aac"
         let app = testdata_app();
         {
             let mut cat = app.catalog.write().expect("catalog");
-            let ids: Vec<String> = cat
+            let mut videos: Vec<String> = cat
                 .items
                 .values()
-                .filter(|i| i.path.ends_with("movie.mkv") || i.title.contains("Fixture"))
+                .filter(|i| {
+                    i.class.contains("video")
+                        && i.ref_id.is_none()
+                        && i.object_id
+                            .starts_with(rusty_dlna_protocol::object_id::BROWSEDIR_ID)
+                })
                 .map(|i| i.object_id.clone())
                 .collect();
-            for oid in ids {
-                if let Some(it) = cat.items.get_mut(&oid) {
+            videos.sort();
+            assert!(
+                videos.len() >= 2,
+                "need two browse-folder videos, got {videos:?}"
+            );
+            let high_oid = videos[0].clone();
+            let low_oid = videos[1].clone();
+            let high_detail = cat.items.get(&high_oid).unwrap().detail_id;
+            let low_detail = cat.items.get(&low_oid).unwrap().detail_id;
+            for it in cat.items.values_mut() {
+                if it.detail_id == high_detail {
+                    it.title = "Aaa HighTrack".into();
                     it.disc = Some(2);
                     it.track = Some(5);
+                } else if it.detail_id == low_detail {
+                    it.title = "Zzz LowTrack".into();
+                    it.disc = Some(1);
+                    it.track = Some(1);
                 }
             }
         }
@@ -3837,10 +4632,12 @@ audio_out = "to-aac"
             "BrowseDirectChildren",
             "Panasonic DLNADOC/1.50",
         );
-        assert_eq!(st, 200);
+        assert_eq!(st, 200, "{xml}");
+        let low = xml.find("Zzz LowTrack").expect("Zzz LowTrack in DIDL");
+        let high = xml.find("Aaa HighTrack").expect("Aaa HighTrack in DIDL");
         assert!(
-            xml.contains("Fixture Movie") || xml.contains("/MediaItems/"),
-            "{xml}"
+            low < high,
+            "FORCE_SORT disc/track must put Zzz LowTrack before Aaa HighTrack: {xml}"
         );
         let (st709, body709) = soap_action(
             &app,
@@ -3941,16 +4738,390 @@ audio_out = "to-aac"
             let mut cache = app.client_cache.lock().unwrap();
             cache.set_age(ip, 0);
         }
-        let kept = app
-            .client_cache
-            .lock()
-            .unwrap()
-            .search(ip, 3601, Some([1, 2, 3, 4, 5, 6]));
-        let _ = kept;
-        let after = {
+        assert!(
+            app.client_cache
+                .lock()
+                .unwrap()
+                .search(ip, 3601, Some([1, 2, 3, 4, 5, 6]))
+                .is_none(),
+            "HTTP stores no MAC"
+        );
+        {
+            let kodi = identify_user_agent("Kodi/21.0").expect("kodi");
             let mut cache = app.client_cache.lock().unwrap();
-            cache.search(ip, 3601, None)
+            cache.remember(ip, kodi, Some([1, 2, 3, 4, 5, 6]), 0);
+            assert_eq!(
+                cache
+                    .search(ip, 3601, Some([1, 2, 3, 4, 5, 6]))
+                    .map(|p| p.kind),
+                Some(ClientKind::Kodi)
+            );
+        }
+    }
+
+    #[test]
+    fn pfs_xbox_browse_eight_is_video_all() {
+        let app = testdata_app();
+        let (st8, eight) = soap_browse(&app, "8", "BrowseDirectChildren", "Xbox/360");
+        let (st, all) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Xbox/360");
+        assert_eq!(st8, 200, "{eight}");
+        assert_eq!(st, 200, "{all}");
+        assert!(
+            eight.contains("/MediaItems/"),
+            "Xbox Browse 8 must remap to Video All: {eight}"
+        );
+        assert!(
+            eight.contains("NumberReturned") && all.contains("NumberReturned"),
+            "both pages return items"
+        );
+        let n8 = xml_tag_text(&eight, "NumberReturned").unwrap_or_default();
+        let nall = xml_tag_text(&all, "NumberReturned").unwrap_or_default();
+        assert_eq!(n8, nall, "8 and 2$8 must return the same page");
+    }
+
+    #[test]
+    fn feature_list_dcm10_and_root_container_collapse() {
+        let mut app = testdata_app();
+        let tv = feature_list(&app, "DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0");
+        assert!(tv.contains("id=&quot;A&quot;"), "{tv}");
+        assert!(tv.contains("id=&quot;V&quot;"), "{tv}");
+        assert!(tv.contains("id=&quot;I&quot;"), "{tv}");
+        app.cfg.root_container = Some("V".into());
+        let collapsed = feature_list(&app, "DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0");
+        let video_hits = collapsed.matches("id=&quot;2&quot;").count()
+            + collapsed.matches("id=&quot;V&quot;").count();
+        assert!(
+            video_hits >= 3,
+            "non-64 root_container collapses FeatureList: {collapsed}"
+        );
+        app.cfg.root_container = Some("64".into());
+        let folders = feature_list(&app, "Kodi/21.0");
+        assert!(folders.contains("id=&quot;1$14&quot;"), "{folders}");
+        assert!(folders.contains("id=&quot;2$15&quot;"), "{folders}");
+        assert!(folders.contains("id=&quot;3$16&quot;"), "{folders}");
+    }
+
+    #[test]
+    fn setbookmark_missing_object_is_701() {
+        let app = testdata_app();
+        let (st, xml) = soap_action(
+            &app,
+            "X_SetBookmark",
+            "<ObjectID>no-such-object</ObjectID><PosSecond>90</PosSecond>",
+            "Kodi/21.0",
+        );
+        assert_eq!(st, 500, "{xml}");
+        assert!(xml.contains("<errorCode>701</errorCode>"), "{xml}");
+    }
+
+    #[test]
+    fn search_negative_starting_index_is_402() {
+        let app = testdata_app();
+        let (st, xml) = soap_action(
+            &app,
+            "Search",
+            r#"<ContainerID>0</ContainerID><SearchCriteria></SearchCriteria><Filter>*</Filter><StartingIndex>-1</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>"#,
+            "Kodi/21.0",
+        );
+        assert_eq!(st, 500, "{xml}");
+        assert!(xml.contains("<errorCode>402</errorCode>"), "{xml}");
+    }
+
+    #[test]
+    fn query_state_variable_connection_status_missing_unknown() {
+        let app = testdata_app();
+        let (st, xml) = soap_action(
+            &app,
+            "QueryStateVariable",
+            "<varName>ConnectionStatus</varName>",
+            "Kodi/21.0",
+        );
+        assert_eq!(st, 200, "{xml}");
+        assert!(xml.contains("<return>Connected</return>"), "{xml}");
+        let (st, xml) = soap_action(&app, "QueryStateVariable", "", "Kodi/21.0");
+        assert_eq!(st, 500, "{xml}");
+        assert!(xml.contains("<errorCode>402</errorCode>"), "{xml}");
+        let (st, xml) = soap_action(
+            &app,
+            "QueryStateVariable",
+            "<varName>NotAVariable</varName>",
+            "Kodi/21.0",
+        );
+        assert_eq!(st, 500, "{xml}");
+        assert!(xml.contains("<errorCode>404</errorCode>"), "{xml}");
+    }
+
+    #[test]
+    fn browse_metadata_root_includes_search_class() {
+        let app = testdata_app();
+        let (st, meta) = soap_browse(&app, "0", "BrowseMetadata", "Kodi/21.0");
+        assert_eq!(st, 200, "{meta}");
+        assert!(
+            meta.contains("searchClass") && meta.contains("includeDerived"),
+            "{meta}"
+        );
+        assert!(meta.contains("object.item.audioItem"), "{meta}");
+        assert!(meta.contains("object.item.imageItem"), "{meta}");
+        assert!(meta.contains("object.item.videoItem"), "{meta}");
+    }
+
+    #[test]
+    fn didl_alias_items_have_refid() {
+        let app = testdata_app();
+        let alias = {
+            let cat = app.catalog.read().unwrap();
+            cat.items
+                .values()
+                .find(|i| i.ref_id.as_ref().is_some_and(|r| !r.is_empty()))
+                .cloned()
+                .expect("virtual alias with REF_ID")
         };
-        assert!(after.is_none() || after.unwrap().kind == ClientKind::Kodi);
+        let (st, xml) = soap_browse(&app, &alias.object_id, "BrowseMetadata", "Kodi/21.0");
+        assert_eq!(st, 200, "{xml}");
+        let rid = alias.ref_id.as_deref().unwrap();
+        assert!(
+            xml.contains(&format!("refID=\"{rid}\""))
+                || xml.contains(&format!("refID=&quot;{rid}&quot;")),
+            "alias {} missing refID={rid}: {xml}",
+            alias.object_id
+        );
+    }
+
+    #[test]
+    fn music_and_image_virtuals_browse_ok() {
+        let app = testdata_app();
+        for oid in ["1", "3", "1$4", "3$B", "1$FF0", "3$FF0"] {
+            let (st, xml) = soap_browse(&app, oid, "BrowseDirectChildren", "Kodi/21.0");
+            assert_eq!(st, 200, "{oid} {xml}");
+            assert!(xml.contains("BrowseResponse"), "{oid} {xml}");
+            assert!(
+                !xml.contains("<errorCode>"),
+                "virtual {oid} must not fault: {xml}"
+            );
+        }
+        let (st, music) = soap_browse(&app, "1", "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200, "{music}");
+        assert!(
+            music.contains("id=\"1$4\"")
+                || music.contains("All Music")
+                || music.contains("Recently Added"),
+            "{music}"
+        );
+        let (st, pics) = soap_browse(&app, "3", "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200, "{pics}");
+        assert!(
+            pics.contains("id=\"3$B\"")
+                || pics.contains("All Pictures")
+                || pics.contains("Recently Added"),
+            "{pics}"
+        );
+        let (st, tracks) = soap_browse(&app, "1$4", "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200, "{tracks}");
+        assert!(
+            tracks.contains("Fixture Track"),
+            "All Music must list the FLAC fixture: {tracks}"
+        );
+    }
+
+    #[test]
+    fn recent_keeps_old_mtime_and_caps_at_200() {
+        let app = testdata_app();
+        let movie = {
+            let cat = app.catalog.read().unwrap();
+            cat.items
+                .values()
+                .find(|i| {
+                    i.path.ends_with("movie.mkv")
+                        && i.ref_id.is_none()
+                        && i.object_id.starts_with(rusty_dlna_protocol::object_id::BROWSEDIR_ID)
+                })
+                .cloned()
+                .expect("browse-folder movie.mkv")
+        };
+        {
+            let mut cat = app.catalog.write().expect("catalog");
+            if let Some(it) = cat.items.get_mut(&movie.object_id) {
+                it.mtime = 1;
+                it.ref_id = None;
+            }
+            cat.recent_ids.clear();
+            cat.recent_count = 0;
+        }
+        let (st, xml) = soap_browse(&app, "2$FF0", "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200, "{xml}");
+        assert!(
+            xml.contains("Fixture Movie") || xml.contains(&movie.title),
+            "old-mtime files stay in Recent (no 90-day window): {xml}"
+        );
+        {
+            let mut cat = app.catalog.write().expect("catalog");
+            for i in 0..210i64 {
+                let oid = format!("64$RECENTTEST${i:X}");
+                let mut clone = movie.clone();
+                clone.object_id = oid.clone();
+                clone.parent_id = "64".into();
+                clone.ref_id = None;
+                clone.detail_id = 50_000 + i;
+                clone.title = format!("cap{i:03}");
+                clone.mtime = 2_000_000_000 + i;
+                clone.inode = 80_000 + i as u64;
+                clone.device = 9;
+                cat.items.insert(oid, clone);
+            }
+            cat.recent_ids.clear();
+            cat.recent_count = 0;
+        }
+        let (st, xml) = soap_browse(&app, "2$FF0", "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200, "{xml}");
+        let returned: u32 = xml_tag_text(&xml, "NumberReturned")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let total: u32 = xml_tag_text(&xml, "TotalMatches")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        assert!(
+            returned <= 200 && total <= 200,
+            "RECENT_MAX is 200 unique items: returned={returned} total={total}"
+        );
+        assert_eq!(total, 200, "cap is exactly 200 with 210+ videos: {xml}");
+    }
+
+    #[test]
+    fn getcontentfeatures_not_one_is_400() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let bad = format!(
+            "GET /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Kodi/21.0\r\ngetcontentFeatures.dlna.org: 0\r\n\r\n",
+            movie.detail_id
+        );
+        assert_eq!(app.handle(&req(&bad)).status, 400);
+        let ok = format!(
+            "GET /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Kodi/21.0\r\ngetcontentFeatures.dlna.org: 1\r\n\r\n",
+            movie.detail_id
+        );
+        assert_eq!(app.handle(&req(&ok)).status, 200);
+    }
+
+    #[test]
+    fn interactive_on_non_image_is_406_except_samsung() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let kodi = format!(
+            "GET /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Kodi/21.0\r\ntransferMode.dlna.org: Interactive\r\n\r\n",
+            movie.detail_id
+        );
+        assert_eq!(app.handle(&req(&kodi)).status, 406);
+        let samsung = format!(
+            "GET /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0\r\ntransferMode.dlna.org: Interactive\r\n\r\n",
+            movie.detail_id
+        );
+        assert_eq!(app.handle(&req(&samsung)).status, 200);
+        let strict = format!(
+            "GET /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0\r\ntransferMode.dlna.org: Interactive\r\nuctt.upnp.org: 1\r\n\r\n",
+            movie.detail_id
+        );
+        assert_eq!(app.handle(&req(&strict)).status, 406);
+    }
+
+    #[test]
+    fn skip_dlna_pn_omits_pn_on_http_content_features() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        set_detail_dlna_pn(&app, movie.detail_id, "AVC_MP4_MP_SD_AC3");
+        let kodi = app.handle(&req(&format!(
+            "GET /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Kodi/21.0\r\n\r\n",
+            movie.detail_id
+        )));
+        assert_eq!(kodi.status, 200);
+        let kfeats = resp_header(&kodi, "contentFeatures.dlna.org").unwrap_or("");
+        assert!(
+            kfeats.contains("DLNA.ORG_PN=AVC_MP4_MP_SD_AC3"),
+            "Kodi keeps PN on the by_detail item: {kfeats}"
+        );
+        let j5500 = app.handle(&req(&format!(
+            "GET /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: DLNADOC/1.50 [BD]J5500\r\n\r\n",
+            movie.detail_id
+        )));
+        assert_eq!(j5500.status, 200);
+        let feats = resp_header(&j5500, "contentFeatures.dlna.org").unwrap_or("");
+        assert!(
+            !feats.contains("DLNA.ORG_PN="),
+            "J5500 SKIP_DLNA_PN must omit PN on contentFeatures: {feats}"
+        );
+        assert!(feats.contains("DLNA.ORG_OP=01"), "{feats}");
+    }
+
+    #[test]
+    fn lg_browse_captioned_title_ends_with_dot() {
+        let app = testdata_app();
+        let (st, xml) = soap_browse(
+            &app,
+            "2$8",
+            "BrowseDirectChildren",
+            "LGE_DLNA_SDK/1.6.0",
+        );
+        assert_eq!(st, 200, "{xml}");
+        assert!(
+            xml.contains("Fixture Movie."),
+            "LG caption hack appends '.': {xml}"
+        );
+    }
+
+    #[test]
+    fn toshiba_browse_extra_ci1_res() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        set_detail_dlna_pn(&app, movie.detail_id, "MPEG_TS_HD_NA");
+        let oid = {
+            let cat = app.catalog.read().unwrap();
+            cat.by_detail
+                .get(&movie.detail_id)
+                .cloned()
+                .expect("by_detail oid")
+        };
+        let (st, xml) = soap_browse(
+            &app,
+            &oid,
+            "BrowseMetadata",
+            "UPnP/1.0 DLNADOC/1.50 Intel_SDK_for_UPnP_devices/1.2",
+        );
+        assert_eq!(st, 200, "{xml}");
+        assert!(
+            xml.contains("DLNA.ORG_PN=MPEG_PS_NTSC") && xml.contains("DLNA.ORG_CI=1"),
+            "Toshiba extra CI=1 res: {xml}"
+        );
+    }
+
+    #[test]
+    fn sony_bdp_get_remaps_mkv_to_divx() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let raw = format!(
+            "GET /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: UPnP/1.0 DLNADOC/1.50\r\nX-AV-Client-Info: av=\"5.0\"; cn=\"Sony Corporation\"; mv=\"2.0\"\r\n\r\n",
+            movie.detail_id
+        );
+        let r = app.handle(&req(&raw));
+        assert_eq!(r.status, 200);
+        assert_eq!(resp_header(&r, "Content-Type"), Some("video/divx"));
+
+        let (st, xml) = {
+            let body = format!(
+                r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"#
+            );
+            let hdr = format!(
+                "POST /whatever HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nX-AV-Client-Info: av=\"5.0\"; mv=\"2.0\"\r\nSOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n",
+                body.len()
+            );
+            let mut req = HttpRequest::parse_headers(&hdr).unwrap();
+            req.body = body.into_bytes();
+            let r = app.handle(&req);
+            (r.status, String::from_utf8_lossy(&r.body).into_owned())
+        };
+        assert_eq!(st, 200, "{xml}");
+        assert!(xml.contains("video/divx"), "primary remapped mime: {xml}");
+        assert!(
+            xml.contains("MPEG_PS_NTSC") && xml.contains("DLNA.ORG_CI=1"),
+            "extra CI=1 still uses original mkv mime: {xml}"
+        );
     }
 }

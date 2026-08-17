@@ -19,7 +19,8 @@ mod oracle;
 
 pub use client_cache::{ClientCache, ClientCacheEntry, CLIENT_CACHE_SLOTS, CLIENT_CACHE_TTL_SECS};
 pub use clients::{
-    identify_friendly_name, identify_user_agent, identify_x_av_client_info, remap_mime,
+    identify_friendly_name, identify_friendly_name_ssdp, identify_model_name, identify_request,
+    identify_user_agent, identify_x_av_client_info, remap_mime, remap_mime_full,
     ClientFlags, ClientKind, ClientProfile, MatchKind, CLIENTS,
 };
 pub use date::{w3c_date_from_unix, w3c_normalize_date};

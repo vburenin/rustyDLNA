@@ -27,6 +27,7 @@ NFO wins when present: `<premiered>`, then `<aired>`, then `<year>`
 - Kodi `*-poster.jpg/.png`, `*-fanart.jpg/.png`, folder `poster.jpg`.
 - PNG converted to JPEG for DLNA.
 - Optional video thumbnails only when no sidecar/embedded art.
+- Video Series (`2$E`) and Genre (`2$9`) from NFO `showtitle` / `<genre>`.
 - `tvshow.nfo` inherited by episodes.
 
 ## Symlink aliases

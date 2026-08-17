@@ -8,13 +8,23 @@ pub mod nfo;
 pub mod probe;
 pub mod watch;
 pub use db::{mime_to_ext, LibraryDb};
-pub use nfo::{nfo_date_from_text, nfo_for_file, nfo_too_large, parse_nfo_text, NfoMeta};
-pub use probe::{probe_media, MediaProbe};
+pub use nfo::{
+    episode_display_title, nfo_date_from_text, nfo_for_file, nfo_too_large, parse_nfo_text,
+    split_genres, NfoMeta,
+};
+pub use probe::{
+    attached_pic_stream, extract_attached_pic, generate_video_thumb, probe_media, scale_jpeg,
+    MediaProbe,
+};
 pub use watch::{repair_objects_if_needed, run_inotify};
 
 use rusty_dlna_protocol::object_id::{
-    BROWSEDIR_ID, IMAGE_ALL_ID, IMAGE_ID, MUSIC_ALL_ID, MUSIC_ID, RECENT_MAX, ROOT_ID,
-    VIDEO_ALL_ID, VIDEO_DIR_ID, VIDEO_ID, VIDEO_RECENT_ID,
+    BROWSEDIR_ID, IMAGE_ALBUM_ID, IMAGE_ALL_ID, IMAGE_CAMERA_ID, IMAGE_DATE_ID, IMAGE_DIR_ID,
+    IMAGE_ID, IMAGE_PLIST_ID, IMAGE_RATING_ID, IMAGE_RECENT_ID, MUSIC_ALBUM_ARTIST_ID,
+    MUSIC_ALBUM_ID, MUSIC_ALL_ID, MUSIC_ARTIST_ID, MUSIC_COMPOSER_ID, MUSIC_CONTRIB_ARTIST_ID,
+    MUSIC_DIR_ID, MUSIC_GENRE_ID, MUSIC_ID, MUSIC_PLIST_ID, MUSIC_RATING_ID, MUSIC_RECENT_ID,
+    RECENT_MAX, ROOT_ID, VIDEO_ACTOR_ID, VIDEO_ALL_ID, VIDEO_DIR_ID,
+    VIDEO_GENRE_ID, VIDEO_ID, VIDEO_PLIST_ID, VIDEO_RATING_ID, VIDEO_RECENT_ID, VIDEO_SERIES_ID,
 };
 use rusty_dlna_protocol::w3c_date_from_unix;
 
@@ -286,13 +296,7 @@ pub fn persist_album_art_file(cfg: &ScanConfig, src: &Path) -> Option<PathBuf> {
     }
 }
 
-fn attach_album_art(db: &LibraryDb, cfg: &ScanConfig, path: &Path, detail_id: i64) -> bool {
-    let Some(src) = find_album_art(path) else {
-        return false;
-    };
-    let Some(stored) = persist_album_art_file(cfg, &src) else {
-        return false;
-    };
+fn store_album_art_path(db: &LibraryDb, stored: &Path, detail_id: i64) -> bool {
     let stored_s = stored.to_string_lossy();
     let Ok(art_id) = db.upsert_album_art(&stored_s) else {
         return false;
@@ -308,6 +312,37 @@ fn attach_album_art(db: &LibraryDb, cfg: &ScanConfig, path: &Path, detail_id: i6
     true
 }
 
+fn cache_art_jpeg(cfg: &ScanConfig, key: &str) -> Option<PathBuf> {
+    let cache = cfg.db_path.as_ref()?.parent()?;
+    Some(cache.join("art").join(format!("{key}.jpg")))
+}
+
+fn attach_album_art(db: &LibraryDb, cfg: &ScanConfig, path: &Path, detail_id: i64) -> bool {
+    if let Some(src) = find_album_art(path) {
+        if let Some(stored) = persist_album_art_file(cfg, &src) {
+            return store_album_art_path(db, &stored, detail_id);
+        }
+    }
+    if let Some(dest) = cache_art_jpeg(cfg, &format!("embed-{detail_id}")) {
+        if dest.is_file() || extract_attached_pic(path, &dest) {
+            if dest.is_file() {
+                return store_album_art_path(db, &dest, detail_id);
+            }
+        }
+    }
+    if db.detail_album_art(detail_id) > 0 {
+        return false;
+    }
+    if let Some(dest) = cache_art_jpeg(cfg, &format!("thumb-{detail_id}")) {
+        if dest.is_file() || generate_video_thumb(path, &dest) {
+            if dest.is_file() {
+                return store_album_art_path(db, &dest, detail_id);
+            }
+        }
+    }
+    false
+}
+
 fn apply_nfo_to_detail(db: &LibraryDb, id: i64, nfo: &NfoMeta) {
     if nfo.is_empty() {
         return;
@@ -316,12 +351,183 @@ fn apply_nfo_to_detail(db: &LibraryDb, id: i64, nfo: &NfoMeta) {
     let _ = db.copy_nfo_to_inode_aliases(id);
 }
 
+fn find_or_create_container(db: &LibraryDb, parent: &str, name: &str, class: &str) -> String {
+    if let Some(oid) = db.find_child_object(parent, name) {
+        if db.object_detail_id(&oid).is_none() {
+            let _ = db.upsert_object(&oid, parent, class, None, name, None);
+            return oid;
+        }
+    }
+    let id = allocate_child_id(db, parent);
+    let _ = db.upsert_object(&id, parent, class, None, name, None);
+    id
+}
+
+fn recent_root(id: &str) -> Option<&'static str> {
+    match id {
+        VIDEO_RECENT_ID => Some(VIDEO_RECENT_ID),
+        MUSIC_RECENT_ID => Some(MUSIC_RECENT_ID),
+        IMAGE_RECENT_ID => Some(IMAGE_RECENT_ID),
+        _ => None,
+    }
+}
+
+fn season_folder_title(disc: Option<i64>) -> Option<String> {
+    match disc {
+        Some(0) => Some("Specials".into()),
+        Some(n) => Some(format!("Season {n}")),
+        None => None,
+    }
+}
+
+fn attach_video_virtuals(db: &LibraryDb, detail: i64, class: &str, browse_oid: &str) {
+    if !class.contains("video") {
+        return;
+    }
+    let Ok((album, genre, disc, _track, title)) = db.detail_group_fields(detail) else {
+        return;
+    };
+    let title = title.unwrap_or_default();
+    let _ = db.delete_detail_under_root(detail, VIDEO_SERIES_ID);
+    let _ = db.delete_detail_under_root(detail, VIDEO_GENRE_ID);
+    if let Some(show) = album.as_deref().filter(|s| !s.is_empty()) {
+        let show_id = find_or_create_container(
+            db,
+            VIDEO_SERIES_ID,
+            show,
+            "container.album.videoAlbum",
+        );
+        let parent = match season_folder_title(disc) {
+            Some(season) => find_or_create_container(
+                db,
+                &show_id,
+                &season,
+                "container.storageFolder",
+            ),
+            None => show_id,
+        };
+        let ep_name = episode_display_title(&title, Some(show));
+        let ep_id = format!("{parent}${detail:X}");
+        let _ = db.upsert_object(
+            &ep_id,
+            &parent,
+            class,
+            Some(detail),
+            &ep_name,
+            Some(browse_oid),
+        );
+    }
+    if let Some(g) = genre.as_deref().filter(|s| !s.is_empty()) {
+        for name in split_genres(g) {
+            let gid = find_or_create_container(db, VIDEO_GENRE_ID, &name, "container.genre.videoGenre");
+            let iid = format!("{gid}${detail:X}");
+            let _ = db.upsert_object(
+                &iid,
+                &gid,
+                class,
+                Some(detail),
+                &title,
+                Some(browse_oid),
+            );
+        }
+    }
+    if let Some(actor) = db
+        .detail_tag_fields(detail)
+        .ok()
+        .and_then(|(artist, _, _, creator, _)| artist.or(creator))
+        .filter(|s| !s.is_empty())
+    {
+        let aid = find_or_create_container(db, VIDEO_ACTOR_ID, &actor, "container.person.movieActor");
+        let iid = format!("{aid}${detail:X}");
+        let _ = db.upsert_object(&iid, &aid, class, Some(detail), &title, Some(browse_oid));
+    }
+}
+
+fn attach_audio_virtuals(db: &LibraryDb, detail: i64, class: &str, browse_oid: &str) {
+    let Ok((artist, album, genre, _, _)) = db.detail_tag_fields(detail) else {
+        return;
+    };
+    let _ = db.delete_detail_under_root(detail, MUSIC_GENRE_ID);
+    let _ = db.delete_detail_under_root(detail, MUSIC_ARTIST_ID);
+    let _ = db.delete_detail_under_root(detail, MUSIC_ALBUM_ID);
+    let title = db
+        .detail_group_fields(detail)
+        .ok()
+        .and_then(|(_, _, _, _, t)| t)
+        .unwrap_or_else(|| browse_oid.to_string());
+    if let Some(album) = album.as_deref().filter(|s| !s.is_empty()) {
+        let aid = find_or_create_container(db, MUSIC_ALBUM_ID, album, "container.album.musicAlbum");
+        let iid = format!("{aid}${detail:X}");
+        let _ = db.upsert_object(&iid, &aid, class, Some(detail), &title, Some(browse_oid));
+    }
+    if let Some(artist) = artist.as_deref().filter(|s| !s.is_empty()) {
+        let aid = find_or_create_container(db, MUSIC_ARTIST_ID, artist, "container.person.musicArtist");
+        let parent = match album.as_deref().filter(|s| !s.is_empty()) {
+            Some(al) => find_or_create_container(db, &aid, al, "container.album.musicAlbum"),
+            None => aid,
+        };
+        let iid = format!("{parent}${detail:X}");
+        let _ = db.upsert_object(&iid, &parent, class, Some(detail), &title, Some(browse_oid));
+    }
+    if let Some(g) = genre.as_deref().filter(|s| !s.is_empty()) {
+        for name in split_genres(g) {
+            let gid = find_or_create_container(db, MUSIC_GENRE_ID, &name, "container.genre.musicGenre");
+            let iid = format!("{gid}${detail:X}");
+            let _ = db.upsert_object(&iid, &gid, class, Some(detail), &title, Some(browse_oid));
+        }
+    }
+}
+
+fn attach_image_virtuals(db: &LibraryDb, detail: i64, class: &str, browse_oid: &str) {
+    let Ok((_, album, _, creator, date)) = db.detail_tag_fields(detail) else {
+        return;
+    };
+    let _ = db.delete_detail_under_root(detail, IMAGE_DATE_ID);
+    let _ = db.delete_detail_under_root(detail, IMAGE_CAMERA_ID);
+    let _ = db.delete_detail_under_root(detail, IMAGE_ALBUM_ID);
+    let title = db
+        .detail_group_fields(detail)
+        .ok()
+        .and_then(|(_, _, _, _, t)| t)
+        .unwrap_or_else(|| browse_oid.to_string());
+    let day = date
+        .as_deref()
+        .filter(|s| s.len() >= 10)
+        .map(|s| s[..10].to_string())
+        .unwrap_or_else(|| "Unknown Date".into());
+    let date_id = find_or_create_container(db, IMAGE_DATE_ID, &day, "container.album.photoAlbum");
+    let did = format!("{date_id}${detail:X}");
+    let _ = db.upsert_object(&did, &date_id, class, Some(detail), &title, Some(browse_oid));
+    let camera = creator
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Unknown Camera");
+    let cam_id = find_or_create_container(db, IMAGE_CAMERA_ID, camera, "container.storageFolder");
+    let cam_date = find_or_create_container(db, &cam_id, &day, "container.album.photoAlbum");
+    let cid = format!("{cam_date}${detail:X}");
+    let _ = db.upsert_object(&cid, &cam_date, class, Some(detail), &title, Some(browse_oid));
+    if let Some(al) = album.as_deref().filter(|s| !s.is_empty()) {
+        let aid = find_or_create_container(db, IMAGE_ALBUM_ID, al, "container.album.photoAlbum");
+        let iid = format!("{aid}${detail:X}");
+        let _ = db.upsert_object(&iid, &aid, class, Some(detail), &title, Some(browse_oid));
+    }
+}
+
 fn apply_nfo(db: &LibraryDb, cfg: &ScanConfig, path: &Path, detail_id: i64) -> bool {
     let nfo = nfo_for_file(path, &cfg.media_dirs);
     if nfo.is_empty() {
         return false;
     }
     apply_nfo_to_detail(db, detail_id, &nfo);
+    if is_video(
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(""),
+    ) {
+        if let Some(browse) = db.browse_object_for_detail(detail_id) {
+            attach_video_virtuals(db, detail_id, "item.videoItem", &browse);
+        }
+    }
     true
 }
 
@@ -822,6 +1028,8 @@ pub struct AvMeta {
     pub samplerate: Option<i64>,
     /// Embedded subtitle codecs, comma-separated (`dvd_subtitle,mov_text`).
     pub subs: Option<String>,
+    /// AVI DiVX fourcc → `CREATOR=DiVX`.
+    pub creator: Option<String>,
 }
 
 /// dialect `GetVideoMetadata` / lav: duration, bitrate/8, WxH, audio.
@@ -955,11 +1163,116 @@ impl Catalog {
             false,
         );
         c.add_container(
+            VIDEO_SERIES_ID,
+            VIDEO_ID,
+            "Series",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            VIDEO_GENRE_ID,
+            VIDEO_ID,
+            "Genre",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            VIDEO_ACTOR_ID,
+            VIDEO_ID,
+            "Actor",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            VIDEO_PLIST_ID,
+            VIDEO_ID,
+            "Playlists",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            VIDEO_RATING_ID,
+            VIDEO_ID,
+            "Rating",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
             MUSIC_ALL_ID,
             MUSIC_ID,
             "All Music",
             "container.storageFolder",
             true,
+        );
+        c.add_container(
+            MUSIC_GENRE_ID,
+            MUSIC_ID,
+            "Genre",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            MUSIC_ARTIST_ID,
+            MUSIC_ID,
+            "Artist",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            MUSIC_ALBUM_ID,
+            MUSIC_ID,
+            "Album",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            MUSIC_DIR_ID,
+            MUSIC_ID,
+            "Folders",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            MUSIC_PLIST_ID,
+            MUSIC_ID,
+            "Playlists",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            MUSIC_CONTRIB_ARTIST_ID,
+            MUSIC_ID,
+            "Contributing Artists",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            MUSIC_ALBUM_ARTIST_ID,
+            MUSIC_ID,
+            "Album Artist",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            MUSIC_COMPOSER_ID,
+            MUSIC_ID,
+            "Composer",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            MUSIC_RATING_ID,
+            MUSIC_ID,
+            "Rating",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            MUSIC_RECENT_ID,
+            MUSIC_ID,
+            "Recently Added",
+            "container.storageFolder",
+            false,
         );
         c.add_container(
             IMAGE_ALL_ID,
@@ -968,6 +1281,55 @@ impl Catalog {
             "container.storageFolder",
             true,
         );
+        c.add_container(
+            IMAGE_DATE_ID,
+            IMAGE_ID,
+            "Date Taken",
+            "container.album.photoAlbum",
+            true,
+        );
+        c.add_container(
+            IMAGE_ALBUM_ID,
+            IMAGE_ID,
+            "Album",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            IMAGE_CAMERA_ID,
+            IMAGE_ID,
+            "Camera",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            IMAGE_DIR_ID,
+            IMAGE_ID,
+            "Folders",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            IMAGE_PLIST_ID,
+            IMAGE_ID,
+            "Playlists",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            IMAGE_RATING_ID,
+            IMAGE_ID,
+            "Rating",
+            "container.storageFolder",
+            true,
+        );
+        c.add_container(
+            IMAGE_RECENT_ID,
+            IMAGE_ID,
+            "Recently Added",
+            "container.storageFolder",
+            false,
+        );
         c.link_child(ROOT_ID, BROWSEDIR_ID);
         c.link_child(ROOT_ID, MUSIC_ID);
         c.link_child(ROOT_ID, VIDEO_ID);
@@ -975,8 +1337,30 @@ impl Catalog {
         c.link_child(VIDEO_ID, VIDEO_ALL_ID);
         c.link_child(VIDEO_ID, VIDEO_DIR_ID);
         c.link_child(VIDEO_ID, VIDEO_RECENT_ID);
+        c.link_child(VIDEO_ID, VIDEO_SERIES_ID);
+        c.link_child(VIDEO_ID, VIDEO_GENRE_ID);
+        c.link_child(VIDEO_ID, VIDEO_ACTOR_ID);
+        c.link_child(VIDEO_ID, VIDEO_PLIST_ID);
+        c.link_child(VIDEO_ID, VIDEO_RATING_ID);
         c.link_child(MUSIC_ID, MUSIC_ALL_ID);
+        c.link_child(MUSIC_ID, MUSIC_GENRE_ID);
+        c.link_child(MUSIC_ID, MUSIC_ARTIST_ID);
+        c.link_child(MUSIC_ID, MUSIC_ALBUM_ID);
+        c.link_child(MUSIC_ID, MUSIC_DIR_ID);
+        c.link_child(MUSIC_ID, MUSIC_PLIST_ID);
+        c.link_child(MUSIC_ID, MUSIC_CONTRIB_ARTIST_ID);
+        c.link_child(MUSIC_ID, MUSIC_ALBUM_ARTIST_ID);
+        c.link_child(MUSIC_ID, MUSIC_COMPOSER_ID);
+        c.link_child(MUSIC_ID, MUSIC_RATING_ID);
+        c.link_child(MUSIC_ID, MUSIC_RECENT_ID);
         c.link_child(IMAGE_ID, IMAGE_ALL_ID);
+        c.link_child(IMAGE_ID, IMAGE_DATE_ID);
+        c.link_child(IMAGE_ID, IMAGE_ALBUM_ID);
+        c.link_child(IMAGE_ID, IMAGE_CAMERA_ID);
+        c.link_child(IMAGE_ID, IMAGE_DIR_ID);
+        c.link_child(IMAGE_ID, IMAGE_PLIST_ID);
+        c.link_child(IMAGE_ID, IMAGE_RATING_ID);
+        c.link_child(IMAGE_ID, IMAGE_RECENT_ID);
         c
     }
 
@@ -1029,8 +1413,8 @@ impl Catalog {
         start: usize,
         take: usize,
     ) -> Option<(Vec<CatalogChild>, u32)> {
-        if id == VIDEO_RECENT_ID {
-            let mut all = self.recent_videos();
+        if let Some(root) = recent_root(id) {
+            let mut all = self.recent_items(root);
             let total = all.len() as u32;
             if start >= all.len() || take == 0 {
                 return Some((Vec::new(), total));
@@ -1070,8 +1454,8 @@ impl Catalog {
     }
 
     pub fn displayed_child_count(&self, id: &str) -> u32 {
-        if id == VIDEO_RECENT_ID {
-            return self.recent_count;
+        if recent_root(id).is_some() {
+            return self.recent_items(id).len() as u32;
         }
         self.containers
             .get(id)
@@ -1080,7 +1464,7 @@ impl Catalog {
     }
 
     pub fn displayed_container_count(&self, id: &str) -> u32 {
-        if id == VIDEO_RECENT_ID {
+        if recent_root(id).is_some() {
             return 0;
         }
         self.containers
@@ -1097,33 +1481,32 @@ impl Catalog {
     /// Newest unique videos (inode-deduped so symlink aliases count once),
     /// newest first, up to `RECENT_MAX`. Object IDs are `2$FF0$` + source id.
     pub fn recent_videos(&self) -> Vec<CatalogChild> {
-        let owned = if self.recent_ids.is_empty() {
-            self.compute_recent_ids()
-        } else {
-            Vec::new()
-        };
-        let ids: &[String] = if owned.is_empty() {
-            &self.recent_ids
-        } else {
-            &owned
-        };
-        ids.iter()
-            .filter_map(|id| {
-                let it = self.items.get(id)?;
-                let mut clone = it.clone();
-                clone.object_id = format!("{VIDEO_RECENT_ID}${id}");
-                clone.parent_id = VIDEO_RECENT_ID.to_string();
-                Some(CatalogChild::Item(clone))
-            })
-            .collect()
+        self.recent_items(VIDEO_RECENT_ID)
     }
 
-    fn compute_recent_ids(&self) -> Vec<String> {
+    pub fn recent_items(&self, root: &str) -> Vec<CatalogChild> {
+        if root == VIDEO_RECENT_ID && !self.recent_ids.is_empty() {
+            return self.recent_ids
+                .iter()
+                .filter_map(|id| {
+                    let it = self.items.get(id)?;
+                    let mut clone = it.clone();
+                    clone.object_id = format!("{root}${id}");
+                    clone.parent_id = root.to_string();
+                    Some(CatalogChild::Item(clone))
+                })
+                .collect();
+        }
+        let class_pat = match root {
+            MUSIC_RECENT_ID => "audio",
+            IMAGE_RECENT_ID => "image",
+            _ => "video",
+        };
         let mut items: Vec<&MediaItem> = self
             .items
             .values()
             .filter(|i| {
-                i.class.contains("video")
+                i.class.contains(class_pat)
                     && i.ref_id.is_none()
                     && i.object_id.starts_with(BROWSEDIR_ID)
             })
@@ -1155,11 +1538,29 @@ impl Catalog {
                 break;
             }
         }
-        ids
+        ids.into_iter()
+            .filter_map(|id| {
+                let it = self.items.get(&id)?;
+                let mut clone = it.clone();
+                clone.object_id = format!("{root}${id}");
+                clone.parent_id = root.to_string();
+                Some(CatalogChild::Item(clone))
+            })
+            .collect()
     }
 
     fn rebuild_recent_index(&mut self) {
-        self.recent_ids = self.compute_recent_ids();
+        self.recent_ids = self
+            .recent_items(VIDEO_RECENT_ID)
+            .into_iter()
+            .filter_map(|ch| match ch {
+                CatalogChild::Item(it) => it
+                    .object_id
+                    .strip_prefix(&format!("{VIDEO_RECENT_ID}$"))
+                    .map(str::to_string),
+                _ => None,
+            })
+            .collect();
         self.recent_count = self.recent_ids.len() as u32;
     }
 
@@ -1237,6 +1638,26 @@ impl Catalog {
                 false,
             );
             self.link_child(VIDEO_ID, VIDEO_RECENT_ID);
+        }
+        if !self.containers.contains_key(VIDEO_SERIES_ID) {
+            self.add_container(
+                VIDEO_SERIES_ID,
+                VIDEO_ID,
+                "Series",
+                "container.storageFolder",
+                true,
+            );
+            self.link_child(VIDEO_ID, VIDEO_SERIES_ID);
+        }
+        if !self.containers.contains_key(VIDEO_GENRE_ID) {
+            self.add_container(
+                VIDEO_GENRE_ID,
+                VIDEO_ID,
+                "Genre",
+                "container.storageFolder",
+                true,
+            );
+            self.link_child(VIDEO_ID, VIDEO_GENRE_ID);
         }
         let videos: Vec<MediaItem> = self
             .items
@@ -1324,6 +1745,31 @@ pub struct ScanDelta {
 
 pub fn path_is_live_file(path: &Path) -> bool {
     std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
+}
+
+/// Album art / caption files served into RAM. Larger → 413.
+pub const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
+
+/// True if `path` is a regular file whose canonical location is under one
+/// of `roots`. Follows symlinks, so a link that escapes the tree is false.
+pub fn path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    if roots.is_empty() {
+        return false;
+    }
+    let Ok(real) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(meta) = std::fs::metadata(&real) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    roots.iter().any(|root| {
+        root.canonicalize()
+            .ok()
+            .is_some_and(|r| real.starts_with(&r))
+    })
 }
 
 /// If `stored` is missing, rebase it onto a configured media root.
@@ -1756,6 +2202,9 @@ pub fn apply_probe_to_detail(db: &LibraryDb, id: i64, got: &MediaProbe) {
         got.probe.height,
     );
     let _ = db.update_detail_dlna_pn(id, pn.as_deref());
+    if let Some(c) = got.av.creator.as_deref().filter(|s| !s.is_empty()) {
+        let _ = db.update_detail_creator_if_empty(id, c);
+    }
     let _ = db.copy_stream_to_inode_aliases(id);
 }
 
@@ -2622,6 +3071,16 @@ fn attach_objects(
     ino: u64,
 ) {
     if db.folder_has_inode_named(folder_id, dev as i64, ino as i64, title) {
+        let browse = db
+            .browse_object_for_detail(detail)
+            .unwrap_or_else(|| format!("{folder_id}$0"));
+        if class.contains("video") {
+            attach_video_virtuals(db, detail, class, &browse);
+        } else if class.contains("audio") {
+            attach_audio_virtuals(db, detail, class, &browse);
+        } else if class.contains("image") {
+            attach_image_virtuals(db, detail, class, &browse);
+        }
         return;
     }
     let object_id = match db.find_child_object(folder_id, title) {
@@ -2653,12 +3112,23 @@ fn attach_objects(
         let vdir = browse_to_typed_dir(folder_id, VIDEO_DIR_ID);
         let vobj = browse_to_typed_dir(&object_id, VIDEO_DIR_ID);
         let _ = db.upsert_object(&vobj, &vdir, class, Some(detail), title, Some(&object_id));
+        attach_video_virtuals(db, detail, class, &object_id);
     } else if class.contains("audio") {
         let aid = format!("{MUSIC_ALL_ID}${detail:X}");
         let _ = db.upsert_object(&aid, MUSIC_ALL_ID, class, Some(detail), title, Some(&object_id));
+        ensure_typed_dir_chain(db, folder_id, MUSIC_DIR_ID);
+        let mdir = browse_to_typed_dir(folder_id, MUSIC_DIR_ID);
+        let mobj = browse_to_typed_dir(&object_id, MUSIC_DIR_ID);
+        let _ = db.upsert_object(&mobj, &mdir, class, Some(detail), title, Some(&object_id));
+        attach_audio_virtuals(db, detail, class, &object_id);
     } else if class.contains("image") {
         let iid = format!("{IMAGE_ALL_ID}${detail:X}");
         let _ = db.upsert_object(&iid, IMAGE_ALL_ID, class, Some(detail), title, Some(&object_id));
+        ensure_typed_dir_chain(db, folder_id, IMAGE_DIR_ID);
+        let idir = browse_to_typed_dir(folder_id, IMAGE_DIR_ID);
+        let iobj = browse_to_typed_dir(&object_id, IMAGE_DIR_ID);
+        let _ = db.upsert_object(&iobj, &idir, class, Some(detail), title, Some(&object_id));
+        attach_image_virtuals(db, detail, class, &object_id);
     }
 }
 
@@ -2876,6 +3346,37 @@ pub fn ensure_pattern_fixture(root: &Path) -> PathBuf {
     movie
 }
 
+/// TV-show tree used by Series/Genre Browse tests (`video/The Show/…`).
+pub fn ensure_show_fixture(root: &Path) {
+    let show = root.join("video/The Show");
+    let _ = std::fs::create_dir_all(&show);
+    let tv = show.join("tvshow.nfo");
+    if !tv.exists() {
+        let _ = std::fs::write(
+            &tv,
+            "<tvshow><title>The Show</title><genre>Drama</genre><genre>Crime</genre></tvshow>\n",
+        );
+    }
+    for (stem, title, season, ep) in [
+        ("S01E01", "Pilot", 1, 1),
+        ("S01E02", "Second", 1, 2),
+    ] {
+        let mkv = show.join(format!("{stem}.mkv"));
+        if !file_is_viable(&mkv) {
+            write_fake_mkv(&mkv, 64);
+        }
+        let nfo = show.join(format!("{stem}.nfo"));
+        if !nfo.exists() {
+            let _ = std::fs::write(
+                &nfo,
+                format!(
+                    "<episodedetails><title>{title}</title><season>{season}</season><episode>{ep}</episode></episodedetails>\n"
+                ),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3023,6 +3524,12 @@ mod tests {
     fn nfo_title_plot_show_season() {
         let parsed = parse_nfo_text(EPISODE_NFO);
         assert_eq!(parsed.title.as_deref(), Some("The Show - Pilot"));
+        assert_eq!(parsed.showtitle.as_deref(), Some("The Show"));
+        assert_eq!(parsed.episode_title.as_deref(), Some("Pilot"));
+        assert_eq!(
+            episode_display_title("The Show - Pilot", Some("The Show")),
+            "Pilot"
+        );
         assert_eq!(parsed.comment.as_deref(), Some("The plot text"));
         assert_eq!(parsed.genre.as_deref(), Some("Drama / Crime"));
         assert_eq!(parsed.creator.as_deref(), Some("Jane Doe"));
@@ -3137,7 +3644,7 @@ mod tests {
         let ep1 = cat
             .items
             .values()
-            .find(|i| i.path.ends_with("S01E01.mkv"))
+            .find(|i| i.path.ends_with("S01E01.mkv") && i.ref_id.is_none())
             .expect("S01E01");
         assert_eq!(ep1.title, "The Show - Pilot");
         assert_eq!(ep1.comment.as_deref(), Some("Show plot"));
@@ -3145,11 +3652,154 @@ mod tests {
         let ep2 = cat
             .items
             .values()
-            .find(|i| i.path.ends_with("S01E02.mkv"))
+            .find(|i| i.path.ends_with("S01E02.mkv") && i.ref_id.is_none())
             .expect("S01E02");
         assert_eq!(ep2.title, "The Show - Second");
         assert_eq!(ep2.comment.as_deref(), Some("Own plot"));
         assert_eq!(ep2.genre.as_deref(), Some("Drama"));
+        assert_eq!(ep1.album.as_deref(), Some("The Show"));
+        assert_eq!(ep2.album.as_deref(), Some("The Show"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn series_and_genre_trees_from_nfo() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-series-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("The Show")).unwrap();
+        std::fs::write(
+            tmp.join("The Show/tvshow.nfo"),
+            r#"<tvshow><title>The Show</title><genre>Drama</genre><genre>Crime</genre></tvshow>"#,
+        )
+        .unwrap();
+        write_fake_mkv(&tmp.join("The Show/S01E01.mkv"), 64);
+        std::fs::write(
+            tmp.join("The Show/S01E01.nfo"),
+            "<episodedetails><title>Pilot</title><season>1</season><episode>1</episode></episodedetails>\n",
+        )
+        .unwrap();
+        write_fake_mkv(&tmp.join("The Show/S01E02.mkv"), 64);
+        std::fs::write(
+            tmp.join("The Show/S01E02.nfo"),
+            "<episodedetails><title>Second</title><season>1</season><episode>2</episode></episodedetails>\n",
+        )
+        .unwrap();
+        write_fake_mkv(&tmp.join("The Show/S02E01.mkv"), 64);
+        std::fs::write(
+            tmp.join("The Show/S02E01.nfo"),
+            "<episodedetails><title>Return</title><season>2</season><episode>1</episode></episodedetails>\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.join("movies")).unwrap();
+        write_fake_mkv(&tmp.join("movies/film.mkv"), 64);
+        std::fs::write(
+            tmp.join("movies/film.nfo"),
+            "<movie><title>Standalone</title><genre>Action</genre></movie>\n",
+        )
+        .unwrap();
+
+        let cat = scan(&ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        });
+        assert!(cat.containers.contains_key(VIDEO_SERIES_ID));
+        assert!(cat.containers.contains_key(VIDEO_GENRE_ID));
+        let series = cat.children_of(VIDEO_SERIES_ID).expect("series");
+        let shows: Vec<_> = series
+            .iter()
+            .filter_map(|c| match c {
+                CatalogChild::Container(x) => Some(x.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shows, ["The Show"], "{shows:?}");
+        let show = series
+            .iter()
+            .find_map(|c| match c {
+                CatalogChild::Container(x) if x.title == "The Show" => Some(x),
+                _ => None,
+            })
+            .expect("show container");
+        let seasons = cat.children_of(&show.object_id).expect("seasons");
+        let season_titles: Vec<_> = seasons
+            .iter()
+            .filter_map(|c| match c {
+                CatalogChild::Container(x) => Some(x.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(season_titles, ["Season 1", "Season 2"], "{season_titles:?}");
+        let s1 = seasons
+            .iter()
+            .find_map(|c| match c {
+                CatalogChild::Container(x) if x.title == "Season 1" => Some(x),
+                _ => None,
+            })
+            .unwrap();
+        let eps = cat.children_of(&s1.object_id).expect("s1 eps");
+        let ep_titles: Vec<_> = eps
+            .iter()
+            .filter_map(|c| match c {
+                CatalogChild::Item(i) => Some(i.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ep_titles, ["Pilot", "Second"], "{ep_titles:?}");
+        assert!(
+            eps.iter().all(|c| match c {
+                CatalogChild::Item(i) => i.ref_id.is_some(),
+                _ => true,
+            }),
+            "series items must be REF_ID aliases"
+        );
+        let genres = cat.children_of(VIDEO_GENRE_ID).expect("genres");
+        let genre_names: Vec<_> = genres
+            .iter()
+            .filter_map(|c| match c {
+                CatalogChild::Container(x) => Some(x.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(genre_names.contains(&"Drama"), "{genre_names:?}");
+        assert!(genre_names.contains(&"Crime"), "{genre_names:?}");
+        assert!(genre_names.contains(&"Action"), "{genre_names:?}");
+        let action = genres
+            .iter()
+            .find_map(|c| match c {
+                CatalogChild::Container(x) if x.title == "Action" => Some(x),
+                _ => None,
+            })
+            .unwrap();
+        let action_items = cat.children_of(&action.object_id).expect("action items");
+        assert!(
+            action_items.iter().any(|c| match c {
+                CatalogChild::Item(i) => i.title.contains("Standalone"),
+                _ => false,
+            }),
+            "{action_items:?}"
+        );
+        let show_ids: Vec<_> = series
+            .iter()
+            .filter_map(|c| match c {
+                CatalogChild::Container(x) => Some(x.object_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        for id in show_ids {
+            let kids = cat.children_of(id).unwrap_or_default();
+            assert!(
+                !kids.iter().any(|c| match c {
+                    CatalogChild::Item(i) => i.title.contains("Standalone"),
+                    _ => false,
+                }),
+                "movie must not appear under Series"
+            );
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3372,6 +4022,88 @@ mod tests {
     }
 
     #[test]
+    fn art_embedded_and_thumbnail_fallback() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-embed-art-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let poster = tmp.join("cover.jpg");
+        std::fs::write(&poster, TINY_JPEG).unwrap();
+        let embedded = tmp.join("withcover.mp4");
+        let mk = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=64x64:rate=2",
+                "-i",
+            ])
+            .arg(&poster)
+            .args([
+                "-map",
+                "0",
+                "-map",
+                "1",
+                "-c:v:0",
+                "libx264",
+                "-pix_fmt:v:0",
+                "yuv420p",
+                "-c:v:1",
+                "mjpeg",
+                "-disposition:1",
+                "attached_pic",
+            ])
+            .arg(&embedded)
+            .status();
+        if !mk.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("skip embedded art (could not mux attached_pic)");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+        assert!(
+            attached_pic_stream(&embedded).is_some(),
+            "fixture must expose attached_pic"
+        );
+        let bare = tmp.join("bare.mkv");
+        write_fake_mkv(&bare, 64);
+        let dbp = tmp.join("files.db");
+        let cat = scan(&ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(dbp),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        });
+        let cover = cat
+            .items
+            .values()
+            .find(|i| i.path.ends_with("withcover.mp4"))
+            .expect("embedded");
+        assert!(cover.album_art > 0, "attached pic must become ALBUM_ART");
+        let art_path = cat
+            .album_art_paths
+            .get(&cover.album_art)
+            .expect("art path");
+        let bytes = std::fs::read(art_path).unwrap_or_default();
+        assert!(is_jpeg_bytes(&bytes), "extracted art must be jpeg");
+        let thumb = cat
+            .items
+            .values()
+            .find(|i| i.path.ends_with("bare.mkv"))
+            .expect("bare");
+        assert!(
+            thumb.album_art > 0,
+            "video without sidecar/embed gets a thumbnail"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn monitor_empty_dirty_attaches_new_poster() {
         let tmp = std::env::temp_dir().join(format!(
             "rusty-dlna-art-restat-{}",
@@ -3393,7 +4125,7 @@ mod tests {
             .values()
             .find(|i| i.path.ends_with("clip.mkv"))
             .expect("clip");
-        assert_eq!(before.album_art, 0, "no poster yet");
+        let before_art = before.album_art;
         std::fs::write(tmp.join("clip-poster.jpg"), TINY_JPEG).unwrap();
         let (cat2, delta) = monitor(&cfg);
         let cat2 = cat2.expect("restat must notice new art");
@@ -3403,7 +4135,10 @@ mod tests {
             .find(|i| i.path.ends_with("clip.mkv"))
             .expect("clip after restat");
         assert!(after.album_art > 0, "periodic/startup monitor attaches poster");
-        assert!(delta.changed >= 1);
+        assert!(
+            delta.changed >= 1 || after.album_art != before_art,
+            "sidecar must attach or replace a generated thumb"
+        );
         let (none, delta2) = monitor(&cfg);
         assert!(none.is_none(), "second restat must not rewrite: {delta2:?}");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3614,7 +4349,19 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(titles, ["All Video", "Folders", "Recently Added"]);
+        assert_eq!(
+            titles,
+            [
+                "Actor",
+                "All Video",
+                "Folders",
+                "Genre",
+                "Playlists",
+                "Rating",
+                "Recently Added",
+                "Series"
+            ]
+        );
         assert!(cat.containers.contains_key(VIDEO_DIR_ID));
         let folders = cat.children_of(VIDEO_DIR_ID).expect("folders");
         assert!(
@@ -3836,6 +4583,31 @@ mod tests {
         let (t, p) = parse_media_dir("V,/storage/video");
         assert_eq!(t, MediaTypes::video_only());
         assert_eq!(p, PathBuf::from("/storage/video"));
+    }
+
+    #[test]
+    fn path_is_under_roots_rejects_escape_symlink() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-jail-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("video");
+        std::fs::create_dir_all(&root).unwrap();
+        let inside = root.join("poster.jpg");
+        std::fs::write(&inside, b"ok").unwrap();
+        assert!(path_is_under_roots(&inside, &[root.clone()]));
+        let outside = tmp.join("secret.txt");
+        std::fs::write(&outside, b"no").unwrap();
+        assert!(!path_is_under_roots(&outside, &[root.clone()]));
+        let link = root.join("escape.jpg");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(path_is_symlink(&link));
+        assert!(
+            !path_is_under_roots(&link, &[root.clone()]),
+            "symlink out of media root must fail"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

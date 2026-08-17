@@ -14,7 +14,7 @@ rustyDLNA keeps the dialect in `replica.md` and changes the process.
                     │    client cache (by IPv4 + MAC)     │
                     │           │                         │
                     │           ├─ original file ──► ranged file read
-                    │           └─ remux/transcode ──► ffmpeg live fMP4 pipe
+                    │           └─ remux/transcode ──► growing fMP4 file cache
                     └─────────────────────────────────────┘
 ```
 
@@ -26,7 +26,7 @@ rustyDLNA keeps the dialect in `replica.md` and changes the process.
 | SOAP Browse/Search | async, one DB pool | shared library |
 | Description / art / captions | async, Keep-Alive | persist rule |
 | Original `/MediaItems/` | file Range | large `Range` reads; **Connection: close** |
-| Transcode | ffmpeg live fMP4 pipe, cap `max_jobs` | first fragment immediately; disconnect kills ffmpeg |
+| Transcode | ffmpeg growing fMP4 file cache, cap `max_jobs` | first fragment immediately; finished dest is Rangeable |
 | Scan / inotify | background task | must not stall Browse |
 
 Do **not** `fork` the HTTP server to serve a file. Isolation is a
@@ -37,7 +37,7 @@ SQLite handle and the cache maps.
 
 - `protocol` — the dialect. No I/O.
 - `ssdp` / `soap` / `http` — packet and route helpers, then sockets.
-- `scan` — skip rules, later inode reuse + NFO.
+- `scan` — skip rules, inode reuse, NFO, Series/Genre trees, embedded art.
 - `transcode` — `decide(client, source)` then ffmpeg argv.
 - `server` — config, runtime, wiring.
 

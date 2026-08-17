@@ -32,8 +32,10 @@ This tree is GPLv2.
 | `restart.sh` | `docker compose build && up -d` |
 
 The accept loop, SQLite library (`files.db`), inotify scan, and remux
-path are implemented. Transcode Range is a **file cache** (not a live
-ffmpeg pipe). The live daemon uses TCP **8200** and UDP **1900**.
+path are implemented. Transcode is a **growing fMP4 file cache** (not a
+live ffmpeg stdout pipe). `remux-p8` uses `dovi_tool` when present and
+falls back to HDR10. Video Browse includes Series (`2$E`) and Genre
+(`2$9`) from NFO. The live daemon uses TCP **8200** and UDP **1900**.
 
 ## Isolation from the live daemon
 
