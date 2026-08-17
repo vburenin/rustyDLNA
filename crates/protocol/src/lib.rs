@@ -4,6 +4,7 @@
 //! `docs/replica.md`. A rewrite that changes these without a client reason
 //! will break TVs that already work.
 
+pub mod client_cache;
 pub mod clients;
 pub mod date;
 pub mod isolation;
@@ -16,6 +17,7 @@ pub mod ssdp;
 #[cfg(test)]
 mod oracle;
 
+pub use client_cache::{ClientCache, ClientCacheEntry, CLIENT_CACHE_SLOTS, CLIENT_CACHE_TTL_SECS};
 pub use clients::{
     identify_friendly_name, identify_user_agent, identify_x_av_client_info, remap_mime,
     ClientFlags, ClientKind, ClientProfile, MatchKind, CLIENTS,
@@ -26,7 +28,8 @@ pub use isolation::{
     TEST_SSDP_PORT,
 };
 pub use paths::{
-    caption_from_path, media_item_id_from_path, strtoll_prefix, transcode_id_from_path,
+    album_art_id_from_path, caption_from_path, media_item_id_from_path, strtoll_prefix,
+    transcode_id_from_path,
 };
 pub use persist::http_should_persist;
 

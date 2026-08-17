@@ -28,3 +28,4 @@ serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"

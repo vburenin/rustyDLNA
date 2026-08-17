@@ -4,9 +4,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub mod db;
+pub mod nfo;
 pub mod probe;
 pub mod watch;
 pub use db::{mime_to_ext, LibraryDb};
+pub use nfo::{nfo_date_from_text, nfo_for_file, nfo_too_large, parse_nfo_text, NfoMeta};
 pub use probe::{probe_media, MediaProbe};
 pub use watch::{repair_objects_if_needed, run_inotify};
 
@@ -15,7 +17,6 @@ use rusty_dlna_protocol::object_id::{
     VIDEO_ALL_ID, VIDEO_DIR_ID, VIDEO_ID, VIDEO_RECENT_ID,
 };
 use rusty_dlna_protocol::w3c_date_from_unix;
-use rusty_dlna_protocol::w3c_normalize_date;
 
 pub fn is_junk_dir(name: &str) -> bool {
     matches!(
@@ -158,20 +159,225 @@ pub fn is_image(name: &str) -> bool {
 
 pub fn is_album_art_name(name: &str) -> bool {
     let l = name.to_ascii_lowercase();
+    if l.ends_with("-poster.jpg")
+        || l.ends_with("-poster.jpeg")
+        || l.ends_with("-poster.png")
+        || l.ends_with("-fanart.jpg")
+        || l.ends_with("-fanart.jpeg")
+        || l.ends_with("-fanart.png")
+    {
+        return true;
+    }
     matches!(
         l.as_str(),
         "cover.jpg"
             | "cover.jpeg"
+            | "cover.png"
             | "folder.jpg"
             | "folder.jpeg"
+            | "folder.png"
             | "poster.jpg"
             | "poster.jpeg"
+            | "poster.png"
             | "albumart.jpg"
+            | "albumart.jpeg"
+            | "albumart.png"
             | "albumartsmall.jpg"
+            | "albumartsmall.jpeg"
+            | "albumartsmall.png"
             | "album.jpg"
+            | "album.jpeg"
+            | "album.png"
             | "thumb.jpg"
-    ) || l.ends_with("-poster.jpg")
-        || l.ends_with("-fanart.jpg")
+            | "thumb.jpeg"
+            | "thumb.png"
+    )
+}
+
+/// JPEG SOI: `FF D8 FF`.
+pub fn is_jpeg_bytes(bytes: &[u8]) -> bool {
+    bytes.len() >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff
+}
+
+/// First matching sidecar next to `video_path`. Stem poster, then fanart,
+/// then folder poster/folder/cover (MiniDLNA case variants).
+pub fn find_album_art(video_path: &Path) -> Option<PathBuf> {
+    let parent = video_path.parent()?;
+    let stem = video_path.file_stem()?.to_str()?;
+    for suffix in ["-poster.jpg", "-poster.png", "-fanart.jpg", "-fanart.png"] {
+        let p = parent.join(format!("{stem}{suffix}"));
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    const FOLDER: &[&str] = &[
+        "poster.jpg",
+        "Poster.jpg",
+        "poster.png",
+        "poster.jpeg",
+        "Poster.jpeg",
+        "Poster.png",
+        "folder.jpg",
+        "Folder.jpg",
+        "folder.png",
+        "folder.jpeg",
+        "Folder.jpeg",
+        "Folder.png",
+        "cover.jpg",
+        "Cover.jpg",
+        "cover.png",
+        "cover.jpeg",
+        "Cover.jpeg",
+        "Cover.png",
+    ];
+    for name in FOLDER {
+        let p = parent.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn sha1_hex(data: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let digest = Sha1::digest(data);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+fn convert_image_to_jpeg(src: &Path, dest: &Path) -> bool {
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::process::Command::new("ffmpeg")
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(src)
+        .arg(dest)
+        .status()
+        .map(|s| s.success() && dest.is_file())
+        .unwrap_or(false)
+}
+
+/// JPEG sidecars stay in place. Anything else is converted once under
+/// `{db_path.parent()}/art/{sha1}.jpg`. Memory DBs skip conversion.
+pub fn persist_album_art_file(cfg: &ScanConfig, src: &Path) -> Option<PathBuf> {
+    let bytes = std::fs::read(src).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    if is_jpeg_bytes(&bytes) {
+        return Some(src.to_path_buf());
+    }
+    let cache = cfg.db_path.as_ref()?.parent()?;
+    let dest = cache.join("art").join(format!("{}.jpg", sha1_hex(&bytes)));
+    if dest.is_file() {
+        return Some(dest);
+    }
+    if convert_image_to_jpeg(src, &dest) {
+        Some(dest)
+    } else {
+        None
+    }
+}
+
+fn attach_album_art(db: &LibraryDb, cfg: &ScanConfig, path: &Path, detail_id: i64) -> bool {
+    let Some(src) = find_album_art(path) else {
+        return false;
+    };
+    let Some(stored) = persist_album_art_file(cfg, &src) else {
+        return false;
+    };
+    let stored_s = stored.to_string_lossy();
+    let Ok(art_id) = db.upsert_album_art(&stored_s) else {
+        return false;
+    };
+    let prev = db.detail_album_art(detail_id);
+    if prev == art_id {
+        return false;
+    }
+    if db.set_detail_album_art(detail_id, art_id).is_err() {
+        return false;
+    }
+    let _ = db.copy_album_art_to_inode_aliases(detail_id);
+    true
+}
+
+fn apply_nfo_to_detail(db: &LibraryDb, id: i64, nfo: &NfoMeta) {
+    if nfo.is_empty() {
+        return;
+    }
+    let _ = db.update_detail_nfo(id, nfo);
+    let _ = db.copy_nfo_to_inode_aliases(id);
+}
+
+fn apply_nfo(db: &LibraryDb, cfg: &ScanConfig, path: &Path, detail_id: i64) -> bool {
+    let nfo = nfo_for_file(path, &cfg.media_dirs);
+    if nfo.is_empty() {
+        return false;
+    }
+    apply_nfo_to_detail(db, detail_id, &nfo);
+    true
+}
+
+fn apply_nfo_in_dir(db: &LibraryDb, cfg: &ScanConfig, dir: &Path, recursive: bool) -> bool {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let mut any = false;
+    for ent in rd.filter_map(|e| e.ok()) {
+        let path = ent.path();
+        let name = ent.file_name().to_string_lossy().into_owned();
+        let is_dir = match ent.file_type() {
+            Ok(t) if t.is_dir() => true,
+            Ok(t) if t.is_symlink() => path.is_dir(),
+            _ => false,
+        };
+        if is_dir {
+            if recursive && !is_skipped_dir(&name) && apply_nfo_in_dir(db, cfg, &path, true) {
+                any = true;
+            }
+            continue;
+        }
+        if !is_video(&name) && !is_audio(&name) {
+            continue;
+        }
+        let path_s = path.to_string_lossy();
+        if let Some((id, ..)) = db.find_detail_by_path(&path_s).ok().flatten() {
+            if apply_nfo(db, cfg, &path, id) {
+                any = true;
+            }
+        }
+    }
+    any
+}
+
+fn attach_album_art_in_dir(db: &LibraryDb, cfg: &ScanConfig, dir: &Path) -> bool {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let mut any = false;
+    for ent in rd.filter_map(|e| e.ok()) {
+        let path = ent.path();
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if !is_video(&name) && !is_audio(&name) {
+            continue;
+        }
+        let path_s = path.to_string_lossy();
+        if let Some((id, ..)) = db.find_detail_by_path(&path_s).ok().flatten() {
+            if attach_album_art(db, cfg, &path, id) {
+                any = true;
+            }
+        }
+    }
+    any
 }
 
 /// Which media classes a `media_dir=` root accepts (dialect `V,` / `A,` / `P,`).
@@ -501,21 +707,6 @@ fn mime_and_class(name: &str) -> (&'static str, &'static str, &'static str) {
     }
 }
 
-pub fn nfo_date_from_text(text: &str) -> Option<String> {
-    for tag in ["premiered", "aired", "year"] {
-        if let Some(start) = text.find(&format!("<{tag}>")) {
-            let rest = &text[start + tag.len() + 2..];
-            if let Some(end) = rest.find(&format!("</{tag}>")) {
-                let raw = rest[..end].trim();
-                if !raw.is_empty() {
-                    return Some(w3c_normalize_date(raw));
-                }
-            }
-        }
-    }
-    None
-}
-
 #[derive(Clone, Debug)]
 pub struct SourceProbe {
     pub container: String,
@@ -595,6 +786,19 @@ pub struct MediaItem {
     pub resolution: Option<String>,
     pub channels: Option<i64>,
     pub samplerate: Option<i64>,
+    /// `DETAILS.ALBUM_ART` (`0` = none).
+    pub album_art: i64,
+    pub creator: Option<String>,
+    pub comment: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub disc: Option<i64>,
+    pub track: Option<i64>,
+    /// `BOOKMARKS.SEC` (raw seconds). Default 0 when no row.
+    pub bookmark_sec: i64,
+    /// `BOOKMARKS.WATCH_COUNT`. Default 0 when no row.
+    pub watch_count: i64,
 }
 
 /// dialect `duration_str` (`H:MM:SS.mmm` from milliseconds).
@@ -703,6 +907,8 @@ pub struct Catalog {
     pub recent_count: u32,
     /// Newest unique browse-folder item ids (already sorted).
     pub recent_ids: Vec<String>,
+    /// `ALBUM_ART.ID` → stored JPEG path.
+    pub album_art_paths: HashMap<i64, PathBuf>,
 }
 
 impl Catalog {
@@ -714,6 +920,7 @@ impl Catalog {
             next_detail: 1,
             recent_count: 0,
             recent_ids: Vec::new(),
+            album_art_paths: HashMap::new(),
         };
         c.add_container(ROOT_ID, "-1", "root", "container.storageFolder", true);
         c.add_container(
@@ -924,6 +1131,10 @@ impl Catalog {
         items.sort_by(|a, b| {
             b.mtime
                 .cmp(&a.mtime)
+                .then_with(|| {
+                    path_is_symlink(&a.path)
+                        .cmp(&path_is_symlink(&b.path))
+                })
                 .then_with(|| a.title.cmp(&b.title))
                 .then_with(|| a.object_id.cmp(&b.object_id))
         });
@@ -1696,13 +1907,6 @@ pub fn probe_stream_identity(path: &Path) -> Option<SourceProbe> {
     Some(p)
 }
 
-fn nfo_for(file: &Path) -> Option<String> {
-    let nfo = file.with_extension("nfo");
-    std::fs::read_to_string(nfo)
-        .ok()
-        .and_then(|t| nfo_date_from_text(&t))
-}
-
 #[cfg(unix)]
 fn inode_key(meta: &std::fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
@@ -1991,6 +2195,40 @@ pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, S
             }
         }
     }
+    if restat_all {
+        let mut parents = HashSet::new();
+        for st in listed.values() {
+            if let Some(p) = st.path.parent() {
+                parents.insert(p.to_path_buf());
+            }
+        }
+        for dir in parents {
+            if attach_album_art_in_dir(&db, cfg, &dir) {
+                changed += 1;
+            }
+        }
+    }
+    for d in dirty {
+        let name = d
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let Some(dir) = d.parent() else {
+            continue;
+        };
+        if is_album_art_name(name) {
+            if attach_album_art_in_dir(&db, cfg, dir) {
+                changed += 1;
+            }
+            continue;
+        }
+        if name.ends_with(".nfo") {
+            let recursive = name == "tvshow.nfo";
+            if apply_nfo_in_dir(&db, cfg, dir, recursive) {
+                changed += 1;
+            }
+        }
+    }
     let _ = db.commit();
     removed += db.prune_empty_folders().unwrap_or(0);
     let delta = ScanDelta {
@@ -2262,6 +2500,8 @@ pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, fold
         .and_then(|s| s.to_str())
         .unwrap_or(&name)
         .to_string();
+    let nfo = nfo_for_file(path, &cfg.media_dirs);
+    let display_title = nfo.title.as_deref().unwrap_or(&title);
 
     if let Some((id, old_sz, old_ts, old_dev, old_ino)) =
         db.find_detail_by_path(&path_s).ok().flatten()
@@ -2295,7 +2535,9 @@ pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, fold
                 mtime,
             );
         }
+        apply_nfo_to_detail(db, id, &nfo);
         attach_objects(db, folder_id, id, &title, class, dev, ino);
+        attach_album_art(db, cfg, path, id);
         return true;
     }
 
@@ -2319,6 +2561,7 @@ pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, fold
                 }
             }
             attach_objects(db, folder_id, src, &title, class, dev, ino);
+            attach_album_art(db, cfg, path, src);
             return true;
         }
         if src_ts >= mtime {
@@ -2326,6 +2569,7 @@ pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, fold
                 db.clone_detail_for_path(src, &path_s, size, mtime, dev as i64, ino as i64)
             {
                 attach_objects(db, folder_id, id, &title, class, dev, ino);
+                attach_album_art(db, cfg, path, id);
                 return true;
             }
         }
@@ -2334,12 +2578,12 @@ pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, fold
     if !file_is_viable(path) {
         return false;
     }
-    let date = nfo_for(path).unwrap_or_else(|| file_mtime_date(path));
+    let date = nfo.date.clone().unwrap_or_else(|| file_mtime_date(path));
     let Ok(detail) = db.insert_detail(
         &path_s,
         size,
         mtime,
-        &title,
+        display_title,
         &date,
         mime,
         dev as i64,
@@ -2348,10 +2592,12 @@ pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, fold
     ) else {
         return false;
     };
+    apply_nfo_to_detail(db, detail, &nfo);
     let caps = captions_for(path);
     let _ = db.replace_captions(detail, &caps);
     let _ = persist_probe(db, path, detail);
     attach_objects(db, folder_id, detail, &title, class, dev, ino);
+    attach_album_art(db, cfg, path, detail);
     true
 }
 
@@ -2704,6 +2950,16 @@ mod tests {
                     resolution: None,
                     channels: None,
                     samplerate: None,
+                    album_art: 0,
+                    creator: None,
+                    comment: None,
+                    artist: None,
+                    album: None,
+                    genre: None,
+                    disc: None,
+                    track: None,
+                    bookmark_sec: 0,
+                    watch_count: 0,
                 },
             );
             cat.link_child("64$1", &oid);
@@ -2748,6 +3004,178 @@ mod tests {
             nfo_date_from_text("<movie><year>1999</year></movie>").as_deref(),
             Some("1999-01-01")
         );
+    }
+
+    const EPISODE_NFO: &str = r#"<episodedetails>
+  <showtitle>The Show</showtitle>
+  <title>Pilot</title>
+  <plot>The plot text</plot>
+  <genre>Drama</genre>
+  <genre>Crime</genre>
+  <director>Jane Doe</director>
+  <studio>Network</studio>
+  <season>1</season>
+  <episode>2</episode>
+  <premiered>2020-05-01</premiered>
+</episodedetails>"#;
+
+    #[test]
+    fn nfo_title_plot_show_season() {
+        let parsed = parse_nfo_text(EPISODE_NFO);
+        assert_eq!(parsed.title.as_deref(), Some("The Show - Pilot"));
+        assert_eq!(parsed.comment.as_deref(), Some("The plot text"));
+        assert_eq!(parsed.genre.as_deref(), Some("Drama / Crime"));
+        assert_eq!(parsed.creator.as_deref(), Some("Jane Doe"));
+        assert!(
+            parsed.artist.as_deref() == Some("Network")
+                || parsed.artist.as_deref() == Some("The Show"),
+            "artist={:?}",
+            parsed.artist
+        );
+        assert_eq!(parsed.disc, Some(1));
+        assert_eq!(parsed.track, Some(2));
+        assert!(
+            parsed.date.as_deref().is_some_and(|d| d.starts_with("2020-05-01")),
+            "date={:?}",
+            parsed.date
+        );
+
+        let credits = parse_nfo_text("<credits>Pat Lee</credits>");
+        assert_eq!(credits.creator.as_deref(), Some("Pat Lee"));
+        let studio = parse_nfo_text("<studio>Network</studio>");
+        assert_eq!(studio.creator.as_deref(), Some("Network"));
+        assert_eq!(studio.artist.as_deref(), Some("Network"));
+        let director_wins = parse_nfo_text(
+            "<director>Jane Doe</director><credits>Pat Lee</credits><studio>Network</studio>",
+        );
+        assert_eq!(director_wins.creator.as_deref(), Some("Jane Doe"));
+
+        assert!(nfo_too_large(64 * 1024 + 1));
+        assert!(!nfo_too_large(64 * 1024));
+
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-nfo-ep-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("show")).unwrap();
+        write_fake_mkv(&tmp.join("show/S01E01.mkv"), 64);
+        std::fs::write(tmp.join("show/S01E01.nfo"), EPISODE_NFO).unwrap();
+        let huge = "x".repeat(64 * 1024 + 1);
+        std::fs::write(tmp.join("show/huge.nfo"), format!("<title>TooBig</title>{huge}")).unwrap();
+        let huge_meta = nfo_for_file(&tmp.join("show/huge.mkv"), &[tmp.clone()]);
+        assert!(huge_meta.title.is_none(), "skip >64KiB: {huge_meta:?}");
+
+        let cat = scan(&ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        });
+        let ep = cat
+            .items
+            .values()
+            .find(|i| i.title == "The Show - Pilot")
+            .expect("episode title from nfo");
+        assert!(
+            ep.comment.as_deref().is_some_and(|c| c.contains("The plot text")),
+            "comment={:?}",
+            ep.comment
+        );
+        assert_eq!(ep.genre.as_deref(), Some("Drama / Crime"));
+        assert_eq!(ep.creator.as_deref(), Some("Jane Doe"));
+        assert!(
+            ep.artist.as_deref() == Some("Network") || ep.artist.as_deref() == Some("The Show"),
+            "artist={:?}",
+            ep.artist
+        );
+        assert_eq!(ep.disc, Some(1));
+        assert_eq!(ep.track, Some(2));
+        assert!(
+            ep.date.starts_with("2020-05-01"),
+            "date={}",
+            ep.date
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tvshow_nfo_inherited_by_episode() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-nfo-tv-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("show")).unwrap();
+        std::fs::write(
+            tmp.join("show/tvshow.nfo"),
+            r#"<tvshow>
+  <title>The Show</title>
+  <plot>Show plot</plot>
+  <genre>Drama</genre>
+  <studio>Network</studio>
+</tvshow>"#,
+        )
+        .unwrap();
+        write_fake_mkv(&tmp.join("show/S01E01.mkv"), 64);
+        std::fs::write(
+            tmp.join("show/S01E01.nfo"),
+            "<episodedetails><title>Pilot</title></episodedetails>\n",
+        )
+        .unwrap();
+        write_fake_mkv(&tmp.join("show/S01E02.mkv"), 64);
+        std::fs::write(
+            tmp.join("show/S01E02.nfo"),
+            "<episodedetails><title>Second</title><plot>Own plot</plot></episodedetails>\n",
+        )
+        .unwrap();
+
+        let cat = scan(&ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        });
+        let ep1 = cat
+            .items
+            .values()
+            .find(|i| i.path.ends_with("S01E01.mkv"))
+            .expect("S01E01");
+        assert_eq!(ep1.title, "The Show - Pilot");
+        assert_eq!(ep1.comment.as_deref(), Some("Show plot"));
+        assert_eq!(ep1.genre.as_deref(), Some("Drama"));
+        let ep2 = cat
+            .items
+            .values()
+            .find(|i| i.path.ends_with("S01E02.mkv"))
+            .expect("S01E02");
+        assert_eq!(ep2.title, "The Show - Second");
+        assert_eq!(ep2.comment.as_deref(), Some("Own plot"));
+        assert_eq!(ep2.genre.as_deref(), Some("Drama"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn bookmark_survives_reopen() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-bookmark-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dbp = tmp.join("files.db");
+        {
+            let db = LibraryDb::open(&dbp).unwrap();
+            db.set_bookmark(42, 120).unwrap();
+            db.set_watch_count(42, 3).unwrap();
+            assert_eq!(db.get_bookmark(42).unwrap(), Some((120, 3)));
+        }
+        let db = LibraryDb::open(&dbp).unwrap();
+        assert_eq!(
+            db.get_bookmark(42).unwrap(),
+            Some((120, 3)),
+            "BOOKMARKS must survive LibraryDb::open"
+        );
+        assert_eq!(db.get_bookmark(7).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -2823,8 +3251,16 @@ mod tests {
             db_path: Some(dbp.clone()),
             ..Default::default()
         });
-        let orig = cat.items.values().find(|i| i.title == "orig").unwrap();
-        let alias = cat.items.values().find(|i| i.title == "alias").unwrap();
+        let orig = cat
+            .items
+            .values()
+            .find(|i| i.path.ends_with("orig.mkv"))
+            .expect("orig.mkv");
+        let alias = cat
+            .items
+            .values()
+            .find(|i| i.path.ends_with("alias.mkv"))
+            .expect("alias.mkv");
         let db = LibraryDb::open(&dbp).unwrap();
         let o = db.find_detail_by_path(&orig.path.to_string_lossy()).unwrap().unwrap();
         let arow = db.find_detail_by_path(&alias.path.to_string_lossy()).unwrap().unwrap();
@@ -2838,6 +3274,138 @@ mod tests {
         assert_eq!(all_video.len(), 1, "All Video must not list hardlink twice");
         assert_eq!(orig.date, alias.date, "alias must clone original DATE");
         assert_eq!(orig.mime, alias.mime, "alias must clone original MIME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 1×1 JPEG (SOI + JFIF + EOI). Real enough for sidecar + HTTP magic checks.
+    const TINY_JPEG: &[u8] = &[
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06,
+        0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D,
+        0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12, 0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D,
+        0x1A, 0x1C, 0x1C, 0x20, 0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28,
+        0x37, 0x29, 0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
+        0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01,
+        0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0xFF, 0xC4,
+        0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00,
+        0x3F, 0x00, 0x2A, 0x1F, 0xFF, 0xD9,
+    ];
+
+    #[test]
+    fn jpeg_magic_and_art_name_png() {
+        assert!(is_jpeg_bytes(TINY_JPEG));
+        assert!(!is_jpeg_bytes(b"\x89PNG"));
+        assert!(is_album_art_name("clip-poster.png"));
+        assert!(is_album_art_name("clip-fanart.png"));
+        assert!(is_album_art_name("poster.png"));
+        assert!(is_album_art_name("Poster.jpg"));
+        assert!(!is_album_art_name("clip.mkv"));
+    }
+
+    #[test]
+    fn art_sidecar_indexed_and_cloned() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-art-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        write_fake_mkv(&tmp.join("clip.mkv"), 64);
+        std::fs::write(tmp.join("clip-poster.jpg"), TINY_JPEG).unwrap();
+        let dbp = tmp.join("files.db");
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(dbp.clone()),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let cat = scan(&cfg);
+        let video = cat
+            .items
+            .values()
+            .find(|i| i.path.ends_with("clip.mkv"))
+            .expect("clip indexed");
+        assert!(video.album_art > 0, "sidecar must set ALBUM_ART: {video:?}");
+        assert!(
+            !cat.items
+                .values()
+                .any(|i| i.title.contains("poster") || i.title == "clip-poster"),
+            "art files stay skipped"
+        );
+        assert!(cat.album_art_paths.contains_key(&video.album_art));
+
+        let alias = tmp.join("alias.mkv");
+        let _ = std::fs::remove_file(&alias);
+        std::fs::hard_link(tmp.join("clip.mkv"), &alias).unwrap();
+        let (cat2, _) = rescan(&cfg, &cat);
+        let clip2 = cat2
+            .items
+            .values()
+            .find(|i| i.path.ends_with("clip.mkv"))
+            .expect("clip after clone");
+        let alias_item = cat2
+            .items
+            .values()
+            .find(|i| i.path.ends_with("alias.mkv"))
+            .expect("hardlink alias");
+        assert_eq!(
+            alias_item.album_art, clip2.album_art,
+            "clone must share ALBUM_ART id"
+        );
+        assert!(alias_item.album_art > 0);
+
+        let poster = tmp.join("clip-poster.jpg");
+        let _ = std::fs::write(&poster, TINY_JPEG);
+        let (cat3, _) = monitor_dirty(&cfg, &[poster]);
+        let cat3 = cat3.unwrap_or(cat2);
+        let ids: Vec<i64> = cat3
+            .items
+            .values()
+            .filter(|i| i.path.ends_with("clip.mkv") || i.path.ends_with("alias.mkv"))
+            .map(|i| i.album_art)
+            .collect();
+        assert!(ids.len() >= 2, "both aliases still listed");
+        assert!(ids.iter().all(|id| *id == ids[0] && *id > 0));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn monitor_empty_dirty_attaches_new_poster() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rusty-dlna-art-restat-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        write_fake_mkv(&tmp.join("clip.mkv"), 64);
+        let dbp = tmp.join("files.db");
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(dbp.clone()),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let cat = scan(&cfg);
+        let before = cat
+            .items
+            .values()
+            .find(|i| i.path.ends_with("clip.mkv"))
+            .expect("clip");
+        assert_eq!(before.album_art, 0, "no poster yet");
+        std::fs::write(tmp.join("clip-poster.jpg"), TINY_JPEG).unwrap();
+        let (cat2, delta) = monitor(&cfg);
+        let cat2 = cat2.expect("restat must notice new art");
+        let after = cat2
+            .items
+            .values()
+            .find(|i| i.path.ends_with("clip.mkv"))
+            .expect("clip after restat");
+        assert!(after.album_art > 0, "periodic/startup monitor attaches poster");
+        assert!(delta.changed >= 1);
+        let (none, delta2) = monitor(&cfg);
+        assert!(none.is_none(), "second restat must not rewrite: {delta2:?}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2907,8 +3475,8 @@ mod tests {
             ..Default::default()
         };
         let cat = scan(&cfg);
-        assert!(cat.items.values().any(|i| i.title == "orig"));
-        assert!(cat.items.values().any(|i| i.title == "link"));
+        assert!(cat.items.values().any(|i| i.path.ends_with("orig.mkv")));
+        assert!(cat.items.values().any(|i| i.path.ends_with("link.mkv")));
         assert!(dbp.is_file(), "files.db must exist on disk");
 
         std::fs::remove_file(&orig).unwrap();
@@ -3054,29 +3622,32 @@ mod tests {
             "Video/Folders must list the media tree"
         );
         let recent = cat.children_of(VIDEO_RECENT_ID).expect("recent");
-        let recent_titles: Vec<_> = recent
+        let recent_paths: Vec<_> = recent
             .iter()
             .filter_map(|c| match c {
-                CatalogChild::Item(i) => Some(i.title.as_str()),
+                CatalogChild::Item(i) => Some(i.path.display().to_string()),
                 _ => None,
             })
             .collect();
         assert!(
-            recent_titles.contains(&"fresh"),
-            "recent={recent_titles:?}"
+            recent_paths.iter().any(|p| p.ends_with("fresh.mkv")),
+            "recent={recent_paths:?}"
         );
         assert!(
-            recent_titles.contains(&"stale"),
-            "no time window: old files stay in recent: {recent_titles:?}"
+            recent_paths.iter().any(|p| p.ends_with("stale.mkv")),
+            "no time window: old files stay in recent: {recent_paths:?}"
         );
         assert_eq!(
-            recent_titles.iter().filter(|t| **t == "fresh" || t.starts_with("fresh")).count(),
+            recent_paths
+                .iter()
+                .filter(|p| p.ends_with("fresh.mkv") || p.contains("fresh"))
+                .count(),
             1,
-            "symlink alias must not duplicate recent: {recent_titles:?}"
+            "symlink alias must not duplicate recent: {recent_paths:?}"
         );
         assert!(
-            !recent_titles.iter().any(|t| t.contains("alias")),
-            "recent must not list symlink alias: {recent_titles:?}"
+            !recent_paths.iter().any(|p| p.contains("alias")),
+            "recent must not list symlink alias: {recent_paths:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -3111,6 +3682,16 @@ mod tests {
                     resolution: None,
                     channels: None,
                     samplerate: None,
+                    album_art: 0,
+                    creator: None,
+                    comment: None,
+                    artist: None,
+                    album: None,
+                    genre: None,
+                    disc: None,
+                    track: None,
+                    bookmark_sec: 0,
+                    watch_count: 0,
                 },
             );
             let alias = format!("64$2${i:X}");
@@ -3139,6 +3720,16 @@ mod tests {
                     resolution: None,
                     channels: None,
                     samplerate: None,
+                    album_art: 0,
+                    creator: None,
+                    comment: None,
+                    artist: None,
+                    album: None,
+                    genre: None,
+                    disc: None,
+                    track: None,
+                    bookmark_sec: 0,
+                    watch_count: 0,
                 },
             );
         }

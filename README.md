@@ -11,6 +11,7 @@ This tree is GPLv2.
 | Path | Role |
 |---|---|
 | `replica.md` | Full wire spec |
+| `docs/specs/` | Official UPnP Forum PDFs (UDA, MediaServer, CDS, CMS). IEC 62481 / DLNA Guidelines are not redistributable — see that README |
 | `docs/ARCHITECTURE.md` | Threads, tasks, process model |
 | `docs/TRANSCODE.md` | When to transcode; HDR10 vs Dolby Vision |
 | `docs/INHERITED.md` | Product behavior to keep (dates, NFO, inodes, skips) |

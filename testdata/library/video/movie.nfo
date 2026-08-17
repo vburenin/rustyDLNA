@@ -2,4 +2,8 @@
 <movie>
   <title>Fixture Movie</title>
   <year>1999</year>
+  <plot>A tiny fixture.</plot>
+  <genre>Drama</genre>
+  <director>Fixture Director</director>
+  <studio>Fixture Studio</studio>
 </movie>

@@ -221,20 +221,20 @@ clears resume. DIDL never emits `upnp:lastPlaybackPosition` /
 `bookmark_seconds` + `CONVERT_MS` unit-tested. `update_id` already
 increments on library change.
 
-- [ ] `X_SetBookmark`: write `BOOKMARKS` keyed by **detail id** (not
+- [x] `X_SetBookmark`: write `BOOKMARKS` keyed by **detail id** (not
       object id string). `CONVERT_MS` ÷1000; `< 30` → 0. Empty 200 body.
-- [ ] Load bookmarks into `App` on start (or read-through on Browse).
+- [x] Load bookmarks into `App` on start (or read-through on Browse).
       Drop the HashMap-only path.
-- [ ] DIDL item: `upnp:lastPlaybackPosition` is **raw seconds** (not
+- [x] DIDL item: `upnp:lastPlaybackPosition` is **raw seconds** (not
       `H:MM:SS`). `CONVERT_MS` multiplies by 1000 on the way out.
-- [ ] Samsung: `sec:dcmInfo`  
+- [x] Samsung: `sec:dcmInfo`  
       `CREATIONDATE=0,FOLDER={title},BM={sec}` when `sec` filter/default.
-- [ ] `UpdateObject`: parse `CurrentTagValue` / `NewTagValue`.
+- [x] `UpdateObject`: parse `CurrentTagValue` / `NewTagValue`.
       `upnp:lastPlaybackPosition` → `BOOKMARKS.SEC` (same 30s / −1
       dialect as MiniDLNA). `upnp:playbackCount` **or** Kodi’s
       `upnp:playCount` → `WATCH_COUNT`. Unknown tags ignored. Missing
       ObjectID → 402; unknown object → 701.
-- [ ] `upnp:playbackCount` in DIDL when watch count > 0.
+- [x] `upnp:playbackCount` in DIDL when watch count > 0.
 
 **Files:** `crates/scan/src/db.rs` (`get/set_bookmark`, `set_watch_count`),
 `crates/soap/src/lib.rs` (`dispatch_simple` / new `dispatch_update_object`),

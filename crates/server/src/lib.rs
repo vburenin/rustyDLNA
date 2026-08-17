@@ -8,22 +8,23 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use rusty_dlna_http::{
-    dlna_org_features, gen_root_desc, live_transcode_response, media_response, now_imf_date,
-    parse_byte_range, persist_for_route, protocol_info, read_file_range, route,
-    scpd_connection_manager, scpd_content_directory, scpd_registrar, timeseek_without_range,
-    valid_host_header, ByteRange, HttpRequest, HttpResponse, HttpRoute, RangeError, RemuxJobSpec,
-    RootDescOpts,
+    caption_info_sec_url, dlna_org_features, gen_root_desc, live_transcode_response,
+    media_response, now_imf_date, parse_byte_range, persist_for_route, protocol_info,
+    read_file_range, route, scpd_connection_manager, scpd_content_directory, scpd_registrar,
+    set_caption_info_sec, timeseek_without_range, valid_host_header, wants_caption_info_sec,
+    ByteRange, HttpRequest, HttpResponse, HttpRoute, RangeError, RemuxJobSpec, RootDescOpts,
 };
 use rusty_dlna_protocol::isolation::collides_with_live_ports;
 use rusty_dlna_protocol::paths::{
-    caption_from_path, media_item_id_from_path, media_item_url, transcode_id_from_path,
+    album_art_id_from_path, album_art_url, caption_default_url, caption_from_path,
+    caption_indexed_url, media_item_id_from_path, media_item_url, transcode_id_from_path,
     transcode_item_url,
 };
 use rusty_dlna_protocol::server_header;
 use rusty_dlna_protocol::w3c_normalize_date;
 use rusty_dlna_protocol::{
-    identify_friendly_name, identify_user_agent, identify_x_av_client_info, remap_mime, ClientFlags,
-    ClientKind, ClientProfile, CLIENTS,
+    identify_friendly_name, identify_user_agent, identify_x_av_client_info, remap_mime, ClientCache,
+    ClientFlags, ClientKind, ClientProfile, CLIENTS,
 };
 use rusty_dlna_scan::{
     caption_http_mime, collect_media_dirs, load_existing, monitor, repair_objects_if_needed,
@@ -33,16 +34,23 @@ use rusty_dlna_scan::{
 
 pub use rusty_dlna_scan::ensure_pattern_fixture;
 use rusty_dlna_soap::{
-    build_browse, dispatch_simple, magic_object_id, parse_soap_call, soap_fault, DidlObject,
-    DidlRes, SoapCall, SoapOutcome,
+    bookmark_seconds, build_browse, default_order, dispatch_simple, empty_cd_response,
+    magic_object_id, parse_filter, parse_search_criteria, parse_soap_call, parse_update_object_tags,
+    row_matches, soap_fault, sort_or_709, DefaultOrder, DidlCaption, DidlObject, DidlRes,
+    FilterBits, SearchRow, SoapCall, SoapOutcome, SortKey, SortSpec,
 };
-use rusty_dlna_ssdp::{msearch_replies, parse_msearch};
+use rusty_dlna_ssdp::{
+    jitter_ms, msearch_jitter_ms_range, msearch_replies, notify_byebye, parse_msearch,
+    ALIVE_DUP_DELAY_MS,
+};
 use rusty_dlna_transcode::{
     cache_dest, cache_part, decide_for, ffmpeg_grow_args, probe_to_source, Decision, JobGate,
     RemapRule,
 };
 
+mod events;
 mod remux;
+mod status;
 
 #[derive(Debug, serde::Deserialize)]
 pub struct Config {
@@ -173,9 +181,10 @@ pub struct App {
     pub notify_interval: u32,
     pub cache_dir: PathBuf,
     pub update_id: AtomicU32,
-    pub bookmarks: Mutex<HashMap<String, i64>>,
     pub jobs: JobGate,
-    remuxes: Mutex<HashMap<i64, Arc<remux::RemuxJob>>>,
+    pub(crate) remuxes: Mutex<HashMap<i64, Arc<remux::RemuxJob>>>,
+    events: Mutex<events::EventHub>,
+    pub(crate) client_cache: Mutex<ClientCache>,
 }
 
 struct DidlSnap {
@@ -247,6 +256,12 @@ impl App {
             });
         let notify_interval = cfg.notify_interval.unwrap_or(895);
         let max_jobs = cfg.transcode.max_jobs.max(1) as usize;
+        let update_id = scan_cfg
+            .db_path
+            .as_ref()
+            .and_then(|p| LibraryDb::open(p).ok())
+            .map(|db| db.get_update_id())
+            .unwrap_or(1);
         Self {
             cfg,
             catalog: RwLock::new(catalog),
@@ -260,10 +275,11 @@ impl App {
             listen_ip,
             notify_interval,
             cache_dir,
-            update_id: AtomicU32::new(1),
-            bookmarks: Mutex::new(HashMap::new()),
+            update_id: AtomicU32::new(update_id),
             jobs: JobGate::new(max_jobs),
             remuxes: Mutex::new(HashMap::new()),
+            events: Mutex::new(events::EventHub::new()),
+            client_cache: Mutex::new(ClientCache::new()),
         }
     }
 
@@ -278,26 +294,45 @@ impl App {
     }
 
     pub fn identify(&self, req: &HttpRequest) -> &'static ClientProfile {
-        if let Some(ua) = req.user_agent() {
-            if let Some(p) = identify_user_agent(ua) {
-                return p;
-            }
-        }
-        if let Some(x) = req.header("X-AV-Client-Info") {
-            if let Some(p) = identify_x_av_client_info(x) {
-                return p;
-            }
-        }
-        if let Some(f) = req.header("FriendlyName") {
-            if let Some(p) = identify_friendly_name(f) {
-                return p;
-            }
-        }
-        &CLIENTS[0]
+        self.identify_peer(req, "127.0.0.1:9".parse().unwrap())
     }
 
-    /// Shipped request handler. Tests drive this; the accept loop calls it.
+    pub fn identify_peer(&self, req: &HttpRequest, peer: SocketAddr) -> &'static ClientProfile {
+        let specific = req
+            .user_agent()
+            .and_then(identify_user_agent)
+            .or_else(|| req.header("X-AV-Client-Info").and_then(identify_x_av_client_info))
+            .or_else(|| req.header("FriendlyName").and_then(identify_friendly_name));
+        let ip = match peer {
+            SocketAddr::V4(v) => *v.ip(),
+            SocketAddr::V6(_) => Ipv4Addr::LOCALHOST,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mac = lookup_arp_mac(ip);
+        let mut cache = self.client_cache.lock().expect("client cache");
+        if let Some(p) = specific {
+            cache.remember(ip, p, mac, now)
+        } else if let Some(p) = cache.search(ip, now, mac) {
+            p
+        } else {
+            &CLIENTS[0]
+        }
+    }
+
+    /// Tests that do not pass a peer use a unique 127.0.0.x so UA-matrix
+    /// rows do not share the 25-slot IPv4 cache. Production uses `handle_from`.
     pub fn handle(&self, req: &HttpRequest) -> HttpResponse {
+        static SEQ: AtomicU32 = AtomicU32::new(1);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let host = Ipv4Addr::new(127, 0, 0, ((n % 250) + 1) as u8);
+        self.handle_from(req, SocketAddr::from((host, 9)))
+    }
+
+    /// Shipped request handler. The accept loop passes the real peer.
+    pub fn handle_from(&self, req: &HttpRequest, peer: SocketAddr) -> HttpResponse {
         let method = req.method.as_str();
         if !(method.eq_ignore_ascii_case("GET")
             || method.eq_ignore_ascii_case("HEAD")
@@ -328,7 +363,7 @@ impl App {
             req.conn_keep(),
         );
         let mut resp = match r {
-            HttpRoute::RootDesc => self.root_desc(req),
+            HttpRoute::RootDesc => self.root_desc(req, peer),
             HttpRoute::ScpdContentDir => {
                 HttpResponse::xml(200, scpd_content_directory().to_string(), persist)
             }
@@ -340,16 +375,24 @@ impl App {
             }
             HttpRoute::EventContentDir
             | HttpRoute::EventConnectionMgr
-            | HttpRoute::EventRegistrar => self.gena(req, persist),
-            HttpRoute::Soap => self.soap(req, persist),
-            HttpRoute::MediaItem => self.media(req, false),
-            HttpRoute::Transcode => self.media(req, true),
+            | HttpRoute::EventRegistrar => self.gena(req, persist, peer),
+            HttpRoute::Soap => self.soap(req, persist, peer),
+            HttpRoute::MediaItem => self.media(req, false, peer),
+            HttpRoute::Transcode => self.media(req, true, peer),
+            HttpRoute::AlbumArt => self.album_art(req),
             HttpRoute::Caption => self.caption(req),
             HttpRoute::Icon => icon_response(&req.path),
             HttpRoute::Status | HttpRoute::Presentation => {
-                HttpResponse::html(200, "OK", &format!("<p>{}</p>", self.cfg.friendly_name))
+                let body = status::status_html(self);
+                let mut r = HttpResponse::new(200, "OK");
+                r.set("Content-Type", "text/html");
+                r.body = body.into_bytes();
+                r.set("Content-Length", r.body.len());
+                r
             }
-            HttpRoute::NotFound | _ => HttpResponse::html(404, "Not Found", "not found"),
+            HttpRoute::Thumbnail | HttpRoute::Resized | HttpRoute::NotFound => {
+                HttpResponse::html(404, "Not Found", "not found")
+            }
         };
         if r == HttpRoute::MediaItem || r == HttpRoute::Transcode || r == HttpRoute::Soap {
             resp.persist = false;
@@ -371,13 +414,13 @@ impl App {
         resp
     }
 
-    fn root_desc(&self, req: &HttpRequest) -> HttpResponse {
+    fn root_desc(&self, req: &HttpRequest, peer: SocketAddr) -> HttpResponse {
         tracing::debug!(
             host = req.header("Host").unwrap_or("-"),
             ua = req.user_agent().unwrap_or("-"),
             "rootDesc"
         );
-        let client = self.identify(req);
+        let client = self.identify_peer(req, peer);
         let opts = RootDescOpts {
             friendly_name: self.cfg.friendly_name.clone(),
             uuid: self.uuid.clone(),
@@ -401,51 +444,116 @@ impl App {
         HttpResponse::xml(200, xml, true)
     }
 
-    /// rustyDLNA GENA: SUBSCRIBE returns SID + Timeout. Kodi/Platinum
-    /// subscribe to ContentDirectory after reading the SCPD.
-    fn gena(&self, req: &HttpRequest, persist: bool) -> HttpResponse {
+    /// GENA subscribe/unsubscribe (`replica.md` §9). Peer IPv4 is required
+    /// so CALLBACK cannot point at a third host.
+    fn gena(&self, req: &HttpRequest, persist: bool, peer: SocketAddr) -> HttpResponse {
         let method = req.method.to_ascii_uppercase();
+        let sid_hdr = req.header("SID").map(str::trim).filter(|s| !s.is_empty());
+        let cb_hdr = req
+            .header("Callback")
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         if method == "UNSUBSCRIBE" {
-            let mut r = HttpResponse::new(200, "OK");
-            r.set("Content-Length", "0");
-            r.persist = persist;
-            return r;
+            let Some(sid) = sid_hdr else {
+                return HttpResponse::html(412, "Precondition Failed", "missing SID");
+            };
+            let res = self
+                .events
+                .lock()
+                .expect("events")
+                .unsubscribe(sid);
+            return match res {
+                Ok(()) => {
+                    let mut r = HttpResponse::new(200, "OK");
+                    r.set("Content-Length", "0");
+                    r.persist = persist;
+                    r
+                }
+                Err(st) => HttpResponse::html(st, "Precondition Failed", "unknown SID"),
+            };
         }
         if method != "SUBSCRIBE" {
             return HttpResponse::html(404, "Not Found", "not found");
         }
-        let timeout = req
-            .header("Timeout")
-            .and_then(|t| {
-                t.split("Second-")
-                    .nth(1)
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-            })
-            .filter(|n| *n > 0)
-            .unwrap_or(300);
-        let sid = req
-            .header("SID")
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                format!(
-                    "uuid:{}",
-                    uuid_v4_like(self.update_id.load(Ordering::Relaxed))
-                )
-            });
-        let mut r = HttpResponse::new(200, "OK");
-        r.set("SID", sid);
-        r.set("Timeout", format!("Second-{timeout}"));
-        r.set("Content-Length", "0");
-        r.persist = persist;
-        r
+        if sid_hdr.is_some() && cb_hdr.is_some() {
+            return HttpResponse::html(400, "Bad Request", "SID and Callback");
+        }
+        if let Some(raw_cb) = cb_hdr {
+            let nt = req.header("NT").map(str::trim).filter(|s| !s.is_empty());
+            if nt.is_none() {
+                return HttpResponse::html(400, "Bad Request", "missing NT");
+            }
+            if !nt.unwrap().eq_ignore_ascii_case("upnp:event") {
+                return HttpResponse::html(412, "Precondition Failed", "NT");
+            }
+            let Some(cb) = events::parse_callback(raw_cb) else {
+                return HttpResponse::html(412, "Precondition Failed", "Callback");
+            };
+            let Some(peer_ip) = events::peer_ipv4(peer) else {
+                return HttpResponse::html(412, "Precondition Failed", "peer");
+            };
+            if cb.ip != peer_ip {
+                return HttpResponse::html(412, "Precondition Failed", "Callback host");
+            }
+            let Some(service) = events::service_from_path(&req.path) else {
+                return HttpResponse::html(412, "Precondition Failed", "service");
+            };
+            let timeout = req
+                .header("Timeout")
+                .and_then(|t| {
+                    t.split("Second-")
+                        .nth(1)
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                })
+                .filter(|n| *n > 0)
+                .unwrap_or(events::DEFAULT_TIMEOUT_SECS);
+            let sid = format!(
+                "uuid:{}",
+                uuid_v4_like(self.update_id.load(Ordering::Relaxed))
+            );
+            let job = {
+                let mut hub = self.events.lock().expect("events");
+                match hub.subscribe_new(sid.clone(), cb.as_url(), service, timeout) {
+                    Ok(job) => job,
+                    Err(st) => {
+                        return HttpResponse::html(st, "Precondition Failed", "subscriber table");
+                    }
+                }
+            };
+            let update_id = self.update_id.load(Ordering::Relaxed);
+            events::spawn_notify(job, events::propertyset(service, update_id));
+            let mut r = HttpResponse::new(200, "OK");
+            r.set("SID", sid);
+            r.set("Timeout", format!("Second-{timeout}"));
+            r.set("Content-Length", "0");
+            r.persist = persist;
+            return r;
+        }
+        if let Some(sid) = sid_hdr {
+            return match self.events.lock().expect("events").renew(sid) {
+                Ok(timeout) => {
+                    let mut r = HttpResponse::new(200, "OK");
+                    r.set("SID", sid);
+                    r.set("Timeout", format!("Second-{timeout}"));
+                    r.set("Content-Length", "0");
+                    r.persist = persist;
+                    r
+                }
+                Err(st) => HttpResponse::html(st, "Precondition Failed", "unknown SID"),
+            };
+        }
+        HttpResponse::html(412, "Precondition Failed", "missing Callback or SID")
     }
 
-    fn soap(&self, req: &HttpRequest, persist: bool) -> HttpResponse {
+    fn soap(&self, req: &HttpRequest, persist: bool, peer: SocketAddr) -> HttpResponse {
         let action = req.header("SOAPAction").unwrap_or("");
         let body = String::from_utf8_lossy(&req.body);
         let call = parse_soap_call(action, &body);
-        let client = self.identify(req);
+        let client = self.identify_peer(req, peer);
+        let filter_bits = parse_filter(
+            call.filter.as_deref(),
+            client.flags.contains(ClientFlags::SAMSUNG),
+        );
         if call.method.is_none() {
             return soap_fault_logged(
                 SoapOutcome::fault401(),
@@ -455,24 +563,17 @@ impl App {
             );
         }
         if call.method == Some("X_SetBookmark") {
-            let mut bookmarks = self.bookmarks.lock().expect("bookmarks");
-            if let Some(out) = dispatch_simple(
-                &call,
-                client,
-                &self.uuid,
-                self.update_id.load(Ordering::Relaxed),
-                self.cfg.root_container.as_deref(),
-                Some(&mut bookmarks),
-            ) {
-                return soap_outcome_http(out, persist, &call, req.user_agent().unwrap_or("-"));
-            }
-        } else if let Some(out) = dispatch_simple(
+            return self.soap_set_bookmark(&call, client, persist, req.user_agent().unwrap_or("-"));
+        }
+        if call.method == Some("UpdateObject") {
+            return self.soap_update_object(&call, client, persist, req.user_agent().unwrap_or("-"));
+        }
+        if let Some(out) = dispatch_simple(
             &call,
             client,
             &self.uuid,
             self.update_id.load(Ordering::Relaxed),
             self.cfg.root_container.as_deref(),
-            None,
         ) {
             return soap_outcome_http(out, persist, &call, req.user_agent().unwrap_or("-"));
         }
@@ -503,21 +604,7 @@ impl App {
                     req.user_agent().unwrap_or("-"),
                 );
             }
-            let mut oid = magic_object_id(oid_raw, client);
-            if oid == rusty_dlna_protocol::object_id::ROOT_ID {
-                match self.cfg.root_container.as_deref() {
-                    Some("V") | Some("v") | Some("2") => {
-                        oid = rusty_dlna_protocol::object_id::VIDEO_ID.to_string();
-                    }
-                    Some("A") | Some("1") => {
-                        oid = rusty_dlna_protocol::object_id::MUSIC_ID.to_string();
-                    }
-                    Some("64") => {
-                        oid = rusty_dlna_protocol::object_id::BROWSEDIR_ID.to_string();
-                    }
-                    _ => {}
-                }
-            }
+            let oid = self.remap_object_id(oid_raw, client);
             if flag != "BrowseDirectChildren" && flag != "BrowseMetadata" {
                 return soap_fault_logged(
                     SoapOutcome::fault402(),
@@ -549,8 +636,31 @@ impl App {
                         }
                     }
                 } else {
-                    match cat.page_children(&oid, start, take) {
-                        Some(v) => v,
+                    let sort = match sort_or_709(call.sort_criteria.as_deref(), client) {
+                        Ok(s) => s,
+                        Err(709) => {
+                            return soap_fault_logged(
+                                SoapOutcome::fault709(),
+                                persist,
+                                &call,
+                                req.user_agent().unwrap_or("-"),
+                            );
+                        }
+                        Err(_) => Vec::new(),
+                    };
+                    match cat.page_children(&oid, 0, usize::MAX) {
+                        Some((mut all, _)) => {
+                            let order = default_order(client);
+                            // Empty SortCriteria + folders-first already matches
+                            // page_children (and Recent mtime-desc). Re-sort only
+                            // for client keys or FORCE_SORT / LG defaults.
+                            if !sort.is_empty() || order != DefaultOrder::FoldersFirst {
+                                sort_catalog_children(&mut all, &sort, order);
+                            }
+                            let total = all.len() as u32;
+                            let page: Vec<_> = all.into_iter().skip(start).take(take).collect();
+                            (page, total)
+                        }
                         None => {
                             return soap_fault_logged(
                                 SoapOutcome::fault701(),
@@ -571,7 +681,7 @@ impl App {
             let didl: Vec<DidlObject> = slice
                 .into_iter()
                 .map(|snap| {
-                    let mut o = self.to_didl_snap(snap, client, ua);
+                    let mut o = self.to_didl_snap(snap, client, ua, &filter_bits);
                     // rustyDLNA magic container parentid_sql = "0": children of
                     // remapped root are advertised with parentID of the requested id.
                     if remapped_root {
@@ -586,6 +696,7 @@ impl App {
                 didl.len() as u32,
                 total,
                 self.update_id.load(Ordering::Relaxed),
+                &filter_bits,
             );
             tracing::info!(
                 ua = req.user_agent().unwrap_or("-"),
@@ -600,65 +711,65 @@ impl App {
             r.persist = false;
             return r;
         }
-        // Search: dialect. Container class queries must return
-        // folders (VLC expand / some library UIs Search instead of Browse).
         let ua = req.user_agent();
-        let crit = call.search_criteria.unwrap_or_default();
-        let want_containers = crit.contains("object.container");
-        let want_items = crit.contains("object.item") || !want_containers;
+        let sort = match sort_or_709(call.sort_criteria.as_deref(), client) {
+            Ok(s) => s,
+            Err(709) => {
+                return soap_fault_logged(
+                    SoapOutcome::fault709(),
+                    persist,
+                    &call,
+                    req.user_agent().unwrap_or("-"),
+                );
+            }
+            Err(_) => Vec::new(),
+        };
+        let clauses = parse_search_criteria(call.search_criteria.as_deref());
+        let start = call.starting_index.max(0) as usize;
+        let take = if call.requested_count == 0 {
+            usize::MAX
+        } else {
+            call.requested_count as usize
+        };
         let (slice, total) = {
             let cat = self.catalog.read().expect("catalog");
-            let start = call.starting_index.max(0) as usize;
-            let mut n = 0usize;
-            if want_containers {
-                n += cat
-                    .containers
-                    .values()
-                    .filter(|c| c.object_id != rusty_dlna_protocol::object_id::ROOT_ID)
-                    .count();
-            }
-            if want_items {
-                n += cat.items.len();
-            }
-            let take = if call.requested_count == 0 {
-                n
-            } else {
-                call.requested_count as usize
-            };
-            let mut out = Vec::new();
-            let mut skipped = 0usize;
-            if want_containers {
-                for c in cat.containers.values() {
-                    if c.object_id == rusty_dlna_protocol::object_id::ROOT_ID {
-                        continue;
-                    }
-                    if skipped < start {
-                        skipped += 1;
-                        continue;
-                    }
-                    if out.len() >= take {
-                        break;
-                    }
-                    out.push(self.snapshot_didl(&CatalogChild::Container(c.clone()), &cat));
+            let scope = self.remap_object_id(call.object_id.as_deref().unwrap_or("0"), client);
+            let scoped = search_scope(&cat, &scope);
+            let mut hits: Vec<CatalogChild> = Vec::new();
+            for c in cat.containers.values() {
+                if c.object_id == rusty_dlna_protocol::object_id::ROOT_ID {
+                    continue;
+                }
+                if !scoped.contains(&c.object_id) {
+                    continue;
+                }
+                let row = container_search_row(c);
+                if row_matches(&clauses, &row) {
+                    hits.push(CatalogChild::Container(c.clone()));
                 }
             }
-            if want_items && out.len() < take {
-                for it in cat.items.values() {
-                    if skipped < start {
-                        skipped += 1;
-                        continue;
-                    }
-                    if out.len() >= take {
-                        break;
-                    }
-                    out.push(self.snapshot_didl(&CatalogChild::Item(it.clone()), &cat));
+            for it in cat.items.values() {
+                if !item_in_scope(it, &scoped) {
+                    continue;
+                }
+                let row = item_search_row(it);
+                if row_matches(&clauses, &row) {
+                    hits.push(CatalogChild::Item(it.clone()));
                 }
             }
-            (out, n as u32)
+            sort_catalog_children(&mut hits, &sort, default_order(client));
+            let total = hits.len() as u32;
+            let page: Vec<_> = hits
+                .into_iter()
+                .skip(start)
+                .take(take)
+                .map(|ch| self.snapshot_didl(&ch, &cat))
+                .collect();
+            (page, total)
         };
         let didl: Vec<DidlObject> = slice
             .into_iter()
-            .map(|snap| self.to_didl_snap(snap, client, ua))
+            .map(|snap| self.to_didl_snap(snap, client, ua, &filter_bits))
             .collect();
         let xml = build_browse(
             true,
@@ -666,6 +777,7 @@ impl App {
             didl.len() as u32,
             total,
             self.update_id.load(Ordering::Relaxed),
+            &filter_bits,
         );
         let mut r = HttpResponse::xml(200, xml, false);
         r.persist = false;
@@ -692,6 +804,7 @@ impl App {
         snap: DidlSnap,
         client: &ClientProfile,
         ua: Option<&str>,
+        bits: &FilterBits,
     ) -> DidlObject {
         match snap.child {
             CatalogChild::Container(c) => DidlObject {
@@ -706,9 +819,58 @@ impl App {
                 child_container_count: snap.child_container_count,
                 is_container: true,
                 resources: vec![],
+                album_art_uri: None,
+                album_art_profile: false,
+                creator: None,
+                description: None,
+                artist: None,
+                actor: None,
+                album: None,
+                genre: None,
+                track: None,
+                season: None,
+                episode: None,
+                captions: vec![],
+                last_playback_position: None,
+                playback_count: None,
+                dcm_info: None,
             },
             CatalogChild::Item(it) => {
                 let date = w3c_normalize_date(&it.date);
+                let art_url = (it.album_art > 0).then(|| {
+                    album_art_url(&self.advertise_ip, self.http_port, it.album_art, it.detail_id)
+                });
+                let audio = it.class.contains("audio");
+                let video = it.class.contains("video");
+                let captions = it
+                    .captions
+                    .iter()
+                    .map(|c| DidlCaption {
+                        ext: c.ext.clone(),
+                        url: caption_indexed_url(
+                            &self.advertise_ip,
+                            self.http_port,
+                            it.detail_id,
+                            c.index,
+                            &c.ext,
+                        ),
+                    })
+                    .collect();
+                let convert_ms = client.flags.contains(ClientFlags::CONVERT_MS);
+                let last_playback_position = (it.bookmark_sec > 0).then(|| {
+                    if convert_ms {
+                        it.bookmark_sec.saturating_mul(1000)
+                    } else {
+                        it.bookmark_sec
+                    }
+                });
+                let playback_count = (it.watch_count > 0).then_some(it.watch_count);
+                let dcm_info = (bits.sec && it.bookmark_sec > 0).then(|| {
+                    format!(
+                        "CREATIONDATE=0,FOLDER={},BM={}",
+                        it.title, it.bookmark_sec
+                    )
+                });
                 DidlObject {
                     id: it.object_id.clone(),
                     parent_id: it.parent_id.clone(),
@@ -720,7 +882,138 @@ impl App {
                     child_count: None,
                     child_container_count: None,
                     is_container: false,
-                    resources: self.item_resources(&it, client, ua),
+                    resources: self.item_resources(&it, client, ua, bits),
+                    album_art_uri: if audio { art_url } else { None },
+                    album_art_profile: audio && client_wants_art_profile(client),
+                    creator: it.creator.clone(),
+                    description: it.comment.clone(),
+                    artist: it.artist.clone(),
+                    actor: None,
+                    album: it.album.clone(),
+                    genre: it.genre.clone(),
+                    track: if audio { it.track } else { None },
+                    season: if video { it.disc } else { None },
+                    episode: if video { it.track } else { None },
+                    captions,
+                    last_playback_position,
+                    playback_count,
+                    dcm_info,
+                }
+            }
+        }
+    }
+
+    fn soap_set_bookmark(
+        &self,
+        call: &SoapCall,
+        client: &ClientProfile,
+        persist: bool,
+        ua: &str,
+    ) -> HttpResponse {
+        let Some(oid) = call.object_id.as_deref().filter(|s| !s.is_empty()) else {
+            return soap_fault_logged(SoapOutcome::fault402(), persist, call, ua);
+        };
+        if let Some(detail_id) = self.resolve_detail_id(oid, client) {
+            let pos = call.pos_second.unwrap_or(0);
+            let sec = bookmark_seconds(pos, client.flags.contains(ClientFlags::CONVERT_MS));
+            self.persist_bookmark(detail_id, Some(sec), None);
+        }
+        soap_outcome_http(
+            SoapOutcome::Ok(empty_cd_response("X_SetBookmark")),
+            persist,
+            call,
+            ua,
+        )
+    }
+
+    fn soap_update_object(
+        &self,
+        call: &SoapCall,
+        client: &ClientProfile,
+        persist: bool,
+        ua: &str,
+    ) -> HttpResponse {
+        let Some(oid) = call.object_id.as_deref().filter(|s| !s.is_empty()) else {
+            return soap_fault_logged(SoapOutcome::fault402(), persist, call, ua);
+        };
+        let Some(detail_id) = self.resolve_detail_id(oid, client) else {
+            return soap_fault_logged(SoapOutcome::fault701(), persist, call, ua);
+        };
+        let tags = parse_update_object_tags(
+            call.current_tag_value.as_deref(),
+            call.new_tag_value.as_deref(),
+        );
+        let convert_ms = client.flags.contains(ClientFlags::CONVERT_MS);
+        // -1 / values < 30 store as 0 (clear). Do not map -1 to None —
+        // that leaves BOOKMARKS.SEC unchanged.
+        let sec = tags
+            .last_playback_position
+            .map(|pos| bookmark_seconds(pos, convert_ms));
+        self.persist_bookmark(detail_id, sec, tags.playback_count);
+        soap_outcome_http(
+            SoapOutcome::Ok(empty_cd_response("UpdateObject")),
+            persist,
+            call,
+            ua,
+        )
+    }
+
+    /// Samsung `A`/`V`/`I` and `root_container=` rewrite. Shared by Browse and Search.
+    fn remap_object_id(&self, oid_raw: &str, client: &ClientProfile) -> String {
+        let mut oid = magic_object_id(oid_raw, client);
+        if oid == rusty_dlna_protocol::object_id::ROOT_ID {
+            match self.cfg.root_container.as_deref() {
+                Some("V") | Some("v") | Some("2") => {
+                    oid = rusty_dlna_protocol::object_id::VIDEO_ID.to_string();
+                }
+                Some("A") | Some("1") => {
+                    oid = rusty_dlna_protocol::object_id::MUSIC_ID.to_string();
+                }
+                Some("64") => {
+                    oid = rusty_dlna_protocol::object_id::BROWSEDIR_ID.to_string();
+                }
+                _ => {}
+            }
+        }
+        oid
+    }
+
+    /// Catalog item by object id, `REF_ID` alias, magic container, or detail id.
+    fn resolve_detail_id(&self, oid_raw: &str, client: &ClientProfile) -> Option<i64> {
+        let oid = magic_object_id(oid_raw, client);
+        let cat = self.catalog.read().ok()?;
+        if let Some(it) = cat.items.get(oid_raw).or_else(|| cat.items.get(&oid)) {
+            return Some(it.detail_id);
+        }
+        match cat.metadata(oid_raw).or_else(|| cat.metadata(&oid)) {
+            Some(CatalogChild::Item(it)) => Some(it.detail_id),
+            _ => None,
+        }
+    }
+
+    fn persist_bookmark(&self, detail_id: i64, sec: Option<i64>, watch: Option<i64>) {
+        if sec.is_none() && watch.is_none() {
+            return;
+        }
+        if let Some(path) = self.scan_cfg.db_path.as_ref() {
+            if let Ok(db) = LibraryDb::open(path) {
+                if let Some(s) = sec {
+                    let _ = db.set_bookmark(detail_id, s);
+                }
+                if let Some(w) = watch {
+                    let _ = db.set_watch_count(detail_id, w);
+                }
+            }
+        }
+        if let Ok(mut cat) = self.catalog.write() {
+            for it in cat.items.values_mut() {
+                if it.detail_id == detail_id {
+                    if let Some(s) = sec {
+                        it.bookmark_sec = s;
+                    }
+                    if let Some(w) = watch {
+                        it.watch_count = w;
+                    }
                 }
             }
         }
@@ -731,7 +1024,13 @@ impl App {
         it.probe.clone()
     }
 
-    fn item_resources(&self, it: &MediaItem, client: &ClientProfile, ua: Option<&str>) -> Vec<DidlRes> {
+    fn item_resources(
+        &self,
+        it: &MediaItem,
+        client: &ClientProfile,
+        ua: Option<&str>,
+        bits: &FilterBits,
+    ) -> Vec<DidlRes> {
         let mime = remap_mime(client, &it.mime);
         let orig_url = media_item_url(
             &self.advertise_ip,
@@ -754,6 +1053,8 @@ impl App {
             resolution: it.resolution.clone(),
             sample_frequency: it.samplerate,
             nr_audio_channels: it.channels,
+            pv_subtitle_type: None,
+            pv_subtitle_uri: None,
         };
         let probe = self.browse_probe(it);
         let src = probe_to_source(
@@ -776,8 +1077,7 @@ impl App {
         }
         // Any matching remap: advertise the remux first so the client
         // (Kodi included) plays /Transcode/ instead of the original P7.
-        if plan.decision == Decision::Recode
-        {
+        let mut res = if plan.decision == Decision::Recode {
             let remap_url = transcode_item_url(&self.advertise_ip, self.http_port, it.detail_id);
             // Live fMP4 pipe (OP=00). Do not stat the remux cache on Browse.
             let remap = DidlRes {
@@ -792,35 +1092,78 @@ impl App {
                 resolution: it.resolution.clone(),
                 sample_frequency: it.samplerate,
                 nr_audio_channels: it.channels,
+                pv_subtitle_type: None,
+                pv_subtitle_uri: None,
             };
-            return vec![remap, orig];
-        }
-        let mut res = vec![orig];
-        if client.flags.contains(ClientFlags::CAPTION_RES) {
-            for cap in &it.captions {
-                let url = rusty_dlna_protocol::paths::caption_indexed_url(
+            vec![remap, orig]
+        } else {
+            let mut res = vec![orig];
+            if client.flags.contains(ClientFlags::CAPTION_RES) {
+                for cap in &it.captions {
+                    let url = caption_indexed_url(
+                        &self.advertise_ip,
+                        self.http_port,
+                        it.detail_id,
+                        cap.index,
+                        &cap.ext,
+                    );
+                    res.push(DidlRes {
+                        url,
+                        protocol_info: format!("http-get:*:{}:*", caption_http_mime(&cap.ext)),
+                        size: None,
+                        duration: None,
+                        bitrate: None,
+                        resolution: None,
+                        sample_frequency: None,
+                        nr_audio_channels: None,
+                        pv_subtitle_type: None,
+                        pv_subtitle_uri: None,
+                    });
+                }
+            }
+            res
+        };
+        if bits.pv && !it.captions.is_empty() {
+            if let Some(first) = res.first_mut() {
+                first.pv_subtitle_type = Some("SRT".into());
+                first.pv_subtitle_uri = Some(caption_default_url(
                     &self.advertise_ip,
                     self.http_port,
                     it.detail_id,
-                    cap.index,
-                    &cap.ext,
-                );
-                res.push(DidlRes {
-                    url,
-                    protocol_info: format!("http-get:*:{}:*", caption_http_mime(&cap.ext)),
-                    size: None,
-                    duration: None,
-                    bitrate: None,
-                    resolution: None,
-                    sample_frequency: None,
-                    nr_audio_channels: None,
-                });
+                ));
             }
         }
+        self.push_video_album_art(&mut res, it, client);
         res
     }
 
-    fn media(&self, req: &HttpRequest, transcode: bool) -> HttpResponse {
+    fn push_video_album_art(&self, res: &mut Vec<DidlRes>, it: &MediaItem, client: &ClientProfile) {
+        if it.album_art <= 0 || !it.class.contains("video") {
+            return;
+        }
+        if client.flags.contains(ClientFlags::MS_PFS) {
+            return;
+        }
+        res.push(DidlRes {
+            url: album_art_url(
+                &self.advertise_ip,
+                self.http_port,
+                it.album_art,
+                it.detail_id,
+            ),
+            protocol_info: "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_TN".into(),
+            size: None,
+            duration: None,
+            bitrate: None,
+            resolution: None,
+            sample_frequency: None,
+            nr_audio_channels: None,
+            pv_subtitle_type: None,
+            pv_subtitle_uri: None,
+        });
+    }
+
+    fn media(&self, req: &HttpRequest, transcode: bool, peer: SocketAddr) -> HttpResponse {
         let id = if transcode {
             transcode_id_from_path(&req.path)
         } else {
@@ -838,7 +1181,16 @@ impl App {
         else {
             return HttpResponse::html(404, "Not Found", "no such object");
         };
-        let client = self.identify(req);
+        let client = self.identify_peer(req, peer);
+        if !transcode
+            && query_has_album_art(&req.query)
+            && client.flags.contains(ClientFlags::MS_PFS)
+        {
+            if item.album_art > 0 {
+                return self.serve_album_art(item.album_art, req);
+            }
+            return HttpResponse::html(404, "Not Found", "no album art");
+        }
         if transcode {
             let probe = self.browse_probe(&item);
             let src = probe_to_source(
@@ -929,6 +1281,15 @@ impl App {
         };
         const RAM_CAP: u64 = 8 * 1024 * 1024;
         let span = end.saturating_sub(start).saturating_add(1);
+        let caption_sec = if wants_caption_info_sec(req) && !item.captions.is_empty() {
+            Some(caption_info_sec_url(
+                &self.advertise_ip,
+                self.http_port,
+                item.detail_id,
+            ))
+        } else {
+            None
+        };
         if span > RAM_CAP {
             let mut r = media_response(
                 &self.server,
@@ -940,6 +1301,9 @@ impl App {
                 pn.as_deref(),
                 ci,
             );
+            if let Some(url) = caption_sec.as_deref() {
+                set_caption_info_sec(&mut r, url);
+            }
             r.file_range = Some((path, start, end));
             return r;
         }
@@ -947,7 +1311,7 @@ impl App {
             Ok(b) => b,
             Err(e) => return HttpResponse::html(500, "Internal Server Error", &e.to_string()),
         };
-        media_response(
+        let mut r = media_response(
             &self.server,
             &now_imf_date(),
             &mime,
@@ -956,7 +1320,48 @@ impl App {
             body,
             pn.as_deref(),
             ci,
-        )
+        );
+        if let Some(url) = caption_sec.as_deref() {
+            set_caption_info_sec(&mut r, url);
+        }
+        r
+    }
+
+    fn album_art(&self, req: &HttpRequest) -> HttpResponse {
+        let Some(id) = album_art_id_from_path(&req.path) else {
+            return HttpResponse::html(404, "Not Found", "bad art id");
+        };
+        self.serve_album_art(id, req)
+    }
+
+    fn serve_album_art(&self, art_id: i64, req: &HttpRequest) -> HttpResponse {
+        if req.header("Range").is_some() {
+            return HttpResponse::html(406, "Not Acceptable", "Range not allowed on image");
+        }
+        if req
+            .header("transferMode.dlna.org")
+            .is_some_and(|v| v.eq_ignore_ascii_case("Streaming"))
+        {
+            return HttpResponse::html(406, "Not Acceptable", "Streaming not allowed on image");
+        }
+        let path = {
+            let cat = self.catalog.read().expect("catalog");
+            cat.album_art_paths.get(&art_id).cloned()
+        };
+        let Some(path) = path else {
+            return HttpResponse::html(404, "Not Found", "no such art");
+        };
+        let path = rusty_dlna_scan::rebase_media_path(&path, &self.scan_cfg.media_dirs);
+        let Ok(body) = std::fs::read(&path) else {
+            return HttpResponse::html(404, "Not Found", "art missing");
+        };
+        let mut r = HttpResponse::new(200, "OK");
+        r.set("Content-Type", "image/jpeg");
+        r.set("transferMode.dlna.org", "Interactive");
+        r.set("contentFeatures.dlna.org", "DLNA.ORG_PN=JPEG_TN");
+        r.set("Content-Length", body.len());
+        r.body = body;
+        r
     }
 
     fn caption(&self, req: &HttpRequest) -> HttpResponse {
@@ -987,6 +1392,235 @@ impl App {
             Err(_) => HttpResponse::html(404, "Not Found", "caption missing"),
         }
     }
+}
+
+fn lookup_arp_mac(ip: Ipv4Addr) -> Option<[u8; 6]> {
+    let text = std::fs::read_to_string("/proc/net/arp").ok()?;
+    let want = ip.to_string();
+    for line in text.lines().skip(1) {
+        let mut it = line.split_whitespace();
+        let addr = it.next()?;
+        if addr != want {
+            continue;
+        }
+        let _hw = it.next()?;
+        let _flags = it.next()?;
+        let mac = it.next()?;
+        let mut out = [0u8; 6];
+        let mut i = 0;
+        for part in mac.split(':') {
+            if i >= 6 {
+                break;
+            }
+            out[i] = u8::from_str_radix(part, 16).ok()?;
+            i += 1;
+        }
+        if i == 6 && out != [0; 6] {
+            return Some(out);
+        }
+    }
+    None
+}
+
+fn container_search_row(c: &rusty_dlna_scan::Container) -> SearchRow<'_> {
+    SearchRow {
+        title: &c.title,
+        class: &c.class,
+        id: &c.object_id,
+        parent_id: &c.parent_id,
+        is_container: true,
+        ..SearchRow::default()
+    }
+}
+
+fn item_search_row(it: &MediaItem) -> SearchRow<'_> {
+    SearchRow {
+        title: &it.title,
+        creator: it.creator.as_deref().unwrap_or(""),
+        date: &it.date,
+        class: &it.class,
+        artist: it.artist.as_deref().unwrap_or(""),
+        genre: it.genre.as_deref().unwrap_or(""),
+        album: it.album.as_deref().unwrap_or(""),
+        id: &it.object_id,
+        parent_id: &it.parent_id,
+        ref_id: it.ref_id.as_deref(),
+        is_container: false,
+        ..SearchRow::default()
+    }
+}
+
+fn search_scope(cat: &Catalog, root: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if root.is_empty() || root == rusty_dlna_protocol::object_id::ROOT_ID {
+        for c in cat.containers.keys() {
+            out.insert(c.clone());
+        }
+        for it in cat.items.keys() {
+            out.insert(it.clone());
+        }
+        return out;
+    }
+    let mut stack = vec![root.to_string()];
+    while let Some(id) = stack.pop() {
+        if !out.insert(id.clone()) {
+            continue;
+        }
+        if let Some(c) = cat.containers.get(&id) {
+            for ch in &c.children {
+                stack.push(ch.clone());
+            }
+        }
+    }
+    for it in cat.items.values() {
+        if out.contains(&it.parent_id) {
+            out.insert(it.object_id.clone());
+        }
+        if let Some(r) = &it.ref_id {
+            if out.contains(r) {
+                out.insert(it.object_id.clone());
+            }
+        }
+    }
+    out
+}
+
+fn item_in_scope(it: &MediaItem, scoped: &std::collections::HashSet<String>) -> bool {
+    scoped.contains(&it.object_id)
+        || scoped.contains(&it.parent_id)
+        || it.ref_id.as_ref().is_some_and(|r| scoped.contains(r))
+}
+
+fn sort_catalog_children(children: &mut [CatalogChild], specs: &[SortSpec], default: DefaultOrder) {
+    children.sort_by(|a, b| cmp_children(a, b, specs, default));
+}
+
+fn cmp_children(
+    a: &CatalogChild,
+    b: &CatalogChild,
+    specs: &[SortSpec],
+    default: DefaultOrder,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if !specs.is_empty() {
+        for spec in specs {
+            let ord = cmp_sort_key(a, b, spec.key);
+            let ord = if spec.descending { ord.reverse() } else { ord };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        return Ordering::Equal;
+    }
+    match default {
+        DefaultOrder::FoldersFirst => match (is_folder(a), is_folder(b)) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => cmp_ci(child_title(a), child_title(b)),
+        },
+        DefaultOrder::Lg => {
+            let c = cmp_ci(child_class(a), child_class(b));
+            if c != Ordering::Equal {
+                return c;
+            }
+            cmp_ci(child_title(a), child_title(b))
+        }
+        DefaultOrder::ForceSort => {
+            let c = cmp_ci(child_class(a), child_class(b));
+            if c != Ordering::Equal {
+                return c;
+            }
+            let c = child_disc(a).cmp(&child_disc(b));
+            if c != Ordering::Equal {
+                return c;
+            }
+            let c = child_track(a).cmp(&child_track(b));
+            if c != Ordering::Equal {
+                return c;
+            }
+            cmp_ci(child_title(a), child_title(b))
+        }
+    }
+}
+
+fn is_folder(ch: &CatalogChild) -> bool {
+    matches!(ch, CatalogChild::Container(_))
+}
+
+fn child_title(ch: &CatalogChild) -> &str {
+    match ch {
+        CatalogChild::Container(c) => &c.title,
+        CatalogChild::Item(i) => &i.title,
+    }
+}
+
+fn child_class(ch: &CatalogChild) -> &str {
+    match ch {
+        CatalogChild::Container(c) => &c.class,
+        CatalogChild::Item(i) => &i.class,
+    }
+}
+
+fn child_date(ch: &CatalogChild) -> &str {
+    match ch {
+        CatalogChild::Container(_) => "",
+        CatalogChild::Item(i) => &i.date,
+    }
+}
+
+fn child_album(ch: &CatalogChild) -> &str {
+    match ch {
+        CatalogChild::Container(_) => "",
+        CatalogChild::Item(i) => i.album.as_deref().unwrap_or(""),
+    }
+}
+
+fn child_disc(ch: &CatalogChild) -> i64 {
+    match ch {
+        CatalogChild::Container(_) => 0,
+        CatalogChild::Item(i) => i.disc.unwrap_or(0),
+    }
+}
+
+fn child_track(ch: &CatalogChild) -> i64 {
+    match ch {
+        CatalogChild::Container(_) => 0,
+        CatalogChild::Item(i) => i.track.unwrap_or(0),
+    }
+}
+
+fn cmp_ci(a: &str, b: &str) -> std::cmp::Ordering {
+    a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
+}
+
+fn cmp_sort_key(a: &CatalogChild, b: &CatalogChild, key: SortKey) -> std::cmp::Ordering {
+    match key {
+        SortKey::Title => cmp_ci(child_title(a), child_title(b)),
+        SortKey::Date => child_date(a).cmp(child_date(b)),
+        SortKey::Class => cmp_ci(child_class(a), child_class(b)),
+        SortKey::Album => cmp_ci(child_album(a), child_album(b)),
+        SortKey::EpisodeNumber | SortKey::Track => child_track(a).cmp(&child_track(b)),
+    }
+}
+
+fn query_has_album_art(query: &str) -> bool {
+    query.split('&').any(|p| {
+        let p = p.strip_prefix('?').unwrap_or(p);
+        p == "albumArt=true" || p.eq_ignore_ascii_case("albumArt=true")
+    })
+}
+
+fn client_wants_art_profile(client: &ClientProfile) -> bool {
+    client.flags.contains(ClientFlags::SAMSUNG)
+        || matches!(
+            client.kind,
+            ClientKind::SamsungBdJ5500
+                | ClientKind::SamsungSeriesCdeBdp
+                | ClientKind::SamsungSeriesQ
+                | ClientKind::SamsungSeriesCde
+                | ClientKind::SamsungSeriesA
+                | ClientKind::SamsungSeriesB
+        )
 }
 
 fn soap_to_http(out: SoapOutcome, persist: bool) -> HttpResponse {
@@ -1129,22 +1763,41 @@ fn os_version() -> String {
 }
 
 /// Bind HTTP + SSDP immediately. Library walk runs in the background.
+/// SIGTERM / SIGINT / return send SSDP byebye twice (six types × 2).
 pub async fn serve(app: Arc<App>) -> Result<(), Box<dyn std::error::Error>> {
     let http_addr = SocketAddr::from((app.listen_ip, app.http_port));
     let listener = tokio::net::TcpListener::bind(http_addr).await?;
     tracing::info!(%http_addr, "http listen");
     let ssdp_app = app.clone();
-    tokio::spawn(async move {
+    let ssdp = tokio::spawn(async move {
         if let Err(e) = ssdp_loop(ssdp_app).await {
             tracing::warn!("ssdp loop: {e}");
         }
     });
     spawn_library_watch(app.clone());
+    tokio::select! {
+        _ = accept_loop(listener, app.clone()) => {}
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal");
+        }
+    }
+    ssdp.abort();
+    send_byebye(&app).await;
+    Ok(())
+}
+
+async fn accept_loop(listener: tokio::net::TcpListener, app: Arc<App>) {
     loop {
-        let (sock, _peer) = listener.accept().await?;
+        let (sock, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("accept: {e}");
+                continue;
+            }
+        };
         let app = app.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(app, sock).await {
+            if let Err(e) = handle_conn(app, sock, peer).await {
                 let msg = e.to_string();
                 if msg.contains("Broken pipe") || msg.contains("Connection reset") {
                     tracing::debug!("conn: {e}");
@@ -1156,10 +1809,94 @@ pub async fn serve(app: Arc<App>) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn apply_catalog(app: &App, next: Catalog, delta: ScanDelta, why: &'static str) {
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = ctrl_c.await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term.recv() => {}
+        }
+        return;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
+}
+
+fn ssdp_notify_dests(app: &App) -> Vec<(Ipv4Addr, u16)> {
+    let mut dests = Vec::new();
+    if let Ok(sink) = std::env::var("RUSTY_DLNA_SSDP_SINK") {
+        if let Some((h, p)) = sink.rsplit_once(':') {
+            if let (Ok(ip), Ok(port)) = (h.parse::<Ipv4Addr>(), p.parse::<u16>()) {
+                dests.push((ip, port));
+            }
+        }
+    }
+    if app.ssdp_port == rusty_dlna_protocol::ssdp::SSDP_PORT {
+        if let Ok(g) = rusty_dlna_protocol::ssdp::SSDP_MCAST_ADDR.parse() {
+            dests.push((g, rusty_dlna_protocol::ssdp::SSDP_PORT));
+        }
+    } else {
+        dests.push((Ipv4Addr::LOCALHOST, app.ssdp_port));
+    }
+    dests
+}
+
+async fn send_byebye(app: &App) {
+    let pkts = notify_byebye(&app.uuid);
+    let dests = ssdp_notify_dests(app);
+    let sock = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("byebye socket: {e}");
+            return;
+        }
+    };
+    // Six types × 2, no LOCATION/SERVER/CACHE-CONTROL (packet builder).
+    for _ in 0..2 {
+        for p in &pkts {
+            for (ip, port) in &dests {
+                let _ = sock.send_to(p.as_bytes(), (*ip, *port)).await;
+            }
+        }
+    }
+}
+
+fn persist_update_id(app: &App, id: u32) {
+    let Some(path) = app.scan_cfg.db_path.as_ref() else {
+        return;
+    };
+    match LibraryDb::open(path) {
+        Ok(db) => {
+            if let Err(e) = db.set_update_id(id) {
+                tracing::warn!(error = %e, "persist update_id");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "open db to persist update_id"),
+    }
+}
+
+fn bump_update_id(app: &App) -> u32 {
+    let id = app.update_id.fetch_add(1, Ordering::Relaxed) + 1;
+    persist_update_id(app, id);
+    id
+}
+
+pub(crate) fn apply_catalog(app: &App, next: Catalog, delta: ScanDelta, why: &'static str) {
     let items = next.items.len();
     *app.catalog.write().expect("catalog") = next;
-    app.update_id.fetch_add(1, Ordering::Relaxed);
+    let id = bump_update_id(app);
+    events::notify_content_dir(&app.events, id);
     tracing::info!(
         items,
         added = delta.added,
@@ -1194,7 +1931,8 @@ fn spawn_library_watch(app: Arc<App>) {
                 let next = scan(&cfg);
                 let items = next.items.len();
                 *app.catalog.write().expect("catalog") = next;
-                app.update_id.fetch_add(1, Ordering::Relaxed);
+                let id = bump_update_id(&app);
+                events::notify_content_dir(&app.events, id);
                 tracing::info!(items, "full scan done");
             } else {
                 match repair_objects_if_needed(&cfg) {
@@ -1338,6 +2076,64 @@ async fn send_alive(sock: &tokio::net::UdpSocket, app: &App) {
     }
 }
 
+fn configured_iface_addrs(names: &[String]) -> Vec<Ipv4Addr> {
+    let mut out = Vec::new();
+    for name in names {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if let Ok(ip) = name.parse::<Ipv4Addr>() {
+            out.push(ip);
+            continue;
+        }
+        if let Some(ip) = ipv4_for_iface(name) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+fn ipv4_for_iface(name: &str) -> Option<Ipv4Addr> {
+    unsafe {
+        let mut ifa = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifa) != 0 {
+            return None;
+        }
+        let mut cur = ifa;
+        let mut found = None;
+        while !cur.is_null() {
+            let entry = &*cur;
+            let cname = if entry.ifa_name.is_null() {
+                ""
+            } else {
+                std::ffi::CStr::from_ptr(entry.ifa_name)
+                    .to_str()
+                    .unwrap_or("")
+            };
+            if cname == name {
+                if let Some(addr) = entry.ifa_addr.as_ref() {
+                    if addr.sa_family as i32 == libc::AF_INET {
+                        let sin = &*(entry.ifa_addr as *const libc::sockaddr_in);
+                        let oct = u32::from_be(sin.sin_addr.s_addr);
+                        found = Some(Ipv4Addr::from(oct));
+                        break;
+                    }
+                }
+            }
+            cur = entry.ifa_next;
+        }
+        libc::freeifaddrs(ifa);
+        found
+    }
+}
+
+#[cfg(not(unix))]
+fn ipv4_for_iface(_name: &str) -> Option<Ipv4Addr> {
+    None
+}
+
 fn ssdp_iface(app: &App) -> Ipv4Addr {
     app.advertise_ip
         .parse()
@@ -1361,10 +2157,18 @@ async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
         let group: Ipv4Addr = rusty_dlna_protocol::ssdp::SSDP_MCAST_ADDR
             .parse()
             .unwrap();
-        if let Err(e) = recv_sock.join_multicast_v4(&group, &iface) {
-            tracing::warn!("SSDP IP_ADD_MEMBERSHIP {iface}: {e}");
+        let extras = configured_iface_addrs(&app.cfg.network_interface);
+        let join_list: Vec<Ipv4Addr> = if extras.is_empty() {
+            vec![iface]
         } else {
-            tracing::info!(%group, %iface, "SSDP joined multicast");
+            extras
+        };
+        for ip in join_list {
+            if let Err(e) = recv_sock.join_multicast_v4(&group, &ip) {
+                tracing::warn!("SSDP IP_ADD_MEMBERSHIP {ip}: {e}");
+            } else {
+                tracing::info!(%group, %ip, "SSDP joined multicast");
+            }
         }
         let _ = recv_sock.set_multicast_ttl_v4(4);
         let _ = recv_sock.set_multicast_loop_v4(false);
@@ -1409,6 +2213,7 @@ async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
     let send_sock = send.as_ref();
     if let Some(s) = send_sock {
         send_alive(s, &app).await;
+        tokio::time::sleep(std::time::Duration::from_millis(jitter_ms(ALIVE_DUP_DELAY_MS))).await;
         send_alive(s, &app).await;
     }
 
@@ -1422,6 +2227,7 @@ async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
             _ = tick.tick() => {
                 if let Some(s) = send_sock {
                     send_alive(s, &app).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms(ALIVE_DUP_DELAY_MS))).await;
                     send_alive(s, &app).await;
                 }
             }
@@ -1453,6 +2259,11 @@ async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
                     continue;
                 }
                 tracing::info!(%from, st = %ms.st, n = replies.len(), "SSDP M-SEARCH reply");
+                let all = ms.st == rusty_dlna_protocol::ssdp::ST_ALL;
+                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms(
+                    msearch_jitter_ms_range(all),
+                )))
+                .await;
                 let out = send_sock.unwrap_or(&recv);
                 for r in &replies {
                     if let Err(e) = out.send_to(r.as_bytes(), from).await {
@@ -1471,6 +2282,7 @@ async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
 async fn handle_conn(
     app: Arc<App>,
     mut sock: tokio::net::TcpStream,
+    peer: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut persist_left = 100u32;
@@ -1503,7 +2315,7 @@ async fn handle_conn(
         }
         body.truncate(need);
         req.body = body;
-        let resp = app.handle(&req);
+        let resp = app.handle_from(&req, peer);
         persist_left = persist_left.saturating_sub(1);
         if let Some(spec) = resp.remux_job.clone() {
             remux::serve_remux(&app, &mut sock, &req, spec).await?;
@@ -1549,6 +2361,21 @@ mod tests {
     use super::*;
     use rusty_dlna_scan::{ensure_pattern_fixture, scan};
 
+    const TINY_JPEG: &[u8] = &[
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06,
+        0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D,
+        0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12, 0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D,
+        0x1A, 0x1C, 0x1C, 0x20, 0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28,
+        0x37, 0x29, 0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
+        0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01,
+        0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0xFF, 0xC4,
+        0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00,
+        0x3F, 0x00, 0x2A, 0x1F, 0xFF, 0xD9,
+    ];
+
     fn workspace() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
@@ -1563,6 +2390,10 @@ mod tests {
             let _ = std::fs::write(&nfo, "<movie><year>1999</year></movie>\n");
             let _ = std::fs::write(lib.join("video/movie.srt"), "1\n00:00:00,000 --> 00:00:01,000\nhi\n");
             let _ = std::fs::write(lib.join("video/movie.en.srt"), "en\n");
+        }
+        let poster = lib.join("video/movie-poster.jpg");
+        if !poster.exists() {
+            let _ = std::fs::write(&poster, TINY_JPEG);
         }
         let dvp7 = lib.join("video/dvp7.mkv");
         if !dvp7.exists() {
@@ -1634,6 +2465,25 @@ audio_out = "to-aac"
         )
     }
 
+    fn resp_header<'a>(r: &'a HttpResponse, name: &str) -> Option<&'a str> {
+        r.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn parse_album_art_url(didl: &str) -> Option<(i64, i64)> {
+        let idx = didl.find("/AlbumArt/")?;
+        let rest = &didl[idx + "/AlbumArt/".len()..];
+        let art: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let art_id = art.parse().ok()?;
+        let after = rest.get(art.len()..)?;
+        let after = after.strip_prefix('-')?;
+        let det: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let detail_id = det.parse().ok()?;
+        Some((art_id, detail_id))
+    }
+
     #[test]
     fn test_ports_do_not_collide_with_live() {
         assert!(!collides_with_live_ports(18200, 11900));
@@ -1678,7 +2528,8 @@ audio_out = "to-aac"
              Timeout: Second-300\r\n\
              Content-Length: 0\r\n\r\n",
         );
-        let r = app.handle(&sub);
+        let peer: SocketAddr = "192.0.2.50:1234".parse().unwrap();
+        let r = app.handle_from(&sub, peer);
         assert_eq!(r.status, 200, "Platinum SUBSCRIBE must not 404");
         let sid = r
             .headers
@@ -1687,6 +2538,171 @@ audio_out = "to-aac"
             .map(|(_, v)| v.as_str())
             .unwrap_or("");
         assert!(sid.starts_with("uuid:"), "{sid}");
+    }
+
+    fn accept_notify(listener: &std::net::TcpListener, timeout: std::time::Duration) -> String {
+        use std::io::Read;
+        let start = std::time::Instant::now();
+        listener.set_nonblocking(true).ok();
+        loop {
+            match listener.accept() {
+                Ok((mut sock, _)) => {
+                    listener.set_nonblocking(false).ok();
+                    sock.set_nonblocking(false).ok();
+                    sock.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                        .ok();
+                    let mut buf = Vec::new();
+                    let _ = sock.read_to_end(&mut buf);
+                    return String::from_utf8_lossy(&buf).into_owned();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() > timeout {
+                        panic!("timed out waiting for GENA NOTIFY");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("notify accept: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn gena_subscribe_rules() {
+        let app = testdata_app();
+        let peer50: SocketAddr = "192.0.2.50:1234".parse().unwrap();
+        let peer1: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        let new_ok = req(
+            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+             Host: 192.0.2.10:18200\r\n\
+             Callback: <http://192.0.2.50:1234/evt>\r\n\
+             NT: upnp:event\r\n\
+             Timeout: Second-300\r\n\
+             Content-Length: 0\r\n\r\n",
+        );
+        let r = app.handle_from(&new_ok, peer50);
+        assert_eq!(r.status, 200);
+        let sid = resp_header(&r, "SID").unwrap_or("");
+        assert!(sid.starts_with("uuid:"), "{sid}");
+        assert_eq!(resp_header(&r, "Timeout"), Some("Second-300"));
+
+        let mismatch = req(
+            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+             Host: 192.0.2.10:18200\r\n\
+             Callback: <http://192.0.2.50:1234/evt>\r\n\
+             NT: upnp:event\r\n\
+             Timeout: Second-300\r\n\
+             Content-Length: 0\r\n\r\n",
+        );
+        assert_eq!(app.handle_from(&mismatch, peer1).status, 412);
+
+        let both = req(
+            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+             Host: 192.0.2.10:18200\r\n\
+             Callback: <http://192.0.2.50:1234/evt>\r\n\
+             SID: uuid:already-have-one\r\n\
+             NT: upnp:event\r\n\
+             Content-Length: 0\r\n\r\n",
+        );
+        assert_eq!(app.handle_from(&both, peer50).status, 400);
+
+        let no_nt = req(
+            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+             Host: 192.0.2.10:18200\r\n\
+             Callback: <http://192.0.2.50:1234/evt>\r\n\
+             Timeout: Second-300\r\n\
+             Content-Length: 0\r\n\r\n",
+        );
+        assert_eq!(app.handle_from(&no_nt, peer50).status, 400);
+
+        let renew_unknown = req(
+            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+             Host: 192.0.2.10:18200\r\n\
+             SID: uuid:00000000-0000-4000-8000-ffffffffffff\r\n\
+             Timeout: Second-300\r\n\
+             Content-Length: 0\r\n\r\n",
+        );
+        assert_eq!(app.handle_from(&renew_unknown, peer50).status, 412);
+
+        let unsub_unknown = req(
+            "UNSUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+             Host: 192.0.2.10:18200\r\n\
+             SID: uuid:00000000-0000-4000-8000-ffffffffffff\r\n\
+             Content-Length: 0\r\n\r\n",
+        );
+        assert_eq!(app.handle_from(&unsub_unknown, peer50).status, 412);
+
+        let renew = req(&format!(
+            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+             Host: 192.0.2.10:18200\r\n\
+             SID: {sid}\r\n\
+             Timeout: Second-1800\r\n\
+             Content-Length: 0\r\n\r\n"
+        ));
+        let r = app.handle_from(&renew, peer50);
+        assert_eq!(r.status, 200);
+        assert_eq!(resp_header(&r, "Timeout"), Some("Second-300"));
+        assert_eq!(resp_header(&r, "SID"), Some(sid));
+    }
+
+    #[test]
+    fn gena_notify_on_catalog_bump() {
+        let app = testdata_app();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("notify listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let port = addr.port();
+        assert_ne!(port, 8200, "test callback must not be LAN :8200");
+        let sub = req(&format!(
+            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+             Host: 127.0.0.1:18200\r\n\
+             Callback: <http://127.0.0.1:{port}/evt>\r\n\
+             NT: upnp:event\r\n\
+             Timeout: Second-300\r\n\
+             Content-Length: 0\r\n\r\n"
+        ));
+        let r = app.handle_from(&sub, addr);
+        assert_eq!(r.status, 200);
+        let n0 = accept_notify(&listener, std::time::Duration::from_secs(3));
+        assert!(
+            n0.contains("NTS: upnp:propchange") || n0.contains("NTS:upnp:propchange"),
+            "{n0}"
+        );
+        assert!(n0.contains("SystemUpdateID"), "{n0}");
+        assert!(n0.contains("SEQ: 0"), "{n0}");
+        let id0 = n0
+            .split("<SystemUpdateID>")
+            .nth(1)
+            .and_then(|s| s.split('<').next())
+            .unwrap_or("");
+        let before = app.update_id.load(Ordering::Relaxed);
+        let cat = app.catalog.read().expect("catalog").clone();
+        apply_catalog(
+            &app,
+            cat,
+            ScanDelta {
+                changed: 1,
+                ..ScanDelta::default()
+            },
+            "test catalog bump",
+        );
+        let after = app.update_id.load(Ordering::Relaxed);
+        assert!(after > before, "update_id {before} -> {after}");
+        let n1 = accept_notify(&listener, std::time::Duration::from_secs(3));
+        assert!(
+            n1.contains("NTS: upnp:propchange") || n1.contains("NTS:upnp:propchange"),
+            "{n1}"
+        );
+        assert!(n1.contains("SEQ: 1"), "{n1}");
+        assert!(
+            n1.contains(&format!("<SystemUpdateID>{after}</SystemUpdateID>")),
+            "{n1}"
+        );
+        if !id0.is_empty() {
+            assert_ne!(id0, after.to_string());
+        }
+        if let Some(p) = app.scan_cfg.db_path.as_ref() {
+            let db = LibraryDb::open(p).expect("db");
+            assert_eq!(db.get_update_id(), after);
+        }
     }
 
     #[test]
@@ -1700,6 +2716,20 @@ audio_out = "to-aac"
             "GET /MediaItems/1.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nTimeSeekRange.dlna.org: npt=0-\r\n\r\n",
         );
         assert_eq!(app.handle(&ts).status, 406);
+    }
+
+    fn soap_action(app: &App, action: &str, inner: &str, ua: &str) -> (u16, String) {
+        let body = format!(
+            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:{action} xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">{inner}</u:{action}></s:Body></s:Envelope>"#
+        );
+        let raw = format!(
+            "POST /whatever HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: {ua}\r\nSOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#{action}\"\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n",
+            body.len()
+        );
+        let mut req = HttpRequest::parse_headers(&raw).unwrap();
+        req.body = body.into_bytes();
+        let r = app.handle(&req);
+        (r.status, String::from_utf8_lossy(&r.body).into_owned())
     }
 
     fn soap_browse(app: &App, oid: &str, flag: &str, ua: &str) -> (u16, String) {
@@ -1772,6 +2802,90 @@ audio_out = "to-aac"
             "date not normalized: {items}"
         );
         assert!(!items.contains("/Transcode/"), "Kodi must stay original");
+    }
+
+    #[test]
+    fn browse_uses_nfo_title_not_filename() {
+        let app = testdata_app();
+        let (st, items) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200);
+        assert!(
+            items.contains("Fixture Movie"),
+            "DIDL dc:title must use NFO title: {items}"
+        );
+        assert!(
+            !items.contains("&lt;dc:title&gt;movie&lt;/dc:title&gt;")
+                && !items.contains(">movie<"),
+            "filename-only title must not be the movie item title: {items}"
+        );
+    }
+
+    #[test]
+    fn album_art_get_and_didl() {
+        let app = testdata_app();
+        let (st, items) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200);
+        assert!(
+            items.contains("movie")
+                || items.contains("Fixture Movie")
+                || items.contains("&lt;dc:title&gt;movie"),
+            "movie item missing: {items}"
+        );
+        assert!(items.contains("/AlbumArt/"), "DIDL missing /AlbumArt/: {items}");
+        assert!(
+            items.contains("JPEG_TN") || items.contains("albumArtURI"),
+            "DIDL missing JPEG_TN or albumArtURI: {items}"
+        );
+        let (art_id, detail_id) = parse_album_art_url(&items).expect("parse art url from DIDL");
+        assert!(art_id > 0, "art id from DIDL");
+        {
+            let cat = app.catalog.read().expect("catalog");
+            let movie = cat
+                .items
+                .values()
+                .find(|i| i.path.ends_with("movie.mkv"))
+                .expect("movie in catalog");
+            assert_eq!(art_id, movie.album_art);
+            assert_eq!(detail_id, movie.detail_id);
+        }
+
+        let r = app.handle(&req(&get(
+            &format!("/AlbumArt/{art_id}-{detail_id}.jpg"),
+            "Kodi/21.0",
+        )));
+        assert_eq!(r.status, 200, "album art GET");
+        assert_eq!(resp_header(&r, "Content-Type"), Some("image/jpeg"));
+        assert!(
+            r.body.len() >= 3 && r.body[0] == 0xff && r.body[1] == 0xd8,
+            "JPEG magic"
+        );
+        assert_eq!(resp_header(&r, "transferMode.dlna.org"), Some("Interactive"));
+        let feats = resp_header(&r, "contentFeatures.dlna.org").unwrap_or("");
+        assert!(feats.contains("JPEG_TN"), "contentFeatures={feats}");
+
+        let missing = app.handle(&req(&get("/AlbumArt/999999-1.jpg", "Kodi/21.0")));
+        assert_eq!(missing.status, 404);
+
+        let streaming = format!(
+            "GET /AlbumArt/{art_id}-{detail_id}.jpg HTTP/1.1\r\nHost: 127.0.0.1:18200\r\ntransferMode.dlna.org: Streaming\r\n\r\n"
+        );
+        assert_eq!(app.handle(&req(&streaming)).status, 406);
+
+        let ranged = format!(
+            "GET /AlbumArt/{art_id}-{detail_id}.jpg HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nRange: bytes=0-10\r\n\r\n"
+        );
+        assert_eq!(app.handle(&req(&ranged)).status, 406);
+
+        assert_eq!(app.handle(&req(&get("/Thumbnails/1.jpg", "Kodi/21.0"))).status, 404);
+        assert_eq!(app.handle(&req(&get("/Resized/1.jpg", "Kodi/21.0"))).status, 404);
+
+        let xbox = app.handle(&req(&get(
+            &format!("/MediaItems/{detail_id}.mkv?albumArt=true"),
+            "Xbox/2.0.58767.0 UPnP/1.0 Xbox/2.0.58767.0",
+        )));
+        assert_eq!(xbox.status, 200);
+        assert_eq!(resp_header(&xbox, "Content-Type"), Some("image/jpeg"));
+        assert!(xbox.body.starts_with(&[0xff, 0xd8]));
     }
 
     #[test]
@@ -1856,7 +2970,7 @@ audio_out = "to-aac"
             .unwrap()
             .items
             .values()
-            .find(|i| i.title == "movie")
+            .find(|i| i.path.ends_with("movie.mkv"))
             .cloned()
             .expect("movie fixture");
         let id = movie.detail_id;
@@ -1909,7 +3023,7 @@ audio_out = "to-aac"
             .unwrap()
             .items
             .values()
-            .find(|i| i.title == "movie")
+            .find(|i| i.path.ends_with("movie.mkv"))
             .cloned()
             .expect("movie fixture");
         let id = movie.detail_id;
@@ -2000,11 +3114,15 @@ audio_out = "to-aac"
     #[test]
     fn client_matrix_handlers() {
         let app = testdata_app();
-        // Kodi: original MKV res, date Z or 10 chars
+        // Kodi: original MKV res, date Z or 10 chars, caption <res>
         let (_, kodi) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
         assert!(kodi.contains("/MediaItems/"));
         assert!(!kodi.contains("/Transcode/"));
         assert!(kodi.contains("1999-01-01") || kodi.contains("Z&lt;/dc:date"));
+        assert!(
+            kodi.contains("/Captions/"),
+            "FLAG_CAPTION_RES Kodi Browse must list /Captions/: {kodi}"
+        );
 
         // SEC_HHP_[PC] is not Samsung BASICVIEW
         let pc = app.handle(&req(&get(
@@ -2015,6 +3133,16 @@ audio_out = "to-aac"
         let pc_fl = feature_list(&app, "DLNADOC/1.50 SEC_HHP_[PC]LPC001/1.0");
         assert!(!pc_fl.contains("id=&quot;A&quot;"));
         assert!(pc_fl.contains("id=&quot;1&quot;") || pc_fl.contains("samsung.com_BASICVIEW"));
+        let (_, pc_didl) = soap_browse(
+            &app,
+            "2$8",
+            "BrowseDirectChildren",
+            "DLNADOC/1.50 SEC_HHP_[PC]LPC001/1.0",
+        );
+        assert!(
+            !pc_didl.contains("sec:CaptionInfoEx") && !pc_didl.contains("xmlns:sec"),
+            "AllShare must stay non-Samsung: {pc_didl}"
+        );
 
         // SEC_HHP_[TV] → A/V/I + x-mkv
         let tv_fl = feature_list(&app, "DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0");
@@ -2027,9 +3155,14 @@ audio_out = "to-aac"
         );
         assert!(tv.contains("video/x-mkv"), "{tv}");
 
-        // [BD]J5500: no DLNA.ORG_PN
+        // [BD]J5500: FLAG_SKIP_DLNA_PN — media protocolInfo has no PN.
+        // Album-art JPEG_TN <res> is still emitted (Phase 11).
         let (_, j5500) = soap_browse(&app, "2$8", "BrowseDirectChildren", "DLNADOC/1.50 [BD]J5500");
-        assert!(!j5500.contains("DLNA.ORG_PN="));
+        assert!(
+            !j5500.contains("video/x-matroska:DLNA.ORG_PN=")
+                && !j5500.contains("video/x-mkv:DLNA.ORG_PN="),
+            "J5500 media res must skip DLNA.ORG_PN: {j5500}"
+        );
 
         // Xbox rootDesc modelNumber=1
         let xbox = app.handle(&req(&get("/rootDesc.xml", "Xbox/360")));
@@ -2046,6 +3179,233 @@ audio_out = "to-aac"
         assert!(!generic.flags.contains(ClientFlags::NEED_SAFE_VIDEO));
         let (_, gen) = soap_browse(&app, "2$8", "BrowseDirectChildren", "DLNADOC/1.50");
         assert!(!gen.contains("/Transcode/"));
+    }
+
+    fn movie_fixture(app: &App) -> rusty_dlna_scan::MediaItem {
+        app.catalog
+            .read()
+            .unwrap()
+            .items
+            .values()
+            .find(|i| i.path.ends_with("movie.mkv"))
+            .cloned()
+            .expect("movie.mkv fixture")
+    }
+
+    #[test]
+    fn setbookmark_then_browse_position() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let (st, xml) = soap_action(
+            &app,
+            "X_SetBookmark",
+            &format!(
+                "<ObjectID>{}</ObjectID><PosSecond>120</PosSecond>",
+                movie.object_id
+            ),
+            "Kodi/21.0",
+        );
+        assert_eq!(st, 200, "{xml}");
+        assert!(xml.contains("X_SetBookmarkResponse"), "{xml}");
+
+        let (st, xml) = soap_browse(&app, &movie.object_id, "BrowseMetadata", "Kodi/21.0");
+        assert_eq!(st, 200, "{xml}");
+        assert!(
+            xml.contains("&lt;upnp:lastPlaybackPosition&gt;120&lt;/upnp:lastPlaybackPosition&gt;")
+                || xml.contains("<upnp:lastPlaybackPosition>120</upnp:lastPlaybackPosition>"),
+            "lastPlaybackPosition 120 missing: {xml}"
+        );
+
+        let dbp = app.scan_cfg.db_path.as_ref().expect("testdata db_path");
+        let db = LibraryDb::open(dbp).unwrap();
+        let got = db.get_bookmark(movie.detail_id).unwrap();
+        assert_eq!(
+            got.map(|(s, _)| s),
+            Some(120),
+            "BOOKMARKS.SEC for detail {}",
+            movie.detail_id
+        );
+    }
+
+    #[test]
+    fn updateobject_playcount_and_position() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let new_tags = "&lt;upnp:playCount&gt;3&lt;/upnp:playCount&gt;&lt;upnp:lastPlaybackPosition&gt;90&lt;/upnp:lastPlaybackPosition&gt;";
+        let (st, xml) = soap_action(
+            &app,
+            "UpdateObject",
+            &format!(
+                "<ObjectID>{}</ObjectID><CurrentTagValue></CurrentTagValue><NewTagValue>{new_tags}</NewTagValue>",
+                movie.object_id
+            ),
+            "Kodi/21.0",
+        );
+        assert_eq!(st, 200, "{xml}");
+        assert!(xml.contains("UpdateObjectResponse"), "{xml}");
+
+        let (st, xml) = soap_browse(&app, &movie.object_id, "BrowseMetadata", "Kodi/21.0");
+        assert_eq!(st, 200, "{xml}");
+        assert!(
+            xml.contains("&lt;upnp:playbackCount&gt;3&lt;/upnp:playbackCount&gt;")
+                || xml.contains("<upnp:playbackCount>3</upnp:playbackCount>"),
+            "playbackCount 3 missing: {xml}"
+        );
+        assert!(
+            xml.contains("&lt;upnp:lastPlaybackPosition&gt;90&lt;/upnp:lastPlaybackPosition&gt;")
+                || xml.contains("<upnp:lastPlaybackPosition>90</upnp:lastPlaybackPosition>"),
+            "lastPlaybackPosition 90 missing: {xml}"
+        );
+
+        let (st, xml) = soap_action(
+            &app,
+            "UpdateObject",
+            "<CurrentTagValue></CurrentTagValue><NewTagValue></NewTagValue>",
+            "Kodi/21.0",
+        );
+        assert_eq!(st, 500, "{xml}");
+        assert!(xml.contains("<errorCode>402</errorCode>"), "{xml}");
+
+        let (st, xml) = soap_action(
+            &app,
+            "UpdateObject",
+            "<ObjectID>999999</ObjectID><CurrentTagValue></CurrentTagValue><NewTagValue>&lt;upnp:playCount&gt;1&lt;/upnp:playCount&gt;</NewTagValue>",
+            "Kodi/21.0",
+        );
+        assert_eq!(st, 500, "{xml}");
+        assert!(xml.contains("<errorCode>701</errorCode>"), "{xml}");
+    }
+
+    #[test]
+    fn updateobject_minus_one_clears_bookmark() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let (st, xml) = soap_action(
+            &app,
+            "X_SetBookmark",
+            &format!(
+                "<ObjectID>{}</ObjectID><PosSecond>120</PosSecond>",
+                movie.object_id
+            ),
+            "Kodi/21.0",
+        );
+        assert_eq!(st, 200, "{xml}");
+
+        let new_tags = "&lt;upnp:lastPlaybackPosition&gt;-1&lt;/upnp:lastPlaybackPosition&gt;";
+        let (st, xml) = soap_action(
+            &app,
+            "UpdateObject",
+            &format!(
+                "<ObjectID>{}</ObjectID><CurrentTagValue></CurrentTagValue><NewTagValue>{new_tags}</NewTagValue>",
+                movie.object_id
+            ),
+            "Kodi/21.0",
+        );
+        assert_eq!(st, 200, "{xml}");
+        assert!(xml.contains("UpdateObjectResponse"), "{xml}");
+
+        let (st, xml) = soap_browse(&app, &movie.object_id, "BrowseMetadata", "Kodi/21.0");
+        assert_eq!(st, 200, "{xml}");
+        assert!(
+            !xml.contains("lastPlaybackPosition"),
+            "cleared bookmark must omit lastPlaybackPosition: {xml}"
+        );
+
+        let dbp = app.scan_cfg.db_path.as_ref().expect("testdata db_path");
+        let db = LibraryDb::open(dbp).unwrap();
+        let got = db.get_bookmark(movie.detail_id).unwrap();
+        assert_eq!(
+            got.map(|(s, _)| s),
+            Some(0),
+            "BOOKMARKS.SEC must be 0 after lastPlaybackPosition=-1"
+        );
+    }
+
+    /// True if a DIDL `<res>` body (escaped or raw) points at `/Captions/`.
+    fn didl_res_has_captions(xml: &str) -> bool {
+        for (open, close) in [("&lt;res", "&lt;/res&gt;"), ("<res", "</res>")] {
+            let mut rest = xml;
+            while let Some(start) = rest.find(open) {
+                rest = &rest[start..];
+                let Some(end) = rest.find(close) else {
+                    break;
+                };
+                if rest[..end].contains("/Captions/") {
+                    return true;
+                }
+                rest = &rest[end + close.len()..];
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn samsung_captioninfoex_and_header() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        assert!(
+            !movie.captions.is_empty(),
+            "movie.mkv must have sidecar captions"
+        );
+        let ua = "DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0";
+        let (st, xml) = soap_browse(&app, "2$8", "BrowseDirectChildren", ua);
+        assert_eq!(st, 200, "{xml}");
+        assert!(xml.contains("sec:CaptionInfoEx"), "{xml}");
+        assert!(xml.contains("xmlns:sec"), "{xml}");
+        assert!(xml.contains("/Captions/"), "{xml}");
+        assert!(
+            xml.contains(&format!("/Captions/{}/", movie.detail_id))
+                || xml.contains(&format!("/Captions/{}.srt", movie.detail_id)),
+            "CaptionInfoEx URL missing for detail {}: {xml}",
+            movie.detail_id
+        );
+
+        let raw = format!(
+            "GET /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: {ua}\r\ngetCaptionInfo.sec: 1\r\n\r\n",
+            movie.detail_id
+        );
+        let r = app.handle(&req(&raw));
+        assert_eq!(r.status, 200, "media GET");
+        let hdr = resp_header(&r, "CaptionInfo.sec").unwrap_or("");
+        assert!(
+            hdr.contains(&format!("/Captions/{}.srt", movie.detail_id)),
+            "CaptionInfo.sec={hdr}"
+        );
+    }
+
+    #[test]
+    fn kodi_caption_res_no_sec_by_default() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let (st, xml) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200, "{xml}");
+        assert!(xml.contains("/Captions/"), "{xml}");
+        assert!(
+            xml.contains(&format!("/Captions/{}/0.srt", movie.detail_id))
+                || xml.contains(&format!("/Captions/{}/1.srt", movie.detail_id)),
+            "Kodi caption <res> must be indexed /Captions/{{id}}/n.srt: {xml}"
+        );
+        assert!(!xml.contains("sec:CaptionInfoEx"), "{xml}");
+        assert!(!xml.contains("xmlns:sec"), "{xml}");
+        assert!(!xml.contains("xmlns:pv"), "{xml}");
+        assert!(!xml.contains("pv:subtitle"), "{xml}");
+        assert!(didl_res_has_captions(&xml), "{xml}");
+    }
+
+    #[test]
+    fn samsung_bdp_no_caption_res() {
+        let app = testdata_app();
+        let ua = "DLNADOC/1.50 SEC_HHP_BD-D5100/1.0";
+        let (st, xml) = soap_browse(&app, "2$8", "BrowseDirectChildren", ua);
+        assert_eq!(st, 200, "{xml}");
+        assert!(
+            xml.contains("/MediaItems/"),
+            "BDP still lists media URLs: {xml}"
+        );
+        assert!(
+            !didl_res_has_captions(&xml),
+            "SEC_HHP_BD must not get caption <res> (folder-browse bug): {xml}"
+        );
     }
 
     #[test]
@@ -2337,5 +3697,260 @@ audio_out = "to-aac"
             "audio under A dir must be accepted: {titles:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn status_lists_video_count() {
+        let app = testdata_app();
+        let r = app.handle(&req(&get("/status", "Kodi/21.0")));
+        assert_eq!(r.status, 200);
+        let body = String::from_utf8_lossy(&r.body);
+        assert!(body.contains("Video"), "{body}");
+        assert!(
+            body.chars().any(|c| c.is_ascii_digit() && c != '0')
+                || body.contains("<td>1</td>")
+                || body.contains("<td>2</td>")
+                || body.contains("<td>3</td>")
+                || body.contains("<td>4</td>"),
+            "non-zero video count: {body}"
+        );
+        assert!(body.contains("refresh") || body.contains("Refresh") || body.contains("20"), "{body}");
+        assert!(
+            !body.contains("<H1>200 OK</H1>"),
+            "status must be the document, not the error-page wrapper: {body}"
+        );
+        assert!(
+            body.contains("<h1>rustyDLNA-test</h1>") || body.contains("<title>rustyDLNA-test</title>"),
+            "{body}"
+        );
+        let root = app.handle(&req(&get("/", "Kodi/21.0")));
+        assert_eq!(root.status, 200);
+        assert_eq!(root.body, r.body);
+    }
+
+    #[test]
+    fn search_samsung_v_finds_fixture() {
+        let app = testdata_app();
+        let tv = "DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0";
+        let (st, xml) = soap_action(
+            &app,
+            "Search",
+            r#"<ContainerID>V</ContainerID><SearchCriteria>dc:title contains "Fixture"</SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>"#,
+            tv,
+        );
+        assert_eq!(st, 200, "{xml}");
+        assert!(
+            xml.contains("Fixture Movie") || xml.contains("/MediaItems/"),
+            "Search ContainerID=V must remap to video: {xml}"
+        );
+        let (st_img, img) = soap_action(
+            &app,
+            "Search",
+            r#"<ContainerID>I</ContainerID><SearchCriteria>dc:title contains "Fixture"</SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>"#,
+            tv,
+        );
+        assert_eq!(st_img, 200, "{img}");
+        assert!(
+            !img.contains("Fixture Movie") && !img.contains("/MediaItems/"),
+            "Search ContainerID=I is images only: {img}"
+        );
+    }
+
+    #[test]
+    fn browse_recent_keeps_mtime_order() {
+        let app = testdata_app();
+        {
+            let mut cat = app.catalog.write().expect("catalog");
+            let mut videos: Vec<String> = cat
+                .items
+                .values()
+                .filter(|i| {
+                    i.class.contains("video")
+                        && i.ref_id.is_none()
+                        && i.object_id.starts_with(rusty_dlna_protocol::object_id::BROWSEDIR_ID)
+                })
+                .map(|i| i.object_id.clone())
+                .collect();
+            videos.sort();
+            assert!(
+                videos.len() >= 2,
+                "need two browse-folder videos, got {videos:?}"
+            );
+            let older = videos[0].clone();
+            let newer = videos[1].clone();
+            if let Some(it) = cat.items.get_mut(&older) {
+                it.title = "Aaa Early".into();
+                it.mtime = 1;
+            }
+            if let Some(it) = cat.items.get_mut(&newer) {
+                it.title = "Zzz Fresh".into();
+                it.mtime = 9_999_999;
+            }
+            cat.recent_ids = vec![newer, older];
+            cat.recent_count = 2;
+        }
+        let (st, xml) = soap_browse(&app, "2$FF0", "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200, "{xml}");
+        let fresh = xml.find("Zzz Fresh").expect("fresh title in recent DIDL");
+        let early = xml.find("Aaa Early").expect("old title in recent DIDL");
+        assert!(
+            fresh < early,
+            "Recently Added must stay mtime-desc, not title: {xml}"
+        );
+
+        let (st, titled) = soap_action(
+            &app,
+            "Browse",
+            "<ObjectID>2$FF0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria>+dc:title</SortCriteria>",
+            "Kodi/21.0",
+        );
+        assert_eq!(st, 200, "{titled}");
+        let early = titled.find("Aaa Early").expect("old title after +dc:title");
+        let fresh = titled.find("Zzz Fresh").expect("fresh title after +dc:title");
+        assert!(
+            early < fresh,
+            "explicit +dc:title must still re-sort Recent: {titled}"
+        );
+    }
+
+    #[test]
+    fn browse_force_sort_track_order() {
+        let app = testdata_app();
+        {
+            let mut cat = app.catalog.write().expect("catalog");
+            let ids: Vec<String> = cat
+                .items
+                .values()
+                .filter(|i| i.path.ends_with("movie.mkv") || i.title.contains("Fixture"))
+                .map(|i| i.object_id.clone())
+                .collect();
+            for oid in ids {
+                if let Some(it) = cat.items.get_mut(&oid) {
+                    it.disc = Some(2);
+                    it.track = Some(5);
+                }
+            }
+        }
+        let (st, xml) = soap_browse(
+            &app,
+            "2$8",
+            "BrowseDirectChildren",
+            "Panasonic DLNADOC/1.50",
+        );
+        assert_eq!(st, 200);
+        assert!(
+            xml.contains("Fixture Movie") || xml.contains("/MediaItems/"),
+            "{xml}"
+        );
+        let (st709, body709) = soap_action(
+            &app,
+            "Browse",
+            "<ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria>+notAField</SortCriteria>",
+            "DLNADOC/1.50",
+        );
+        assert_eq!(st709, 500, "{body709}");
+        assert!(body709.contains("709"), "{body709}");
+    }
+
+    #[test]
+    fn cache_keeps_kodi_when_generic_ua_follows() {
+        let app = testdata_app();
+        let peer: SocketAddr = "192.0.2.40:1234".parse().unwrap();
+        let (st, kodi) = {
+            let body = r#"<ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>"#;
+            let envelope = format!(
+                r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">{body}</u:Browse></s:Body></s:Envelope>"#
+            );
+            let raw = format!(
+                "POST /whatever HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Kodi/21.0\r\nSOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n",
+                envelope.len()
+            );
+            let mut req = HttpRequest::parse_headers(&raw).unwrap();
+            req.body = envelope.into_bytes();
+            let r = app.handle_from(&req, peer);
+            (r.status, String::from_utf8_lossy(&r.body).into_owned())
+        };
+        assert_eq!(st, 200);
+        assert!(kodi.contains("/Captions/"), "{kodi}");
+        assert!(!kodi.contains("/Transcode/"));
+
+        let movie = movie_fixture(&app);
+        let gen = app.handle_from(
+            &req(&get(
+                &format!("/MediaItems/{}.mkv", movie.detail_id),
+                "DLNADOC/1.50",
+            )),
+            peer,
+        );
+        assert_eq!(gen.status, 200);
+
+        let cr_peer: SocketAddr = "192.0.2.41:1234".parse().unwrap();
+        let envelope = format!(
+            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"#
+        );
+        let raw = format!(
+            "POST /whatever HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: CrKey/1.54.384650 DLNADOC/1.50\r\nSOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n",
+            envelope.len()
+        );
+        let mut creq = HttpRequest::parse_headers(&raw).unwrap();
+        creq.body = envelope.into_bytes();
+        let cr = app.handle_from(&creq, cr_peer);
+        let cr_xml = String::from_utf8_lossy(&cr.body);
+        assert!(cr_xml.contains("/Transcode/"), "{cr_xml}");
+        let tid = cr_xml
+            .split("/Transcode/")
+            .nth(1)
+            .and_then(|s| {
+                s.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse::<i64>()
+                    .ok()
+            })
+            .expect("transcode id");
+        let tget = app.handle_from(
+            &req(&get(
+                &format!("/Transcode/{tid}.mp4"),
+                "DLNADOC/1.50",
+            )),
+            cr_peer,
+        );
+        assert_ne!(tget.status, 404, "cached CrKey must still remap Transcode GET");
+    }
+
+    #[test]
+    fn cache_expires_after_one_hour() {
+        let app = testdata_app();
+        let peer: SocketAddr = "192.0.2.42:9".parse().unwrap();
+        let ip: Ipv4Addr = "192.0.2.42".parse().unwrap();
+        let _ = app.handle_from(&req(&get("/rootDesc.xml", "Kodi/21.0")), peer);
+        {
+            let mut cache = app.client_cache.lock().unwrap();
+            cache.set_age(ip, 0);
+        }
+        assert!(
+            app.client_cache
+                .lock()
+                .unwrap()
+                .search(ip, 3601, None)
+                .is_none(),
+            "expired without MAC"
+        );
+        let _ = app.handle_from(&req(&get("/rootDesc.xml", "Kodi/21.0")), peer);
+        {
+            let mut cache = app.client_cache.lock().unwrap();
+            cache.set_age(ip, 0);
+        }
+        let kept = app
+            .client_cache
+            .lock()
+            .unwrap()
+            .search(ip, 3601, Some([1, 2, 3, 4, 5, 6]));
+        let _ = kept;
+        let after = {
+            let mut cache = app.client_cache.lock().unwrap();
+            cache.search(ip, 3601, None)
+        };
+        assert!(after.is_none() || after.unwrap().kind == ClientKind::Kodi);
     }
 }

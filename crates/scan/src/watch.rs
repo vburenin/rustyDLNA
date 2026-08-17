@@ -318,11 +318,7 @@ fn collect_events<'a>(
             }
             continue;
         }
-        if excluded
-            || is_unfinished_name(&name)
-            || looks_like_sample_file(&name)
-            || is_sidecar_name(&name)
-        {
+        if drop_create_event(&name, excluded) {
             continue;
         }
         let apply = ev.mask.intersects(EventMask::CLOSE_WRITE | EventMask::MOVED_TO)
@@ -385,6 +381,12 @@ fn is_sidecar_name(name: &str) -> bool {
         || name.ends_with(".nfo")
         || name.ends_with(".probe.toml")
         || is_album_art_name(name)
+}
+
+/// Junk / unfinished / samples are ignored. Poster and NFO writes must
+/// reach `add_files` so `monitor_dirty` can attach them without a video rewrite.
+fn drop_create_event(name: &str, excluded: bool) -> bool {
+    excluded || is_unfinished_name(name) || looks_like_sample_file(name)
 }
 
 #[derive(Default, Debug)]
@@ -554,6 +556,18 @@ mod tests {
         b.add_file(PathBuf::from("/v/ep.mkv"));
         assert!(b.remove_files.is_empty());
         assert!(b.add_files.contains(Path::new("/v/ep.mkv")));
+    }
+
+    #[test]
+    fn poster_and_nfo_writes_are_not_dropped() {
+        assert!(is_sidecar_name("clip-poster.jpg"));
+        assert!(is_sidecar_name("movie.nfo"));
+        assert!(is_sidecar_name("tvshow.nfo"));
+        assert!(!drop_create_event("clip-poster.jpg", false));
+        assert!(!drop_create_event("movie.nfo", false));
+        assert!(!drop_create_event("tvshow.nfo", false));
+        assert!(drop_create_event("unfinished.mkv.part", false));
+        assert!(drop_create_event("clip-poster.jpg", true));
     }
 
     #[test]

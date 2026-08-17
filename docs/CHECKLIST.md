@@ -223,6 +223,94 @@ Phase 9 is done. rustyDLNA is the LAN daemon. Tests stay on 18200/11900.
 
 ---
 
+## Phase 10 — Artwork HTTP + DIDL `albumArtURI`
+
+- [x] Sidecar `{stem}-poster.jpg` / folder `poster.jpg` indexed into `ALBUM_ART` / `DETAILS.ALBUM_ART`; inode clone copies art id; art files skipped as library items — `cargo test -p rusty-dlna-scan art_sidecar_indexed_and_cloned`
+- [x] `GET /AlbumArt/{artId}-{detailId}.jpg` 200 `image/jpeg`; Browse extra JPEG_TN `<res>` or `albumArtURI` — `cargo test -p rusty-dlna --lib album_art_get_and_didl`
+- [x] Xbox `?albumArt=true`, Streaming/Range on image → 406; `/Thumbnails/` and `/Resized/` stay 404 (covered by the same lib test)
+
+**Verify** fixture `testdata/library/video/movie.mkv` + `movie-poster.jpg`.
+
+**Prove** isolation: tests stay on 18200/11900; host `:8200` is not a test target.
+
+---
+
+## Phase 11 — NFO beyond date
+
+- [x] Structured NFO writes TITLE/COMMENT/GENRE/CREATOR/ARTIST/DISC/TRACK — `cargo test -p rusty-dlna-scan nfo_title_plot_show_season`
+- [x] Folder `tvshow.nfo` inherited up to media root — `cargo test -p rusty-dlna-scan tvshow_nfo_inherited_by_episode`
+- [x] DIDL `dc:title` is `DETAILS.TITLE` (`Fixture Movie`) — `cargo test -p rusty-dlna --lib browse_uses_nfo_title_not_filename`
+- [x] Existing date tests still pass — `cargo test -p rusty-dlna-scan nfo_year_becomes_ten_char_date`
+
+**Prove** Kodi 1905 `Z` / 10-char date regressions still pass.
+
+---
+
+## Phase 12 — Caption headers (Samsung / Kodi)
+
+- [x] Samsung `sec:CaptionInfoEx` + `CaptionInfo.sec` header — `cargo test -p rusty-dlna --lib samsung_captioninfoex_and_header`
+- [x] Kodi `*` Filter has caption `<res>`, no `sec`/`pv` — `cargo test -p rusty-dlna --lib kodi_caption_res_no_sec_by_default`
+- [x] Samsung BDP no caption `<res>` — `cargo test -p rusty-dlna --lib samsung_bdp_no_caption_res`
+
+**Prove** existing `FLAG_CAPTION_RES` Kodi Browse still lists `/Captions/{id}/{n}.srt`.
+
+---
+
+## Phase 13 — Persistent bookmarks
+
+- [x] `BOOKMARKS` keyed by detail id survives `LibraryDb::open` — `cargo test -p rusty-dlna-scan bookmark_survives_reopen`
+- [x] `CONVERT_MS` dialect — `cargo test -p rusty-dlna-soap bookmark_convert_ms`
+- [x] `X_SetBookmark` then Browse `upnp:lastPlaybackPosition` — `cargo test -p rusty-dlna --lib setbookmark_then_browse_position`
+- [x] `UpdateObject` playCount / lastPlaybackPosition — `cargo test -p rusty-dlna --lib updateobject_playcount_and_position`
+
+---
+
+## Phase 14 — GENA notify
+
+- [x] Subscribe 400/412 rules, peer IPv4, SID — `cargo test -p rusty-dlna --lib gena_subscribe_rules`
+- [x] Catalog bump NOTIFY `NTS:upnp:propchange` + `SystemUpdateID` — `cargo test -p rusty-dlna --lib gena_notify_on_catalog_bump`
+
+**Prove** notify only goes to the test callback; isolation ports unchanged.
+
+---
+
+## Phase 15 — Real Search + SortCriteria
+
+- [x] `dc:title contains` — `cargo test -p rusty-dlna-soap search_title_contains`
+- [x] `upnp:class derivedfrom object.item.videoItem` returns no folders — `cargo test -p rusty-dlna-soap search_class_derivedfrom_video`
+- [x] Unparseable SortCriteria + `FLAG_DLNA` → 709 — `cargo test -p rusty-dlna-soap bad_sort_is_709_for_dlna`
+- [x] `FLAG_FORCE_SORT` Browse track order — `cargo test -p rusty-dlna --lib browse_force_sort_track_order`
+
+**Prove** VLC container Search still returns folders.
+
+---
+
+## Phase 16 — `/status`
+
+- [x] `GET /` and `GET /status` list Video count (non-zero on fixture) — `cargo test -p rusty-dlna --lib status_lists_video_count`
+
+**Prove** optional `curl` only against container `:18200`, never host `:8200`.
+
+---
+
+## Phase 17 — 25-slot client cache
+
+- [x] Cache keeps Kodi when generic UA follows — `cargo test -p rusty-dlna --lib cache_keeps_kodi_when_generic_ua_follows`
+- [x] Cache expires after one hour — `cargo test -p rusty-dlna --lib cache_expires_after_one_hour`
+
+**Prove** CrKey Browse remap and CrKey GET `/Transcode/` still match when GET UA is only `DLNADOC/1.50`.
+
+---
+
+## Phase 18 — SSDP byebye + multi-iface
+
+- [x] Byebye six packets, no LOCATION — `cargo test -p rusty-dlna-ssdp byebye_has_six_no_location`
+- [x] Byebye on drop — `RUSTY_DLNA_HTTP_PORT=18200 RUSTY_DLNA_SSDP_PORT=11900 cargo test -p rusty-dlna --test listen_e2e ssdp_byebye_on_drop`
+
+**Prove** host `:8200`/`:1900` still only the live daemon. Tests do not join `239.255.255.250`.
+
+---
+
 ## Commands cheat sheet
 
 ```bash

@@ -7,10 +7,10 @@ pub mod request;
 
 use rusty_dlna_protocol::http_should_persist;
 use rusty_dlna_protocol::paths::{
-    ALBUM_ART_PREFIX, CAPTIONS_PREFIX, CONNECTIONMGR_CONTROLURL, CONNECTIONMGR_PATH,
-    CONTENTDIRECTORY_CONTROLURL, CONTENTDIRECTORY_PATH, ICONS_PREFIX, MEDIA_ITEMS_PREFIX,
-    RESIZED_PREFIX, ROOTDESC_PATH, STATUS_PATH, THUMBNAILS_PREFIX, TRANSCODE_PREFIX,
-    X_MS_MEDIARECEIVERREGISTRAR_CONTROLURL, X_MS_MEDIARECEIVERREGISTRAR_PATH,
+    caption_default_url, ALBUM_ART_PREFIX, CAPTIONS_PREFIX, CONNECTIONMGR_CONTROLURL,
+    CONNECTIONMGR_PATH, CONTENTDIRECTORY_CONTROLURL, CONTENTDIRECTORY_PATH, ICONS_PREFIX,
+    MEDIA_ITEMS_PREFIX, RESIZED_PREFIX, ROOTDESC_PATH, STATUS_PATH, THUMBNAILS_PREFIX,
+    TRANSCODE_PREFIX, X_MS_MEDIARECEIVERREGISTRAR_CONTROLURL, X_MS_MEDIARECEIVERREGISTRAR_PATH,
 };
 
 pub use desc::{
@@ -279,6 +279,25 @@ impl HttpResponse {
     }
 }
 
+/// Samsung media GET request header (any value, typically `1`).
+pub const GET_CAPTION_INFO_SEC: &str = "getCaptionInfo.sec";
+/// Response header naming the default caption URL.
+pub const CAPTION_INFO_SEC: &str = "CaptionInfo.sec";
+
+/// True when the client asked for `CaptionInfo.sec` on this media GET.
+pub fn wants_caption_info_sec(req: &HttpRequest) -> bool {
+    req.header(GET_CAPTION_INFO_SEC).is_some()
+}
+
+/// `http://{host}:{port}/Captions/{detail_id}.srt` (first/default caption).
+pub fn caption_info_sec_url(host: &str, port: u16, detail_id: i64) -> String {
+    caption_default_url(host, port, detail_id)
+}
+
+pub fn set_caption_info_sec(r: &mut HttpResponse, url: &str) {
+    r.set(CAPTION_INFO_SEC, url);
+}
+
 /// Original `/MediaItems/` headers: `Accept-Ranges: bytes`, `OP=01`, `CI=0`,
 /// `Connection: close`. Empty `DLNA_PN` on HEVC MKV remux.
 pub fn media_response(
@@ -378,5 +397,25 @@ mod tests {
         assert!(!valid_host_header("localhost"));
         assert!(!valid_host_header("0.0.0.0"));
         assert!(!valid_host_header("192.0.2.1:99999"));
+    }
+
+    #[test]
+    fn caption_info_sec_header_helper() {
+        let req = HttpRequest::parse_headers(
+            "GET /MediaItems/9.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\ngetCaptionInfo.sec: 1\r\n\r\n",
+        )
+        .unwrap();
+        assert!(wants_caption_info_sec(&req));
+        let url = caption_info_sec_url("192.0.2.10", 18200, 9);
+        assert_eq!(url, "http://192.0.2.10:18200/Captions/9.srt");
+        let mut r = HttpResponse::new(200, "OK");
+        set_caption_info_sec(&mut r, &url);
+        assert_eq!(
+            r.headers
+                .iter()
+                .find(|(k, _)| k == CAPTION_INFO_SEC)
+                .map(|(_, v)| v.as_str()),
+            Some(url.as_str())
+        );
     }
 }

@@ -18,7 +18,8 @@ use rusty_dlna_protocol::object_id::{
 };
 
 use crate::{
-    path_is_live_file, path_is_unwanted, Caption, Catalog, Container, MediaItem, ScanConfig,
+    path_is_live_file, path_is_unwanted, Caption, Catalog, Container, MediaItem, NfoMeta,
+    ScanConfig,
 };
 
 #[derive(Clone, Debug)]
@@ -320,6 +321,111 @@ impl LibraryDb {
                  DLNA_PN = (SELECT DLNA_PN FROM DETAILS WHERE ID = ?1)
              WHERE ID = ?2",
             params![src, dest],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_album_art(&self, path: &str) -> rusqlite::Result<i64> {
+        if let Some(id) = self
+            .conn
+            .query_row(
+                "SELECT ID FROM ALBUM_ART WHERE PATH = ?1",
+                [path],
+                |r| r.get(0),
+            )
+            .optional()?
+        {
+            return Ok(id);
+        }
+        self.conn
+            .execute("INSERT INTO ALBUM_ART (PATH) VALUES (?1)", [path])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn set_detail_album_art(&self, id: i64, art_id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET ALBUM_ART = ?1 WHERE ID = ?2",
+            params![art_id, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn detail_album_art(&self, id: i64) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(ALBUM_ART, 0) FROM DETAILS WHERE ID = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    pub fn album_art_path(&self, id: i64) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT PATH FROM ALBUM_ART WHERE ID = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
+    pub fn copy_album_art_to_inode_aliases(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET
+                 ALBUM_ART = (SELECT ALBUM_ART FROM DETAILS WHERE ID = ?1)
+             WHERE DEVICE = (SELECT DEVICE FROM DETAILS WHERE ID = ?1)
+               AND INODE = (SELECT INODE FROM DETAILS WHERE ID = ?1)
+               AND INODE != 0
+               AND ID != ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_detail_nfo(&self, id: i64, nfo: &NfoMeta) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET
+                 TITLE = COALESCE(?1, TITLE),
+                 CREATOR = ?2,
+                 ARTIST = ?3,
+                 GENRE = ?4,
+                 COMMENT = ?5,
+                 DISC = ?6,
+                 TRACK = ?7,
+                 DATE = COALESCE(?8, DATE)
+             WHERE ID = ?9",
+            params![
+                nfo.title,
+                nfo.creator,
+                nfo.artist,
+                nfo.genre,
+                nfo.comment,
+                nfo.disc,
+                nfo.track,
+                nfo.date,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn copy_nfo_to_inode_aliases(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET
+                 TITLE = (SELECT TITLE FROM DETAILS WHERE ID = ?1),
+                 CREATOR = (SELECT CREATOR FROM DETAILS WHERE ID = ?1),
+                 ARTIST = (SELECT ARTIST FROM DETAILS WHERE ID = ?1),
+                 GENRE = (SELECT GENRE FROM DETAILS WHERE ID = ?1),
+                 COMMENT = (SELECT COMMENT FROM DETAILS WHERE ID = ?1),
+                 DISC = (SELECT DISC FROM DETAILS WHERE ID = ?1),
+                 TRACK = (SELECT TRACK FROM DETAILS WHERE ID = ?1),
+                 DATE = (SELECT DATE FROM DETAILS WHERE ID = ?1)
+             WHERE DEVICE = (SELECT DEVICE FROM DETAILS WHERE ID = ?1)
+               AND INODE = (SELECT INODE FROM DETAILS WHERE ID = ?1)
+               AND INODE != 0
+               AND ID != ?1",
+            [id],
         )?;
         Ok(())
     }
@@ -885,6 +991,35 @@ impl LibraryDb {
         Ok(n)
     }
 
+    /// `BOOKMARKS` is keyed by DETAILS.ID. `sec < 30` is stored as 0 by the SOAP helper.
+    pub fn set_bookmark(&self, detail_id: i64, sec: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO BOOKMARKS (ID, SEC, WATCH_COUNT) VALUES (?1, ?2, 0)
+             ON CONFLICT(ID) DO UPDATE SET SEC = excluded.SEC",
+            params![detail_id, sec],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_watch_count(&self, detail_id: i64, count: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO BOOKMARKS (ID, SEC, WATCH_COUNT) VALUES (?1, 0, ?2)
+             ON CONFLICT(ID) DO UPDATE SET WATCH_COUNT = excluded.WATCH_COUNT",
+            params![detail_id, count],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_bookmark(&self, detail_id: i64) -> rusqlite::Result<Option<(i64, i64)>> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(SEC, 0), COALESCE(WATCH_COUNT, 0) FROM BOOKMARKS WHERE ID = ?1",
+                [detail_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
     pub fn clear_objects(&self) -> rusqlite::Result<()> {
         self.conn.execute("DELETE FROM OBJECTS", [])?;
         Ok(())
@@ -1028,7 +1163,9 @@ impl LibraryDb {
                 "SELECT o.OBJECT_ID, o.PARENT_ID, o.CLASS, o.NAME, o.DETAIL_ID, o.REF_ID,
                         d.PATH, d.SIZE, d.TIMESTAMP, d.DATE, d.MIME, d.DLNA_PN,
                         d.DEVICE, d.INODE, d.DURATION, d.BITRATE, d.RESOLUTION,
-                        d.CHANNELS, d.SAMPLERATE, d.CONTAINER, d.VIDEO, d.AUDIO, d.HDR
+                        d.CHANNELS, d.SAMPLERATE, d.CONTAINER, d.VIDEO, d.AUDIO, d.HDR,
+                        d.ALBUM_ART, d.TITLE, d.CREATOR, d.ARTIST, d.ALBUM, d.GENRE,
+                        d.COMMENT, d.DISC, d.TRACK
                  FROM OBJECTS o JOIN DETAILS d ON o.DETAIL_ID = d.ID
                  WHERE o.DETAIL_ID IS NOT NULL",
             )?;
@@ -1057,6 +1194,15 @@ impl LibraryDb {
                     r.get::<_, Option<String>>(20)?,
                     r.get::<_, Option<String>>(21)?,
                     r.get::<_, Option<String>>(22)?,
+                    r.get::<_, Option<i64>>(23)?,
+                    r.get::<_, Option<String>>(24)?,
+                    r.get::<_, Option<String>>(25)?,
+                    r.get::<_, Option<String>>(26)?,
+                    r.get::<_, Option<String>>(27)?,
+                    r.get::<_, Option<String>>(28)?,
+                    r.get::<_, Option<String>>(29)?,
+                    r.get::<_, Option<i64>>(30)?,
+                    r.get::<_, Option<i64>>(31)?,
                 ))
             })?;
             for row in rows {
@@ -1084,16 +1230,28 @@ impl LibraryDb {
                     video,
                     audio,
                     hdr,
+                    album_art,
+                    detail_title,
+                    creator,
+                    artist,
+                    album,
+                    genre,
+                    comment,
+                    disc,
+                    track,
                 ) = row?;
                 let path = PathBuf::from(path.unwrap_or_default());
                 let mime_s = mime.unwrap_or_else(|| "video/x-matroska".into());
                 let ext = mime_to_ext(&mime_s);
-                let title = name.unwrap_or_else(|| {
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("item")
-                        .to_string()
-                });
+                let nonempty = |s: Option<String>| s.filter(|v| !v.is_empty());
+                let title = nonempty(detail_title)
+                    .or_else(|| nonempty(name))
+                    .unwrap_or_else(|| {
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("item")
+                            .to_string()
+                    });
                 let probe = crate::probe_from_stored(
                     ext,
                     container.as_deref(),
@@ -1135,6 +1293,16 @@ impl LibraryDb {
                     resolution: resolution.filter(|s| !s.is_empty()),
                     channels,
                     samplerate,
+                    album_art: album_art.unwrap_or(0),
+                    creator: nonempty(creator),
+                    comment: nonempty(comment),
+                    artist: nonempty(artist),
+                    album: nonempty(album),
+                    genre: nonempty(genre),
+                    disc,
+                    track,
+                    bookmark_sec: 0,
+                    watch_count: 0,
                 };
                 cat.by_detail.entry(did).or_insert_with(|| oid.clone());
                 if let Some(p) = cat.containers.get_mut(&parent) {
@@ -1144,6 +1312,35 @@ impl LibraryDb {
                 }
                 cat.next_detail = cat.next_detail.max(did + 1);
                 cat.items.insert(oid, item);
+            }
+        }
+        {
+            let mut marks: HashMap<i64, (i64, i64)> = HashMap::new();
+            let mut stmt = self.conn.prepare(
+                "SELECT ID, COALESCE(SEC, 0), COALESCE(WATCH_COUNT, 0) FROM BOOKMARKS",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            })?;
+            for row in rows {
+                let (id, sec, wc) = row?;
+                marks.insert(id, (sec, wc));
+            }
+            for it in cat.items.values_mut() {
+                if let Some(&(sec, wc)) = marks.get(&it.detail_id) {
+                    it.bookmark_sec = sec;
+                    it.watch_count = wc;
+                }
+            }
+        }
+        {
+            let mut stmt = self.conn.prepare("SELECT ID, PATH FROM ALBUM_ART")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, path) = row?;
+                cat.album_art_paths.insert(id, PathBuf::from(path));
             }
         }
         cat.ensure_video_folder_mirrors();

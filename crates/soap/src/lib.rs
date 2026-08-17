@@ -1,12 +1,20 @@
 //! SOAP envelope, DIDL emit, and ContentDirectory dispatch.
 
+mod filter;
+mod search;
+mod sort;
+
 use rusty_dlna_protocol::object_id::{BROWSEDIR_ID, IMAGE_ID, MUSIC_ID, ROOT_ID, VIDEO_ID};
 use rusty_dlna_protocol::soap::{
-    soap_action_method, CONNECTIONMANAGER_TYPE, CONTENTDIRECTORY_TYPE, DIDL_SCHEMAS,
-    MS_REGISTRAR_TYPE, SEARCH_CAPS, SORT_CAPS,
+    soap_action_method, CONNECTIONMANAGER_TYPE, CONTENTDIRECTORY_TYPE, MS_REGISTRAR_TYPE,
+    SEARCH_CAPS, SORT_CAPS,
 };
 use rusty_dlna_protocol::w3c_normalize_date;
 use rusty_dlna_protocol::{ClientFlags, ClientProfile};
+
+pub use filter::{didl_xmlns, parse_filter, FilterBits};
+pub use search::{parse_search_criteria, row_matches, SearchClause, SearchRow};
+pub use sort::{default_order, parse_sort_criteria, sort_or_709, DefaultOrder, SortKey, SortSpec};
 
 pub fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -132,8 +140,15 @@ pub fn soap_fault(code: u16, desc: &str) -> String {
 }
 
 /// `didl_inner` is raw (unescaped) DIDL children. Result is XML-escaped.
-pub fn browse_response(didl_inner: &str, returned: u32, total: u32, update_id: u32) -> String {
-    let didl = format!("<DIDL-Lite{DIDL_SCHEMAS}>\n{didl_inner}</DIDL-Lite>");
+pub fn browse_response(
+    didl_inner: &str,
+    returned: u32,
+    total: u32,
+    update_id: u32,
+    bits: &FilterBits,
+) -> String {
+    let xmlns = didl_xmlns(bits);
+    let didl = format!("<DIDL-Lite{xmlns}>\n{didl_inner}</DIDL-Lite>");
     let body = format!(
         "<u:BrowseResponse xmlns:u=\"{CONTENTDIRECTORY_TYPE}\">\
          <Result>{}</Result>\n\
@@ -146,8 +161,15 @@ pub fn browse_response(didl_inner: &str, returned: u32, total: u32, update_id: u
     wrap_soap_success(&body)
 }
 
-pub fn search_response(didl_inner: &str, returned: u32, total: u32, update_id: u32) -> String {
-    let didl = format!("<DIDL-Lite{DIDL_SCHEMAS}>\n{didl_inner}</DIDL-Lite>");
+pub fn search_response(
+    didl_inner: &str,
+    returned: u32,
+    total: u32,
+    update_id: u32,
+    bits: &FilterBits,
+) -> String {
+    let xmlns = didl_xmlns(bits);
+    let didl = format!("<DIDL-Lite{xmlns}>\n{didl_inner}</DIDL-Lite>");
     let body = format!(
         "<u:SearchResponse xmlns:u=\"{CONTENTDIRECTORY_TYPE}\">\
          <Result>{}</Result>\n\
@@ -174,6 +196,16 @@ pub struct DidlRes {
     pub resolution: Option<String>,
     pub sample_frequency: Option<i64>,
     pub nr_audio_channels: Option<i64>,
+    /// Filter `pv:subtitleFileType` — always `SRT` when set.
+    pub pv_subtitle_type: Option<String>,
+    /// Filter `pv:subtitleFileUri` — `/Captions/{id}.srt` (first caption).
+    pub pv_subtitle_uri: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DidlCaption {
+    pub ext: String,
+    pub url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -189,9 +221,29 @@ pub struct DidlObject {
     pub child_container_count: Option<u32>,
     pub is_container: bool,
     pub resources: Vec<DidlRes>,
+    pub album_art_uri: Option<String>,
+    /// Samsung `dlna:profileID="JPEG_TN"` on `upnp:albumArtURI`.
+    pub album_art_profile: bool,
+    pub creator: Option<String>,
+    pub description: Option<String>,
+    pub artist: Option<String>,
+    pub actor: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub track: Option<i64>,
+    pub season: Option<i64>,
+    pub episode: Option<i64>,
+    /// Indexed caption URLs for `sec:CaptionInfoEx` (`/Captions/{id}/{n}.{ext}`).
+    pub captions: Vec<DidlCaption>,
+    /// Raw seconds, or CONVERT_MS milliseconds. Emit when `Some`.
+    pub last_playback_position: Option<i64>,
+    /// `upnp:playbackCount` when watch count > 0.
+    pub playback_count: Option<i64>,
+    /// Samsung `sec:dcmInfo` (`CREATIONDATE=0,FOLDER={title},BM={sec}`).
+    pub dcm_info: Option<String>,
 }
 
-pub fn emit_didl_object(o: &DidlObject) -> String {
+pub fn emit_didl_object(o: &DidlObject, bits: &FilterBits) -> String {
     if o.is_container {
         let mut s = format!(
             "<container id=\"{}\" parentID=\"{}\" restricted=\"{}\"",
@@ -220,6 +272,7 @@ pub fn emit_didl_object(o: &DidlObject) -> String {
         if o.class.contains("storageFolder") {
             s.push_str("<upnp:storageUsed>-1</upnp:storageUsed>");
         }
+        emit_album_art_uri(&mut s, o);
         s.push_str("</container>");
         s
     } else {
@@ -234,11 +287,50 @@ pub fn emit_didl_object(o: &DidlObject) -> String {
             xml_escape(&o.title),
             o.class
         ));
-        if let Some(d) = &o.date {
-            let nd = w3c_normalize_date(d);
-            if !nd.is_empty() {
-                s.push_str(&format!("<dc:date>{}</dc:date>", xml_escape(&nd)));
+        if bits.dc_date {
+            if let Some(d) = &o.date {
+                let nd = w3c_normalize_date(d);
+                if !nd.is_empty() {
+                    s.push_str(&format!("<dc:date>{}</dc:date>", xml_escape(&nd)));
+                }
             }
+        }
+        emit_opt_tag(&mut s, "dc:creator", o.creator.as_deref());
+        if let Some(desc) = o.description.as_deref().filter(|v| !v.is_empty()) {
+            let cut = truncate_chars(desc, 384);
+            emit_opt_tag(&mut s, "dc:description", Some(cut));
+        }
+        emit_opt_tag(&mut s, "upnp:artist", o.artist.as_deref());
+        emit_opt_tag(&mut s, "upnp:actor", o.actor.as_deref());
+        emit_opt_tag(&mut s, "upnp:album", o.album.as_deref());
+        emit_opt_tag(&mut s, "upnp:genre", o.genre.as_deref());
+        if o.class.contains("audio") {
+            if let Some(n) = o.track {
+                s.push_str(&format!(
+                    "<upnp:originalTrackNumber>{n}</upnp:originalTrackNumber>"
+                ));
+            }
+        }
+        if let Some(n) = o.season {
+            s.push_str(&format!("<upnp:episodeSeason>{n}</upnp:episodeSeason>"));
+        }
+        if let Some(n) = o.episode {
+            s.push_str(&format!("<upnp:episodeNumber>{n}</upnp:episodeNumber>"));
+        }
+        if let Some(pos) = o.last_playback_position {
+            s.push_str(&format!(
+                "<upnp:lastPlaybackPosition>{pos}</upnp:lastPlaybackPosition>"
+            ));
+        }
+        if bits.sec {
+            if let Some(dcm) = o.dcm_info.as_deref().filter(|v| !v.is_empty()) {
+                s.push_str("<sec:dcmInfo>");
+                s.push_str(&xml_escape(dcm));
+                s.push_str("</sec:dcmInfo>");
+            }
+        }
+        if let Some(n) = o.playback_count.filter(|n| *n > 0) {
+            s.push_str(&format!("<upnp:playbackCount>{n}</upnp:playbackCount>"));
         }
         for r in &o.resources {
             s.push_str("<res protocolInfo=\"");
@@ -262,19 +354,74 @@ pub fn emit_didl_object(o: &DidlObject) -> String {
             if let Some(res) = &r.resolution {
                 s.push_str(&format!(" resolution=\"{}\"", xml_escape(res)));
             }
+            if bits.pv {
+                if let Some(t) = &r.pv_subtitle_type {
+                    s.push_str(" pv:subtitleFileType=\"");
+                    s.push_str(&xml_escape(t));
+                    s.push('"');
+                }
+                if let Some(u) = &r.pv_subtitle_uri {
+                    s.push_str(" pv:subtitleFileUri=\"");
+                    s.push_str(&xml_escape(u));
+                    s.push('"');
+                }
+            }
             s.push('>');
             s.push_str(&xml_escape(&r.url));
             s.push_str("</res>");
         }
+        if bits.sec {
+            for cap in &o.captions {
+                s.push_str("<sec:CaptionInfoEx sec:type=\"");
+                s.push_str(&xml_escape(&cap.ext));
+                s.push_str("\">");
+                s.push_str(&xml_escape(&cap.url));
+                s.push_str("</sec:CaptionInfoEx>");
+            }
+        }
+        emit_album_art_uri(&mut s, o);
         s.push_str("</item>");
         s
     }
 }
 
-pub fn emit_didl(objects: &[DidlObject]) -> String {
+fn emit_opt_tag(s: &mut String, tag: &str, val: Option<&str>) {
+    let Some(v) = val.filter(|v| !v.is_empty()) else {
+        return;
+    };
+    s.push('<');
+    s.push_str(tag);
+    s.push('>');
+    s.push_str(&xml_escape(v));
+    s.push_str("</");
+    s.push_str(tag);
+    s.push('>');
+}
+
+fn truncate_chars(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+fn emit_album_art_uri(s: &mut String, o: &DidlObject) {
+    let Some(uri) = &o.album_art_uri else {
+        return;
+    };
+    if o.album_art_profile {
+        s.push_str("<upnp:albumArtURI dlna:profileID=\"JPEG_TN\">");
+    } else {
+        s.push_str("<upnp:albumArtURI>");
+    }
+    s.push_str(&xml_escape(uri));
+    s.push_str("</upnp:albumArtURI>");
+}
+
+pub fn emit_didl(objects: &[DidlObject], bits: &FilterBits) -> String {
     let mut s = String::with_capacity(objects.len().saturating_mul(384));
     for o in objects {
-        s.push_str(&emit_didl_object(o));
+        s.push_str(&emit_didl_object(o, bits));
     }
     s
 }
@@ -289,6 +436,10 @@ pub struct SoapCall {
     pub search_criteria: Option<String>,
     pub pos_second: Option<i64>,
     pub connection_id: Option<String>,
+    pub filter: Option<String>,
+    pub current_tag_value: Option<String>,
+    pub new_tag_value: Option<String>,
+    pub sort_criteria: Option<String>,
 }
 
 pub fn parse_soap_call(action: &str, body: &str) -> SoapCall {
@@ -308,6 +459,10 @@ pub fn parse_soap_call(action: &str, body: &str) -> SoapCall {
         search_criteria: xml_tag_text(body, "SearchCriteria"),
         pos_second: xml_tag_text(body, "PosSecond").and_then(|s| s.trim().parse().ok()),
         connection_id: xml_tag_text(body, "ConnectionID"),
+        filter: xml_tag_text(body, "Filter"),
+        current_tag_value: xml_tag_text(body, "CurrentTagValue"),
+        new_tag_value: xml_tag_text(body, "NewTagValue"),
+        sort_criteria: xml_tag_text(body, "SortCriteria"),
     }
 }
 
@@ -347,6 +502,14 @@ impl SoapOutcome {
             persist: false,
         }
     }
+    pub fn fault709() -> Self {
+        Self::Fault {
+            http: 500,
+            code: 709,
+            desc: "Unsupported or invalid sort criteria",
+            persist: false,
+        }
+    }
 }
 
 /// dialect `X_SetBookmark`: CONVERT_MS divides by 1000; values < 30 store as 0.
@@ -357,6 +520,88 @@ pub fn bookmark_seconds(pos: i64, convert_ms: bool) -> i64 {
     } else {
         sec
     }
+}
+
+/// Tags parsed from UpdateObject `CurrentTagValue` / `NewTagValue`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UpdateObjectTags {
+    pub last_playback_position: Option<i64>,
+    pub playback_count: Option<i64>,
+}
+
+/// MiniDLNA-style tag list: `<upnp:lastPlaybackPosition>N</…>` or `name=N`.
+/// NewTagValue wins over CurrentTagValue. Unknown tags ignored.
+pub fn parse_update_object_tags(current: Option<&str>, new: Option<&str>) -> UpdateObjectTags {
+    let new = new.unwrap_or("");
+    let current = current.unwrap_or("");
+    let pick = |names: &[&str]| update_tag_i64(new, names).or_else(|| update_tag_i64(current, names));
+    UpdateObjectTags {
+        last_playback_position: pick(&["upnp:lastPlaybackPosition", "lastPlaybackPosition"]),
+        playback_count: pick(&[
+            "upnp:playbackCount",
+            "upnp:playCount",
+            "playbackCount",
+            "playCount",
+        ]),
+    }
+}
+
+fn unescape_xml_light(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn parse_pos_or_count(v: &str) -> Option<i64> {
+    let v = v.trim();
+    if v.contains(':') {
+        let parts: Vec<&str> = v.split(':').collect();
+        if parts.len() == 3 {
+            let h: i64 = parts[0].parse().ok()?;
+            let m: i64 = parts[1].parse().ok()?;
+            let s: i64 = parts[2].split('.').next()?.parse().ok()?;
+            return Some(h.saturating_mul(3600) + m.saturating_mul(60) + s);
+        }
+    }
+    v.parse().ok()
+}
+
+fn update_tag_i64(hay: &str, names: &[&str]) -> Option<i64> {
+    if hay.is_empty() {
+        return None;
+    }
+    let decoded = unescape_xml_light(hay);
+    for tag in names {
+        let local = tag.rsplit(':').next().unwrap_or(tag);
+        if let Some(v) = xml_tag_text(&decoded, local) {
+            if let Some(n) = parse_pos_or_count(&v) {
+                return Some(n);
+            }
+        }
+        for key in [*tag, local] {
+            let pat = format!("{key}=");
+            if let Some(i) = decoded.find(&pat) {
+                let rest = decoded[i + pat.len()..].trim_start();
+                let num: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '-')
+                    .collect();
+                if let Some(n) = parse_pos_or_count(&num) {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn empty_cd_response(method: &str) -> String {
+    ok_tag(method, CONTENTDIRECTORY_TYPE, "")
 }
 
 pub fn feature_list_ids(client: &ClientProfile, root_container: Option<&str>) -> [&'static str; 3] {
@@ -410,15 +655,14 @@ fn ok_tag(method: &str, xmlns: &str, inner: &str) -> String {
     ))
 }
 
-/// Catalog-independent SOAP methods. Browse/Search are built by the caller
-/// via [`build_browse`].
+/// Catalog-independent SOAP methods. Browse/Search, `X_SetBookmark`, and
+/// `UpdateObject` are built by the caller (need catalog / `BOOKMARKS`).
 pub fn dispatch_simple(
     call: &SoapCall,
     client: &ClientProfile,
     uuid: &str,
     update_id: u32,
     root_container: Option<&str>,
-    bookmarks: Option<&mut std::collections::HashMap<String, i64>>,
 ) -> Option<SoapOutcome> {
     let method = call.method?;
     match method {
@@ -480,21 +724,9 @@ pub fn dispatch_simple(
                 &format!("<FeatureList>{}</FeatureList>", xml_escape(&feat)),
             )))
         }
-        "X_SetBookmark" => {
-            let Some(oid) = &call.object_id else {
-                return Some(SoapOutcome::fault402());
-            };
-            let pos = call.pos_second.unwrap_or(0);
-            let sec = bookmark_seconds(pos, client.flags.contains(ClientFlags::CONVERT_MS));
-            if let Some(map) = bookmarks {
-                map.insert(oid.clone(), sec);
-            }
-            Some(SoapOutcome::Ok(ok_tag(method, CONTENTDIRECTORY_TYPE, "")))
-        }
-        "QueryStateVariable" | "UpdateObject" => {
-            Some(SoapOutcome::Ok(ok_tag(method, CONTENTDIRECTORY_TYPE, "")))
-        }
-        "Browse" | "Search" => None,
+        "QueryStateVariable" => Some(SoapOutcome::Ok(ok_tag(method, CONTENTDIRECTORY_TYPE, ""))),
+        // Persist via the server catalog / `BOOKMARKS` path.
+        "X_SetBookmark" | "UpdateObject" | "Browse" | "Search" => None,
         _ => Some(SoapOutcome::fault401()),
     }
 }
@@ -505,12 +737,13 @@ pub fn build_browse(
     returned: u32,
     total: u32,
     update_id: u32,
+    bits: &FilterBits,
 ) -> String {
-    let inner = emit_didl(objects);
+    let inner = emit_didl(objects, bits);
     if is_search {
-        search_response(&inner, returned, total, update_id)
+        search_response(&inner, returned, total, update_id, bits)
     } else {
-        browse_response(&inner, returned, total, update_id)
+        browse_response(&inner, returned, total, update_id, bits)
     }
 }
 
@@ -535,7 +768,13 @@ mod tests {
 
     #[test]
     fn browse_is_escaped_didl() {
-        let xml = browse_response("<container id=\"0\"/>", 1, 1, 28);
+        let xml = browse_response(
+            "<container id=\"0\"/>",
+            1,
+            1,
+            28,
+            &FilterBits::standard(),
+        );
         assert!(xml.contains("&lt;DIDL-Lite"));
         assert!(
             xml.contains("&lt;container id=\"0\"/&gt;"),
@@ -570,6 +809,8 @@ mod tests {
         assert_eq!(bookmark_seconds(120_000, true), 120);
         assert_eq!(bookmark_seconds(10, false), 0);
         assert_eq!(bookmark_seconds(45, false), 45);
+        assert_eq!(bookmark_seconds(-1, false), 0);
+        assert_eq!(bookmark_seconds(-1, true), 0);
     }
 
     #[test]
@@ -583,19 +824,37 @@ mod tests {
 
     #[test]
     fn container_didl_is_storage_folder() {
-        let xml = emit_didl_object(&DidlObject {
-            id: "2$15".into(),
-            parent_id: "0".into(),
-            title: "Folders".into(),
-            class: "container.storageFolder".into(),
-            date: None,
-            restricted: true,
-            searchable: Some(true),
-            child_count: Some(1),
-            child_container_count: Some(1),
-            is_container: true,
-            resources: vec![],
-        });
+        let xml = emit_didl_object(
+            &DidlObject {
+                id: "2$15".into(),
+                parent_id: "0".into(),
+                title: "Folders".into(),
+                class: "container.storageFolder".into(),
+                date: None,
+                restricted: true,
+                searchable: Some(true),
+                child_count: Some(1),
+                child_container_count: Some(1),
+                is_container: true,
+                resources: vec![],
+                album_art_uri: None,
+                album_art_profile: false,
+                creator: None,
+                description: None,
+                artist: None,
+                actor: None,
+                album: None,
+                genre: None,
+                track: None,
+                season: None,
+                episode: None,
+                captions: vec![],
+                last_playback_position: None,
+                playback_count: None,
+                dcm_info: None,
+            },
+            &FilterBits::standard(),
+        );
         assert!(
             xml.starts_with("<container "),
             "folders must be DIDL containers, not items: {xml}"
@@ -609,10 +868,147 @@ mod tests {
         assert!(xml.contains("<upnp:storageUsed>-1</upnp:storageUsed>"));
         assert!(xml.ends_with("</container>"));
         assert!(!xml.contains("<item"));
-        let wrapped = browse_response(&xml, 1, 1, 1);
+        let wrapped = browse_response(&xml, 1, 1, 1, &FilterBits::standard());
         assert!(
-            wrapped.contains("xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\""),
+            wrapped.contains("xmlns:dc=\"http://purl.org/dc/elements/1.1/\""),
             "{wrapped}"
         );
+        assert!(
+            !wrapped.contains("xmlns:dlna="),
+            "standard Filter omits xmlns:dlna: {wrapped}"
+        );
+    }
+
+    #[test]
+    fn didl_namespaces_follow_filter_bits() {
+        let samsung = parse_filter(Some("*"), true);
+        let xml = browse_response("<item/>", 1, 1, 1, &samsung);
+        assert!(xml.contains("xmlns:sec=\"http://www.sec.co.kr/dlna\""), "{xml}");
+        assert!(
+            xml.contains("xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\""),
+            "{xml}"
+        );
+        assert!(!xml.contains("xmlns:pv="), "{xml}");
+
+        let kodi = parse_filter(Some("*"), false);
+        let xml = browse_response("<item/>", 1, 1, 1, &kodi);
+        assert!(!xml.contains("xmlns:sec="), "{xml}");
+        assert!(!xml.contains("xmlns:pv="), "{xml}");
+        assert!(!xml.contains("xmlns:dlna="), "{xml}");
+
+        let pv = parse_filter(Some("pv:subtitleFileUri"), false);
+        let xml = browse_response("<item/>", 1, 1, 1, &pv);
+        assert!(xml.contains("xmlns:pv=\"http://www.pv.com/pvns/\""), "{xml}");
+    }
+
+    #[test]
+    fn parse_soap_call_reads_update_tags() {
+        let body = r#"<u:UpdateObject><ObjectID>64$1</ObjectID><CurrentTagValue>old</CurrentTagValue><NewTagValue>&lt;upnp:playCount&gt;3&lt;/upnp:playCount&gt;</NewTagValue></u:UpdateObject>"#;
+        let call = parse_soap_call("urn:x#UpdateObject", body);
+        assert_eq!(call.object_id.as_deref(), Some("64$1"));
+        assert_eq!(call.current_tag_value.as_deref(), Some("old"));
+        assert!(
+            call.new_tag_value
+                .as_deref()
+                .unwrap_or("")
+                .contains("playCount")
+        );
+        let tags = parse_update_object_tags(call.current_tag_value.as_deref(), call.new_tag_value.as_deref());
+        assert_eq!(tags.playback_count, Some(3));
+        assert_eq!(
+            parse_update_object_tags(
+                None,
+                Some("<upnp:lastPlaybackPosition>90</upnp:lastPlaybackPosition>")
+            )
+            .last_playback_position,
+            Some(90)
+        );
+        assert_eq!(
+            parse_update_object_tags(None, Some("upnp:lastPlaybackPosition=90,upnp:playCount=3"))
+                .last_playback_position,
+            Some(90)
+        );
+    }
+
+    #[test]
+    fn parse_soap_call_reads_filter() {
+        let body = r#"<u:Browse><ObjectID>0</ObjectID><Filter>*</Filter></u:Browse>"#;
+        let call = parse_soap_call(
+            r#""urn:schemas-upnp-org:service:ContentDirectory:1#Browse""#,
+            body,
+        );
+        assert_eq!(call.filter.as_deref(), Some("*"));
+        let listed = r#"<Browse><Filter>dc:title,sec:CaptionInfoEx</Filter></Browse>"#;
+        let call = parse_soap_call("urn:x#Browse", listed);
+        assert_eq!(
+            call.filter.as_deref(),
+            Some("dc:title,sec:CaptionInfoEx")
+        );
+    }
+
+    #[test]
+    fn emit_sec_and_pv_follow_bits() {
+        let obj = DidlObject {
+            id: "64$1".into(),
+            parent_id: "64".into(),
+            title: "movie".into(),
+            class: "item.videoItem".into(),
+            date: Some("1999-01-01".into()),
+            restricted: true,
+            searchable: None,
+            child_count: None,
+            child_container_count: None,
+            is_container: false,
+            resources: vec![DidlRes {
+                url: "http://127.0.0.1:18200/MediaItems/9.mkv".into(),
+                protocol_info: "http-get:*:video/x-matroska:*".into(),
+                size: Some(1),
+                duration: None,
+                bitrate: None,
+                resolution: None,
+                sample_frequency: None,
+                nr_audio_channels: None,
+                pv_subtitle_type: Some("SRT".into()),
+                pv_subtitle_uri: Some("http://127.0.0.1:18200/Captions/9.srt".into()),
+            }],
+            album_art_uri: None,
+            album_art_profile: false,
+            creator: None,
+            description: None,
+            artist: None,
+            actor: None,
+            album: None,
+            genre: None,
+            track: None,
+            season: None,
+            episode: None,
+            captions: vec![DidlCaption {
+                ext: "srt".into(),
+                url: "http://127.0.0.1:18200/Captions/9/0.srt".into(),
+            }],
+            last_playback_position: Some(120),
+            playback_count: Some(3),
+            dcm_info: Some("CREATIONDATE=0,FOLDER=movie,BM=120".into()),
+        };
+        let star = parse_filter(Some("*"), false);
+        let kodi = emit_didl_object(&obj, &star);
+        assert!(kodi.contains("<dc:date>1999-01-01</dc:date>"));
+        assert!(!kodi.contains("sec:CaptionInfoEx"));
+        assert!(!kodi.contains("pv:subtitle"));
+        assert!(kodi.contains("<upnp:lastPlaybackPosition>120</upnp:lastPlaybackPosition>"));
+        assert!(kodi.contains("<upnp:playbackCount>3</upnp:playbackCount>"));
+        assert!(!kodi.contains("sec:dcmInfo"));
+
+        let tv = emit_didl_object(&obj, &parse_filter(Some("*"), true));
+        assert!(tv.contains("<sec:CaptionInfoEx sec:type=\"srt\">"));
+        assert!(tv.contains("/Captions/9/0.srt"));
+        assert!(!tv.contains("pv:subtitle"));
+        assert!(tv.contains("<sec:dcmInfo>CREATIONDATE=0,FOLDER=movie,BM=120</sec:dcmInfo>"));
+
+        let pv = emit_didl_object(&obj, &parse_filter(Some("pv:subtitleFileType"), false));
+        assert!(pv.contains("pv:subtitleFileType=\"SRT\""));
+        assert!(pv.contains("pv:subtitleFileUri=\"http://127.0.0.1:18200/Captions/9.srt\""));
+        assert!(!pv.contains("sec:CaptionInfoEx"));
+        assert!(!pv.contains("<dc:date>"));
     }
 }

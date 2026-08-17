@@ -41,9 +41,11 @@ SQLite handle and the cache maps.
 - `transcode` — `decide(client, source)` then ffmpeg argv.
 - `server` — config, runtime, wiring.
 
-A client profile is resolved **once** per TCP peer (25-slot
-cache, 1 hour, do not overwrite a specific type with generic
-`DLNADOC/1.50`). SOAP and media GET must see the same profile so DIDL
+A client profile is resolved **once** per TCP peer via `ClientCache`
+(25 IPv4 slots, 1 hour TTL; same MAC extends another hour). Later
+generic `DLNADOC/1.50` / `UPnP/1.0` must not overwrite a more specific
+type (`type < StandardDlna150`). Samsung Series B is not overwritten
+by Series A. SOAP and media GET must see the same profile so DIDL
 and HTTP MIME lies match.
 
 ## DIDL and transcode

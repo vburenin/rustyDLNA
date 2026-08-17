@@ -29,11 +29,12 @@ pub fn soap_action_method(action: &str) -> Option<&'static str> {
         .find(|name| rest.starts_with(name))
 }
 
+/// Base DIDL-Lite namespaces (`CONTENT_DIRECTORY_SCHEMAS`). Vendor
+/// `xmlns:dlna` / `xmlns:pv` / `xmlns:sec` are appended from `FilterBits`.
 pub const DIDL_SCHEMAS: &str = concat!(
     " xmlns:dc=\"http://purl.org/dc/elements/1.1/\"",
     " xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\"",
-    " xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\"",
-    " xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\""
+    " xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\""
 );
 pub const DLNA_NAMESPACE: &str = " xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\"";
 pub const PV_NAMESPACE: &str = " xmlns:pv=\"http://www.pv.com/pvns/\"";

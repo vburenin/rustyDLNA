@@ -24,7 +24,11 @@ struct Server(Child);
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.0.kill();
+        // SIGTERM so `serve` can send SSDP byebye. SIGKILL skips that path.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(self.0.id() as i32, libc::SIGTERM);
+        }
         let _ = self.0.wait();
     }
 }
@@ -110,18 +114,24 @@ fn ensure_fixtures() {
 }
 
 fn spawn_bin(http: u16, ssdp: u16) -> Server {
+    spawn_bin_with_sink(http, ssdp, None)
+}
+
+fn spawn_bin_with_sink(http: u16, ssdp: u16, sink: Option<String>) -> Server {
     ensure_fixtures();
     let root = workspace();
     let bin = env!("CARGO_BIN_EXE_rusty-dlna");
-    let child = Command::new(bin)
-        .current_dir(&root)
+    let mut cmd = Command::new(bin);
+    cmd.current_dir(&root)
         .arg("--config")
         .arg(root.join("testdata/rusty-dlna.test.toml"))
         .env("RUSTY_DLNA_HTTP_PORT", http.to_string())
         .env("RUSTY_DLNA_SSDP_PORT", ssdp.to_string())
-        .env("RUST_LOG", "info")
-        .spawn()
-        .expect("spawn rusty-dlna");
+        .env("RUST_LOG", "info");
+    if let Some(s) = sink {
+        cmd.env("RUSTY_DLNA_SSDP_SINK", s);
+    }
+    let child = cmd.spawn().expect("spawn rusty-dlna");
     wait_http(http);
     Server(child)
 }
@@ -148,8 +158,18 @@ fn one_run(http: u16, ssdp: u16) {
     assert_eq!(st, 200);
     assert!(browse0.contains("&lt;DIDL-Lite"), "{browse0}");
     assert!(browse0.contains("64"), "{browse0}");
-    assert!(browse0.contains("id=&quot;1&quot;") || browse0.contains("&quot;1&quot;"));
-    assert!(browse0.contains("id=&quot;2&quot;") || browse0.contains("&quot;2&quot;"));
+    assert!(
+        browse0.contains("id=\"1\"")
+            || browse0.contains("id=&quot;1&quot;")
+            || browse0.contains("&quot;1&quot;"),
+        "{browse0}"
+    );
+    assert!(
+        browse0.contains("id=\"2\"")
+            || browse0.contains("id=&quot;2&quot;")
+            || browse0.contains("&quot;2&quot;"),
+        "{browse0}"
+    );
 
     let inner8 = r#"<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse>"#;
     let items = {
@@ -172,12 +192,23 @@ fn one_run(http: u16, ssdp: u16) {
     };
     assert!(items.contains("/MediaItems/"), "{items}");
     assert!(
+        items.contains("Fixture Movie"),
+        "NFO title in Browse: {items}"
+    );
+    assert!(
         items.contains("1999-01-01") || items.contains("Z&lt;/dc:date"),
         "dc:date {items}"
     );
+    assert!(
+        items.contains("/AlbumArt/") && items.contains("JPEG_TN"),
+        "album art DIDL: {items}"
+    );
 
     // original GET + two ranges — pick the movie title's MediaItems id
-    let movie_at = items.find("movie").expect("movie title");
+    let movie_at = items
+        .find("Fixture Movie")
+        .or_else(|| items.find("movie"))
+        .expect("movie title");
     let after = &items[movie_at..];
     let url_start = after.find("/MediaItems/").expect("movie res");
     let rest = &after[url_start..];
@@ -212,6 +243,41 @@ fn one_run(http: u16, ssdp: u16) {
     );
     assert_eq!(st, 206);
     assert_eq!(b2, expect[64..128]);
+
+    // Phase 10 /AlbumArt/ + Phase 16 /status on the live test listener
+    if let Some(art_at) = items.find("/AlbumArt/") {
+        let rest = &items[art_at + "/AlbumArt/".len()..];
+        let art_id: i64 = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+        if art_id > 0 {
+            let (st, hdr, body) = raw_http(
+                http,
+                &format!("GET /AlbumArt/{art_id}-{id}.jpg HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"),
+            );
+            assert_eq!(st, 200, "album art GET {hdr}");
+            assert!(hdr.to_ascii_lowercase().contains("image/jpeg"));
+            assert!(body.len() >= 3 && body[0] == 0xff && body[1] == 0xd8);
+        }
+    }
+    let (st, _hdr, status_body) = raw_http(
+        http,
+        &format!("GET /status HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"),
+    );
+    assert_eq!(st, 200);
+    let status_txt = String::from_utf8_lossy(&status_body);
+    assert!(status_txt.contains("Video"), "{status_txt}");
+    assert!(
+        status_txt.contains("<td>1</td>")
+            || status_txt.contains("<td>2</td>")
+            || status_txt.contains("<td>3</td>")
+            || status_txt.contains("<td>4</td>")
+            || status_txt.chars().any(|c| c.is_ascii_digit() && c != '0'),
+        "status video count: {status_txt}"
+    );
 
     // CrKey remap DIDL
     let (_, cr) = soap(
@@ -267,6 +333,8 @@ fn one_run(http: u16, ssdp: u16) {
     assert!(last.contains("/rootDesc.xml"));
     assert!(last.contains("max-age=1800"));
 
+    sock.set_read_timeout(Some(Duration::from_millis(50))).ok();
+    while sock.recv_from(&mut buf).is_ok() {}
     let bad = "M-SEARCH * HTTP/1.1\r\nMAN: ssdp:discover\r\nMX: 1\r\nST: ssdp:all\r\n\r\n";
     sock.send_to(bad.as_bytes(), ("127.0.0.1", ssdp)).unwrap();
     sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
@@ -282,4 +350,46 @@ fn container_listen_twice() {
     };
     one_run(http, ssdp);
     one_run(http, ssdp);
+}
+
+#[test]
+fn ssdp_byebye_on_drop() {
+    let Some((http, ssdp)) = env_ports() else {
+        eprintln!("skip listen e2e (RUSTY_DLNA_HTTP_PORT unset)");
+        return;
+    };
+    // Distinct ports so this can run beside `container_listen_twice`.
+    let http = http.saturating_add(1);
+    let ssdp = ssdp.saturating_add(1);
+    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(http, ssdp));
+    let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sink.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    let sink_addr = sink.local_addr().unwrap();
+    let srv = spawn_bin_with_sink(http, ssdp, Some(sink_addr.to_string()));
+    drop(srv);
+    let mut buf = [0u8; 2048];
+    let mut got = 0;
+    let mut last = String::new();
+    let mut saw_byebye = false;
+    let mut saw_location = false;
+    while got < 12 {
+        match sink.recv_from(&mut buf) {
+            Ok((n, _)) => {
+                last = String::from_utf8_lossy(&buf[..n]).into_owned();
+                if last.contains("NTS:ssdp:byebye") {
+                    saw_byebye = true;
+                }
+                if last.contains("LOCATION") {
+                    saw_location = true;
+                }
+                got += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_byebye && got >= 6,
+        "byebye on drop: got={got} last={last}"
+    );
+    assert!(!saw_location, "byebye must omit LOCATION: {last}");
 }

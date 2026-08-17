@@ -196,6 +196,27 @@ pub fn msearch_replies(
         .collect()
 }
 
+/// Second NOTIFY-alive pass waits 150–250 ms (`replica.md` §1).
+pub const ALIVE_DUP_DELAY_MS: std::ops::RangeInclusive<u64> = 150..=250;
+
+/// M-SEARCH reply jitter: 13–30 ms for `ssdp:all`, 13–20 ms for a specific ST.
+pub fn msearch_jitter_ms_range(ssdp_all: bool) -> std::ops::RangeInclusive<u64> {
+    if ssdp_all {
+        13..=30
+    } else {
+        13..=20
+    }
+}
+
+pub fn jitter_ms(range: std::ops::RangeInclusive<u64>) -> u64 {
+    let span = range.end().saturating_sub(*range.start()).saturating_add(1);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    range.start() + (now % span)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,8 +258,24 @@ mod tests {
         let pkts = notify_byebye("uuid:x");
         assert_eq!(pkts.len(), 6);
         assert!(pkts.iter().all(|p| !p.contains("LOCATION")));
+        assert!(pkts.iter().all(|p| !p.contains("SERVER")));
+        assert!(pkts.iter().all(|p| !p.contains("CACHE-CONTROL")));
         assert!(pkts.iter().all(|p| p.contains("NTS:ssdp:byebye")));
         assert!(pkts[0].contains("HOST:239.255.255.250:1900"));
+    }
+
+    #[test]
+    fn jitter_ranges_match_replica() {
+        assert_eq!(*ALIVE_DUP_DELAY_MS.start(), 150);
+        assert_eq!(*ALIVE_DUP_DELAY_MS.end(), 250);
+        assert_eq!(msearch_jitter_ms_range(true), 13..=30);
+        assert_eq!(msearch_jitter_ms_range(false), 13..=20);
+        let all = jitter_ms(msearch_jitter_ms_range(true));
+        assert!((13..=30).contains(&all), "ssdp:all jitter {all}");
+        let one = jitter_ms(msearch_jitter_ms_range(false));
+        assert!((13..=20).contains(&one), "specific ST jitter {one}");
+        let dup = jitter_ms(ALIVE_DUP_DELAY_MS);
+        assert!((150..=250).contains(&dup), "alive dup delay {dup}");
     }
 
     #[test]

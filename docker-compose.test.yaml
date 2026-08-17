@@ -27,8 +27,11 @@ services:
       - sh
       - -c
       - |
-        if ! command -v ffmpeg >/dev/null 2>&1; then
-          apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg
+        if ! command -v ffmpeg >/dev/null 2>&1 || ! pkg-config --exists libavutil; then
+          apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            ffmpeg pkg-config clang \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev
         fi
         cargo test --workspace && cargo run -p rusty-dlna -- --check
     # cap_drop is extra insurance we are not a LAN advertiser

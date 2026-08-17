@@ -89,6 +89,16 @@ pub fn caption_default_url(host: &str, port: u16, detail_id: i64) -> String {
     format!("http://{host}:{port}{CAPTIONS_PREFIX}{detail_id}.srt")
 }
 
+/// `/AlbumArt/{artId}-{detailId}.jpg` — only the leading integer is `ALBUM_ART.ID`.
+pub fn album_art_id_from_path(path: &str) -> Option<i64> {
+    let rest = strip_query(path).strip_prefix(ALBUM_ART_PREFIX)?;
+    strtoll_prefix(rest)
+}
+
+pub fn album_art_url(host: &str, port: u16, art_id: i64, detail_id: i64) -> String {
+    format!("http://{host}:{port}{ALBUM_ART_PREFIX}{art_id}-{detail_id}.jpg")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +131,11 @@ mod tests {
         assert_eq!(caption_from_path("/Captions/9/1.srt"), Some((9, 1)));
         assert_eq!(caption_from_path("/Captions/9.srt"), Some((9, 0)));
         assert_eq!(transcode_id_from_path("/Transcode/12.mp4"), Some(12));
+        assert_eq!(album_art_id_from_path("/AlbumArt/7-3.jpg"), Some(7));
+        assert_eq!(album_art_id_from_path("/AlbumArt/042-1.jpg"), Some(42));
+        assert_eq!(
+            album_art_url("192.0.2.1", 18200, 3, 9),
+            "http://192.0.2.1:18200/AlbumArt/3-9.jpg"
+        );
     }
 }
