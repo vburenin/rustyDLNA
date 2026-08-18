@@ -1,5 +1,15 @@
-//! In-container listen tests. Bind only when RUSTY_DLNA_HTTP_PORT is set
-//! (compose sets 18200 / 11900). Host `cargo test` skips sockets.
+//! Live listen tests against a spawned `rusty-dlna` binary.
+//!
+//! Host / this environment:
+//! ```
+//! RUSTY_DLNA_HTTP_PORT=18200 RUSTY_DLNA_SSDP_PORT=11900 \
+//!   cargo test -p rusty-dlna --test listen_e2e -- --test-threads=1
+//! ```
+//! Tests offset from those ports so they can run together:
+//! `one_run` +0, byebye +1, series/remux +2, body-cap +3, dialect +4,
+//! remaining +5, kodi-platinum +6. Never bind live 8200/1900 (`isolation`).
+//!
+//! Unset env → skip (so host `cargo test` without sockets stays green).
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
@@ -1011,5 +1021,111 @@ fn replica_dialect_e2e() {
     assert!(
         ok && last_st == 200,
         "status after renderer NOTIFY must stay 200 for ~500ms: {last_st} {last_hdr}"
+    );
+}
+
+#[test]
+fn remaining_dialect_e2e() {
+    let Some((http, ssdp)) = env_ports() else {
+        eprintln!("skip remaining dialect e2e (RUSTY_DLNA_HTTP_PORT unset)");
+        return;
+    };
+    let http = http.saturating_add(5);
+    let ssdp = ssdp.saturating_add(5);
+    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(http, ssdp));
+    let _srv = spawn_bin(http, ssdp);
+    let items = wait_media_items(http, "Kodi/21.0", "2$8");
+    assert!(items.contains("Fixture Movie"), "{items}");
+
+    // Xbox Search: originals only (`@refID exists false`)
+    let (st, xbox) = soap(
+        http,
+        "Xbox/360",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Search",
+        r#"<u:Search xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ContainerID>0</ContainerID><SearchCriteria>upnp:class derivedfrom "object.item.videoItem" and @refID exists false</SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Search>"#,
+    );
+    assert_eq!(st, 200, "{xbox}");
+    assert!(xbox.contains("Fixture Movie"), "Xbox exists false: {xbox}");
+    assert!(!xbox.contains("refID="), "Xbox must drop aliases: {xbox}");
+
+    // OR across audio/video
+    let (st, or_xml) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Search",
+        r#"<u:Search xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ContainerID>0</ContainerID><SearchCriteria>(upnp:class derivedfrom "object.item.audioItem") or (upnp:class derivedfrom "object.item.videoItem")</SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Search>"#,
+    );
+    assert_eq!(st, 200, "{or_xml}");
+    assert!(or_xml.contains("Fixture Movie"), "{or_xml}");
+    assert!(or_xml.contains("Fixture Track"), "{or_xml}");
+
+    // Listed Filter without res@size omits size and <res>
+    let (st, filt) = soap(
+        http,
+        "Kodi/21.0",
+        "urn:schemas-upnp-org:service:ContentDirectory:1#Browse",
+        r#"<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>dc:title,upnp:class</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse>"#,
+    );
+    assert_eq!(st, 200, "{filt}");
+    assert!(filt.contains("Fixture Movie"), "{filt}");
+    assert!(!filt.contains(" size=&quot;") && !filt.contains(" size=\""), "{filt}");
+    assert!(!filt.contains("&lt;res ") && !filt.contains("<res "), "{filt}");
+
+    // SSDP ST leftover :10 must not reply
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(300))).ok();
+    let bad_st = "M-SEARCH * HTTP/1.1\r\nHOST:127.0.0.1:11900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: urn:schemas-upnp-org:service:ContentDirectory:10\r\n\r\n";
+    sock.send_to(bad_st.as_bytes(), ("127.0.0.1", ssdp))
+        .expect("send");
+    let mut buf = [0u8; 2048];
+    assert!(
+        sock.recv_from(&mut buf).is_err(),
+        "ContentDirectory:10 must not get an M-SEARCH reply"
+    );
+    let ok_st = "M-SEARCH * HTTP/1.1\r\nHOST:127.0.0.1:11900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: urn:schemas-upnp-org:service:ContentDirectory:1\r\n\r\n";
+    sock.send_to(ok_st.as_bytes(), ("127.0.0.1", ssdp))
+        .expect("send");
+    sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    let (n, _) = sock.recv_from(&mut buf).expect("CD:1 reply");
+    let reply = String::from_utf8_lossy(&buf[..n]);
+    assert!(reply.contains("HTTP/1.1 200 OK"), "{reply}");
+    assert!(reply.contains("ContentDirectory:1"), "{reply}");
+}
+
+/// Real Kodi/Platinum control-point walk (scripts/kodi_upnp_client.py).
+/// UA, Filter, page size 200, NPT date rules, and resource pick come from
+/// xbmc/xbmc lib/libUPnP — not a homemade User-Agent string.
+#[test]
+fn kodi_platinum_client_e2e() {
+    let Some((http, ssdp)) = env_ports() else {
+        eprintln!("skip kodi platinum e2e (RUSTY_DLNA_HTTP_PORT unset)");
+        return;
+    };
+    let http = http.saturating_add(6);
+    let ssdp = ssdp.saturating_add(6);
+    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(
+        http, ssdp
+    ));
+    let _srv = spawn_bin(http, ssdp);
+    let _ = wait_media_items(http, "UPnP/1.0 DLNADOC/1.50 Platinum/1.0.5.13", "2$8");
+    let script = workspace().join("scripts/kodi_upnp_client.py");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg("--http")
+        .arg(http.to_string())
+        .arg("--ssdp")
+        .arg(ssdp.to_string())
+        .output()
+        .expect("python3 kodi_upnp_client.py");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "Kodi/Platinum client failed status={:?}\n{stdout}{stderr}",
+        out.status
+    );
+    assert!(
+        stdout.contains("Kodi/Platinum walk OK"),
+        "{stdout}{stderr}"
     );
 }

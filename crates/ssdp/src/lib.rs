@@ -161,8 +161,8 @@ fn st_matches(known: &str, client_st: &str) -> bool {
     if !client_st.starts_with(known) {
         return false;
     }
-    let extra = &client_st[known.len()..];
-    extra.trim().is_empty() || extra.trim() == "1" || extra.starts_with('1')
+    let extra = client_st[known.len()..].trim();
+    extra.is_empty() || extra == "1"
 }
 
 /// Which `known_service_types` indices to reply with. `ssdp:all` → all six;
@@ -364,6 +364,17 @@ mod tests {
             1
         );
         assert!(msearch_reply_indices(uuid, "urn:foo:bar").is_empty());
+        let cd = "urn:schemas-upnp-org:service:ContentDirectory:1";
+        assert_eq!(msearch_reply_indices(uuid, cd).len(), 1);
+        assert!(
+            msearch_reply_indices(uuid, "urn:schemas-upnp-org:service:ContentDirectory:10")
+                .is_empty(),
+            "ST leftover must be version 1, not 10"
+        );
+        assert!(
+            msearch_reply_indices(uuid, "urn:schemas-upnp-org:service:ContentDirectory:1foo")
+                .is_empty()
+        );
         let replies = msearch_replies(
             uuid,
             "ssdp:all",

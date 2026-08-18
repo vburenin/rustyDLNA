@@ -15,6 +15,14 @@ pub struct FilterBits {
     pub pv: bool,
     /// `xmlns:dlna`.
     pub dlna_ns: bool,
+    /// Emit `<res>`. Empty/`*` or any `res` token.
+    pub res: bool,
+    pub res_size: bool,
+    pub res_duration: bool,
+    pub res_bitrate: bool,
+    pub res_resolution: bool,
+    pub res_sample: bool,
+    pub res_channels: bool,
 }
 
 impl FilterBits {
@@ -25,6 +33,13 @@ impl FilterBits {
             sec: false,
             pv: false,
             dlna_ns: false,
+            res: true,
+            res_size: true,
+            res_duration: true,
+            res_bitrate: true,
+            res_resolution: true,
+            res_sample: true,
+            res_channels: true,
         }
     }
 }
@@ -52,13 +67,28 @@ pub fn parse_filter(filter: Option<&str>, samsung: bool) -> FilterBits {
             sec: samsung,
             pv: false,
             dlna_ns: samsung,
+            res: true,
+            res_size: true,
+            res_duration: true,
+            res_bitrate: true,
+            res_resolution: true,
+            res_sample: true,
+            res_channels: true,
         };
     }
+    let has = |tok: &str| raw.contains(tok);
     FilterBits {
-        dc_date: raw.contains("dc:date"),
-        sec: raw.contains("sec:CaptionInfoEx") || raw.contains("sec:dcmInfo"),
-        pv: raw.contains("pv:subtitleFileType") || raw.contains("pv:subtitleFileUri"),
-        dlna_ns: raw.contains("dlna") || samsung,
+        dc_date: has("dc:date"),
+        sec: has("sec:CaptionInfoEx") || has("sec:dcmInfo"),
+        pv: has("pv:subtitleFileType") || has("pv:subtitleFileUri"),
+        dlna_ns: has("dlna") || samsung,
+        res: has("res"),
+        res_size: has("res@size"),
+        res_duration: has("res@duration"),
+        res_bitrate: has("res@bitrate"),
+        res_resolution: has("res@resolution"),
+        res_sample: has("res@sampleFrequency"),
+        res_channels: has("res@nrAudioChannels"),
     }
 }
 
@@ -132,11 +162,19 @@ mod tests {
 
     #[test]
     fn xmlns_order_is_dlna_then_pv_then_sec() {
+        let listed = parse_filter(Some("dc:title,upnp:class"), false);
+        assert!(!listed.res && !listed.res_size && !listed.dc_date);
+        let res_only = parse_filter(Some("res"), false);
+        assert!(res_only.res && !res_only.res_size);
+        let sized = parse_filter(Some("res,res@size"), false);
+        assert!(sized.res && sized.res_size);
+
         let xmlns = didl_xmlns(&FilterBits {
             dc_date: true,
             sec: true,
             pv: true,
             dlna_ns: true,
+            ..FilterBits::standard()
         });
         let dlna = xmlns.find("xmlns:dlna=").unwrap();
         let pv = xmlns.find("xmlns:pv=").unwrap();

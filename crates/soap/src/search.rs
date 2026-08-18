@@ -6,10 +6,18 @@ pub enum SearchClause {
     Contains { prop: SearchProp, needle: String },
     Equals { prop: SearchProp, value: String },
     DerivedFrom { prop: SearchProp, prefix: String },
+    /// MiniDLNA `exists true/false` → IS NOT NULL / IS NULL.
+    Exists { prop: SearchProp, want: bool },
     /// Parsed but not a known property — never matches.
     Unknown,
     /// Empty / `*` / missing → every row in scope.
     All,
+}
+
+/// OR of AND-groups. SQL-style: `and` binds tighter than `or`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchQuery {
+    pub groups: Vec<Vec<SearchClause>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,42 +51,44 @@ pub struct SearchRow<'a> {
     pub is_container: bool,
 }
 
-/// Parse MiniDLNA-style SearchCriteria. AND of clauses (spaces / `and`);
-/// `or` is accepted as a separator but still evaluated as a list of
-/// clauses — callers use [`row_matches`] which requires every
-/// non-`All` clause to match (AND). Empty/`*`/missing → [`SearchClause::All`].
-pub fn parse_search_criteria(raw: Option<&str>) -> Vec<SearchClause> {
+/// Parse MiniDLNA-style SearchCriteria. `and` / `or` with SQL precedence
+/// (`and` tighter). Empty/`*`/`1=1` → one `All` group.
+pub fn parse_search_criteria(raw: Option<&str>) -> SearchQuery {
     let s = raw.map(str::trim).unwrap_or("");
     if s.is_empty() || s == "*" || s == "1=1" {
-        return vec![SearchClause::All];
+        return SearchQuery {
+            groups: vec![vec![SearchClause::All]],
+        };
     }
-    let mut out = Vec::new();
-    for piece in split_clauses(s) {
-        out.push(parse_clause(piece));
+    let mut groups = Vec::new();
+    for or_piece in split_on(s, " or ") {
+        let ands: Vec<SearchClause> = split_on(or_piece, " and ")
+            .into_iter()
+            .map(parse_clause)
+            .collect();
+        if !ands.is_empty() {
+            groups.push(ands);
+        }
     }
-    if out.is_empty() {
-        vec![SearchClause::All]
+    if groups.is_empty() {
+        SearchQuery {
+            groups: vec![vec![SearchClause::All]],
+        }
     } else {
-        out
+        SearchQuery { groups }
     }
 }
 
-fn split_clauses(s: &str) -> Vec<&str> {
+fn split_on<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
     let lower = s.to_ascii_lowercase();
+    let sep_l = sep.to_ascii_lowercase();
     let mut parts = Vec::new();
     let mut start = 0;
-    let bytes = s.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if i + 5 <= bytes.len() && lower[i..].starts_with(" and ") {
+    while i + sep_l.len() <= s.len() {
+        if lower[i..].starts_with(&sep_l) {
             parts.push(s[start..i].trim());
-            i += 5;
-            start = i;
-            continue;
-        }
-        if i + 4 <= bytes.len() && lower[i..].starts_with(" or ") {
-            parts.push(s[start..i].trim());
-            i += 4;
+            i += sep_l.len();
             start = i;
             continue;
         }
@@ -99,6 +109,9 @@ fn parse_clause(raw: &str) -> SearchClause {
     if let Some(clause) = parse_op(s, " derivedfrom ") {
         return clause;
     }
+    if let Some(clause) = parse_exists(s) {
+        return clause;
+    }
     if let Some(clause) = parse_op(s, " = ") {
         return clause;
     }
@@ -109,6 +122,21 @@ fn parse_clause(raw: &str) -> SearchClause {
         }
     }
     SearchClause::Unknown
+}
+
+fn parse_exists(s: &str) -> Option<SearchClause> {
+    let lower = s.to_ascii_lowercase();
+    let idx = lower.find(" exists")?;
+    let prop = parse_prop(s[..idx].trim())?;
+    let rest = s[idx + " exists".len()..].trim().to_ascii_lowercase();
+    let want = if rest.starts_with("true") {
+        true
+    } else if rest.starts_with("false") {
+        false
+    } else {
+        return Some(SearchClause::Unknown);
+    };
+    Some(SearchClause::Exists { prop, want })
 }
 
 fn parse_op(s: &str, op: &str) -> Option<SearchClause> {
@@ -195,6 +223,10 @@ pub fn clause_matches(clause: &SearchClause, row: &SearchRow<'_>) -> bool {
             let hay = field(row, *prop);
             class_derivedfrom(hay, prefix)
         }
+        SearchClause::Exists { prop, want } => {
+            let present = !field(row, *prop).is_empty();
+            present == *want
+        }
     }
 }
 
@@ -215,8 +247,11 @@ fn class_derivedfrom(hay: &str, prefix: &str) -> bool {
     hay_full == pre || hay_full.starts_with(&format!("{pre}."))
 }
 
-pub fn row_matches(clauses: &[SearchClause], row: &SearchRow<'_>) -> bool {
-    clauses.iter().all(|c| clause_matches(c, row))
+pub fn row_matches(query: &SearchQuery, row: &SearchRow<'_>) -> bool {
+    query
+        .groups
+        .iter()
+        .any(|ands| ands.iter().all(|c| clause_matches(c, row)))
 }
 
 #[cfg(test)]
@@ -273,5 +308,45 @@ mod tests {
         let contains_c =
             parse_search_criteria(Some(r#"upnp:class contains "object.container""#));
         assert!(row_matches(&contains_c, &folder("Video")));
+    }
+
+    #[test]
+    fn xbox_exists_false_skips_aliases() {
+        let q = parse_search_criteria(Some(
+            r#"upnp:class derivedfrom "object.item.videoItem" and @refID exists false"#,
+        ));
+        let original = SearchRow {
+            title: "Fixture Movie",
+            class: "item.videoItem",
+            ref_id: None,
+            ..SearchRow::default()
+        };
+        let alias = SearchRow {
+            title: "Fixture Movie",
+            class: "item.videoItem",
+            ref_id: Some("64$ABC"),
+            ..SearchRow::default()
+        };
+        assert!(row_matches(&q, &original));
+        assert!(!row_matches(&q, &alias));
+        let want = parse_search_criteria(Some(r#"@refID exists true"#));
+        assert!(row_matches(&want, &alias));
+        assert!(!row_matches(&want, &original));
+    }
+
+    #[test]
+    fn or_is_not_and() {
+        let q = parse_search_criteria(Some(
+            r#"(upnp:class derivedfrom "object.item.videoItem") or (upnp:class derivedfrom "object.item.audioItem")"#,
+        ));
+        assert_eq!(q.groups.len(), 2, "{q:?}");
+        assert!(row_matches(&q, &video("a")));
+        let audio = SearchRow {
+            title: "song",
+            class: "item.audioItem.musicTrack",
+            ..SearchRow::default()
+        };
+        assert!(row_matches(&q, &audio));
+        assert!(!row_matches(&q, &folder("Video")));
     }
 }

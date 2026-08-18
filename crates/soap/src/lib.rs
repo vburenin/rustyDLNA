@@ -17,7 +17,9 @@ use rusty_dlna_protocol::w3c_normalize_date;
 use rusty_dlna_protocol::{ClientFlags, ClientKind, ClientProfile};
 
 pub use filter::{didl_xmlns, parse_filter, FilterBits};
-pub use search::{parse_search_criteria, row_matches, SearchClause, SearchRow};
+pub use search::{
+    parse_search_criteria, row_matches, SearchClause, SearchQuery, SearchRow,
+};
 pub use sort::{default_order, parse_sort_criteria, sort_or_709, DefaultOrder, SortKey, SortSpec};
 
 pub fn xml_escape(s: &str) -> String {
@@ -362,26 +364,41 @@ pub fn emit_didl_object(o: &DidlObject, bits: &FilterBits) -> String {
             s.push_str(&format!("<upnp:playbackCount>{n}</upnp:playbackCount>"));
         }
         for r in &o.resources {
+            if !bits.res && !bits.pv {
+                continue;
+            }
             s.push_str("<res protocolInfo=\"");
             s.push_str(&xml_escape(&r.protocol_info));
             s.push('"');
-            if let Some(sz) = r.size {
-                s.push_str(&format!(" size=\"{sz}\""));
+            if bits.res_size {
+                if let Some(sz) = r.size {
+                    s.push_str(&format!(" size=\"{sz}\""));
+                }
             }
-            if let Some(d) = &r.duration {
-                s.push_str(&format!(" duration=\"{}\"", xml_escape(d)));
+            if bits.res_duration {
+                if let Some(d) = &r.duration {
+                    s.push_str(&format!(" duration=\"{}\"", xml_escape(d)));
+                }
             }
-            if let Some(b) = r.bitrate {
-                s.push_str(&format!(" bitrate=\"{b}\""));
+            if bits.res_bitrate {
+                if let Some(b) = r.bitrate {
+                    s.push_str(&format!(" bitrate=\"{b}\""));
+                }
             }
-            if let Some(sf) = r.sample_frequency {
-                s.push_str(&format!(" sampleFrequency=\"{sf}\""));
+            if bits.res_sample {
+                if let Some(sf) = r.sample_frequency {
+                    s.push_str(&format!(" sampleFrequency=\"{sf}\""));
+                }
             }
-            if let Some(ch) = r.nr_audio_channels {
-                s.push_str(&format!(" nrAudioChannels=\"{ch}\""));
+            if bits.res_channels {
+                if let Some(ch) = r.nr_audio_channels {
+                    s.push_str(&format!(" nrAudioChannels=\"{ch}\""));
+                }
             }
-            if let Some(res) = &r.resolution {
-                s.push_str(&format!(" resolution=\"{}\"", xml_escape(res)));
+            if bits.res_resolution {
+                if let Some(res) = &r.resolution {
+                    s.push_str(&format!(" resolution=\"{}\"", xml_escape(res)));
+                }
             }
             if bits.pv {
                 if let Some(t) = &r.pv_subtitle_type {

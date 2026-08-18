@@ -4533,6 +4533,59 @@ audio_out = "to-aac"
     }
 
     #[test]
+    fn search_xbox_exists_false_skips_refid_aliases() {
+        let app = testdata_app();
+        let xbox = "Xbox/360";
+        let (st, xml) = soap_action(
+            &app,
+            "Search",
+            r#"<ContainerID>0</ContainerID><SearchCriteria>upnp:class derivedfrom "object.item.videoItem" and @refID exists false</SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>"#,
+            xbox,
+        );
+        assert_eq!(st, 200, "{xml}");
+        assert!(
+            xml.contains("Fixture Movie"),
+            "Xbox exists false must still find the original: {xml}"
+        );
+        assert!(
+            !xml.contains("refID="),
+            "Xbox exists false must omit alias rows: {xml}"
+        );
+    }
+
+    #[test]
+    fn search_or_matches_either_class() {
+        let app = testdata_app();
+        let (st, xml) = soap_action(
+            &app,
+            "Search",
+            r#"<ContainerID>0</ContainerID><SearchCriteria>(upnp:class derivedfrom "object.item.audioItem") or (upnp:class derivedfrom "object.item.videoItem")</SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>"#,
+            "Kodi/21.0",
+        );
+        assert_eq!(st, 200, "{xml}");
+        assert!(xml.contains("Fixture Movie"), "or must hit video: {xml}");
+        assert!(xml.contains("Fixture Track"), "or must hit audio: {xml}");
+    }
+
+    #[test]
+    fn browse_listed_filter_omits_res_size() {
+        let app = testdata_app();
+        let (st, xml) = soap_action(
+            &app,
+            "Browse",
+            r#"<ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>dc:title,upnp:class</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>"#,
+            "Kodi/21.0",
+        );
+        assert_eq!(st, 200, "{xml}");
+        assert!(xml.contains("Fixture Movie"), "{xml}");
+        assert!(!xml.contains(" size=&quot;") && !xml.contains(" size=\""), "Filter without res@size: {xml}");
+        assert!(!xml.contains("&lt;res ") && !xml.contains("<res "), "Filter without res: {xml}");
+        let (st, star) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
+        assert_eq!(st, 200);
+        assert!(star.contains("size=&quot;") || star.contains("size=\""), "{star}");
+    }
+
+    #[test]
     fn browse_recent_keeps_mtime_order() {
         let app = testdata_app();
         {

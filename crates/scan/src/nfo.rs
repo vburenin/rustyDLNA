@@ -192,6 +192,17 @@ fn read_nfo_text(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+fn unescape_nfo(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 fn first_tag(text: &str, tag: &str) -> Option<String> {
     all_tags(text, tag).into_iter().next()
 }
@@ -210,9 +221,9 @@ fn all_tags(text: &str, tag: &str) -> Vec<String> {
         let Some(end) = after.find(&close) else {
             break;
         };
-        let raw = after[..end].trim();
+        let raw = unescape_nfo(after[..end].trim());
         if !raw.is_empty() {
-            out.push(raw.to_string());
+            out.push(raw);
         }
         rest = &after[end + close.len()..];
     }
@@ -245,5 +256,16 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(aa), Ok(bb)) => aa == bb,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nfo_unescapes_xml_entities() {
+        let m = parse_nfo_text("<movie><title>Foo &amp; Bar</title></movie>");
+        assert_eq!(m.title.as_deref(), Some("Foo & Bar"));
     }
 }

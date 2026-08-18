@@ -390,6 +390,7 @@ fn attach_video_virtuals(db: &LibraryDb, detail: i64, class: &str, browse_oid: &
     let title = title.unwrap_or_default();
     let _ = db.delete_detail_under_root(detail, VIDEO_SERIES_ID);
     let _ = db.delete_detail_under_root(detail, VIDEO_GENRE_ID);
+    let _ = db.delete_detail_under_root(detail, VIDEO_ACTOR_ID);
     if let Some(show) = album.as_deref().filter(|s| !s.is_empty()) {
         let show_id = find_or_create_container(
             db,
