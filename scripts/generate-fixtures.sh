@@ -47,7 +47,8 @@ COMMON='-nostdin -hide_banner -loglevel error -y -fflags +bitexact'
     -c:a aac -b:a 32k -movflags +faststart -metadata title='Tagged MP4 Fixture' \
     "$ROOT/testdata/library/video/tagged.mp4"
 
-cp "$ROOT/testdata/library/video/movie.mkv" "$ROOT/testdata/library/video/dvp7.mkv"
+"$ROOT/scripts/generate-dolby-vision-fixture.sh" \
+    "$ROOT/testdata/library/video/dvp7.mkv"
 cp "$ROOT/testdata/library/video/movie.mkv" \
     "$ROOT/testdata/library/video/Movie.2024.2160p.UHD.BDRemux.HDR.DV.HEVC.mkv"
 

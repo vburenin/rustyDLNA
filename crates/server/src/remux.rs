@@ -22,26 +22,91 @@ use crate::App;
 const FIRST_BYTES: u64 = 16 * 1024;
 const FIRST_WAIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(50);
+const CHILD_TERM_GRACE: Duration = Duration::from_millis(200);
 
-#[derive(Debug, Default)]
+fn terminate_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: every child using this helper is placed in a fresh process
+        // group before spawn, so the negative PID cannot target the daemon.
+        libc::kill(-(child.id() as i32), libc::SIGTERM);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let deadline = Instant::now() + CHILD_TERM_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                return;
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => break,
+        }
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[derive(Debug)]
 pub(crate) struct RemuxMetrics {
     completed: AtomicU64,
     failed: AtomicU64,
     cancelled: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    coalesced_requests: AtomicU64,
+    cache_maintenance: AtomicU64,
+    cache_maintenance_failures: AtomicU64,
+    cache_evicted_files: AtomicU64,
+    cache_evicted_bytes: AtomicU64,
+    cache_bytes: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RemuxStatus {
+    pub supervisor_ready: bool,
     pub active: usize,
     pub queued: usize,
     pub completed_total: u64,
     pub failed_total: u64,
     pub cancelled_total: u64,
+    pub cache_hits_total: u64,
+    pub cache_misses_total: u64,
+    pub coalesced_requests_total: u64,
+    pub cache_maintenance_total: u64,
+    pub cache_maintenance_failures_total: u64,
+    pub cache_evicted_files_total: u64,
+    pub cache_evicted_bytes_total: u64,
     pub cache_bytes: u64,
     pub oldest_job_secs: u64,
 }
 
 impl RemuxMetrics {
+    pub(crate) fn new(cache_bytes: u64) -> Self {
+        Self {
+            completed: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            cancelled: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            coalesced_requests: AtomicU64::new(0),
+            cache_maintenance: AtomicU64::new(0),
+            cache_maintenance_failures: AtomicU64::new(0),
+            cache_evicted_files: AtomicU64::new(0),
+            cache_evicted_bytes: AtomicU64::new(0),
+            cache_bytes: AtomicU64::new(cache_bytes),
+        }
+    }
+
     fn record(&self, state: &RemuxState) {
         match state {
             RemuxState::Complete => self.completed.fetch_add(1, Ordering::Relaxed),
@@ -49,6 +114,12 @@ impl RemuxMetrics {
             RemuxState::Cancelled => self.cancelled.fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
+    }
+}
+
+impl Default for RemuxMetrics {
+    fn default() -> Self {
+        Self::new(0)
     }
 }
 
@@ -182,7 +253,7 @@ fn spawn_ffmpeg(
                             finish_job(&app, &spec.job_key, &job);
                             return;
                         }
-                        finalize_remux(&job, id, &dest, &part, verify_timeout, true);
+                        finalize_remux(&app, &job, id, &dest, &part, verify_timeout, true);
                         reject_completed_cache_over_limit(&app, &job, &dest);
                         if job.is_complete() {
                             if let Err(error) =
@@ -224,6 +295,7 @@ fn spawn_ffmpeg(
                             .is_some_and(|name| name == "ffmpeg")
                     });
                     finalize_remux(
+                        &app,
                         &job,
                         id,
                         &dest,
@@ -286,6 +358,11 @@ fn run_ffmpeg_growing(
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
     command.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     if let Some(source) = source_file {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
@@ -335,21 +412,18 @@ fn run_ffmpeg_growing(
     let mut next_cache_check = Instant::now();
     let status = loop {
         if job.cancelled.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_process_group(&mut child);
             let _ = stderr_reader.join();
             return Err("cancelled".into());
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_process_group(&mut child);
             let _ = stderr_reader.join();
             return Err("transcode runtime exceeded configured deadline".into());
         }
         if Instant::now() >= next_cache_check {
             if let Err(error) = enforce_active_cache_limits(app) {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_group(&mut child);
                 let _ = stderr_reader.join();
                 return Err(format!("transcode cache limits: {error}"));
             }
@@ -359,8 +433,7 @@ fn run_ffmpeg_growing(
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_group(&mut child);
                 return Err(format!("wait {}: {error}", executable.to_string_lossy()));
             }
         }
@@ -401,6 +474,7 @@ fn finish_job(app: &App, key: &str, job: &Arc<RemuxJob>) {
 }
 
 fn finalize_remux(
+    app: &App,
     job: &RemuxJob,
     id: i64,
     dest: &Path,
@@ -432,6 +506,9 @@ fn finalize_remux(
         return;
     }
     tracing::info!(id, dest = %dest.display(), bytes = n, "remux job done");
+    app.remux_metrics
+        .cache_bytes
+        .fetch_add(n, Ordering::Relaxed);
     job.transition(RemuxState::Complete);
 }
 
@@ -457,6 +534,11 @@ fn verify_finished_output(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     let stderr = child.stderr.take();
     let diagnostics = std::thread::spawn(move || {
@@ -469,14 +551,12 @@ fn verify_finished_output(
     let deadline = Instant::now() + timeout;
     let status = loop {
         if cancelled.load(Ordering::Acquire) {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_process_group(&mut child);
             let _ = diagnostics.join();
             return Err("cancelled".into());
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_process_group(&mut child);
             let _ = diagnostics.join();
             return Err("ffprobe verification timed out".into());
         }
@@ -484,8 +564,7 @@ fn verify_finished_output(
             Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_group(&mut child);
                 let _ = diagnostics.join();
                 return Err(error.to_string());
             }
@@ -514,7 +593,12 @@ fn reject_completed_cache_over_limit(app: &App, job: &RemuxJob, dest: &Path) {
         return;
     }
     if let Err(error) = enforce_active_cache_limits(app) {
-        let _ = std::fs::remove_file(dest);
+        let bytes = dest.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        if std::fs::remove_file(dest).is_ok() {
+            app.remux_metrics
+                .cache_bytes
+                .fetch_sub(bytes, Ordering::Relaxed);
+        }
         let _ = std::fs::remove_file(rusty_dlna_transcode::cache_stamp_path(dest));
         job.transition(RemuxState::Failed(format!(
             "completed transcode exceeds cache limits: {error}"
@@ -543,16 +627,10 @@ pub fn attach(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String
         .values()
         .flat_map(|job| [job.dest.clone(), job.part.clone()])
         .collect::<HashSet<_>>();
-    maintain_transcode_cache(
-        &app.cache_dir,
-        app.cfg.transcode.cache_max_mb.saturating_mul(1024 * 1024),
-        app.cfg.transcode.cache_max_age_days,
-        app.cfg.cache_min_free_mb.saturating_mul(1024 * 1024),
-        &protected,
-        false,
-    )
-    .map_err(|error| format!("transcode cache limits: {error}"))?;
+    maintain_app_cache(&app, &protected, false)
+        .map_err(|error| format!("transcode cache limits: {error}"))?;
     if cache_is_fresh_for_key(&spec.dest, &spec.cache_key) {
+        app.remux_metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
         return Ok(Arc::new(RemuxJob {
             dest: spec.dest.clone(),
             part: cache_part(&spec.dest),
@@ -565,6 +643,9 @@ pub fn attach(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String
     }
     if let Some(job) = map.get(&spec.job_key) {
         if job.err().is_none() {
+            app.remux_metrics
+                .coalesced_requests
+                .fetch_add(1, Ordering::Relaxed);
             tracing::info!(id = spec.detail_id, dest = %spec.dest.display(), "remux attach");
             return Ok(job.clone());
         }
@@ -576,10 +657,19 @@ pub fn attach(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String
             dest = %spec.dest.display(),
             "stale remux cache, rebuilding"
         );
-        let _ = std::fs::remove_file(&spec.dest);
+        if let Ok(metadata) = spec.dest.metadata() {
+            if std::fs::remove_file(&spec.dest).is_ok() {
+                app.remux_metrics
+                    .cache_bytes
+                    .fetch_sub(metadata.len(), Ordering::Relaxed);
+            }
+        }
         let _ = std::fs::remove_file(cache_part(&spec.dest));
         let _ = std::fs::remove_file(rusty_dlna_transcode::cache_stamp_path(&spec.dest));
     }
+    app.remux_metrics
+        .cache_misses
+        .fetch_add(1, Ordering::Relaxed);
     let helper_permit = app
         .helpers
         .try_acquire()
@@ -641,19 +731,28 @@ fn generated_intermediate(path: &Path) -> bool {
     false
 }
 
-pub(crate) fn maintain_transcode_cache(
+#[derive(Clone, Copy, Debug, Default)]
+struct CacheMaintenance {
+    bytes: u64,
+    evicted_files: u64,
+    evicted_bytes: u64,
+}
+
+fn maintain_transcode_cache_report(
     directory: &Path,
     quota_bytes: u64,
     max_age_days: u32,
     minimum_free_bytes: u64,
     protected: &HashSet<PathBuf>,
     startup: bool,
-) -> std::io::Result<u64> {
+) -> std::io::Result<CacheMaintenance> {
     std::fs::create_dir_all(directory)?;
     let now = std::time::SystemTime::now();
     let max_age = Duration::from_secs(u64::from(max_age_days).saturating_mul(86_400));
     let mut finished = Vec::new();
     let mut total = 0u64;
+    let mut evicted_files = 0u64;
+    let mut evicted_bytes = 0u64;
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
@@ -663,7 +762,12 @@ pub(crate) fn maintain_transcode_cache(
         };
         if generated_intermediate(&path) {
             if startup && !protected.contains(&path) {
-                let _ = std::fs::remove_file(&path);
+                if std::fs::remove_file(&path).is_ok() {
+                    evicted_files = evicted_files.saturating_add(1);
+                    evicted_bytes = evicted_bytes.saturating_add(metadata.len());
+                } else {
+                    total = total.saturating_add(metadata.len());
+                }
             } else {
                 total = total.saturating_add(metadata.len());
             }
@@ -674,9 +778,13 @@ pub(crate) fn maintain_transcode_cache(
         }
         total = total.saturating_add(metadata.len());
         let used = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-        if !protected.contains(&path) && now.duration_since(used).unwrap_or_default() > max_age {
+        if !protected.contains(&path)
+            && now.duration_since(used).unwrap_or_default() > max_age
+            && std::fs::remove_file(&path).is_ok()
+        {
             total = total.saturating_sub(metadata.len());
-            let _ = std::fs::remove_file(&path);
+            evicted_files = evicted_files.saturating_add(1);
+            evicted_bytes = evicted_bytes.saturating_add(metadata.len());
             let _ = std::fs::remove_file(rusty_dlna_transcode::cache_stamp_path(&path));
             continue;
         }
@@ -697,6 +805,8 @@ pub(crate) fn maintain_transcode_cache(
             let _ = std::fs::remove_file(rusty_dlna_transcode::cache_stamp_path(&path));
             reclaim = reclaim.saturating_sub(bytes);
             total = total.saturating_sub(bytes);
+            evicted_files = evicted_files.saturating_add(1);
+            evicted_bytes = evicted_bytes.saturating_add(bytes);
         }
     }
     if reclaim > 0 {
@@ -704,7 +814,67 @@ pub(crate) fn maintain_transcode_cache(
             "quota or minimum-free-space target cannot be satisfied",
         ));
     }
-    Ok(total)
+    Ok(CacheMaintenance {
+        bytes: total,
+        evicted_files,
+        evicted_bytes,
+    })
+}
+
+pub(crate) fn maintain_transcode_cache(
+    directory: &Path,
+    quota_bytes: u64,
+    max_age_days: u32,
+    minimum_free_bytes: u64,
+    protected: &HashSet<PathBuf>,
+    startup: bool,
+) -> std::io::Result<u64> {
+    maintain_transcode_cache_report(
+        directory,
+        quota_bytes,
+        max_age_days,
+        minimum_free_bytes,
+        protected,
+        startup,
+    )
+    .map(|report| report.bytes)
+}
+
+fn maintain_app_cache(
+    app: &App,
+    protected: &HashSet<PathBuf>,
+    startup: bool,
+) -> std::io::Result<u64> {
+    app.remux_metrics
+        .cache_maintenance
+        .fetch_add(1, Ordering::Relaxed);
+    match maintain_transcode_cache_report(
+        &app.cache_dir,
+        app.cfg.transcode.cache_max_mb.saturating_mul(1024 * 1024),
+        app.cfg.transcode.cache_max_age_days,
+        app.cfg.cache_min_free_mb.saturating_mul(1024 * 1024),
+        protected,
+        startup,
+    ) {
+        Ok(report) => {
+            app.remux_metrics
+                .cache_bytes
+                .store(report.bytes, Ordering::Relaxed);
+            app.remux_metrics
+                .cache_evicted_files
+                .fetch_add(report.evicted_files, Ordering::Relaxed);
+            app.remux_metrics
+                .cache_evicted_bytes
+                .fetch_add(report.evicted_bytes, Ordering::Relaxed);
+            Ok(report.bytes)
+        }
+        Err(error) => {
+            app.remux_metrics
+                .cache_maintenance_failures
+                .fetch_add(1, Ordering::Relaxed);
+            Err(error)
+        }
+    }
 }
 
 fn enforce_active_cache_limits(app: &App) -> std::io::Result<u64> {
@@ -717,14 +887,7 @@ fn enforce_active_cache_limits(app: &App) -> std::io::Result<u64> {
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default();
-    maintain_transcode_cache(
-        &app.cache_dir,
-        app.cfg.transcode.cache_max_mb.saturating_mul(1024 * 1024),
-        app.cfg.transcode.cache_max_age_days,
-        app.cfg.cache_min_free_mb.saturating_mul(1024 * 1024),
-        &protected,
-        false,
-    )
+    maintain_app_cache(app, &protected, false)
 }
 
 pub async fn wait_ready(job: &RemuxJob) -> Result<PathBuf, String> {
@@ -861,10 +1024,8 @@ pub(crate) async fn wait_for_shutdown(app: &App, timeout: Duration) {
 }
 
 pub(crate) fn runtime_status(app: &App) -> RemuxStatus {
-    let (active, queued, oldest_job_secs) = app
-        .remuxes
-        .lock()
-        .map(|jobs| {
+    let (supervisor_ready, active, queued, oldest_job_secs) = match app.remuxes.lock() {
+        Ok(jobs) => {
             let mut active = 0usize;
             let mut queued = 0usize;
             let mut oldest = 0u64;
@@ -876,24 +1037,34 @@ pub(crate) fn runtime_status(app: &App) -> RemuxStatus {
                 }
                 oldest = oldest.max(job.started.elapsed().as_secs());
             }
-            (active, queued, oldest)
-        })
-        .unwrap_or_default();
-    let cache_bytes = std::fs::read_dir(&app.cache_dir)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter(|entry| generated_cache_mp4(&entry.path()) || generated_intermediate(&entry.path()))
-        .filter_map(|entry| entry.metadata().ok().map(|metadata| metadata.len()))
-        .fold(0u64, u64::saturating_add);
+            (true, active, queued, oldest)
+        }
+        Err(_) => (false, 0, 0, 0),
+    };
     RemuxStatus {
+        supervisor_ready,
         active,
         queued,
         completed_total: app.remux_metrics.completed.load(Ordering::Relaxed),
         failed_total: app.remux_metrics.failed.load(Ordering::Relaxed),
         cancelled_total: app.remux_metrics.cancelled.load(Ordering::Relaxed),
-        cache_bytes,
+        cache_hits_total: app.remux_metrics.cache_hits.load(Ordering::Relaxed),
+        cache_misses_total: app.remux_metrics.cache_misses.load(Ordering::Relaxed),
+        coalesced_requests_total: app.remux_metrics.coalesced_requests.load(Ordering::Relaxed),
+        cache_maintenance_total: app.remux_metrics.cache_maintenance.load(Ordering::Relaxed),
+        cache_maintenance_failures_total: app
+            .remux_metrics
+            .cache_maintenance_failures
+            .load(Ordering::Relaxed),
+        cache_evicted_files_total: app
+            .remux_metrics
+            .cache_evicted_files
+            .load(Ordering::Relaxed),
+        cache_evicted_bytes_total: app
+            .remux_metrics
+            .cache_evicted_bytes
+            .load(Ordering::Relaxed),
+        cache_bytes: app.remux_metrics.cache_bytes.load(Ordering::Relaxed),
         oldest_job_secs,
     }
 }
@@ -1347,10 +1518,16 @@ mod tests {
                 part.display().to_string(),
             ],
         );
+        let cached_success = success.clone();
         let success_job = attach(app.clone(), success).unwrap();
         wait_for_terminal_cleanup(&app, &success_job);
         assert_eq!(success_job.state(), RemuxState::Complete);
         assert!(dest.is_file());
+        let cached_job = attach(app.clone(), cached_success).unwrap();
+        assert_eq!(cached_job.state(), RemuxState::Complete);
+        let cache_metrics = runtime_status(&app);
+        assert_eq!(cache_metrics.cache_hits_total, 1);
+        assert_eq!(cache_metrics.cache_misses_total, 1);
 
         let failure = job_spec(
             &dir,
@@ -1388,6 +1565,11 @@ mod tests {
         wait_for_terminal_cleanup(&app, &first_job);
         // Both one-second commands normally finish in the same monitor tick.
         wait_for_terminal_cleanup(&app, &second_job);
+        let metrics = runtime_status(&app);
+        assert_eq!(metrics.cache_misses_total, 2);
+        assert_eq!(metrics.coalesced_requests_total, 1);
+        assert_eq!(metrics.cache_hits_total, 0);
+        assert!(metrics.cache_maintenance_total >= 3);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1579,6 +1761,47 @@ mod tests {
         maintain_transcode_cache(&dir, 900, 36_500, 0, &HashSet::new(), true).unwrap();
         assert!(!stale_part.exists());
         assert!(!old.exists(), "oldest completed output is LRU victim");
+        assert!(new.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cache_maintenance_metrics_count_evictions_and_bytes() {
+        let dir = temp_dir("cache-metrics");
+        let app = Arc::new(App::from_config(
+            crate::Config {
+                cache_dir: Some(dir.display().to_string()),
+                transcode: crate::TranscodeCfg {
+                    enable: true,
+                    cache_max_mb: 1,
+                    ..crate::TranscodeCfg::default()
+                },
+                rescan_secs: 0,
+                ..crate::Config::default()
+            },
+            18200,
+            11900,
+            &dir,
+        ));
+        let old = dir.join(format!("1-hdr10-{}.mp4", "a".repeat(40)));
+        let new = dir.join(format!("2-remux-{}.mp4", "b".repeat(40)));
+        std::fs::write(&old, vec![1u8; 800_000]).unwrap();
+        std::fs::write(&new, vec![2u8; 800_000]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(10))
+            .unwrap();
+
+        maintain_app_cache(&app, &HashSet::new(), false).unwrap();
+        let metrics = runtime_status(&app);
+        assert_eq!(metrics.cache_maintenance_total, 1);
+        assert_eq!(metrics.cache_maintenance_failures_total, 0);
+        assert_eq!(metrics.cache_evicted_files_total, 1);
+        assert_eq!(metrics.cache_evicted_bytes_total, 800_000);
+        assert_eq!(metrics.cache_bytes, 800_000);
+        assert!(!old.exists());
         assert!(new.exists());
         let _ = std::fs::remove_dir_all(dir);
     }

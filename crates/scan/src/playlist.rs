@@ -25,7 +25,7 @@ struct DesiredPlaylist {
     detail_ids: Vec<i64>,
 }
 
-fn is_playlist(path: &Path) -> bool {
+pub(crate) fn is_playlist(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
         .is_some_and(|extension| {

@@ -14,5 +14,5 @@ inotify = "0.11"
 libc = "0.2"
 ffmpeg-sys-next = { version = "8.1", default-features = false, features = ["avformat"] }
 sha1 = "0.10"
-kamadak-exif = "0.6.1"
+exif = { package = "kamadak-exif", version = "0.6.1" }
 quick-xml.workspace = true

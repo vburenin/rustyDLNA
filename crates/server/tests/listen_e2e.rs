@@ -15,8 +15,8 @@
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::path::PathBuf;
-use std::process::{Child, Command};
-use std::time::Duration;
+use std::process::{Child, Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 fn env_ports() -> Option<(u16, u16)> {
     let required = std::env::var("RUSTY_DLNA_REQUIRE_E2E").as_deref() == Ok("1");
@@ -49,14 +49,41 @@ struct Server {
 impl Drop for Server {
     fn drop(&mut self) {
         // SIGTERM so `serve` can send SSDP byebye. SIGKILL skips that path.
+        if self.child.try_wait().ok().flatten().is_none() {
+            #[cfg(unix)]
+            unsafe {
+                // SAFETY: `Child::id` is the live process we spawned, and
+                // SIGTERM does not dereference memory.
+                libc::kill(self.child.id() as i32, libc::SIGTERM);
+            }
+            let _ = self.child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
+impl Server {
+    fn terminate_bounded(&mut self, timeout: Duration) -> ExitStatus {
+        if let Some(status) = self.child.try_wait().expect("query server status") {
+            return status;
+        }
         #[cfg(unix)]
         unsafe {
-            // SAFETY: `Child::id` is the live process we spawned, and SIGTERM
-            // does not dereference memory or outlive this cleanup operation.
+            // SAFETY: the child is live and owned by this Server.
             libc::kill(self.child.id() as i32, libc::SIGTERM);
         }
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.temp_dir);
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("wait for SIGTERM") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("server exceeded {:?} SIGTERM deadline", timeout);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -177,66 +204,38 @@ fn parse_album_art_url(didl: &str) -> Option<(i64, i64)> {
     Some((art_id, detail_id))
 }
 
-fn ensure_fixtures() {
+fn require_fixtures() {
     let lib = workspace().join("testdata/library");
-    rusty_dlna::ensure_pattern_fixture(&lib);
-    rusty_dlna::ensure_show_fixture(&lib);
-    let music = lib.join("music");
-    let _ = std::fs::create_dir_all(&music);
-    let song = music.join("song.mp3");
-    if !song.exists() {
-        let _ = std::fs::write(&song, b"ID3fake");
-    }
-    let song_nfo = music.join("song.nfo");
-    if !song_nfo.exists() {
-        let _ = std::fs::write(
-            &song_nfo,
-            "<musicvideo><title>Fixture Track</title><genre>Jazz</genre><studio>Fixture Band</studio></musicvideo>\n",
+    for relative in [
+        "@eaDir/junk.mkv",
+        "exclude_me/secret.mkv",
+        "music/fixture.m3u8",
+        "music/song.flac",
+        "music/song.mp3",
+        "music/song.nfo",
+        "pictures/shot.jpg",
+        "sample/ignored.mkv",
+        "unfinished.mkv.part",
+        "video/Movie.2024.2160p.UHD.BDRemux.HDR.DV.HEVC.mkv",
+        "video/movie.mkv",
+        "video/movie.nfo",
+        "video/movie.srt",
+        "video/movie.en.srt",
+        "video/movie-poster.jpg",
+        "video/tagged.mp4",
+        "video/dvp7.mkv",
+        "video/The Show/tvshow.nfo",
+        "video/The Show/S01E01.mkv",
+        "video/The Show/S01E01.nfo",
+        "video/The Show/S01E02.mkv",
+        "video/The Show/S01E02.nfo",
+    ] {
+        let path = lib.join(relative);
+        assert!(
+            path.is_file(),
+            "required tracked fixture is missing: {}; restore testdata instead of generating it during tests",
+            path.display()
         );
-    }
-    let pictures = lib.join("pictures");
-    let _ = std::fs::create_dir_all(&pictures);
-    let shot = pictures.join("shot.jpg");
-    if !shot.exists() {
-        let _ = std::fs::write(
-            &shot,
-            [
-                0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
-                0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
-            ],
-        );
-    }
-    let dvp7 = lib.join("video/dvp7.mkv");
-    if !dvp7.exists() || dvp7.metadata().map(|m| m.len() < 200).unwrap_or(true) {
-        if let Ok(st) = Command::new("ffmpeg")
-            .args([
-                "-nostdin",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=duration=1:size=64x64:rate=2",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=1",
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                dvp7.to_str().unwrap(),
-            ])
-            .stdin(std::process::Stdio::null())
-            .status()
-        {
-            if !st.success() {
-                let _ = std::fs::write(&dvp7, b"tiny-placeholder");
-            }
-        } else {
-            let _ = std::fs::write(&dvp7, b"tiny-placeholder");
-        }
     }
 }
 
@@ -245,7 +244,7 @@ fn spawn_bin(http: u16, ssdp: u16) -> Server {
 }
 
 fn spawn_bin_with_sink(http: u16, ssdp: u16, sink: Option<String>) -> Server {
-    ensure_fixtures();
+    require_fixtures();
     let root = workspace();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -303,6 +302,184 @@ audio_out = "to-aac"
     let server = Server { child, temp_dir };
     wait_http(http);
     server
+}
+
+fn shutdown_case_dir(http: u16, label: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "rusty-dlna-shutdown-{label}-{}-{http}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&path).expect("create shutdown E2E directory");
+    path
+}
+
+fn write_stubborn_helper(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(
+        path,
+        "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = \"-version\" ]; then echo 'test helper version 1'; exit 0; fi; done\necho $$ > \"$RUSTY_DLNA_STUCK_MARKER\"\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+    )
+    .expect("write stubborn helper");
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+fn spawn_shutdown_case(
+    http: u16,
+    ssdp: u16,
+    temp_dir: PathBuf,
+    config: &str,
+    helper_path: Option<&std::path::Path>,
+    marker: Option<&std::path::Path>,
+    sink: &UdpSocket,
+) -> Server {
+    let config_path = temp_dir.join("rusty-dlna.toml");
+    std::fs::write(&config_path, config).expect("write shutdown config");
+    let root = workspace();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rusty-dlna"));
+    command
+        .current_dir(&root)
+        .arg("--config")
+        .arg(&config_path)
+        .env("RUSTY_DLNA_HTTP_PORT", http.to_string())
+        .env("RUSTY_DLNA_SSDP_PORT", ssdp.to_string())
+        .env(
+            "RUSTY_DLNA_SSDP_SINK",
+            sink.local_addr().unwrap().to_string(),
+        )
+        .env("RUST_LOG", "off")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(helper_path) = helper_path {
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let mut path = helper_path.as_os_str().to_os_string();
+        path.push(":");
+        path.push(inherited);
+        command.env("PATH", path);
+    }
+    if let Some(marker) = marker {
+        command.env("RUSTY_DLNA_STUCK_MARKER", marker);
+    }
+    let child = command.spawn().expect("spawn shutdown E2E server");
+    let server = Server { child, temp_dir };
+    wait_http(http);
+    server
+}
+
+fn wait_for_path(path: &std::path::Path, message: &str) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !path.is_file() {
+        assert!(Instant::now() < deadline, "{message}: {}", path.display());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_scanner_ready(http: u16) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let (status, _, body) = raw_http(
+            http,
+            &format!(
+                "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if status == 200
+            && value["scanner"]["worker_state"] == "running"
+            && value["scanner"]["last_success_unix"].is_u64()
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "scanner not ready: {value}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn assert_byebye(sink: &UdpSocket) {
+    sink.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut packet = [0u8; 2048];
+    let mut saw = false;
+    while let Ok((length, _)) = sink.recv_from(&mut packet) {
+        if String::from_utf8_lossy(&packet[..length]).contains("NTS:ssdp:byebye") {
+            saw = true;
+            break;
+        }
+    }
+    assert!(saw, "SIGTERM did not emit SSDP byebye");
+}
+
+fn assert_marker_process_reaped(marker: &std::path::Path) {
+    let pid: libc::pid_t = std::fs::read_to_string(marker)
+        .expect("read helper PID marker")
+        .trim()
+        .parse()
+        .expect("parse helper PID");
+    // SAFETY: signal zero only queries the helper PID recorded by this test.
+    let result = unsafe { libc::kill(pid, 0) };
+    assert_eq!(result, -1, "helper process {pid} survived daemon SIGTERM");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}
+
+fn assert_shutdown_storage_clean(temp_dir: &std::path::Path) {
+    fn visit(path: &std::path::Path, partials: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, partials);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.contains(".tmp") || name.ends_with(".part") || name.ends_with("-journal")
+                })
+            {
+                partials.push(path);
+            }
+        }
+    }
+    let mut partials = Vec::new();
+    visit(temp_dir, &mut partials);
+    assert!(
+        partials.is_empty(),
+        "partial shutdown files remain: {partials:?}"
+    );
+    let db_path = temp_dir.join("database/files.db");
+    if db_path.is_file() {
+        let connection = rusqlite::Connection::open(&db_path).expect("open shutdown database");
+        let check: String = connection
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+            .expect("quick_check shutdown database");
+        assert_eq!(check, "ok");
+    }
+}
+
+fn terminate_shutdown_case(
+    server: &mut Server,
+    sink: &UdpSocket,
+    marker: Option<&std::path::Path>,
+) {
+    let started = Instant::now();
+    let status = server.terminate_bounded(Duration::from_secs(3));
+    assert!(status.success(), "SIGTERM exit status: {status}");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_byebye(sink);
+    if let Some(marker) = marker {
+        assert_marker_process_reaped(marker);
+    }
+    assert_shutdown_storage_clean(&server.temp_dir);
 }
 
 fn one_run(http: u16, ssdp: u16) {
@@ -582,6 +759,220 @@ fn ssdp_byebye_on_drop() {
         "byebye on drop: got={got} last={last}"
     );
     assert!(!saw_location, "byebye must omit LOCATION: {last}");
+}
+
+#[test]
+fn sigterm_interrupts_probe_thumbnail_database_overflow_and_remux() {
+    let Some((base_http, base_ssdp)) = env_ports() else {
+        eprintln!("skip shutdown e2e (RUSTY_DLNA_HTTP_PORT unset)");
+        return;
+    };
+
+    // Stubborn FFprobe while an initial scan transaction is open.
+    {
+        let http = base_http.saturating_add(7);
+        let ssdp = base_ssdp.saturating_add(7);
+        let temp = shutdown_case_dir(http, "probe");
+        let media = temp.join("media");
+        let helpers = temp.join("helpers");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::create_dir_all(&helpers).unwrap();
+        let mut weak_mp3 = vec![0u8; 64];
+        weak_mp3[..4].copy_from_slice(b"ID3\x04");
+        std::fs::write(media.join("stuck.mp3"), weak_mp3).unwrap();
+        write_stubborn_helper(&helpers.join("ffprobe"));
+        let marker = temp.join("probe.pid");
+        let config = format!(
+            "friendly_name = \"shutdown-probe\"\nmedia_dir = [\"A,{}\"]\ncache_dir = \"cache\"\ndb_dir = \"database\"\nadvertise_ip = \"127.0.0.1\"\nthumbnails = false\nrescan_secs = 0\nshutdown_timeout_secs = 2\n",
+            media.display()
+        );
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut server = spawn_shutdown_case(
+            http,
+            ssdp,
+            temp,
+            &config,
+            Some(&helpers),
+            Some(&marker),
+            &sink,
+        );
+        wait_for_path(&marker, "FFprobe did not become active");
+        terminate_shutdown_case(&mut server, &sink, Some(&marker));
+    }
+
+    // Stubborn thumbnail FFmpeg must be killed and its atomic .tmp removed.
+    {
+        let http = base_http.saturating_add(8);
+        let ssdp = base_ssdp.saturating_add(8);
+        let temp = shutdown_case_dir(http, "thumbnail");
+        let media = temp.join("media");
+        let helpers = temp.join("helpers");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::create_dir_all(&helpers).unwrap();
+        std::fs::copy(
+            workspace().join("testdata/library/video/movie.mkv"),
+            media.join("movie.mkv"),
+        )
+        .unwrap();
+        write_stubborn_helper(&helpers.join("ffmpeg"));
+        let marker = temp.join("thumbnail.pid");
+        let config = format!(
+            "friendly_name = \"shutdown-thumbnail\"\nmedia_dir = [\"V,{}\"]\ncache_dir = \"cache\"\ndb_dir = \"database\"\nadvertise_ip = \"127.0.0.1\"\nthumbnails = true\nscan_workers = 1\nrescan_secs = 0\nshutdown_timeout_secs = 2\n",
+            media.display()
+        );
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut server = spawn_shutdown_case(
+            http,
+            ssdp,
+            temp,
+            &config,
+            Some(&helpers),
+            Some(&marker),
+            &sink,
+        );
+        wait_for_path(&marker, "thumbnail FFmpeg did not become active");
+        terminate_shutdown_case(&mut server, &sink, Some(&marker));
+    }
+
+    // A SQLite writer lock cannot extend watcher shutdown to the normal
+    // 15-second database busy timeout, and the interrupted update rolls back.
+    {
+        let http = base_http.saturating_add(9);
+        let ssdp = base_ssdp.saturating_add(9);
+        let temp = shutdown_case_dir(http, "database");
+        let media = temp.join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let config = format!(
+            "friendly_name = \"shutdown-database\"\nmedia_dir = [\"V,{}\"]\ncache_dir = \"cache\"\ndb_dir = \"database\"\nadvertise_ip = \"127.0.0.1\"\nthumbnails = false\nrescan_secs = 0\nshutdown_timeout_secs = 2\n",
+            media.display()
+        );
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut server = spawn_shutdown_case(http, ssdp, temp, &config, None, None, &sink);
+        wait_scanner_ready(http);
+        let db_path = server.temp_dir.join("database/files.db");
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 INSERT OR REPLACE INTO SETTINGS (KEY, VALUE)
+                 VALUES ('shutdown-test-lock', 'held');",
+            )
+            .unwrap();
+        let mut fake = vec![0u8; 64];
+        fake[..4].copy_from_slice(&[0x1a, 0x45, 0xdf, 0xa3]);
+        std::fs::write(media.join("new.mkv"), fake).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let status = server.terminate_bounded(Duration::from_secs(3));
+        assert!(status.success(), "database SIGTERM status: {status}");
+        assert_byebye(&sink);
+        connection.execute_batch("ROLLBACK").unwrap();
+        drop(connection);
+        assert_shutdown_storage_clean(&server.temp_dir);
+    }
+
+    // More paths than the inotify targeted-batch ceiling use the same full
+    // reconcile path as IN_Q_OVERFLOW. Cancel while that full walk is active.
+    {
+        let http = base_http.saturating_add(10);
+        let ssdp = base_ssdp.saturating_add(10);
+        let temp = shutdown_case_dir(http, "overflow");
+        let media = temp.join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let config = format!(
+            "friendly_name = \"shutdown-overflow\"\nmedia_dir = [\"V,{}\"]\ncache_dir = \"cache\"\ndb_dir = \"database\"\nadvertise_ip = \"127.0.0.1\"\nthumbnails = false\nscan_workers = 1\nrescan_secs = 0\nshutdown_timeout_secs = 2\n",
+            media.display()
+        );
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut server = spawn_shutdown_case(http, ssdp, temp, &config, None, None, &sink);
+        wait_scanner_ready(http);
+        let mut fake = vec![0u8; 64];
+        fake[..4].copy_from_slice(&[0x1a, 0x45, 0xdf, 0xa3]);
+        for index in 0..600 {
+            std::fs::write(media.join(format!("overflow-{index:04}.mkv")), &fake).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let (_, _, body) = raw_http(
+                http,
+                &format!(
+                    "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"
+                ),
+            );
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if value["scanner"]["full_reconciles"].as_u64().unwrap_or(0) > 0
+                && value["scanner"]["files_seen"].as_u64().unwrap_or(0) > 0
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "full reconcile did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        terminate_shutdown_case(&mut server, &sink, None);
+    }
+
+    // Active remux FFmpeg receives the same TERM/KILL/reap contract.
+    {
+        let http = base_http.saturating_add(11);
+        let ssdp = base_ssdp.saturating_add(11);
+        let temp = shutdown_case_dir(http, "remux");
+        let media = temp.join("media");
+        let helpers = temp.join("helpers");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::create_dir_all(&helpers).unwrap();
+        std::fs::copy(
+            workspace().join("testdata/library/video/dvp7.mkv"),
+            media.join("dvp7.mkv"),
+        )
+        .unwrap();
+        write_stubborn_helper(&helpers.join("ffmpeg"));
+        let marker = temp.join("remux.pid");
+        let config = format!(
+            "friendly_name = \"shutdown-remux\"\nmedia_dir = [\"V,{}\"]\ncache_dir = \"cache\"\ndb_dir = \"database\"\nadvertise_ip = \"127.0.0.1\"\nthumbnails = false\nrescan_secs = 0\nshutdown_timeout_secs = 2\n
+[transcode]
+enable = true
+encoder = \"libx264\"
+max_jobs = 1
+
+[[remap]]
+name = \"shutdown-remux\"
+client = \"CrKey\"
+hdr = \"dv-p7\"
+action = \"remux-p8\"
+encoder = \"copy\"
+audio_out = \"to-aac\"
+",
+            media.display()
+        );
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut server = spawn_shutdown_case(
+            http,
+            ssdp,
+            temp,
+            &config,
+            Some(&helpers),
+            Some(&marker),
+            &sink,
+        );
+        let items = wait_media_items(http, "CrKey/1.54", "2$8");
+        let position = items.find("/Transcode/").expect("remux DIDL URL");
+        let id: i64 = items[position + "/Transcode/".len()..]
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap();
+        let request = std::thread::spawn(move || {
+            raw_http(
+                http,
+                &format!(
+                    "GET /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nUser-Agent: CrKey/1.54\r\nConnection: close\r\n\r\n"
+                ),
+            )
+        });
+        wait_for_path(&marker, "remux FFmpeg did not become active");
+        terminate_shutdown_case(&mut server, &sink, Some(&marker));
+        let _ = request.join().unwrap();
+    }
 }
 
 #[test]

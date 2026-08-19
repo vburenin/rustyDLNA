@@ -337,7 +337,7 @@ pub(super) fn sorted_child_page(
     default: DefaultOrder,
 ) -> Option<(Vec<CatalogChild>, u32)> {
     let container = cat.containers.get(id)?;
-    let (_, displayed_total) = cat.page_children(id, 0, 0)?;
+    let displayed_total = cat.displayed_child_count(id);
     if displayed_total as usize != container.children.len() {
         let (mut recent, total) = cat.page_children(id, 0, MAX_SOAP_PAGE_OBJECTS)?;
         sort_catalog_children(&mut recent, specs, default);

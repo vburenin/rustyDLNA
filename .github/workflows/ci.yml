@@ -29,7 +29,28 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - run: docker build --pull --tag rustydlna-ci .
+      - name: Reproduce genuine Dolby Vision fixture
+        run: |
+          docker run --rm --user 0 -v "$PWD:/source:ro" rustydlna-ci sh -ec '
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends mkvtoolnix >/dev/null
+            /source/scripts/generate-dolby-vision-fixture.sh /tmp/dvp7.mkv
+            cmp /tmp/dvp7.mkv /source/testdata/library/video/dvp7.mkv
+          '
       - run: RUN_DOCKER_SMOKE=1 scripts/compose-smoke.sh
+      - name: Host-network multicast discovery on disposable runner
+        env:
+          RUSTY_DLNA_HOST_IMAGE: rustydlna-ci
+          RUSTY_DLNA_HOST_DIAGNOSTICS: ${{ runner.temp }}/host-network-diagnostics
+        run: sudo --preserve-env=RUSTY_DLNA_HOST_IMAGE,RUSTY_DLNA_HOST_DIAGNOSTICS scripts/host-network-e2e.sh
+      - name: Retain host-network packet diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: host-network-diagnostics
+          path: ${{ runner.temp }}/host-network-diagnostics
+          if-no-files-found: warn
+          retention-days: 14
       - name: Container vulnerability scan
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
@@ -45,9 +66,31 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - run: rustup toolchain install 1.97.1 --profile minimal && rustup default 1.97.1
-      - run: cargo install cargo-audit --version 0.22.2 --locked && cargo install cargo-deny --version 0.20.2 --locked
+      - run: cargo install cargo-audit --version 0.22.2 --locked && cargo install cargo-deny --version 0.20.2 --locked && cargo install cargo-machete --version 0.9.2 --locked
       - run: cargo audit --deny warnings
       - run: cargo deny check
+      - run: cargo machete
+
+  privileged-ssdp-netns:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavformat-dev iproute2 tcpdump curl
+      - run: rustup toolchain install 1.97.1 --profile minimal && rustup default 1.97.1
+      - run: cargo build --locked -p rusty-dlna
+      - name: Two-interface namespace discovery
+        env:
+          RUSTY_DLNA_NETNS_DIAGNOSTICS: ${{ runner.temp }}/ssdp-netns-diagnostics
+        run: sudo --preserve-env=PATH,RUSTY_DLNA_NETNS_DIAGNOSTICS scripts/ssdp-netns-e2e.sh
+      - name: Retain namespace packet diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ssdp-netns-diagnostics
+          path: ${{ runner.temp }}/ssdp-netns-diagnostics
+          if-no-files-found: warn
+          retention-days: 14
 
   coverage:
     runs-on: ubuntu-24.04
@@ -56,18 +99,29 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavformat-dev ffmpeg
       - run: rustup toolchain install 1.97.1 --profile minimal --component llvm-tools-preview && rustup default 1.97.1
       - run: cargo install cargo-llvm-cov --version 0.9.0 --locked
-      - name: Coverage floor
-        run: cargo llvm-cov --workspace --fail-under-lines 80
+      - name: Workspace and targeted coverage floors
+        run: |
+          cargo llvm-cov --workspace --json --summary-only \
+            --output-path target/coverage.json --fail-under-lines 80
+          scripts/check-targeted-coverage.py target/coverage.json
 
   fuzz-build-and-smoke:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
-      - run: rustup toolchain install nightly-2026-08-01 --profile minimal && cargo +nightly-2026-08-01 install cargo-fuzz --version 0.13.2 --locked
+      - run: rustup toolchain install nightly-2026-08-01 --profile minimal --component rust-src && cargo +nightly-2026-08-01 install cargo-fuzz --version 0.13.2 --locked
       - run: cargo +nightly-2026-08-01 fuzz build
       - name: Bounded parser fuzz smoke
         run: |
           for target in http_request http_range ssdp soap_xml nfo url_ids sidecars; do
-            cargo +nightly-2026-08-01 fuzz run "$target" -- -max_total_time=10 -timeout=5
+            mkdir -p "fuzz/corpus/$target"
+            cp -an "fuzz/seeds/$target/." "fuzz/corpus/$target/"
+            if [ -d "fuzz/regressions/$target" ]; then
+              for regression in "fuzz/regressions/$target"/*; do
+                [ -f "$regression" ] || continue
+                cargo +nightly-2026-08-01 fuzz run "$target" "$regression" -- -runs=1 -timeout=5
+              done
+            fi
+            cargo +nightly-2026-08-01 fuzz run "$target" "fuzz/corpus/$target" -- -max_total_time=10 -timeout=5
           done

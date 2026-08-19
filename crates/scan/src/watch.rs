@@ -14,8 +14,9 @@ use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 
 use crate::{
     is_album_art_name_for_config, is_caption_name, is_skipped_dir, is_unfinished_name,
-    looks_like_sample_file, monitor, monitor_dirty, open_library_db, path_excluded,
-    path_is_allowed_dir, rebuild_objects, Catalog, ScanConfig, ScanDelta, ScanResult,
+    looks_like_sample_file, monitor, monitor_dirty, monitor_dirty_incremental, monitor_incremental,
+    open_library_db, path_excluded, path_is_allowed_dir, rebuild_objects, Catalog, CatalogUpdate,
+    ScanConfig, ScanDelta, ScanResult,
 };
 
 const MASK: WatchMask = WatchMask::CREATE
@@ -194,7 +195,16 @@ const RECONCILE_AFTER: usize = 256;
 pub struct WatchTelemetry {
     pub watch_count: AtomicUsize,
     pub overflow_count: AtomicU64,
+    /// Kernel overflow markers. Each marker means one or more events were
+    /// dropped; inotify does not report the exact number lost.
+    pub dropped_events_total: AtomicU64,
     pub batches: AtomicU64,
+    pub events_total: AtomicU64,
+    pub pending_paths: AtomicUsize,
+    pub pending_paths_peak: AtomicUsize,
+    pub last_batch_paths: AtomicUsize,
+    pub full_reconciles: AtomicU64,
+    pub targeted_batches: AtomicU64,
 }
 
 pub fn repair_objects_if_needed(cfg: &ScanConfig) -> ScanResult<(Option<Catalog>, ScanDelta)> {
@@ -260,6 +270,37 @@ pub fn run_inotify_until(
     telemetry: Option<&WatchTelemetry>,
     mut on_change: impl FnMut(Catalog, ScanDelta),
 ) -> std::io::Result<()> {
+    run_inotify_core(
+        cfg,
+        stopping,
+        scan_gate,
+        telemetry,
+        false,
+        &mut |update, delta| match update {
+            CatalogUpdate::Replacement(catalog) => on_change(catalog, delta),
+            CatalogUpdate::Patch(_) => unreachable!("full inotify monitor returned a patch"),
+        },
+    )
+}
+
+pub fn run_inotify_updates_until(
+    cfg: ScanConfig,
+    stopping: &AtomicBool,
+    scan_gate: Option<&Mutex<()>>,
+    telemetry: Option<&WatchTelemetry>,
+    mut on_change: impl FnMut(CatalogUpdate, ScanDelta),
+) -> std::io::Result<()> {
+    run_inotify_core(cfg, stopping, scan_gate, telemetry, true, &mut on_change)
+}
+
+fn run_inotify_core(
+    cfg: ScanConfig,
+    stopping: &AtomicBool,
+    scan_gate: Option<&Mutex<()>>,
+    telemetry: Option<&WatchTelemetry>,
+    incremental: bool,
+    on_change: &mut impl FnMut(CatalogUpdate, ScanDelta),
+) -> std::io::Result<()> {
     let mut ino = Inotify::init()?;
     let mut wds: HashMap<WatchDescriptor, PathBuf> = HashMap::new();
     let mut directory_inodes = HashSet::new();
@@ -293,6 +334,7 @@ pub fn run_inotify_until(
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
+        observe_pending(telemetry, &batch);
         if batch.is_empty() {
             continue;
         }
@@ -309,6 +351,7 @@ pub fn run_inotify_until(
                 Ok(true) => match ino.read_events(&mut buf) {
                     Ok(events) => {
                         collect_events(events, &wds, &cfg, &mut batch);
+                        observe_pending(telemetry, &batch);
                         deadline = (Instant::now() + SETTLE).min(maximum);
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -320,20 +363,40 @@ pub fn run_inotify_until(
             }
         }
         if stopping.load(Ordering::Acquire) {
+            if let Some(telemetry) = telemetry {
+                telemetry.pending_paths.store(0, Ordering::Relaxed);
+            }
             break;
         }
         let _guard = scan_gate.map(|gate| gate.lock().unwrap_or_else(|error| error.into_inner()));
         apply_batch(
             &cfg,
-            &mut ino,
-            &mut wds,
-            &mut directory_inodes,
+            WatchState {
+                ino: &mut ino,
+                wds: &mut wds,
+                directory_inodes: &mut directory_inodes,
+            },
             batch,
             telemetry,
-            &mut on_change,
+            incremental,
+            on_change,
         );
+        if let Some(telemetry) = telemetry {
+            telemetry.pending_paths.store(0, Ordering::Relaxed);
+        }
     }
     Ok(())
+}
+
+fn observe_pending(telemetry: Option<&WatchTelemetry>, batch: &PendingBatch) {
+    let Some(telemetry) = telemetry else {
+        return;
+    };
+    let pending = batch.unique_paths();
+    telemetry.pending_paths.store(pending, Ordering::Relaxed);
+    telemetry
+        .pending_paths_peak
+        .fetch_max(pending, Ordering::Relaxed);
 }
 
 fn collect_events<'a>(
@@ -406,22 +469,29 @@ fn collect_events<'a>(
     }
 }
 
+struct WatchState<'a> {
+    ino: &'a mut Inotify,
+    wds: &'a mut HashMap<WatchDescriptor, PathBuf>,
+    directory_inodes: &'a mut HashSet<(u64, u64)>,
+}
+
 fn apply_batch(
     cfg: &ScanConfig,
-    ino: &mut Inotify,
-    wds: &mut HashMap<WatchDescriptor, PathBuf>,
-    directory_inodes: &mut HashSet<(u64, u64)>,
+    watch: WatchState<'_>,
     batch: PendingBatch,
     telemetry: Option<&WatchTelemetry>,
-    on_change: &mut impl FnMut(Catalog, ScanDelta),
+    incremental: bool,
+    on_change: &mut impl FnMut(CatalogUpdate, ScanDelta),
 ) {
+    let WatchState {
+        ino,
+        wds,
+        directory_inodes,
+    } = watch;
     let fallback =
         batch.should_reconcile() || !batch.add_dirs.is_empty() || !batch.remove_trees.is_empty();
     if let Some(telemetry) = telemetry {
-        telemetry.batches.fetch_add(1, Ordering::Relaxed);
-        if batch.overflow {
-            telemetry.overflow_count.fetch_add(1, Ordering::Relaxed);
-        }
+        record_batch_telemetry(telemetry, &batch, fallback);
     }
     log_file_events(&batch.events);
     tracing::info!(
@@ -464,17 +534,43 @@ fn apply_batch(
         .chain(batch.remove_files.iter())
         .cloned()
         .collect();
-    let result = if fallback {
-        monitor(cfg)
+    let result = if incremental && fallback {
+        monitor_incremental(cfg)
+    } else if incremental {
+        monitor_dirty_incremental(cfg, &dirty)
+    } else if fallback {
+        monitor(cfg).map(|(catalog, delta)| (catalog.map(CatalogUpdate::Replacement), delta))
     } else {
         monitor_dirty(cfg, &dirty)
+            .map(|(catalog, delta)| (catalog.map(CatalogUpdate::Replacement), delta))
     };
     match result {
-        Ok((Some(cat), delta)) => on_change(cat, delta),
+        Ok((Some(update), delta)) => on_change(update, delta),
         Ok((None, _)) => {}
         Err(error) => {
             tracing::error!(%error, "inotify reconciliation failed; retaining published catalog")
         }
+    }
+}
+
+fn record_batch_telemetry(telemetry: &WatchTelemetry, batch: &PendingBatch, fallback: bool) {
+    telemetry.batches.fetch_add(1, Ordering::Relaxed);
+    telemetry
+        .events_total
+        .fetch_add(batch.events.len() as u64, Ordering::Relaxed);
+    telemetry
+        .last_batch_paths
+        .store(batch.unique_paths(), Ordering::Relaxed);
+    if batch.overflow {
+        telemetry.overflow_count.fetch_add(1, Ordering::Relaxed);
+        telemetry
+            .dropped_events_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if fallback {
+        telemetry.full_reconciles.fetch_add(1, Ordering::Relaxed);
+    } else {
+        telemetry.targeted_batches.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -797,6 +893,42 @@ mod tests {
         assert!(!b.should_reconcile());
     }
 
+    #[test]
+    fn pending_backlog_telemetry_is_bounded_and_records_peaks() {
+        let telemetry = WatchTelemetry::default();
+        let mut batch = PendingBatch::default();
+        batch.add_file(PathBuf::from("/v/one.mkv"));
+        batch.add_file(PathBuf::from("/v/two.mkv"));
+        observe_pending(Some(&telemetry), &batch);
+        assert_eq!(telemetry.pending_paths.load(Ordering::Relaxed), 2);
+        assert_eq!(telemetry.pending_paths_peak.load(Ordering::Relaxed), 2);
+
+        batch.remove_file(PathBuf::from("/v/one.mkv"));
+        observe_pending(Some(&telemetry), &batch);
+        assert_eq!(telemetry.pending_paths.load(Ordering::Relaxed), 2);
+        assert_eq!(telemetry.pending_paths_peak.load(Ordering::Relaxed), 2);
+
+        let empty = PendingBatch::default();
+        observe_pending(Some(&telemetry), &empty);
+        assert_eq!(telemetry.pending_paths.load(Ordering::Relaxed), 0);
+        assert_eq!(telemetry.pending_paths_peak.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn overflow_telemetry_records_dropped_marker_and_full_reconcile() {
+        let telemetry = WatchTelemetry::default();
+        let batch = PendingBatch {
+            overflow: true,
+            ..PendingBatch::default()
+        };
+        record_batch_telemetry(&telemetry, &batch, true);
+        assert_eq!(telemetry.batches.load(Ordering::Relaxed), 1);
+        assert_eq!(telemetry.overflow_count.load(Ordering::Relaxed), 1);
+        assert_eq!(telemetry.dropped_events_total.load(Ordering::Relaxed), 1);
+        assert_eq!(telemetry.full_reconciles.load(Ordering::Relaxed), 1);
+        assert_eq!(telemetry.targeted_batches.load(Ordering::Relaxed), 0);
+    }
+
     #[cfg(unix)]
     #[test]
     fn inotify_reconcile_never_watches_or_indexes_an_outside_link() {
@@ -828,12 +960,18 @@ mod tests {
         batch.add_dir(escape.clone());
         apply_batch(
             &cfg,
-            &mut ino,
-            &mut wds,
-            &mut directory_inodes,
+            WatchState {
+                ino: &mut ino,
+                wds: &mut wds,
+                directory_inodes: &mut directory_inodes,
+            },
             batch,
             None,
-            &mut |catalog, _| {
+            false,
+            &mut |update, _| {
+                let CatalogUpdate::Replacement(catalog) = update else {
+                    panic!("full watcher test received a patch");
+                };
                 outside_published = catalog.items.values().any(|item| item.title == "secret");
             },
         );
@@ -847,12 +985,18 @@ mod tests {
         batch.add_dir(safe_alias.clone());
         apply_batch(
             &cfg,
-            &mut ino,
-            &mut wds,
-            &mut directory_inodes,
+            WatchState {
+                ino: &mut ino,
+                wds: &mut wds,
+                directory_inodes: &mut directory_inodes,
+            },
             batch,
             None,
-            &mut |catalog, _| {
+            false,
+            &mut |update, _| {
+                let CatalogUpdate::Replacement(catalog) = update else {
+                    panic!("full watcher test received a patch");
+                };
                 safe_published = catalog
                     .items
                     .values()

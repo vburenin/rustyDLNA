@@ -120,6 +120,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /tmp/rusty-dlna /usr/local/bin/rusty-dlna
 COPY --from=build /opt/dovi/bin/ /usr/local/bin/
+COPY --chmod=0755 scripts/cache-volume-init.sh /usr/local/libexec/rusty-dlna-cache-volume-init
 COPY rusty-dlna.toml /etc/rusty-dlna.toml
 COPY LICENSE /usr/share/doc/rusty-dlna/LICENSE
 COPY THIRD_PARTY_NOTICES.md /usr/share/doc/rusty-dlna/THIRD_PARTY_NOTICES.md

@@ -17,6 +17,7 @@ scan_workers = 16
 helper_max_jobs = 16
 helper_queue_capacity = 64
 helper_queue_timeout_secs = 30
+shutdown_timeout_secs = 15
 recent_limit = 200
 # recent_days = 90 # optional filesystem-mtime age window
 # Set true only if outside-root symlink targets are intentionally public.
@@ -27,8 +28,14 @@ listen_ip = "0.0.0.0"
 advertise_ip = "192.168.1.10"
 cache_dir = "/var/cache/rusty-dlna"
 db_dir = "/var/cache/rusty-dlna"
+derived_image_cache_mb = 512
+derived_image_cache_age_days = 30
+cache_min_free_mb = 128
 notify_interval = 180
+# Full walks start daily. Unchanged or expensive walks back off as far as one
+# week; inotify continues applying ordinary file updates without a root walk.
 rescan_secs = 86400
+rescan_max_secs = 604800
 # 0 means indefinitely; this deployment keeps Kodi state for three months.
 bookmark_retention_days = 90
 # Generate a stable uuid so clients do not see a new device every rebuild.
@@ -38,6 +45,8 @@ bookmark_retention_days = 90
 enable = true
 encoder = "libx264"
 max_jobs = 16
+cache_max_mb = 51200
+cache_max_age_days = 30
 
 # [[remap]]
 # name = "crkey-dvp7"

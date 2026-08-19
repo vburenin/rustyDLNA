@@ -97,6 +97,11 @@ pub struct Config {
     pub helper_queue_capacity: usize,
     #[serde(default = "default_helper_queue_timeout")]
     pub helper_queue_timeout_secs: u64,
+    /// Whole-daemon graceful stop budget. Scanner/helper cancellation and
+    /// child reaping complete inside this window; service managers may keep a
+    /// slightly larger outer TimeoutStopSec as a final safeguard.
+    #[serde(default = "default_shutdown_timeout")]
+    pub shutdown_timeout_secs: u64,
     #[serde(default = "default_recent_limit")]
     pub recent_limit: usize,
     /// Optional mtime window; omitted means no age cutoff.
@@ -131,6 +136,10 @@ pub struct Config {
     /// Seconds between library rescans (new/changed/deleted files). 0 = off.
     #[serde(default = "default_rescan")]
     pub rescan_secs: u64,
+    /// Optional upper bound for adaptive full reconciliation. Zero keeps the
+    /// legacy fixed cadence. When set, it must be at least `rescan_secs`.
+    #[serde(default)]
+    pub rescan_max_secs: u64,
     /// Keep Kodi resume positions and play counts for this many 24-hour days
     /// since their last update. 0 preserves them indefinitely.
     #[serde(default)]
@@ -179,6 +188,7 @@ impl Default for Config {
             helper_max_jobs: default_helper_max_jobs(),
             helper_queue_capacity: default_helper_queue_capacity(),
             helper_queue_timeout_secs: default_helper_queue_timeout(),
+            shutdown_timeout_secs: default_shutdown_timeout(),
             recent_limit: default_recent_limit(),
             recent_days: None,
             wide_links: false,
@@ -193,6 +203,7 @@ impl Default for Config {
             root_container: None,
             db_dir: None,
             rescan_secs: default_rescan(),
+            rescan_max_secs: 0,
             bookmark_retention_days: 0,
             max_request_body_bytes: default_request_body_bytes(),
             max_connections: default_connections(),
@@ -336,6 +347,10 @@ fn default_helper_queue_timeout() -> u64 {
     30
 }
 
+fn default_shutdown_timeout() -> u64 {
+    15
+}
+
 fn default_transcode_runtime() -> u64 {
     6 * 60 * 60
 }
@@ -464,6 +479,11 @@ pub(crate) fn validate_http_config(cfg: &Config) -> Result<(), ConfigValidationE
     if cfg.rescan_secs > 31_536_000 {
         return Err("rescan_secs must be 0 or at most 31536000".into());
     }
+    if cfg.rescan_max_secs > 31_536_000
+        || (cfg.rescan_max_secs > 0 && cfg.rescan_secs > 0 && cfg.rescan_max_secs < cfg.rescan_secs)
+    {
+        return Err("rescan_max_secs must be 0 or between rescan_secs and 31536000".into());
+    }
     if cfg.bookmark_retention_days > 36_500 {
         return Err("bookmark_retention_days must be 0 or at most 36500".into());
     }
@@ -558,6 +578,9 @@ pub(crate) fn validate_http_config(cfg: &Config) -> Result<(), ConfigValidationE
     }
     if !(1..=600).contains(&cfg.helper_queue_timeout_secs) {
         return Err("helper_queue_timeout_secs must be between 1 and 600".into());
+    }
+    if !(2..=120).contains(&cfg.shutdown_timeout_secs) {
+        return Err("shutdown_timeout_secs must be between 2 and 120".into());
     }
     if !(1..=10_000).contains(&cfg.recent_limit) {
         return Err("recent_limit must be between 1 and 10000".into());

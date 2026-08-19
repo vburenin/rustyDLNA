@@ -23,7 +23,18 @@ fn path_cstring(path: &Path) -> Option<std::ffi::CString> {
 
 use ffmpeg_sys_next as sys;
 
-use crate::{duration_str, AvMeta, EmbeddedTags, SourceProbe};
+use crate::{duration_str, AvMeta, CancellationToken, EmbeddedTags, SourceProbe};
+
+/// Maximum accepted byte length of one embedded container/stream tag.
+/// Oversized values are omitted before allocating an owned Rust string.
+pub const MAX_EMBEDDED_TAG_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub struct MediaHelperControl<'a> {
+    pub timeout: Duration,
+    pub max_alloc_bytes: u64,
+    pub cancellation: &'a CancellationToken,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct MediaProbe {
@@ -63,7 +74,11 @@ unsafe fn dictionary_value(dictionary: *mut sys::AVDictionary, keys: &[&str]) ->
         if entry.is_null() || (*entry).value.is_null() {
             continue;
         }
-        let value = CStr::from_ptr((*entry).value).to_string_lossy();
+        let raw = CStr::from_ptr((*entry).value).to_bytes();
+        if raw.len() > MAX_EMBEDDED_TAG_BYTES {
+            continue;
+        }
+        let value = String::from_utf8_lossy(raw);
         let value = value.trim();
         if !value.is_empty() {
             return Some(value.to_string());
@@ -143,6 +158,14 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
 }
 
 pub fn probe_media_with_timeout(path: &Path, timeout: Duration) -> Option<MediaProbe> {
+    probe_media_with_cancellation(path, timeout, &CancellationToken::default())
+}
+
+pub fn probe_media_with_cancellation(
+    path: &Path,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Option<MediaProbe> {
     init_libav();
     let file = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let path_s = path.display().to_string();
@@ -163,7 +186,7 @@ pub fn probe_media_with_timeout(path: &Path, timeout: Duration) -> Option<MediaP
     };
     // SAFETY: `path_c` is NUL-terminated for the entire call. The helper owns
     // and closes every libav allocation it creates before returning.
-    let got = unsafe { probe_avformat(path_c.as_ptr(), timeout) };
+    let got = unsafe { probe_avformat(path_c.as_ptr(), timeout, cancellation) };
     match &got {
         Some(m) => tracing::debug!(
             target: "rusty_dlna",
@@ -200,7 +223,15 @@ pub fn probe_image(path: &Path) -> Option<MediaProbe> {
 }
 
 pub fn probe_image_with_timeout(path: &Path, timeout: Duration) -> Option<MediaProbe> {
-    let mut image = probe_media_with_timeout(path, timeout)?;
+    probe_image_with_cancellation(path, timeout, &CancellationToken::default())
+}
+
+pub fn probe_image_with_cancellation(
+    path: &Path,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Option<MediaProbe> {
+    let mut image = probe_media_with_cancellation(path, timeout, cancellation)?;
     image.probe.container = "jpeg".into();
     image.probe.video.clear();
     image.probe.audio.clear();
@@ -291,17 +322,24 @@ fn apply_exif(path: &Path, image: &mut MediaProbe) {
     }
 }
 
-struct ProbeDeadline(Instant);
+struct ProbeDeadline {
+    expires: Instant,
+    cancellation: CancellationToken,
+}
 
 unsafe extern "C" fn interrupt_expired(opaque: *mut libc::c_void) -> libc::c_int {
     if opaque.is_null() {
         return 0;
     }
     let deadline = &*(opaque.cast::<ProbeDeadline>());
-    i32::from(Instant::now() >= deadline.0)
+    i32::from(deadline.cancellation.is_cancelled() || Instant::now() >= deadline.expires)
 }
 
-unsafe fn probe_avformat(url: *const libc::c_char, timeout: Duration) -> Option<MediaProbe> {
+unsafe fn probe_avformat(
+    url: *const libc::c_char,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Option<MediaProbe> {
     let mut opts: *mut sys::AVDictionary = ptr::null_mut();
     let k1 = c"probesize";
     let v1 = c"50000000";
@@ -310,9 +348,10 @@ unsafe fn probe_avformat(url: *const libc::c_char, timeout: Duration) -> Option<
     sys::av_dict_set(&mut opts, k1.as_ptr(), v1.as_ptr(), 0);
     sys::av_dict_set(&mut opts, k2.as_ptr(), v2.as_ptr(), 0);
 
-    let mut deadline = Box::new(ProbeDeadline(
-        Instant::now() + timeout.max(Duration::from_secs(1)),
-    ));
+    let mut deadline = Box::new(ProbeDeadline {
+        expires: Instant::now() + timeout.max(Duration::from_secs(1)),
+        cancellation: cancellation.clone(),
+    });
     let mut ctx = sys::avformat_alloc_context();
     if ctx.is_null() {
         sys::av_dict_free(&mut opts);
@@ -584,15 +623,24 @@ pub fn attached_pic_stream(path: &Path) -> Option<i32> {
 }
 
 pub fn attached_pic_stream_with_timeout(path: &Path, timeout: Duration) -> Option<i32> {
+    attached_pic_stream_with_cancellation(path, timeout, &CancellationToken::default())
+}
+
+fn attached_pic_stream_with_cancellation(
+    path: &Path,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> Option<i32> {
     init_libav();
     let path_c = path_cstring(path)?;
     // SAFETY: the CString and boxed deadline remain live while libav uses
     // their pointers. Each successful context allocation is closed on every
     // return path, and stream indices are bounded by `nb_streams`.
     unsafe {
-        let mut deadline = Box::new(ProbeDeadline(
-            Instant::now() + timeout.max(Duration::from_secs(1)),
-        ));
+        let mut deadline = Box::new(ProbeDeadline {
+            expires: Instant::now() + timeout.max(Duration::from_secs(1)),
+            cancellation: cancellation.clone(),
+        });
         let mut ctx = sys::avformat_alloc_context();
         if ctx.is_null() {
             return None;
@@ -673,16 +721,17 @@ pub fn extract_attached_pic_with_limits_result(
     })
 }
 
-pub(crate) fn extract_attached_pic_file_with_limits_result(
+pub(crate) fn extract_attached_pic_file_with_limits_cancelled_result(
     src: &File,
     dest: &Path,
     timeout: Duration,
     max_alloc_bytes: u64,
+    cancellation: &CancellationToken,
 ) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd;
 
     let proc_path = std::path::PathBuf::from(format!("/proc/self/fd/{}", src.as_raw_fd()));
-    let Some(idx) = attached_pic_stream_with_timeout(&proc_path, timeout) else {
+    let Some(idx) = attached_pic_stream_with_cancellation(&proc_path, timeout, cancellation) else {
         return Ok(false);
     };
     with_atomic_image_destination(dest, |temporary| {
@@ -701,7 +750,8 @@ pub(crate) fn extract_attached_pic_file_with_limits_result(
             .args(["-map", &format!("0:{idx}"), "-frames:v", "1", "-an"])
             .arg(temporary);
         inherit_file_at(&mut command, src, 3);
-        command_status_with_timeout(&mut command, timeout).map(|status| status.success())
+        command_status_with_cancellation(&mut command, timeout, cancellation)
+            .map(|status| status.success())
     })
 }
 
@@ -778,6 +828,28 @@ pub fn scale_jpeg_file_with_options_result(
     timeout: Duration,
     max_alloc_bytes: u64,
 ) -> std::io::Result<bool> {
+    scale_jpeg_file_with_options_cancelled_result(
+        src,
+        dest,
+        w,
+        h,
+        quality,
+        MediaHelperControl {
+            timeout,
+            max_alloc_bytes,
+            cancellation: &CancellationToken::default(),
+        },
+    )
+}
+
+pub fn scale_jpeg_file_with_options_cancelled_result(
+    src: &File,
+    dest: &Path,
+    w: u32,
+    h: u32,
+    quality: u8,
+    control: MediaHelperControl<'_>,
+) -> std::io::Result<bool> {
     if w == 0 || h == 0 {
         return Ok(false);
     }
@@ -793,7 +865,7 @@ pub fn scale_jpeg_file_with_options_result(
                 "error",
                 "-max_alloc",
             ])
-            .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
+            .arg(control.max_alloc_bytes.max(16 * 1024 * 1024).to_string())
             .args(["-threads", "1", "-i", "/proc/self/fd/3"])
             .args([
                 "-frames:v",
@@ -806,7 +878,8 @@ pub fn scale_jpeg_file_with_options_result(
             ])
             .arg(temporary);
         inherit_file_at(&mut command, src, 3);
-        command_status_with_timeout(&mut command, timeout).map(|status| status.success())
+        command_status_with_cancellation(&mut command, control.timeout, control.cancellation)
+            .map(|status| status.success())
     })
 }
 
@@ -884,14 +957,13 @@ pub fn generate_video_thumb_with_limits_result(
     })
 }
 
-pub(crate) fn generate_video_thumb_file_with_limits_result(
+pub(crate) fn generate_video_thumb_file_with_limits_cancelled_result(
     src: &File,
     dest: &Path,
     width: u32,
     quality: u8,
     filmstrip: bool,
-    timeout: Duration,
-    max_alloc_bytes: u64,
+    control: MediaHelperControl<'_>,
 ) -> std::io::Result<bool> {
     if width == 0 {
         return Ok(false);
@@ -914,7 +986,7 @@ pub(crate) fn generate_video_thumb_file_with_limits_result(
                 "error",
                 "-max_alloc",
             ])
-            .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
+            .arg(control.max_alloc_bytes.max(16 * 1024 * 1024).to_string())
             .args(["-threads", "1", "-ss", "1", "-i", "/proc/self/fd/3"])
             .args([
                 "-frames:v",
@@ -927,7 +999,8 @@ pub(crate) fn generate_video_thumb_file_with_limits_result(
             ])
             .arg(temporary);
         inherit_file_at(&mut command, src, 3);
-        command_status_with_timeout(&mut command, timeout).map(|status| status.success())
+        command_status_with_cancellation(&mut command, control.timeout, control.cancellation)
+            .map(|status| status.success())
     })
 }
 
@@ -947,7 +1020,13 @@ where
         .unwrap_or("image.jpg");
     let temporary =
         dest.with_file_name(format!(".{name}.{}-{sequence}.tmp.jpg", std::process::id()));
-    let generated = generate(&temporary)?;
+    let generated = match generate(&temporary) {
+        Ok(generated) => generated,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
     if !generated || !temporary.is_file() {
         let _ = std::fs::remove_file(&temporary);
         return Ok(false);
@@ -972,6 +1051,14 @@ pub fn command_status_with_timeout(
     timeout: Duration,
 ) -> std::io::Result<std::process::ExitStatus> {
     command_output_with_timeout(command, timeout).map(|output| output.status)
+}
+
+pub(crate) fn command_status_with_cancellation(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> std::io::Result<std::process::ExitStatus> {
+    command_output_with_cancellation(command, timeout, cancellation).map(|output| output.status)
 }
 
 /// Make one already-open source descriptor available to a helper without
@@ -1007,6 +1094,14 @@ pub(crate) fn inherit_file_at(
 pub fn command_output_with_timeout(
     command: &mut std::process::Command,
     timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    command_output_with_cancellation(command, timeout, &CancellationToken::default())
+}
+
+pub(crate) fn command_output_with_cancellation(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    cancellation: &CancellationToken,
 ) -> std::io::Result<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
@@ -1051,19 +1146,9 @@ pub fn command_output_with_timeout(
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if Instant::now() >= deadline {
-            #[cfg(unix)]
-            {
-                // SAFETY: the child was started as leader of a fresh process
-                // group whose numeric ID is its PID. A negative target sends
-                // SIGKILL only to that group, never to the parent process.
-                unsafe {
-                    libc::kill(-(child.id() as i32), libc::SIGKILL);
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = child.kill();
-            let _ = child.wait();
+        let cancelled = cancellation.is_cancelled();
+        if cancelled || Instant::now() >= deadline {
+            terminate_process_group(&mut child, Duration::from_millis(200));
             if let Some(thread) = stdout_thread {
                 let _ = thread.join();
             }
@@ -1071,8 +1156,16 @@ pub fn command_output_with_timeout(
                 let _ = thread.join();
             }
             return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("external command exceeded {} seconds", timeout.as_secs()),
+                if cancelled {
+                    std::io::ErrorKind::Interrupted
+                } else {
+                    std::io::ErrorKind::TimedOut
+                },
+                if cancelled {
+                    "external command cancelled".to_string()
+                } else {
+                    format!("external command exceeded {} seconds", timeout.as_secs())
+                },
             ));
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -1088,6 +1181,44 @@ pub fn command_output_with_timeout(
         stdout,
         stderr,
     })
+}
+
+fn terminate_process_group(child: &mut std::process::Child, grace: Duration) {
+    #[cfg(unix)]
+    {
+        // SAFETY: helpers are leaders of fresh process groups. Negative PIDs
+        // therefore target only the helper and descendants it spawned.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                #[cfg(unix)]
+                unsafe {
+                    // The leader can exit while a descendant keeps the pipe
+                    // open. Remove any such straggler before drain-thread join.
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                return;
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => break,
+        }
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Extract the JPEG stored in EXIF IFD1, when present. Offsets in these tags
@@ -1190,6 +1321,62 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(1800));
     }
 
+    #[test]
+    fn libav_interrupt_callback_observes_cancellation_before_deadline() {
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let mut deadline = ProbeDeadline {
+            expires: Instant::now() + Duration::from_secs(30),
+            cancellation,
+        };
+        // SAFETY: the callback receives a live ProbeDeadline pointer for the
+        // duration of this direct invocation.
+        let interrupted = unsafe {
+            interrupt_expired((&mut deadline as *mut ProbeDeadline).cast::<libc::c_void>())
+        };
+        assert_eq!(interrupted, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_command_cancellation_terminates_and_reaps_a_stubborn_group() {
+        let tmp = TempDir::new("cancel-helper");
+        let pid_path = tmp.join("pid");
+        let cancellation = CancellationToken::default();
+        let cancel = cancellation.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancel.cancel();
+        });
+        let mut command = std::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "echo $$ > \"$1\"; trap '' TERM; while :; do sleep 1; done",
+                "sh",
+            ])
+            .arg(&pid_path);
+        let started = Instant::now();
+        let error =
+            command_status_with_cancellation(&mut command, Duration::from_secs(30), &cancellation)
+                .expect_err("cancelled helper must fail");
+        canceller.join().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal zero only queries whether this test child remains.
+        let result = unsafe { libc::kill(pid, 0) };
+        assert_eq!(result, -1, "helper process {pid} still exists");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn external_helpers_never_inherit_an_open_terminal_stdin() {
@@ -1266,6 +1453,117 @@ mod tests {
             got.av.duration.is_some() || got.av.resolution.is_some(),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn tracked_dolby_vision_fixture_probes_without_a_sidecar() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/library/video/dvp7.mkv");
+        assert!(fixture.is_file(), "tracked Profile 7 fixture is missing");
+        assert!(
+            !fixture.with_extension("probe.toml").exists(),
+            "Profile 7 must come from the container, not a synthetic sidecar"
+        );
+        let media = probe_media(&fixture).expect("probe tracked genuine Profile 7 fixture");
+        assert_eq!(media.probe.container, "mkv");
+        assert_eq!(media.probe.video, "hevc");
+        assert_eq!(media.probe.hdr, "dv-p7");
+        assert_eq!(media.probe.audio, "truehd");
+        assert_eq!(media.probe.audio_streams, "1:0:truehd:6");
+        assert_eq!((media.probe.width, media.probe.height), (256, 144));
+    }
+
+    #[test]
+    fn generated_advanced_media_is_bounded_and_probed_from_real_streams() {
+        let dir = TempDir::new("advanced-media");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/generate-advanced-fixtures.sh");
+        let generated = std::process::Command::new(&script)
+            .arg(dir.as_ref())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run advanced fixture generator");
+        assert!(
+            generated.status.success(),
+            "advanced fixture generation failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&generated.stdout),
+            String::from_utf8_lossy(&generated.stderr)
+        );
+
+        let truehd = probe_media(&dir.join("truehd.mkv")).expect("probe genuine TrueHD");
+        assert_eq!(truehd.probe.video, "h264");
+        assert_eq!(truehd.probe.audio, "truehd");
+        assert_eq!(truehd.probe.audio_streams, "1:0:truehd:6");
+
+        let hdr10 = probe_media(&dir.join("hdr10-mastering.mkv")).expect("probe genuine HDR10");
+        assert_eq!(hdr10.probe.video, "hevc");
+        assert_eq!(hdr10.probe.hdr, "hdr10");
+        assert_eq!((hdr10.probe.width, hdr10.probe.height), (64, 36));
+
+        let unusual =
+            probe_media(&dir.join("unusual-layout.mkv")).expect("probe unusual stream layout");
+        assert_eq!(unusual.probe.video, "h264");
+        assert_eq!(unusual.probe.audio, "truehd,ac3");
+        assert_eq!(unusual.probe.audio_streams, "0:0:truehd:6,2:1:ac3:1");
+        assert_eq!(unusual.av.subs.as_deref(), Some("subrip"));
+
+        let oversized = probe_media(&dir.join("oversized-metadata.mkv"))
+            .expect("probe oversized embedded metadata");
+        assert_eq!(oversized.tags.title.as_deref(), Some("bounded-title"));
+        assert_eq!(
+            oversized.tags.comment, None,
+            "an embedded tag above the allocation budget must be omitted"
+        );
+
+        for name in ["truncated.mkv", "corrupt.mkv"] {
+            let started = Instant::now();
+            let probe = probe_media_with_timeout(&dir.join(name), Duration::from_secs(2));
+            assert!(
+                probe.as_ref().is_none_or(|media| {
+                    media.probe.video.is_empty() && media.probe.audio.is_empty()
+                }),
+                "malformed fixture unexpectedly exposed playable streams: {name}: {probe:?}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(3));
+        }
+
+        let cfg = crate::ScanConfig {
+            media_dirs: vec![dir.to_path_buf()],
+            db_path: Some(dir.join("files.db")),
+            types: crate::MediaTypes::video_only(),
+            thumbnails: false,
+            subtitles: false,
+            ..crate::ScanConfig::default()
+        };
+        let catalog = crate::scan(&cfg).expect("scan generated advanced fixtures");
+        for valid in [
+            "truehd.mkv",
+            "hdr10-mastering.mkv",
+            "unusual-layout.mkv",
+            "oversized-metadata.mkv",
+        ] {
+            assert!(
+                catalog
+                    .items
+                    .values()
+                    .any(|item| item.path.ends_with(valid)),
+                "valid advanced fixture was not indexed: {valid}"
+            );
+        }
+        for invalid in ["truncated.mkv", "corrupt.mkv"] {
+            for item in catalog
+                .items
+                .values()
+                .filter(|item| item.path.ends_with(invalid))
+            {
+                assert!(
+                    item.probe.video.is_empty()
+                        && item.probe.audio.is_empty()
+                        && item.duration.is_none(),
+                    "malformed fixture must never gain fabricated stream metadata: {item:?}"
+                );
+            }
+        }
     }
 
     #[test]

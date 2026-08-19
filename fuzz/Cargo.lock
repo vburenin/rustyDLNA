@@ -526,7 +526,6 @@ name = "rusty-dlna-http"
 version = "0.1.0"
 dependencies = [
  "rusty-dlna-protocol",
- "thiserror",
 ]
 
 [[package]]
@@ -534,7 +533,6 @@ name = "rusty-dlna-protocol"
 version = "0.1.0"
 dependencies = [
  "bitflags",
- "thiserror",
 ]
 
 [[package]]
@@ -568,7 +566,6 @@ name = "rusty-dlna-ssdp"
 version = "0.1.0"
 dependencies = [
  "rusty-dlna-protocol",
- "thiserror",
 ]
 
 [[package]]

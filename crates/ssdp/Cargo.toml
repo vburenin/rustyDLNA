@@ -7,4 +7,3 @@ description = "SSDP announce and M-SEARCH"
 
 [dependencies]
 rusty-dlna-protocol.workspace = true
-thiserror.workspace = true

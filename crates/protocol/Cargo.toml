@@ -7,4 +7,3 @@ description = "DLNA/UPnP dialect: paths, clients, dates, object IDs"
 
 [dependencies]
 bitflags.workspace = true
-thiserror.workspace = true

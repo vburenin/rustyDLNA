@@ -42,6 +42,7 @@ done
 
 CACHE_VOLUME=${RUSTY_DLNA_CACHE_VOLUME:-rusty-dlna-cache}
 START_TIMEOUT=${RUSTY_DLNA_START_TIMEOUT:-120}
+REPAIR_OWNERSHIP=${RUSTY_DLNA_REPAIR_OWNERSHIP:-0}
 IMAGE=rusty-dlna:local
 CONTAINER=rusty-dlna
 CACHE_DEST=/var/cache/rusty-dlna
@@ -52,6 +53,10 @@ if [[ ! "$CACHE_VOLUME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
 fi
 if [[ ! "$START_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
     echo "RUSTY_DLNA_START_TIMEOUT must be a positive integer" >&2
+    exit 2
+fi
+if [[ ! "$REPAIR_OWNERSHIP" =~ ^[01]$ ]]; then
+    echo "RUSTY_DLNA_REPAIR_OWNERSHIP must be 0 or 1" >&2
     exit 2
 fi
 
@@ -93,16 +98,14 @@ fi
 # warn on every later deployment even though the data is otherwise reusable.
 docker compose create rusty-dlna
 
-# Older deployments may have populated the volume as root. Repair it with a
-# one-shot root container, then prove the image's normal uid/gid can write.
+# Older deployments may have populated the volume as root. The initializer
+# repairs that once and records a marker; normal restarts do not walk the cache.
 docker run --rm \
     --user 0:0 \
-    --entrypoint /bin/sh \
+    --env "RUSTY_DLNA_REPAIR_OWNERSHIP=$REPAIR_OWNERSHIP" \
+    --entrypoint /usr/local/libexec/rusty-dlna-cache-volume-init \
     --mount "type=volume,src=$CACHE_VOLUME,dst=/var/cache/rusty-dlna" \
-    "$IMAGE" -euc '
-        chown -R 10001:10001 /var/cache/rusty-dlna
-        chmod 0750 /var/cache/rusty-dlna
-    '
+    "$IMAGE"
 docker run --rm \
     --entrypoint /bin/sh \
     --mount "type=volume,src=$CACHE_VOLUME,dst=/var/cache/rusty-dlna" \

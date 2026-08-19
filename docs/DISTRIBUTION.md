@@ -27,6 +27,8 @@ The Docker build accepts `BUILD_VERSION`, `VCS_REF`, `BUILD_DATE`, and
 `SOURCE_DATE_EPOCH`; the release workflow derives them from the signed tag
 commit. Base images, Debian snapshot timestamp, `dovi_tool` version/checksums,
 GitHub Actions, Cargo lockfile, and Rust toolchain are pinned.
+The current Rust toolchain is `1.97.1`; the scheduled updater changes this
+documentation, Cargo, Docker, and every CI/release/soak pin in one tested PR.
 
 ## Corresponding source
 

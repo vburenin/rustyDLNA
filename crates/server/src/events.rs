@@ -386,6 +386,12 @@ pub struct NotifyMetrics {
     pub delivered: u64,
     pub failed: u64,
     pub retries: u64,
+    pub pending: usize,
+    pub in_flight: usize,
+    pub capacity: usize,
+    pub workers_total: usize,
+    pub workers_alive: usize,
+    pub stopping: bool,
 }
 
 #[derive(Debug, Default)]
@@ -405,6 +411,7 @@ impl AtomicNotifyMetrics {
             delivered: self.delivered.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             retries: self.retries.load(Ordering::Relaxed),
+            ..NotifyMetrics::default()
         }
     }
 }
@@ -551,7 +558,20 @@ impl NotifyDispatcher {
     }
 
     pub fn metrics(&self) -> NotifyMetrics {
-        self.shared.metrics.snapshot()
+        let mut metrics = self.shared.metrics.snapshot();
+        if let Ok(state) = self.shared.state.lock() {
+            metrics.pending = state.pending.len();
+            metrics.in_flight = state.in_flight.len();
+        }
+        metrics.capacity = self.capacity;
+        metrics.workers_total = self.workers.len();
+        metrics.workers_alive = self
+            .workers
+            .iter()
+            .filter(|worker| !worker.is_finished())
+            .count();
+        metrics.stopping = self.shared.stopping.load(Ordering::Acquire);
+        metrics
     }
 }
 

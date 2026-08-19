@@ -7,7 +7,6 @@ description = "HTTP media, description, and sidecar serving"
 
 [dependencies]
 rusty-dlna-protocol.workspace = true
-thiserror.workspace = true
 
 [dev-dependencies]
 roxmltree.workspace = true

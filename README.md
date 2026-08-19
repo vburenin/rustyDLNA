@@ -52,11 +52,14 @@ player asked* — not titles. Actions are leave it, remux Dolby Vision
 Profile 7 to Profile 8.1, encode HDR10, or convert audio to AC3. Empty
 rules means nobody is remuxed, including Cast.
 
-**Operations.** TOML configuration with unknown keys rejected.
+**Operations.** TOML configuration with unknown keys rejected. A shared,
+cancellation-aware graceful-stop budget defaults to 15 seconds; scanner
+transactions roll back and helper process groups are terminated and reaped.
 `--check` validates the file and the transcode tools on the host.
 `--print-effective-config` shows the resolved settings. Logs go to
-stderr (`RUST_LOG`). A `/health` endpoint is safe for Compose
-healthchecks (no multicast). The Docker image runs unprivileged (uid
+stderr (`RUST_LOG`). A bounded `/health` endpoint is safe for Compose
+healthchecks (no multicast, catalog walk, or inline database integrity scan);
+degraded service remains HTTP 200 while unhealthy service is 503. The Docker image runs unprivileged (uid
 10001, capabilities dropped).
 
 ## Not in this product
@@ -105,3 +108,7 @@ Shipped defaults are in [`rusty-dlna.toml`](rusty-dlna.toml). Remap
 examples and HDR notes are in [`docs/TRANSCODE.md`](docs/TRANSCODE.md).
 Release and source obligations are in
 [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md).
+Capacity planning, alerts, persistent-volume ownership, and the native systemd
+example are in [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+The reproducible 50k-file scale workload and its reference measurements are in
+[`docs/LARGE_LIBRARY_BENCHMARK.md`](docs/LARGE_LIBRARY_BENCHMARK.md).

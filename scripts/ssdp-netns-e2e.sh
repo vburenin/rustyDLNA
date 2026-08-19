@@ -27,17 +27,44 @@ server_b="sb${suffix}"
 client_a="ca${suffix}"
 client_b="cb${suffix}"
 tmp_dir=$(mktemp -d -t rusty-dlna-netns.XXXXXX)
+diagnostics=${RUSTY_DLNA_NETNS_DIAGNOSTICS:-}
 daemon_pid=""
+capture_pids=()
 
 cleanup() {
+  status=$?
+  trap - EXIT INT TERM
+  for capture_pid in "${capture_pids[@]}"; do
+    kill -TERM "${capture_pid}" 2>/dev/null || true
+    wait "${capture_pid}" 2>/dev/null || true
+  done
   if [[ -n ${daemon_pid} ]]; then
     kill -TERM "${daemon_pid}" 2>/dev/null || true
     wait "${daemon_pid}" 2>/dev/null || true
+  fi
+  if [[ ${status} -ne 0 ]]; then
+    ip -n "${server_ns}" -details address show >"${tmp_dir}/server-addresses.log" 2>&1 || true
+    ip -n "${server_ns}" maddress show >"${tmp_dir}/server-multicast.log" 2>&1 || true
+    ip netns exec "${server_ns}" ss -lunp >"${tmp_dir}/server-sockets.log" 2>&1 || true
+    for namespace in "${client_a_ns}" "${client_b_ns}"; do
+      ip -n "${namespace}" -details address show >"${tmp_dir}/${namespace}-addresses.log" 2>&1 || true
+      ip -n "${namespace}" maddress show >"${tmp_dir}/${namespace}-multicast.log" 2>&1 || true
+    done
+    if [[ -n ${diagnostics} ]]; then
+      mkdir -p "${diagnostics}"
+      cp -a "${tmp_dir}/." "${diagnostics}/"
+      chmod -R a+rX "${diagnostics}"
+      echo "ssdp-netns-e2e: failure diagnostics saved to ${diagnostics}" >&2
+    fi
+    for log in "${tmp_dir}"/*probe.log "${tmp_dir}/daemon.log"; do
+      [[ -f ${log} ]] && { echo "--- ${log}" >&2; tail -200 "${log}" >&2; }
+    done
   fi
   ip netns del "${server_ns}" 2>/dev/null || true
   ip netns del "${client_a_ns}" 2>/dev/null || true
   ip netns del "${client_b_ns}" 2>/dev/null || true
   rm -rf -- "${tmp_dir}"
+  exit "${status}"
 }
 trap cleanup EXIT INT TERM
 
@@ -64,6 +91,15 @@ ip -n "${client_b_ns}" link set lo up
 ip -n "${client_b_ns}" address add 10.202.1.2/24 dev "${client_b}"
 ip -n "${client_b_ns}" link set "${client_b}" up
 ip -n "${client_b_ns}" route add 239.0.0.0/8 dev "${client_b}"
+
+if command -v tcpdump >/dev/null; then
+  ip netns exec "${client_a_ns}" tcpdump -U -n -i any udp port 1900 \
+    -w "${tmp_dir}/client-a-ssdp.pcap" >"${tmp_dir}/client-a-tcpdump.log" 2>&1 &
+  capture_pids+=("$!")
+  ip netns exec "${client_b_ns}" tcpdump -U -n -i any udp port 1900 \
+    -w "${tmp_dir}/client-b-ssdp.pcap" >"${tmp_dir}/client-b-tcpdump.log" 2>&1 &
+  capture_pids+=("$!")
+fi
 
 mkdir -p "${tmp_dir}/cache" "${tmp_dir}/media"
 printf '%s\n' \
@@ -97,8 +133,12 @@ q=b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\
 s.sendto(q,("239.255.255.250",1900))
 data,peer=s.recvfrom(8192); text=data.decode("ascii")
 assert peer[0]==expected,(peer,text)
-assert "LOCATION: http://%s:8200/rootDesc.xml"%expected in text,text'
+assert "LOCATION: http://%s:8200/rootDesc.xml"%expected in text,text
+print("peer=%s:%s"%peer)
+print(text)'
 
-ip netns exec "${client_a_ns}" python3 -c "${probe}" 10.201.1.2 10.201.1.1
-ip netns exec "${client_b_ns}" python3 -c "${probe}" 10.202.1.2 10.202.1.1
+ip netns exec "${client_a_ns}" python3 -c "${probe}" 10.201.1.2 10.201.1.1 \
+  >"${tmp_dir}/client-a-probe.log" 2>&1
+ip netns exec "${client_b_ns}" python3 -c "${probe}" 10.202.1.2 10.202.1.1 \
+  >"${tmp_dir}/client-b-probe.log" 2>&1
 echo "ssdp-netns-e2e: both interfaces replied with matching source and LOCATION"

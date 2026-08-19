@@ -29,15 +29,33 @@ run_component() {
 test -f docs/TRANSCODE.md
 test -f docs/COMPATIBILITY.md
 test -f docs/DISTRIBUTION.md
+test -f docs/OPERATIONS.md
+test -f docs/LARGE_LIBRARY_BENCHMARK.md
+test -x scripts/set-rust-version.sh
+test -x scripts/cache-volume-init.sh
+test -x scripts/cache-ownership-benchmark.sh
+test -x scripts/large-library-benchmark.sh
+test -x scripts/large-library-http-benchmark.py
+test -x scripts/check-targeted-coverage.py
+test -x scripts/promote-fuzz-regression.sh
+test -x scripts/host-network-e2e.sh
+test -x scripts/generate-advanced-fixtures.sh
+test -x scripts/generate-dolby-vision-fixture.sh
+test -f contrib/systemd/rusty-dlna.service
 test -x restart.sh
 test ! -e improvement_plan.md
 test ! -d testdata/cache
 test ! -e testdata/testdata/cache/files.db
 (bash -n restart.sh)
+(bash -n scripts/ssdp-netns-e2e.sh scripts/host-network-e2e.sh scripts/compose-smoke.sh scripts/large-library-benchmark.sh scripts/generate-advanced-fixtures.sh scripts/generate-dolby-vision-fixture.sh scripts/promote-fuzz-regression.sh)
+python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding="utf-8")) for path in ("scripts/large-library-http-benchmark.py", "scripts/check-targeted-coverage.py")]'
 ./restart.sh --help >/dev/null
 ! ./restart.sh --nope >/dev/null 2>&1
 ! RUSTY_DLNA_CACHE_VOLUME='invalid,volume' ./restart.sh >/dev/null 2>&1
 ! RUSTY_DLNA_START_TIMEOUT=0 ./restart.sh >/dev/null 2>&1
+! RUSTY_DLNA_REPAIR_OWNERSHIP=invalid ./restart.sh >/dev/null 2>&1
+grep -F -q 'rusty-dlna-cache-volume-init' restart.sh
+! grep -F -q 'chown -R' restart.sh
 grep -F -q 'rusty-dlna-cache:/var/cache/rusty-dlna' docker-compose.yaml
 grep -F -q 'docker compose create rusty-dlna' restart.sh
 grep -F -q 'docker compose rm --force rusty-dlna' restart.sh
@@ -47,12 +65,37 @@ if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; 
 	docker compose config --quiet
 	test "$(docker compose config --volumes)" = "${RUSTY_DLNA_CACHE_VOLUME:-rusty-dlna-cache}"
 fi
+if command -v systemd-analyze >/dev/null 2>&1; then
+	if ! SYSTEMD_VERIFY=$(systemd-analyze verify contrib/systemd/rusty-dlna.service 2>&1); then
+		# The example's native binary is intentionally not installed on CI hosts.
+		SYSTEMD_UNEXPECTED=$(printf '%s\n' "$SYSTEMD_VERIFY" | \
+			grep -Fv 'Command /usr/local/bin/rusty-dlna is not executable: No such file or directory' || true)
+		test -n "$SYSTEMD_VERIFY" && test -z "$SYSTEMD_UNEXPECTED" || {
+			printf '%s\n' "$SYSTEMD_VERIFY" >&2
+			exit 1
+		}
+	fi
+fi
 (cd testdata && sha256sum --check SHA256SUMS)
+REQUIRED_FIXTURES=$(sed '/^[[:space:]]*$/d' testdata/REQUIRED_FILES | LC_ALL=C sort)
+ACTUAL_FIXTURES=$(find testdata/library -type f -printf '%P\n' | LC_ALL=C sort)
+test "$ACTUAL_FIXTURES" = "$REQUIRED_FIXTURES" || {
+	echo "testdata/library differs from testdata/REQUIRED_FILES" >&2
+	printf 'required:\n%s\nactual:\n%s\n' "$REQUIRED_FIXTURES" "$ACTUAL_FIXTURES" >&2
+	exit 1
+}
+test "$(file -b --mime-encoding scripts/fixture-exif.rs)" != binary
+FIXTURE_STATE_BEFORE=$(find testdata/library -type f -exec sha256sum {} + | LC_ALL=C sort)
 ! grep -Eqi 'disconnect kills|kill-on-disconnect|as a live fragmented-MP4 pipe|Transcoded GETs \(live pipe\)|OP=00 \(live pipe\)' \
 	README.md docs/TRANSCODE.md
 run_component fmt --all -- --check
 run_component clippy --workspace --all-targets --all-features -- -D warnings
 run_cargo test --workspace --locked
+FIXTURE_STATE_AFTER=$(find testdata/library -type f -exec sha256sum {} + | LC_ALL=C sort)
+test "$FIXTURE_STATE_AFTER" = "$FIXTURE_STATE_BEFORE" || {
+	echo "tests modified tracked fixture inputs under testdata/library" >&2
+	exit 1
+}
 RUSTDOCFLAGS='-D warnings' run_cargo doc --workspace --no-deps --locked
 
 CHECK_TMP=$(mktemp -d "${TMPDIR:-/tmp}/rusty-dlna-check.XXXXXX")

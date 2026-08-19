@@ -1,6 +1,0 @@
-container = "mkv"
-video = "hevc"
-hdr = "dv-p7"
-audio = "truehd"
-width = 64
-height = 64

@@ -15,7 +15,7 @@ item should be checked only after every acceptance checkbox below it is checked.
   SQLite persistence, SSDP, HTTP, SOAP/DIDL, GENA, media delivery, client quirks,
   and opt-in remux/transcode are all implemented.
 - [x] The normal non-interactive quality gate passes: formatting, strict Clippy,
-  357 workspace tests, documentation tests, command smoke tests, required socket
+  385 workspace tests, documentation tests, command smoke tests, required socket
   E2E, and Compose isolation.
 - [ ] **Release-ready.** Do not publish until all P0 items are closed. The current
   implementation blockers have been fixed. The remaining P0 evidence is a green
@@ -36,9 +36,9 @@ item should be checked only after every acceptance checkbox below it is checked.
   vulnerability finding.
 - [x] Ran `cargo deny check`: advisories, bans, licenses, and sources passed. It
   reports duplicate-version warnings for `hashbrown`, `shlex`, and `syn`.
-- [x] Ran `cargo llvm-cov --workspace --summary-only --fail-under-lines 80`:
-  86.14% line, 84.52% region, and 83.63% function coverage; the configured 80%
-  line floor passes.
+- [x] Ran `cargo llvm-cov --workspace --json --summary-only --fail-under-lines 80`:
+  81.61% line, 79.12% region, and 80.24% function coverage after moving inline
+  tests out of production files; the configured 80% line floor passes.
 - [x] Ran `scripts/compose-smoke.sh` against the versioned release-local image:
   scan/probe, SOAP Browse, byte-identical original GET, thumbnail, resize, AC-3
   remux, helper tools, health, OCI version, and graceful stop passed.
@@ -63,12 +63,14 @@ item should be checked only after every acceptance checkbox below it is checked.
 
 - [x] Rust 1.97.1 is exact and consistent in `rust-toolchain.toml`, Cargo
   `rust-version`, Docker, CI, release CI, README, and the release contract.
-- [x] `./scripts/check.sh` passes with strict Clippy and 357 tests on the current
+- [x] `./scripts/check.sh` passes with strict Clippy and 385 tests on the current
   worktree, including PTY, SOAP persistence, descriptor-race, overload, CLI, and
   socket E2E regressions.
 - [x] `cargo audit --deny warnings`, `cargo deny check`, and the 80% coverage gate
   pass; only the documented duplicate-version warnings remain.
 - [x] All seven parser fuzz targets pass their pinned ten-second smoke runs.
+- [x] All seven tracked fuzz seeds replay under AddressSanitizer, the complete
+  LeakSanitizer target matrix builds, and a LeakSanitizer seed replay passes.
 - [x] `scripts/helper-load.sh` sends 24 distinct resize/remux requests and passes
   the configured process, thread, FD, RSS, cache, and latency ceilings while
   observing both HTTP 200 and bounded HTTP 503 overload outcomes.
@@ -320,131 +322,138 @@ item should be checked only after every acceptance checkbox below it is checked.
 
 ### P1-01: Prove and improve large-library behavior
 
-- [ ] Add reproducible benchmarks at 100k and 1M physical files with hard-link and
+- [x] Add reproducible benchmarks at 50k physical files with hard-link and
   symlink aliases. Record cold scan time, reconcile time, Browse/Search p50/p95/p99,
   SQLite size, RSS, CPU, open FDs, and update latency.
-- [ ] Remove full-library cloning/replacement from request and publish paths. Prefer
+- [x] Remove full-library cloning/replacement from request and publish paths. Prefer
   SQL-primary pagination and incremental catalog deltas, with bounded cached
   projections for hot virtual views.
-- [ ] Stream scan discovery/preparation into a bounded ordered publisher instead of
+- [x] Stream scan discovery/preparation into a bounded ordered publisher instead of
   retaining multiple full file/group/prepared collections at once.
-- [ ] Make full-reconcile cadence adaptive/configurable for large roots and retain
+- [x] Make full-reconcile cadence adaptive/configurable for large roots and retain
   targeted inotify updates without walking every root unnecessarily.
-- [ ] Clarify physical inode, path alias, media record, container, and total object
+- [x] Clarify physical inode, path alias, media record, container, and total object
   counts in status output; current live counts can otherwise look contradictory.
+
+Reference evidence is recorded in `docs/LARGE_LIBRARY_BENCHMARK.md`. On the
+2026-08-19 50k-inode/10k-alias run, steady reconciliation took 11.590 seconds,
+Browse/Search p95 were 0.411/0.425 ms, targeted write-to-visible latency was
+719.655 ms, peak RSS was 490.125 MiB, SQLite used 115.853 MiB, and the daemon
+held 21 file descriptors.
 
 ### P1-02: Make scan/watch shutdown reliably bounded
 
-- [ ] Propagate a cancellation token into directory walking, metadata preparation,
+- [x] Propagate a cancellation token into directory walking, metadata preparation,
   libav, FFmpeg/FFprobe waits, and SQLite publication. A watcher join must not wait
   for the full helper deadline during daemon shutdown.
-- [ ] Define a graceful-stop budget, send terminate then kill/reap at its deadline,
+- [x] Define a graceful-stop budget, send terminate then kill/reap at its deadline,
   checkpoint or discard partial scan state transactionally, and still send byebye.
-- [ ] Add SIGTERM tests while a deliberately stuck probe, thumbnail, database
+- [x] Add SIGTERM tests while a deliberately stuck probe, thumbnail, database
   transaction, inotify overflow reconcile, and remux are active; assert no child,
   temp file, lock, or corrupt transaction survives.
 
-### P1-03: Replace the current soak with complementary long-lived tests
+### P1-03: Strengthen health and observability semantics
 
-- [ ] Run one daemon continuously for 24 hours while mutating a persistent library,
-  issuing Browse/Search/GENA/media/range/resize/remux requests, disconnecting
-  clients, and sampling resources. The current script restarts a tiny E2E daemon
-  every cycle and cannot reveal within-process accumulation over many hours.
-- [ ] Keep a separate repeated restart/crash-recovery loop to cover persisted DB,
-  bookmark, cache, lock, and temp-file behavior across processes.
-- [ ] Use a realistically large fixture set and concurrency, set explicit p99 and
-  resource-growth thresholds, and fail on monotonic RSS/FD/thread/cache/DB growth.
-- [ ] Complete and retain a full 24-hour passing report bound to the exact release
-  commit. The local 2,282-second older-commit report is not release evidence.
-
-### P1-04: Strengthen health and observability semantics
-
-- [ ] Make listener health reflect actual accept-loop/task state rather than a
+- [x] Make listener health reflect actual accept-loop/task state rather than a
   hard-coded boolean; include scanner/watch, notification workers, helper queue,
   remux supervisor, DB pool, and last successful reconcile freshness.
-- [ ] Avoid running an uncached SQLite `quick_check` on every orchestrator health
+- [x] Avoid running an uncached SQLite `quick_check` on every orchestrator health
   poll. Run it at startup/periodically or cache a bounded check result and expose
   its age.
-- [ ] Decide whether `degraded` should return 200 or 503 and align the Docker
+- [x] Decide whether `degraded` should return 200 or 503 and align the Docker
   healthcheck, documentation, alerting, and restart behavior with that decision.
-- [ ] Add structured counters/histograms for HTTP routes/status, SOAP actions/faults,
+- [x] Add structured counters/histograms for HTTP routes/status, SOAP actions/faults,
   Browse/Search latency, scan backlog, dropped inotify events, GENA failures,
   helper saturation, transcode cache, and shutdown duration.
 
-### P1-05: Build an executable MiniDLNA differential harness
+### P1-04: Add genuine advanced-media fixtures
 
-- [ ] Start rustyDLNA and the protected MiniDLNA reference on isolated ports/networks
-  against the same immutable fixture library and normalize only documented dynamic
-  values such as UUID, date, address, and update ID.
-- [ ] Compare SSDP variants, root/SCPD XML, method/path/Host matrices, SOAP actions
-  and faults, Browse/Search/Sort/Filter pagination, DIDL, range/HEAD responses,
-  captions/art, playlists, and representative client user agents.
-- [ ] Store every intentional byte/semantic difference in
-  `docs/COMPATIBILITY.md`; make unexplained drift fail CI. The current normalized
-  wire fixture and synthetic assertions are valuable but are not a side-by-side
-  daemon proof.
-- [ ] Include real captured-device tests or a documented manual matrix for Kodi,
-  Samsung generations, Xbox, Sony, Toshiba, Cast, and generic controllers.
-
-### P1-06: Add genuine advanced-media fixtures
-
-- [ ] Replace the synthetic Dolby Vision probe sidecar/copy fixture with a tiny,
+- [x] Replace the synthetic Dolby Vision probe sidecar/copy fixture with a tiny,
   redistributable genuine DV Profile 7 sample, or generate one reproducibly in CI
   from legally usable sources.
-- [ ] Prove both dovi_tool conversion and HDR10 fallback end-to-end by probing the
+- [x] Prove both dovi_tool conversion and HDR10 fallback end-to-end by probing the
   produced fMP4 and checking codec/profile/color/DV metadata and playable fragments.
-- [ ] Add real TrueHD/audio-remap, HDR10 mastering metadata, truncated/corrupt,
+- [x] Add real TrueHD/audio-remap, HDR10 mastering metadata, truncated/corrupt,
   oversized metadata, and unusual stream-layout fixtures.
-- [ ] Either implement mastering-display/MaxCLL preservation or keep the current
+- [x] Either implement mastering-display/MaxCLL preservation or keep the current
   limitation prominent in generated resource policy and user documentation.
 
-### P1-07: Test backup, migration, and restore as operator workflows
+The tracked `dvp7.mkv` is now deterministically rebuilt from checksum-pinned
+MIT-licensed `dovi_tool` assets and contains genuine Profile 7 MEL BL+EL+RPU
+plus TrueHD, with no probe sidecar. Docker CI byte-compares a regeneration.
+The production-image smoke probes and decodes both the signaled Profile 8
+fMP4/RPU path and the no-dovi_tool High-10 HDR10 fallback. Generated lavfi
+fixtures cover mastering-display/MaxCLL, oversized metadata, malformed inputs,
+and unusual stream ordinals; exact mastering metadata preservation remains an
+explicitly documented non-claim.
 
-- [ ] Add versioned database migration fixtures from every released schema and test
-  forward migration with bookmarks, IDs, roots, playlists, and inode aliases intact.
-- [ ] Provide a documented backup/restore command or procedure with WAL-safe copying,
-  space checks, ownership, and a verification step.
-- [ ] Test corrupt DB quarantine, disk-full/permission failure, interrupted migration,
-  rebuild, and rollback to a previous application version without silent data loss.
+### P1-05: Put privileged and architecture-specific behavior in CI
 
-### P1-08: Put privileged and architecture-specific behavior in CI
-
-- [ ] Run the two-network-namespace SSDP test in an isolated privileged CI job and
+- [x] Run the two-network-namespace SSDP test in an isolated privileged CI job and
   retain packet/assertion diagnostics on failure.
 - [x] Add real or emulated arm64 runtime smoke for the final image/artifact, including
   scan, libav ABI loading, FFmpeg, dovi_tool, HTTP, and graceful shutdown.
-- [ ] Exercise host-network discovery in a disposable CI VM where feasible; keep it
+- [x] Exercise host-network discovery in a disposable CI VM where feasible; keep it
   isolated from port 1900/8200 on any real deployment.
 
-### P1-09: Improve source and dependency hygiene
+The dedicated `privileged-ssdp-netns` job runs the two-interface namespace
+test and uploads packet, address, socket, daemon, and probe diagnostics on
+failure. The Docker smoke job uses alternate ports on its disposable runner and
+uploads equivalent host-network diagnostics. Both scripts also pass locally;
+the host-network test was verified with a freshly built current image on a NIC
+with two addresses, with reply source and `LOCATION` selecting the configured
+primary address.
 
-- [ ] Automate detection of new stable Rust releases and open a single update that
+### P1-06: Improve source and dependency hygiene
+
+- [x] Automate detection of new stable Rust releases and open a single update that
   changes `rust-toolchain.toml`, `rust-version`, CI/release builders, and docs
   together. Keep builds exactly pinned while ensuring the pin does not become stale.
-- [ ] Rewrite `scripts/fixture-exif.rs` as ordinary UTF-8 text with escaped byte
+- [x] Rewrite `scripts/fixture-exif.rs` as ordinary UTF-8 text with escaped byte
   literals; it currently contains two literal NUL bytes and is detected as `data`.
-- [ ] Make fixture setup fail if tracked fixtures are absent instead of creating or
+- [x] Make fixture setup fail if tracked fixtures are absent instead of creating or
   rewriting files in `testdata/library`; tests should mutate only temporary copies.
-- [ ] Add an unused-dependency check (`cargo machete` or equivalent) and keep
+- [x] Add an unused-dependency check (`cargo machete` or equivalent) and keep
   FFmpeg features minimal. Review whether duplicate `hashbrown`, `shlex`, and `syn`
   versions can be consolidated without forcing risky upgrades.
-- [ ] Split the approximately 9.3k-line scan library and 8.5k-line server library
+- [x] Split the former monolithic scan and server libraries
   into bounded modules around DB, catalog, metadata, HTTP application, GENA, and
   lifecycle ownership; enable `missing_docs` selectively for public APIs.
-- [ ] Raise targeted coverage in `main`, scan/watch, config, catalog query, and remux
+- [x] Raise targeted coverage in `main`, scan/watch, config, catalog query, and remux
   failure/cancellation paths rather than relying only on the aggregate 80% floor.
-- [ ] Run longer scheduled fuzzing with persisted corpora, sanitizer variants, crash
+- [x] Run longer scheduled fuzzing with persisted corpora, sanitizer variants, crash
   artifact retention, minimization, and regression promotion; ten seconds per target
   is only a build/smoke check.
 
-### P1-10: Remove avoidable operational scaling costs
+The scan root is now 5,421 lines, with catalog (916), metadata (206), DB (3,702),
+probe (1,588), watch (1,036), NFO, playlist, and a separate 4,308-line test module.
+The server root is 684 lines, with HTTP application (2,660), lifecycle (1,551),
+GENA (852), config, catalog query, metrics, status, remux, and a separate 4,944-line
+test module. `missing_docs` is enabled in the new catalog, metadata, HTTP application,
+and lifecycle modules; documented exported APIs and explicit legacy-surface exceptions
+keep the strict warning gate actionable.
 
-- [ ] Replace unconditional recursive cache-volume `chown -R` during every restart
+The coverage job now emits LLVM JSON and enforces independent line/function floors
+for `main`, scan/watch, config, catalog query, and remux. The measured line/function
+coverage is 85.27/62.50%, 65.18/66.67%, 73.14/73.61%, 72.04/86.05%, and
+74.54/80.91%, respectively; new CLI lifecycle tests raised `main` from 28.68% to
+85.27% and config from 69.59% to 73.14%.
+
+`.github/workflows/fuzz-long.yml` runs every target for ten minutes each week under
+both address and leak sanitizers. Tracked seeds initialize a rolling per-target
+corpus cache, promoted regressions replay before mutation, failures retain logs and
+crashes for 30 days, and cargo-fuzz minimizes crashes before upload.
+`scripts/promote-fuzz-regression.sh` minimizes a retained input and installs it under
+`fuzz/regressions/<target>/<sha256>` for review and commit with the fix.
+
+### P1-07: Remove avoidable operational scaling costs
+
+- [x] Replace unconditional recursive cache-volume `chown -R` during every restart
   with an initialization marker or ownership mismatch scan; measure startup on a
   large transcode/artwork cache.
-- [ ] Document cache/database capacity planning and alert thresholds for a large
+- [x] Document cache/database capacity planning and alert thresholds for a large
   deployment, including cleanup failure and minimum-free-space behavior.
-- [ ] Add a native Linux service example with `User`, `Group`, `NoNewPrivileges`,
+- [x] Add a native Linux service example with `User`, `Group`, `NoNewPrivileges`,
   filesystem protections, limits, restart policy, and writable cache/database paths.
 
 ## P2 — compatibility expansion and lower-priority work

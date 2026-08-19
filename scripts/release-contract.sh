@@ -26,6 +26,17 @@ grep -Fq "FROM rust:${TOOLCHAIN}-" "$ROOT/Dockerfile" || {
     echo "Docker build image does not use Rust $TOOLCHAIN" >&2
     exit 1
 }
+for file in \
+    .github/workflows/ci.yml \
+    .github/workflows/release.yml \
+    .github/workflows/soak.yml \
+    docs/DISTRIBUTION.md
+do
+    grep -Fq "$TOOLCHAIN" "$ROOT/$file" || {
+        echo "$file does not use or document Rust $TOOLCHAIN" >&2
+        exit 1
+    }
+done
 grep -Fq "## $VERSION -" "$ROOT/CHANGELOG.md" || {
     echo "CHANGELOG.md has no section for $VERSION" >&2
     exit 1

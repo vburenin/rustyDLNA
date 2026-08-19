@@ -12,7 +12,8 @@ rusty-dlna.live.toml
 /media
 testdata
 docs
-scripts
+scripts/*
+!scripts/cache-volume-init.sh
 *.md
 !THIRD_PARTY_NOTICES.md
 docker-compose*.yaml

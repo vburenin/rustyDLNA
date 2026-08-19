@@ -54,6 +54,30 @@ ffprobe, compiled encoder support, hardware-device usability, and dovi_tool.
 Missing dovi_tool is reported as a warning because Profile-8 jobs retain the
 documented HDR10 fallback.
 
+## Advanced-media fixture contract
+
+`scripts/generate-advanced-fixtures.sh OUTPUT_DIRECTORY` creates small media
+inputs entirely from FFmpeg `lavfi` sources. The generated set includes real
+six-channel TrueHD, PQ/BT.2020 HEVC with mastering-display and MaxCLL/MaxFALL
+SEI, audio-before-video with two audio ordinals and a subtitle, an 80 KiB
+embedded tag, and deterministic truncated/corrupt Matroska inputs. No fixture
+depends on copyrighted source media.
+
+`scripts/generate-dolby-vision-fixture.sh OUTPUT_MKV` separately rebuilds the
+checked-in `dvp7.mkv` from checksum-pinned HEVC test assets at quietvoid
+`dovi_tool` commit `38adec045bf183c24df38149836c920398072281`. Those assets
+are MIT-licensed (the complete notice is in `testdata/README.md`). The script
+uses `dovi_tool -m 1` and deterministic `mkvmerge` output to produce a genuine
+Profile 7 MEL stream with BL+EL+RPU and real six-channel TrueHD; no probe
+sidecar is used. Docker CI regenerates and byte-compares this fixture.
+
+The scanner tests verify the real codecs, HDR signaling, stream indices,
+metadata allocation cap, and bounded malformed-input behavior. The transcode
+tests and production-image smoke execute TrueHD-to-AC-3 remapping, genuine
+Profile 7 to signaled Profile 8 conversion, and the HDR10 failure fallback.
+They require fragmented, decodable MP4 output and probe codec profile, 10-bit
+format, color metadata, Dolby Vision configuration, and converted RPU bytes.
+
 ## HDR and Dolby Vision
 
 - **HDR10-compatible output** uses PQ `smpte2084`, BT.2020, and 10-bit pixels.
@@ -83,9 +107,11 @@ The rest fills in behind the client.
 | Source `mtime`/`size` ≠ stamp | dest deleted, job restarts | same as growing |
 
 `remux-p8` runs `dovi_tool -m 2 convert --discard` (BL + P8.1 RPU) when
-the binary is on `PATH`. If it is missing or the convert fails, the job
-falls back to the `hdr10` encode. First audio map prefers `aac` / `ac3`
-/ `eac3` over TrueHD / DTS.
+the binary is on `PATH`. The pipeline carries the source Dolby Vision level
+into a Profile 8 `dvvC` record, writes an `hvc1` fragmented MP4, and retains
+PQ/BT.2020 signaling. If dovi_tool is missing or the convert/signaling step
+fails, the job falls back to the `hdr10` encode. First audio map prefers `aac`
+/ `ac3` / `eac3` over TrueHD / DTS.
 
 Kodi opens several GETs at once. They **attach** to the same job. A
 probe disconnect does **not** kill ffmpeg.

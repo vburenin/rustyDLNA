@@ -24,6 +24,8 @@ scan_workers = 16
 helper_max_jobs = 16
 helper_queue_capacity = 64
 helper_queue_timeout_secs = 30
+# Whole-process SIGTERM budget; helpers receive TERM, then KILL/reap within it.
+shutdown_timeout_secs = 15
 # Recently Added uses filesystem mtime, newest first, with inode deduplication.
 recent_limit = 200
 # recent_days = 90 # omitted means no age window
@@ -33,6 +35,9 @@ root_container = "V"
 listen_ip = "0.0.0.0"
 cache_dir = "/var/cache/rusty-dlna"
 db_dir = "/var/cache/rusty-dlna"
+derived_image_cache_mb = 512
+derived_image_cache_age_days = 30
+cache_min_free_mb = 128
 # Kodi resume positions/play counts: 0 = retain indefinitely.
 bookmark_retention_days = 0
 
@@ -40,6 +45,8 @@ bookmark_retention_days = 0
 enable = false
 encoder = "libx264"
 max_jobs = 2
+cache_max_mb = 51200
+cache_max_age_days = 30
 
 # Ad-hoc codec remaps, **per software**. Unset fields are wildcards.
 # First match wins. Match codecs + which player asked — not titles.

@@ -1,3 +1,5 @@
 /artifacts/
 /corpus/
+/logs/
+/minimized/
 /target/

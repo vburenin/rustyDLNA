@@ -856,12 +856,65 @@ fn inherit_source_fd(command: &mut std::process::Command, source_fd: Option<std:
     }
 }
 
+fn terminate_process_group(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+    #[cfg(unix)]
+    unsafe {
+        // SAFETY: run_cmd_controlled starts each helper as a new process-group
+        // leader, so this signal reaches only that helper tree.
+        libc::kill(-(child.id() as i32), libc::SIGTERM);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                return Some(status);
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => break,
+        }
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    child.wait().ok()
+}
+
 fn run_cmd_controlled(
     args: &[String],
     deadline: std::time::Instant,
     cancelled: &std::sync::atomic::AtomicBool,
     source_fd: Option<std::os::fd::RawFd>,
 ) -> Result<(), String> {
+    run_cmd_controlled_output(args, deadline, cancelled, source_fd, false).map(|_| ())
+}
+
+fn run_cmd_capture_controlled(
+    args: &[String],
+    deadline: std::time::Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
+    source_fd: Option<std::os::fd::RawFd>,
+) -> Result<Vec<u8>, String> {
+    run_cmd_controlled_output(args, deadline, cancelled, source_fd, true)
+}
+
+fn run_cmd_controlled_output(
+    args: &[String],
+    deadline: std::time::Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
+    source_fd: Option<std::os::fd::RawFd>,
+    capture_stdout: bool,
+) -> Result<Vec<u8>, String> {
     use std::io::Read;
     use std::sync::atomic::Ordering;
 
@@ -872,13 +925,44 @@ fn run_cmd_controlled(
     command
         .args(&args[1..])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(if capture_stdout {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     inherit_source_fd(&mut command, source_fd);
     let mut child = command
         .spawn()
         .map_err(|e| format!("spawn {}: {e}", args[0]))?;
+    let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || -> Result<Vec<u8>, String> {
+        const MAX_STDOUT: usize = 64 * 1024;
+        let Some(mut stdout) = stdout else {
+            return Ok(Vec::new());
+        };
+        let mut captured = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stdout
+                .read(&mut chunk)
+                .map_err(|error| format!("read helper stdout: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            if captured.len().saturating_add(read) > MAX_STDOUT {
+                return Err(format!("helper stdout exceeded {MAX_STDOUT} bytes"));
+            }
+            captured.extend_from_slice(&chunk[..read]);
+        }
+        Ok(captured)
+    });
     let stderr_reader = std::thread::spawn(move || {
         const MAX_STDERR: usize = 64 * 1024;
         let Some(mut stderr) = stderr else {
@@ -900,23 +984,23 @@ fn run_cmd_controlled(
     });
     let (status, stopped) = loop {
         if cancelled.load(Ordering::Acquire) {
-            let _ = child.kill();
-            break (child.wait().ok(), Some("cancelled"));
+            break (terminate_process_group(&mut child), Some("cancelled"));
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            break (child.wait().ok(), Some("timed out"));
+            break (terminate_process_group(&mut child), Some("timed out"));
         }
         match child.try_wait() {
             Ok(Some(status)) => break (Some(status), None),
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_group(&mut child);
                 return Err(format!("wait {}: {error}", args[0]));
             }
         }
     };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| format!("{} stdout reader panicked", args[0]))??;
     let stderr = stderr_reader.join().unwrap_or_default();
     if let Some(stopped) = stopped {
         return Err(format!("{} {stopped}", args[0]));
@@ -925,7 +1009,156 @@ fn run_cmd_controlled(
         let tail = String::from_utf8_lossy(&stderr);
         return Err(format!("{}: {}", args[0], tail.trim()));
     }
-    Ok(())
+    Ok(stdout)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Mp4BoxSpan {
+    offset: usize,
+    size: usize,
+    header_size: usize,
+    kind: [u8; 4],
+}
+
+impl Mp4BoxSpan {
+    fn content_start(self) -> usize {
+        self.offset + self.header_size
+    }
+
+    fn end(self) -> usize {
+        self.offset + self.size
+    }
+}
+
+fn mp4_boxes(data: &[u8], start: usize, end: usize) -> Result<Vec<Mp4BoxSpan>, String> {
+    if start > end || end > data.len() {
+        return Err("invalid MP4 box bounds".into());
+    }
+    let mut boxes = Vec::new();
+    let mut offset = start;
+    while offset < end {
+        if end - offset < 8 {
+            return Err(format!("truncated MP4 box header at byte {offset}"));
+        }
+        let size32 = u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap());
+        let kind = data[offset + 4..offset + 8].try_into().unwrap();
+        let (size, header_size) = match size32 {
+            0 => (end - offset, 8),
+            1 => {
+                if end - offset < 16 {
+                    return Err(format!("truncated large MP4 box at byte {offset}"));
+                }
+                let size64 = u64::from_be_bytes(data[offset + 8..offset + 16].try_into().unwrap());
+                let size = usize::try_from(size64)
+                    .map_err(|_| format!("MP4 box at byte {offset} is too large"))?;
+                (size, 16)
+            }
+            size => (size as usize, 8),
+        };
+        if size < header_size || size > end - offset {
+            return Err(format!("invalid MP4 box size {size} at byte {offset}"));
+        }
+        boxes.push(Mp4BoxSpan {
+            offset,
+            size,
+            header_size,
+            kind,
+        });
+        offset += size;
+    }
+    Ok(boxes)
+}
+
+fn boxes_of_kind(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    kind: &[u8; 4],
+) -> Result<Vec<Mp4BoxSpan>, String> {
+    Ok(mp4_boxes(data, start, end)?
+        .into_iter()
+        .filter(|span| &span.kind == kind)
+        .collect())
+}
+
+fn profile8_sample_entry_path(data: &[u8]) -> Result<Vec<Mp4BoxSpan>, String> {
+    for moov in boxes_of_kind(data, 0, data.len(), b"moov")? {
+        for trak in boxes_of_kind(data, moov.content_start(), moov.end(), b"trak")? {
+            for mdia in boxes_of_kind(data, trak.content_start(), trak.end(), b"mdia")? {
+                for minf in boxes_of_kind(data, mdia.content_start(), mdia.end(), b"minf")? {
+                    for stbl in boxes_of_kind(data, minf.content_start(), minf.end(), b"stbl")? {
+                        for stsd in boxes_of_kind(data, stbl.content_start(), stbl.end(), b"stsd")?
+                        {
+                            let entries_start = stsd
+                                .content_start()
+                                .checked_add(8)
+                                .ok_or_else(|| "MP4 stsd offset overflow".to_string())?;
+                            if entries_start > stsd.end() {
+                                return Err("truncated MP4 stsd full-box header".into());
+                            }
+                            for entry in mp4_boxes(data, entries_start, stsd.end())? {
+                                if entry.kind == *b"hvc1" || entry.kind == *b"hev1" {
+                                    return Ok(vec![moov, trak, mdia, minf, stbl, stsd, entry]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err("HEVC sample entry not found in intermediate MP4".into())
+}
+
+fn signal_profile8_in_mp4(path: &Path, level: u8) -> Result<(), String> {
+    if level > 63 {
+        return Err(format!("invalid Dolby Vision level {level}"));
+    }
+    let mut data =
+        std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let spans = profile8_sample_entry_path(&data)?;
+    let entry = *spans.last().unwrap();
+    const VISUAL_SAMPLE_ENTRY_FIELDS: usize = 78;
+    let children_start = entry
+        .content_start()
+        .checked_add(VISUAL_SAMPLE_ENTRY_FIELDS)
+        .ok_or_else(|| "MP4 sample-entry offset overflow".to_string())?;
+    if children_start > entry.end() {
+        return Err("truncated HEVC visual sample entry".into());
+    }
+    if mp4_boxes(&data, children_start, entry.end())?
+        .iter()
+        .any(|span| matches!(&span.kind, b"dvcC" | b"dvvC" | b"dvwC"))
+    {
+        return Err("intermediate MP4 already has Dolby Vision signaling".into());
+    }
+
+    // ISO/IEC 14496-15 Dolby Vision decoder configuration record: v1.0,
+    // Profile 8, source level, RPU+BL present, no EL, HDR10 compatibility 1.
+    let mut dvvc = [0u8; 32];
+    dvvc[..4].copy_from_slice(&32u32.to_be_bytes());
+    dvvc[4..8].copy_from_slice(b"dvvC");
+    dvvc[8] = 1;
+    let flags = (8u16 << 9) | (u16::from(level) << 3) | (1 << 2) | 1;
+    dvvc[10..12].copy_from_slice(&flags.to_be_bytes());
+    dvvc[12] = 1 << 4;
+
+    for span in &spans {
+        if span.header_size != 8 || span.size > u32::MAX as usize {
+            return Err(format!(
+                "unsupported large {:?} MP4 box",
+                String::from_utf8_lossy(&span.kind)
+            ));
+        }
+        let grown = span
+            .size
+            .checked_add(dvvc.len())
+            .and_then(|size| u32::try_from(size).ok())
+            .ok_or_else(|| "MP4 box size overflow".to_string())?;
+        data[span.offset..span.offset + 4].copy_from_slice(&grown.to_be_bytes());
+    }
+    data.splice(entry.end()..entry.end(), dvvc);
+    std::fs::write(path, data).map_err(|error| format!("write {}: {error}", path.display()))
 }
 
 /// BL + P8.1 RPU via `dovi_tool -m 2 convert --discard`. Writes `dest_part`
@@ -973,8 +1206,10 @@ fn run_remux_p8_impl(
     }
     let hevc = dest_part.with_extension("hevc");
     let p8 = dest_part.with_extension("p8.hevc");
+    let p8_mp4 = dest_part.with_extension("p8.mp4");
     let _ = std::fs::remove_file(&hevc);
     let _ = std::fs::remove_file(&p8);
+    let _ = std::fs::remove_file(&p8_mp4);
     let source_arg = if source_fd.is_some() {
         "/proc/self/fd/3".to_string()
     } else {
@@ -1009,7 +1244,19 @@ fn run_remux_p8_impl(
         "-o".into(),
         p8.to_string_lossy().into_owned(),
     ];
-    let mut mux = vec![
+    let probe_level = vec![
+        "ffprobe".into(),
+        "-v".into(),
+        "error".into(),
+        "-select_streams".into(),
+        "v:0".into(),
+        "-show_entries".into(),
+        "stream_side_data=dv_level".into(),
+        "-of".into(),
+        "default=noprint_wrappers=1:nokey=1".into(),
+        source_arg.clone(),
+    ];
+    let wrap = vec![
         "ffmpeg".into(),
         "-hide_banner".into(),
         "-nostats".into(),
@@ -1019,6 +1266,23 @@ fn run_remux_p8_impl(
         "+genpts".into(),
         "-i".into(),
         p8.to_string_lossy().into_owned(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-c:v".into(),
+        "copy".into(),
+        "-tag:v".into(),
+        "hvc1".into(),
+        "-an".into(),
+        p8_mp4.to_string_lossy().into_owned(),
+    ];
+    let mut mux = vec![
+        "ffmpeg".into(),
+        "-hide_banner".into(),
+        "-nostats".into(),
+        "-y".into(),
+        "-nostdin".into(),
+        "-i".into(),
+        p8_mp4.to_string_lossy().into_owned(),
         "-i".into(),
         source_arg,
         "-map".into(),
@@ -1029,6 +1293,8 @@ fn run_remux_p8_impl(
         "copy".into(),
         "-tag:v".into(),
         "hvc1".into(),
+        "-strict".into(),
+        "unofficial".into(),
     ];
     match plan.audio {
         AudioAction::Copy => mux.extend(["-c:a".into(), "copy".into()]),
@@ -1040,11 +1306,34 @@ fn run_remux_p8_impl(
         }
     }
     mux.extend(live_frag_tail(&dest_part.to_string_lossy()));
-    let result = run_cmd_controlled(&extract, deadline, cancelled, source_fd)
-        .and_then(|_| run_cmd_controlled(&convert, deadline, cancelled, None))
+    let result = run_cmd_capture_controlled(&probe_level, deadline, cancelled, source_fd)
+        .and_then(|output| {
+            let level = String::from_utf8(output)
+                .map_err(|_| "ffprobe Dolby Vision level was not UTF-8".to_string())?;
+            level
+                .lines()
+                .find_map(|line| line.trim().parse::<u8>().ok())
+                .filter(|level| *level <= 63)
+                .ok_or_else(|| "ffprobe did not report a valid Dolby Vision level".to_string())
+        })
+        .and_then(|level| {
+            run_cmd_controlled(&extract, deadline, cancelled, source_fd).map(|_| level)
+        })
+        .and_then(|level| run_cmd_controlled(&convert, deadline, cancelled, None).map(|_| level))
+        .and_then(|level| run_cmd_controlled(&wrap, deadline, cancelled, None).map(|_| level))
+        .and_then(|level| {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return Err("MP4 signaling cancelled".into());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("MP4 signaling timed out".into());
+            }
+            signal_profile8_in_mp4(&p8_mp4, level)
+        })
         .and_then(|_| run_cmd_controlled(&mux, deadline, cancelled, source_fd));
     let _ = std::fs::remove_file(&hevc);
     let _ = std::fs::remove_file(&p8);
+    let _ = std::fs::remove_file(&p8_mp4);
     result
 }
 
@@ -1479,6 +1768,261 @@ action = "audio-ac3"
         let _ = std::fs::remove_file(&dest);
         assert!(got.len() >= 8, "expected growing fMP4 bytes");
         assert_eq!(&got[4..8], b"ftyp", "first box must be ftyp");
+    }
+
+    #[test]
+    fn genuine_truehd_audio_remap_produces_probeable_fragmented_ac3() {
+        use std::process::{Command, Stdio};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "rdlna-truehd-remap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/generate-advanced-fixtures.sh");
+        let generated = Command::new(script)
+            .arg(&tmp)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run advanced fixture generator");
+        assert!(
+            generated.status.success(),
+            "advanced fixture generation failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&generated.stdout),
+            String::from_utf8_lossy(&generated.stderr)
+        );
+
+        let source = probe_to_source("mkv", "h264", "sdr", "truehd", 64, 36);
+        let rules = parse_remaps_toml(
+            r#"
+[[remap]]
+name = "genuine-truehd"
+client = "CrKey"
+audio = "truehd"
+action = "audio-ac3"
+encoder = "copy"
+"#,
+        )
+        .unwrap();
+        let mut plan = decide_ua("CrKey/1.54", &source, &rules);
+        plan.audio_index = pick_audio_index_from_streams("1:0:truehd:6", "truehd");
+        assert_eq!(plan.decision, Decision::Recode);
+        assert_eq!(plan.action, RecodeAction::AudioAc3);
+        assert_eq!(plan.audio, AudioAction::ToAc3);
+
+        let input = tmp.join("truehd.mkv");
+        let output = tmp.join("truehd-ac3.mp4.part");
+        let args = ffmpeg_grow_os_args(&input, &output, &plan);
+        let converted = Command::new(&args[0])
+            .args(&args[1..])
+            .stdin(Stdio::null())
+            .output()
+            .expect("run genuine TrueHD audio remap");
+        assert!(
+            converted.status.success(),
+            "TrueHD remap failed: {}",
+            String::from_utf8_lossy(&converted.stderr)
+        );
+        let bytes = std::fs::read(&output).unwrap();
+        assert_eq!(&bytes[4..8], b"ftyp");
+        assert!(bytes.windows(4).any(|window| window == b"moof"));
+
+        let probed = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,codec_name",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&output)
+            .stdin(Stdio::null())
+            .output()
+            .expect("probe remapped fMP4");
+        assert!(
+            probed.status.success(),
+            "ffprobe rejected remapped output: {}",
+            String::from_utf8_lossy(&probed.stderr)
+        );
+        let streams = String::from_utf8_lossy(&probed.stdout);
+        assert!(
+            streams.lines().any(|line| line.contains("h264")),
+            "{streams}"
+        );
+        assert!(
+            streams.lines().any(|line| line.contains("ac3")),
+            "{streams}"
+        );
+        assert!(
+            !streams.lines().any(|line| line.contains("truehd")),
+            "{streams}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn genuine_profile7_converts_to_signaled_playable_profile8() {
+        use std::process::{Command, Stdio};
+
+        let Some(dovi) = dovi_tool_path() else {
+            eprintln!("skip genuine Profile 7 conversion (dovi_tool unavailable)");
+            return;
+        };
+        if Command::new("ffmpeg")
+            .args(["-nostdin", "-version"])
+            .stdin(Stdio::null())
+            .output()
+            .is_err()
+        {
+            eprintln!("skip genuine Profile 7 conversion (ffmpeg unavailable)");
+            return;
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "rdlna-dvp7-e2e-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/library/video/dvp7.mkv");
+        assert!(input.is_file(), "tracked genuine Profile 7 fixture missing");
+        assert!(
+            !input.with_extension("probe.toml").exists(),
+            "genuine fixture must not depend on a probe sidecar"
+        );
+        let output = tmp.join("profile8.mp4.part");
+        let plan = TranscodePlan {
+            decision: Decision::Recode,
+            action: RecodeAction::RemuxP8,
+            video_encoder: "copy".into(),
+            audio: AudioAction::ToAc3,
+            audio_index: 0,
+            container: "mp4",
+            ..TranscodePlan::default()
+        };
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        run_remux_p8_controlled(
+            &input,
+            &output,
+            &plan,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            &cancelled,
+        )
+        .unwrap();
+
+        let bytes = std::fs::read(&output).unwrap();
+        assert_eq!(&bytes[4..8], b"ftyp");
+        assert!(bytes.windows(4).any(|window| window == b"moof"));
+        assert!(bytes.windows(4).any(|window| window == b"dvvC"));
+
+        let probed = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_streams",
+                "-show_entries",
+                "stream=codec_name,pix_fmt,color_space,color_transfer,color_primaries:stream_side_data",
+                "-of",
+                "json",
+            ])
+            .arg(&output)
+            .stdin(Stdio::null())
+            .output()
+            .expect("probe converted Profile 8 fMP4");
+        assert!(
+            probed.status.success(),
+            "ffprobe rejected Profile 8 fMP4: {}",
+            String::from_utf8_lossy(&probed.stderr)
+        );
+        let probe = String::from_utf8_lossy(&probed.stdout);
+        for expected in [
+            "\"codec_name\": \"hevc\"",
+            "\"codec_name\": \"ac3\"",
+            "\"pix_fmt\": \"yuv420p10le\"",
+            "\"color_space\": \"bt2020nc\"",
+            "\"color_transfer\": \"smpte2084\"",
+            "\"color_primaries\": \"bt2020\"",
+            "\"dv_profile\": 8",
+            "\"rpu_present_flag\": 1",
+            "\"el_present_flag\": 0",
+            "\"bl_present_flag\": 1",
+            "\"dv_bl_signal_compatibility_id\": 1",
+        ] {
+            assert!(probe.contains(expected), "missing {expected} in {probe}");
+        }
+
+        let decoded = Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-i"])
+            .arg(&output)
+            .args(["-map", "0:v:0", "-frames:v", "1", "-f", "null", "-"])
+            .stdin(Stdio::null())
+            .output()
+            .expect("decode a converted fragment");
+        assert!(
+            decoded.status.success(),
+            "converted fMP4 was not decodable: {}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+
+        let hevc = tmp.join("profile8.hevc");
+        let extracted = Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-i"])
+            .arg(&output)
+            .args([
+                "-map",
+                "0:v:0",
+                "-c:v",
+                "copy",
+                "-bsf:v",
+                "hevc_mp4toannexb",
+                "-an",
+                "-f",
+                "hevc",
+            ])
+            .arg(&hevc)
+            .stdin(Stdio::null())
+            .output()
+            .expect("extract converted HEVC");
+        assert!(extracted.status.success());
+        let rpu = tmp.join("profile8-rpu.bin");
+        let extracted_rpu = Command::new(&dovi)
+            .args(["extract-rpu", "-i"])
+            .arg(&hevc)
+            .arg("-o")
+            .arg(&rpu)
+            .stdin(Stdio::null())
+            .output()
+            .expect("extract converted RPU");
+        assert!(
+            extracted_rpu.status.success(),
+            "converted stream lacks RPU: {}",
+            String::from_utf8_lossy(&extracted_rpu.stderr)
+        );
+        let info = Command::new(dovi)
+            .args(["info", "-i"])
+            .arg(&rpu)
+            .args(["-f", "0"])
+            .stdin(Stdio::null())
+            .output()
+            .expect("inspect converted RPU");
+        let rpu_info = String::from_utf8_lossy(&info.stdout);
+        assert!(info.status.success(), "{rpu_info}");
+        assert!(rpu_info.contains("\"dovi_profile\": 8"), "{rpu_info}");
+        assert!(
+            rpu_info.contains("\"disable_residual_flag\": true"),
+            "{rpu_info}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

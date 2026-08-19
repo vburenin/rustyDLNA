@@ -18,8 +18,8 @@ use rusty_dlna_protocol::object_id::{
 };
 
 use crate::{
-    path_from_db, path_is_live_file, path_is_unwanted, Caption, Catalog, Container, EmbeddedTags,
-    MediaItem, NfoMeta, ScanConfig,
+    path_from_db, path_is_live_file, path_is_unwanted, Caption, Catalog, CatalogPatch, Container,
+    EmbeddedTags, MediaItem, NfoMeta, ScanConfig,
 };
 
 #[derive(Clone, Debug)]
@@ -84,6 +84,109 @@ pub struct DetailStat {
     pub timestamp: i64,
     pub device: i64,
     pub inode: i64,
+}
+
+fn media_item_from_catalog_row(
+    row: &rusqlite::Row<'_>,
+    captions: &HashMap<i64, Vec<Caption>>,
+) -> rusqlite::Result<MediaItem> {
+    let object_id: String = row.get(0)?;
+    let parent_id: String = row.get(1)?;
+    let class: String = row.get(2)?;
+    let object_name: Option<String> = row.get(3)?;
+    let detail_id: i64 = row.get(4)?;
+    let ref_id: Option<String> = row.get(5)?;
+    let path = path_from_db(&row.get::<_, Option<String>>(6)?.unwrap_or_default());
+    let mime = row
+        .get::<_, Option<String>>(10)?
+        .unwrap_or_else(|| "video/x-matroska".into());
+    let ext = mime_to_ext(&mime);
+    let nonempty = |value: Option<String>| value.filter(|value| !value.is_empty());
+    let detail_title: Option<String> = row.get(25)?;
+    let under_series_or_genre = parent_id == VIDEO_SERIES_ID
+        || parent_id.starts_with(&format!("{VIDEO_SERIES_ID}$"))
+        || parent_id == VIDEO_GENRE_ID
+        || parent_id.starts_with(&format!("{VIDEO_GENRE_ID}$"));
+    let title = if under_series_or_genre {
+        nonempty(object_name.clone()).or_else(|| nonempty(detail_title.clone()))
+    } else {
+        nonempty(detail_title).or_else(|| nonempty(object_name))
+    }
+    .unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("item")
+            .to_string()
+    });
+    let container: Option<String> = row.get(19)?;
+    let video: Option<String> = row.get(20)?;
+    let audio: Option<String> = row.get(21)?;
+    let audio_streams: Option<String> = row.get(22)?;
+    let hdr: Option<String> = row.get(23)?;
+    let resolution: Option<String> = row.get(16)?;
+    let probe = crate::probe_from_stored(
+        ext,
+        container.as_deref(),
+        video.as_deref(),
+        audio.as_deref(),
+        audio_streams.as_deref(),
+        hdr.as_deref(),
+        resolution.as_deref(),
+    );
+    let dlna_pn = row
+        .get::<_, Option<String>>(11)?
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            crate::dlna_pn_from_probe(
+                &probe.container,
+                &probe.video,
+                &probe.audio,
+                &probe.hdr,
+                probe.width,
+                probe.height,
+            )
+        });
+    Ok(MediaItem {
+        object_id,
+        parent_id,
+        detail_id,
+        title,
+        class,
+        date: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+        path,
+        mime,
+        ext: ext.into(),
+        size: row.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
+        mtime: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+        captions: captions.get(&detail_id).cloned().unwrap_or_default(),
+        probe,
+        dlna_pn,
+        ref_id,
+        device: row.get::<_, Option<i64>>(12)?.unwrap_or(0) as u64,
+        inode: row.get::<_, Option<i64>>(13)?.unwrap_or(0) as u64,
+        duration: row
+            .get::<_, Option<String>>(14)?
+            .filter(|value| !value.is_empty()),
+        bitrate: row.get(15)?,
+        resolution: resolution.filter(|value| !value.is_empty()),
+        channels: row.get(17)?,
+        samplerate: row.get(18)?,
+        album_art: row.get::<_, Option<i64>>(24)?.unwrap_or(0),
+        creator: nonempty(row.get(26)?),
+        comment: nonempty(row.get(30)?),
+        artist: nonempty(row.get(27)?),
+        album_artist: nonempty(row.get(33)?),
+        composer: nonempty(row.get(34)?),
+        contributor: nonempty(row.get(35)?),
+        album: nonempty(row.get(28)?),
+        genre: nonempty(row.get(29)?),
+        disc: row.get(31)?,
+        track: row.get(32)?,
+        rating: row.get(36)?,
+        rotation: row.get(37)?,
+        bookmark_sec: 0,
+        watch_count: 0,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -312,6 +415,17 @@ const QUERY_TITLE: &str = "CASE \
     THEN COALESCE(NULLIF(o.NAME, ''), NULLIF(d.TITLE, ''), '') \
     ELSE COALESCE(NULLIF(d.TITLE, ''), NULLIF(o.NAME, ''), '') END";
 
+const CATALOG_ITEM_SELECT: &str =
+    "SELECT o.OBJECT_ID, o.PARENT_ID, o.CLASS, o.NAME, o.DETAIL_ID, o.REF_ID,
+            d.PATH, d.SIZE, d.TIMESTAMP, d.DATE, d.MIME, d.DLNA_PN,
+            d.DEVICE, d.INODE, d.DURATION, d.BITRATE, d.RESOLUTION,
+            d.CHANNELS, d.SAMPLERATE, d.CONTAINER, d.VIDEO, d.AUDIO,
+            d.AUDIO_STREAMS, d.HDR,
+            d.ALBUM_ART, d.TITLE, d.CREATOR, d.ARTIST, d.ALBUM, d.GENRE,
+            d.COMMENT, d.DISC, d.TRACK, d.ALBUM_ARTIST, d.COMPOSER,
+            d.CONTRIBUTOR, d.RATING, d.ROTATION
+     FROM OBJECTS o JOIN DETAILS d ON o.DETAIL_ID = d.ID";
+
 fn catalog_field_sql(field: CatalogQueryField) -> &'static str {
     match field {
         CatalogQueryField::Title => QUERY_TITLE,
@@ -440,6 +554,98 @@ pub struct LibraryDb {
 }
 
 impl LibraryDb {
+    /// Make long SQLite statements and lock admission observe daemon
+    /// cancellation. The short busy window bounds a blocked publication;
+    /// normal reconciles retry on the next watcher/periodic pass.
+    pub fn install_cancellation(
+        &self,
+        cancellation: crate::CancellationToken,
+    ) -> rusqlite::Result<()> {
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(250))?;
+        self.conn
+            .progress_handler(1_000, Some(move || cancellation.is_cancelled()));
+        Ok(())
+    }
+
+    /// Capture the exact catalog rows touched by the next scanner transaction.
+    /// TEMP triggers keep the journal connection-local and transactional.
+    pub fn begin_catalog_change_capture(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS catalog_object_changes (
+                 OBJECT_ID TEXT PRIMARY KEY
+             );
+             CREATE TEMP TABLE IF NOT EXISTS catalog_detail_changes (
+                 DETAIL_ID INTEGER PRIMARY KEY
+             );
+             CREATE TEMP TABLE IF NOT EXISTS catalog_album_art_changes (
+                 ALBUM_ART_ID INTEGER PRIMARY KEY
+             );
+             DELETE FROM catalog_object_changes;
+             DELETE FROM catalog_detail_changes;
+             DELETE FROM catalog_album_art_changes;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_object_insert
+             AFTER INSERT ON main.OBJECTS BEGIN
+                 INSERT INTO catalog_object_changes VALUES (NEW.OBJECT_ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_object_update
+             AFTER UPDATE ON main.OBJECTS BEGIN
+                 INSERT INTO catalog_object_changes VALUES (OLD.OBJECT_ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO catalog_object_changes VALUES (NEW.OBJECT_ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_object_delete
+             AFTER DELETE ON main.OBJECTS BEGIN
+                 INSERT INTO catalog_object_changes VALUES (OLD.OBJECT_ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_detail_insert
+             AFTER INSERT ON main.DETAILS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_detail_update
+             AFTER UPDATE ON main.DETAILS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO catalog_detail_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_detail_delete
+             AFTER DELETE ON main.DETAILS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_caption_insert
+             AFTER INSERT ON main.CAPTIONS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_caption_delete
+             AFTER DELETE ON main.CAPTIONS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_bookmark_insert
+             AFTER INSERT ON main.BOOKMARKS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_bookmark_update
+             AFTER UPDATE ON main.BOOKMARKS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_bookmark_delete
+             AFTER DELETE ON main.BOOKMARKS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_album_art_insert
+             AFTER INSERT ON main.ALBUM_ART BEGIN
+                 INSERT INTO catalog_album_art_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_album_art_update
+             AFTER UPDATE ON main.ALBUM_ART BEGIN
+                 INSERT INTO catalog_album_art_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO catalog_album_art_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_album_art_delete
+             AFTER DELETE ON main.ALBUM_ART BEGIN
+                 INSERT INTO catalog_album_art_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+             END;",
+        )
+    }
+
     pub fn quick_check(&self) -> rusqlite::Result<String> {
         self.conn
             .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
@@ -449,15 +655,42 @@ impl LibraryDb {
             std::fs::create_dir_all(dir)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         }
-        Self::open_with_busy_timeout(path, std::time::Duration::from_secs(15))
+        Self::open_with_control(path, std::time::Duration::from_secs(15), None)
     }
 
+    pub fn open_with_cancellation(
+        path: &Path,
+        cancellation: crate::CancellationToken,
+    ) -> rusqlite::Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        }
+        Self::open_with_control(
+            path,
+            std::time::Duration::from_millis(250),
+            Some(cancellation),
+        )
+    }
+
+    #[cfg(test)]
     fn open_with_busy_timeout(
         path: &Path,
         busy_timeout: std::time::Duration,
     ) -> rusqlite::Result<Self> {
+        Self::open_with_control(path, busy_timeout, None)
+    }
+
+    fn open_with_control(
+        path: &Path,
+        busy_timeout: std::time::Duration,
+        cancellation: Option<crate::CancellationToken>,
+    ) -> rusqlite::Result<Self> {
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(busy_timeout)?;
+        if let Some(cancellation) = cancellation {
+            conn.progress_handler(1_000, Some(move || cancellation.is_cancelled()));
+        }
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
@@ -744,6 +977,37 @@ impl LibraryDb {
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn detail_stats_for_paths(&self, paths: &[String]) -> rusqlite::Result<Vec<DetailStat>> {
+        let mut statement = self.conn.prepare(
+            "SELECT PATH, ID, SIZE, TIMESTAMP, DEVICE, INODE
+             FROM DETAILS
+             WHERE PATH = ?1 AND MIME IS NOT NULL",
+        )?;
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for path in paths {
+            if !seen.insert(path) {
+                continue;
+            }
+            let row = statement
+                .query_row([path], |row| {
+                    Ok(DetailStat {
+                        path: row.get(0)?,
+                        id: row.get(1)?,
+                        size: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        timestamp: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        device: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                        inode: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                    })
+                })
+                .optional()?;
+            if let Some(row) = row {
+                out.push(row);
+            }
         }
         Ok(out)
     }
@@ -2324,6 +2588,149 @@ impl LibraryDb {
                 |r| r.get(0),
             )
             .optional()
+    }
+
+    pub fn load_catalog_patch(&self) -> rusqlite::Result<CatalogPatch> {
+        let mut patch = CatalogPatch::default();
+        {
+            let mut statement = self
+                .conn
+                .prepare("SELECT OBJECT_ID FROM temp.catalog_object_changes ORDER BY OBJECT_ID")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                patch.changed_object_ids.push(row?);
+            }
+        }
+        {
+            let mut statement = self
+                .conn
+                .prepare("SELECT DETAIL_ID FROM temp.catalog_detail_changes ORDER BY DETAIL_ID")?;
+            let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+            for row in rows {
+                patch.changed_detail_ids.push(row?);
+            }
+        }
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT ALBUM_ART_ID FROM temp.catalog_album_art_changes ORDER BY ALBUM_ART_ID",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+            for row in rows {
+                patch.changed_album_art_ids.push(row?);
+            }
+        }
+
+        let affected_details = "SELECT DETAIL_ID FROM temp.catalog_detail_changes
+             UNION
+             SELECT DETAIL_ID FROM OBJECTS
+             WHERE OBJECT_ID IN (SELECT OBJECT_ID FROM temp.catalog_object_changes)
+               AND DETAIL_ID IS NOT NULL";
+        let mut captions: HashMap<i64, Vec<Caption>> = HashMap::new();
+        {
+            let sql = format!(
+                "SELECT ID, PATH FROM CAPTIONS WHERE ID IN ({affected_details}) ORDER BY PATH"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (detail_id, stored) = row?;
+                let path = path_from_db(&stored);
+                let ext = path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(|value| crate::caption_ext(&format!("x.{value}")))
+                    .unwrap_or("sub")
+                    .to_string();
+                let entries = captions.entry(detail_id).or_default();
+                entries.push(Caption {
+                    index: entries.len() as u32,
+                    path,
+                    ext,
+                });
+            }
+        }
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT OBJECT_ID, PARENT_ID, CLASS, NAME
+                 FROM OBJECTS
+                 WHERE DETAIL_ID IS NULL
+                   AND OBJECT_ID IN (SELECT OBJECT_ID FROM temp.catalog_object_changes)
+                 ORDER BY OBJECT_ID",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let object_id: String = row.get(0)?;
+                Ok(Container {
+                    parent_id: row.get(1)?,
+                    class: row.get(2)?,
+                    title: row
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| object_id.clone()),
+                    object_id,
+                    children: Vec::new(),
+                    searchable: true,
+                })
+            })?;
+            for row in rows {
+                patch.containers.push(row?);
+            }
+        }
+        {
+            let sql = format!(
+                "{CATALOG_ITEM_SELECT}
+                 WHERE o.OBJECT_ID IN (SELECT OBJECT_ID FROM temp.catalog_object_changes)
+                    OR o.DETAIL_ID IN (SELECT DETAIL_ID FROM temp.catalog_detail_changes)
+                 ORDER BY o.OBJECT_ID"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows =
+                statement.query_map([], |row| media_item_from_catalog_row(row, &captions))?;
+            for row in rows {
+                patch.items.push(row?);
+            }
+        }
+        let mut bookmarks = HashMap::new();
+        {
+            let sql = format!(
+                "SELECT ID, COALESCE(SEC, 0), COALESCE(WATCH_COUNT, 0)
+                 FROM BOOKMARKS WHERE ID IN ({affected_details})"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (detail_id, seconds, watch_count) = row?;
+                bookmarks.insert(detail_id, (seconds, watch_count));
+            }
+        }
+        for item in &mut patch.items {
+            if let Some(&(seconds, watch_count)) = bookmarks.get(&item.detail_id) {
+                item.bookmark_sec = seconds;
+                item.watch_count = watch_count;
+            }
+        }
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT ID, PATH FROM ALBUM_ART
+                 WHERE ID IN (SELECT ALBUM_ART_ID FROM temp.catalog_album_art_changes)",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (album_art_id, stored) = row?;
+                patch
+                    .album_art_paths
+                    .insert(album_art_id, path_from_db(&stored));
+            }
+        }
+        Ok(patch)
     }
 
     pub fn load_catalog(&self) -> rusqlite::Result<Catalog> {
