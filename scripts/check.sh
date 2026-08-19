@@ -34,10 +34,15 @@ test ! -e improvement_plan.md
 test ! -d testdata/cache
 test ! -e testdata/testdata/cache/files.db
 (bash -n restart.sh)
+./restart.sh --help >/dev/null
+! ./restart.sh --nope >/dev/null 2>&1
 ! RUSTY_DLNA_CACHE_VOLUME='invalid,volume' ./restart.sh >/dev/null 2>&1
 ! RUSTY_DLNA_START_TIMEOUT=0 ./restart.sh >/dev/null 2>&1
 grep -F -q 'rusty-dlna-cache:/var/cache/rusty-dlna' docker-compose.yaml
 grep -F -q 'docker compose create rusty-dlna' restart.sh
+grep -F -q 'docker compose rm --force rusty-dlna' restart.sh
+grep -F -q 'docker volume rm' restart.sh
+grep -F -q -- '--clean' restart.sh
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
 	docker compose config --quiet
 	test "$(docker compose config --volumes)" = "${RUSTY_DLNA_CACHE_VOLUME:-rusty-dlna-cache}"

@@ -94,6 +94,7 @@ UUID under the cache volume. If several addresses look equally valid it
 exits; set `advertise_ip` or `network_interface`. Cache and the SQLite
 library (including Kodi bookmarks) live in the Docker volume named by
 `RUSTY_DLNA_CACHE_VOLUME` (default `rusty-dlna-cache`).
+`./restart.sh --clean` discards that volume and starts with an empty catalog.
 `bookmark_retention_days = 0` keeps resume state forever; a positive
 value expires it that many days after the last update.
 
