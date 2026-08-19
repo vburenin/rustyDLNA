@@ -1,4 +1,4 @@
-//! In-memory GENA subscriber table and NOTIFY (`replica.md` §9).
+//! In-memory GENA subscriber table and NOTIFY behavior.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};

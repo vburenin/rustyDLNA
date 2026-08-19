@@ -656,12 +656,51 @@ pub fn extract_attached_pic_with_limits_result(
     with_atomic_image_destination(dest, |temporary| {
         let mut command = std::process::Command::new("ffmpeg");
         command
-            .args(["-y", "-hide_banner", "-loglevel", "error", "-max_alloc"])
+            .args([
+                "-nostdin",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-max_alloc",
+            ])
             .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
             .arg("-i")
             .arg(src)
             .args(["-map", &format!("0:{idx}"), "-frames:v", "1", "-an"])
             .arg(temporary);
+        command_status_with_timeout(&mut command, timeout).map(|status| status.success())
+    })
+}
+
+pub(crate) fn extract_attached_pic_file_with_limits_result(
+    src: &File,
+    dest: &Path,
+    timeout: Duration,
+    max_alloc_bytes: u64,
+) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let proc_path = std::path::PathBuf::from(format!("/proc/self/fd/{}", src.as_raw_fd()));
+    let Some(idx) = attached_pic_stream_with_timeout(&proc_path, timeout) else {
+        return Ok(false);
+    };
+    with_atomic_image_destination(dest, |temporary| {
+        let mut command = std::process::Command::new("ffmpeg");
+        command
+            .args([
+                "-nostdin",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-max_alloc",
+            ])
+            .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
+            .args(["-i", "/proc/self/fd/3"])
+            .args(["-map", &format!("0:{idx}"), "-frames:v", "1", "-an"])
+            .arg(temporary);
+        inherit_file_at(&mut command, src, 3);
         command_status_with_timeout(&mut command, timeout).map(|status| status.success())
     })
 }
@@ -700,7 +739,14 @@ pub fn scale_jpeg_with_options_result(
     with_atomic_image_destination(dest, |temporary| {
         let mut command = std::process::Command::new("ffmpeg");
         command
-            .args(["-y", "-hide_banner", "-loglevel", "error", "-max_alloc"])
+            .args([
+                "-nostdin",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-max_alloc",
+            ])
             .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
             .arg("-threads")
             .arg("1")
@@ -716,6 +762,50 @@ pub fn scale_jpeg_with_options_result(
                 "-an",
             ])
             .arg(temporary);
+        command_status_with_timeout(&mut command, timeout).map(|status| status.success())
+    })
+}
+
+/// Descriptor-backed resize used after rooted authorization. The descriptor
+/// is duplicated into the child after fork, so the source pathname is never
+/// reopened and the descriptor is not leaked to unrelated child processes.
+pub fn scale_jpeg_file_with_options_result(
+    src: &File,
+    dest: &Path,
+    w: u32,
+    h: u32,
+    quality: u8,
+    timeout: Duration,
+    max_alloc_bytes: u64,
+) -> std::io::Result<bool> {
+    if w == 0 || h == 0 {
+        return Ok(false);
+    }
+    let vf = format!("scale={w}:{h}:force_original_aspect_ratio=decrease");
+    with_atomic_image_destination(dest, |temporary| {
+        let mut command = std::process::Command::new("ffmpeg");
+        command
+            .args([
+                "-nostdin",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-max_alloc",
+            ])
+            .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
+            .args(["-threads", "1", "-i", "/proc/self/fd/3"])
+            .args([
+                "-frames:v",
+                "1",
+                "-vf",
+                &vf,
+                "-q:v",
+                &quality.clamp(2, 31).to_string(),
+                "-an",
+            ])
+            .arg(temporary);
+        inherit_file_at(&mut command, src, 3);
         command_status_with_timeout(&mut command, timeout).map(|status| status.success())
     })
 }
@@ -769,7 +859,14 @@ pub fn generate_video_thumb_with_limits_result(
     with_atomic_image_destination(dest, |temporary| {
         let mut command = std::process::Command::new("ffmpeg");
         command
-            .args(["-y", "-hide_banner", "-loglevel", "error", "-max_alloc"])
+            .args([
+                "-nostdin",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-max_alloc",
+            ])
             .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
             .args(["-threads", "1", "-ss", "1", "-i"])
             .arg(src)
@@ -783,6 +880,53 @@ pub fn generate_video_thumb_with_limits_result(
                 "-an",
             ])
             .arg(temporary);
+        command_status_with_timeout(&mut command, timeout).map(|status| status.success())
+    })
+}
+
+pub(crate) fn generate_video_thumb_file_with_limits_result(
+    src: &File,
+    dest: &Path,
+    width: u32,
+    quality: u8,
+    filmstrip: bool,
+    timeout: Duration,
+    max_alloc_bytes: u64,
+) -> std::io::Result<bool> {
+    if width == 0 {
+        return Ok(false);
+    }
+    let filter = if filmstrip {
+        let cell = (width / 4).max(1);
+        format!("fps=1/600,scale={cell}:-2,tile=4x1")
+    } else {
+        format!("scale={width}:-2")
+    };
+    let frames = if filmstrip { "4" } else { "1" };
+    with_atomic_image_destination(dest, |temporary| {
+        let mut command = std::process::Command::new("ffmpeg");
+        command
+            .args([
+                "-nostdin",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-max_alloc",
+            ])
+            .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
+            .args(["-threads", "1", "-ss", "1", "-i", "/proc/self/fd/3"])
+            .args([
+                "-frames:v",
+                frames,
+                "-vf",
+                &filter,
+                "-q:v",
+                &quality.clamp(2, 31).to_string(),
+                "-an",
+            ])
+            .arg(temporary);
+        inherit_file_at(&mut command, src, 3);
         command_status_with_timeout(&mut command, timeout).map(|status| status.success())
     })
 }
@@ -830,6 +974,33 @@ pub fn command_status_with_timeout(
     command_output_with_timeout(command, timeout).map(|output| output.status)
 }
 
+/// Make one already-open source descriptor available to a helper without
+/// clearing `CLOEXEC` in the parent process. Only async-signal-safe operations
+/// run between `fork` and `exec`.
+pub(crate) fn inherit_file_at(
+    command: &mut std::process::Command,
+    source: &File,
+    target_fd: libc::c_int,
+) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let raw_source = source.as_raw_fd();
+    // SAFETY: the source descriptor remains borrowed through command
+    // completion and the closure performs only dup2/fcntl syscalls.
+    unsafe {
+        command.pre_exec(move || {
+            if raw_source != target_fd && libc::dup2(raw_source, target_fd) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(target_fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Run a metadata helper with a deadline while continuously draining bounded
 /// stdout/stderr. Draining avoids child-process pipe deadlocks; retaining only
 /// the first 256 KiB prevents corrupt inputs from growing scanner memory.
@@ -840,7 +1011,10 @@ pub fn command_output_with_timeout(
     use std::io::Read;
     use std::process::Stdio;
 
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     // Put helpers in their own process group so a deadline also terminates
     // descendants that inherited the capture pipes (for example `sh -c`).
     // Otherwise joining the drain threads could wait indefinitely for an
@@ -1014,6 +1188,46 @@ mod tests {
             .expect_err("sleep must exceed the one-second minimum deadline");
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_millis(1800));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_helpers_never_inherit_an_open_terminal_stdin() {
+        use std::os::fd::FromRawFd;
+        use std::process::Stdio;
+
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: openpty initializes both descriptors on success. Each is
+        // immediately transferred to exactly one owned File below.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: successful openpty returned unique live descriptors.
+        let master = unsafe { File::from_raw_fd(master) };
+        // SAFETY: successful openpty returned unique live descriptors.
+        let slave = unsafe { File::from_raw_fd(slave) };
+
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "read terminal_input"])
+            .stdin(Stdio::from(slave));
+        let started = Instant::now();
+        let status = command_status_with_timeout(&mut command, Duration::from_secs(2))
+            .expect("helper should receive EOF from /dev/null");
+        assert!(
+            !status.success(),
+            "shell read unexpectedly received terminal input"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(master);
     }
 
     #[test]

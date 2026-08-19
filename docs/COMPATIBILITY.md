@@ -41,9 +41,8 @@ file, and `--print-effective-config` provides a secret-free resolved view.
 
 ## Reference parity evidence
 
-The repository keeps the MiniDLNA-derived dialect description in
-`replica.md`, licensed oracle snippets in `docs/oracle/`, and normalized
-wire/database fixtures in `testdata/oracle/`. Tests cover rootDesc/SCPDs, SSDP
+The repository keeps normalized MiniDLNA wire/database fixtures in
+`testdata/oracle/`. Self-contained contract tests cover rootDesc/SCPDs, SSDP
 variants, SOAP faults, protocol-info entry structure, DIDL fields, object IDs,
 media classification, virtual views, and representative FLAC/MP3/MP4/MKV/JPEG
 scan/Browse/GET behavior. Differences in this file take precedence over an

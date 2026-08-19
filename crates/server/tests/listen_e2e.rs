@@ -210,6 +210,7 @@ fn ensure_fixtures() {
     if !dvp7.exists() || dvp7.metadata().map(|m| m.len() < 200).unwrap_or(true) {
         if let Ok(st) = Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-y",
                 "-f",
                 "lavfi",
@@ -227,6 +228,7 @@ fn ensure_fixtures() {
                 "aac",
                 dvp7.to_str().unwrap(),
             ])
+            .stdin(std::process::Stdio::null())
             .status()
         {
             if !st.success() {
@@ -292,7 +294,8 @@ audio_out = "to-aac"
         .env(
             "RUST_LOG",
             std::env::var("RUSTY_DLNA_E2E_LOG").unwrap_or_else(|_| "off".into()),
-        );
+        )
+        .stdin(std::process::Stdio::null());
     if let Some(s) = sink {
         cmd.env("RUSTY_DLNA_SSDP_SINK", s);
     }
@@ -1198,6 +1201,7 @@ fn kodi_platinum_client_e2e() {
         .arg(http.to_string())
         .arg("--ssdp")
         .arg(ssdp.to_string())
+        .stdin(std::process::Stdio::null())
         .output()
         .expect("python3 kodi_upnp_client.py");
     let stdout = String::from_utf8_lossy(&out.stdout);

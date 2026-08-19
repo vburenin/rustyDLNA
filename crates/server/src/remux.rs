@@ -12,8 +12,8 @@ use rusty_dlna_http::{
     HttpRequest, HttpResponse, RangeError, RemuxAudio, RemuxJobSpec,
 };
 use rusty_dlna_transcode::{
-    cache_is_fresh_for_key, cache_part, run_remux_p8_controlled, write_cache_stamp_for_key,
-    RecodeAction, TranscodePlan,
+    cache_is_fresh_for_key, cache_part, run_remux_p8_controlled, run_remux_p8_file_controlled,
+    write_cache_stamp_for_key, RecodeAction, TranscodePlan,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -126,7 +126,12 @@ impl RemuxJob {
     }
 }
 
-fn spawn_ffmpeg(app: Arc<App>, spec: RemuxJobSpec, job: Arc<RemuxJob>) {
+fn spawn_ffmpeg(
+    app: Arc<App>,
+    spec: RemuxJobSpec,
+    job: Arc<RemuxJob>,
+    helper_permit: rusty_dlna_scan::HelperPermit,
+) {
     let app_err = app.clone();
     let job_err = job.clone();
     let id_err = spec.detail_id;
@@ -134,6 +139,7 @@ fn spawn_ffmpeg(app: Arc<App>, spec: RemuxJobSpec, job: Arc<RemuxJob>) {
     let spawned = std::thread::Builder::new()
         .name(format!("remux-{}", spec.detail_id))
         .spawn(move || {
+            let _helper_permit = helper_permit;
             let dest = spec.dest.clone();
             let part = job.part.clone();
             let id = spec.detail_id;
@@ -154,8 +160,18 @@ fn spawn_ffmpeg(app: Arc<App>, spec: RemuxJobSpec, job: Arc<RemuxJob>) {
                 };
                 tracing::info!(id, dest = %dest.display(), "remux-p8 dovi_tool start");
                 job.transition(RemuxState::Preprocessing);
-                let p8_result =
-                    run_remux_p8_controlled(&spec.src, &part, &p8, deadline, &job.cancelled);
+                let p8_result = if let Some(source) = spec.source_file.as_deref() {
+                    run_remux_p8_file_controlled(
+                        source,
+                        &spec.src,
+                        &part,
+                        &p8,
+                        deadline,
+                        &job.cancelled,
+                    )
+                } else {
+                    run_remux_p8_controlled(&spec.src, &part, &p8, deadline, &job.cancelled)
+                };
                 match p8_result {
                     Ok(()) => {
                         if let Err(error) = enforce_active_cache_limits(&app) {
@@ -193,7 +209,13 @@ fn spawn_ffmpeg(app: Arc<App>, spec: RemuxJobSpec, job: Arc<RemuxJob>) {
             }
             let args = &spec.args;
             tracing::info!(id, dest = %dest.display(), "remux job start");
-            let result = run_ffmpeg_growing(args, &job, deadline, &app);
+            let result = run_ffmpeg_growing(
+                args,
+                spec.source_file.as_deref(),
+                &job,
+                deadline,
+                &app,
+            );
             match result {
                 Ok((status, _)) if status.success() => {
                     let production_ffmpeg = args.first().is_some_and(|executable| {
@@ -249,6 +271,7 @@ fn spawn_ffmpeg(app: Arc<App>, spec: RemuxJobSpec, job: Arc<RemuxJob>) {
 
 fn run_ffmpeg_growing(
     args: &[std::ffi::OsString],
+    source_file: Option<&std::fs::File>,
     job: &RemuxJob,
     deadline: Instant,
     app: &App,
@@ -263,6 +286,26 @@ fn run_ffmpeg_growing(
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
     command.stderr(std::process::Stdio::piped());
+    if let Some(source) = source_file {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        const CHILD_SOURCE_FD: libc::c_int = 3;
+        let source_fd = source.as_raw_fd();
+        // SAFETY: only async-signal-safe dup2/fcntl calls run after fork. The
+        // source descriptor is owned by the job spec through child completion.
+        unsafe {
+            command.pre_exec(move || {
+                if source_fd != CHILD_SOURCE_FD && libc::dup2(source_fd, CHILD_SOURCE_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(CHILD_SOURCE_FD, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let mut child = command
         .spawn()
         .map_err(|error| format!("spawn {}: {error}", executable.to_string_lossy()))?;
@@ -537,6 +580,10 @@ pub fn attach(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String
         let _ = std::fs::remove_file(cache_part(&spec.dest));
         let _ = std::fs::remove_file(rusty_dlna_transcode::cache_stamp_path(&spec.dest));
     }
+    let helper_permit = app
+        .helpers
+        .try_acquire()
+        .map_err(|error| format!("media helper busy: {error}"))?;
     if !app.jobs.try_add() {
         return Err(format!(
             "transcode busy (max_jobs={})",
@@ -561,7 +608,7 @@ pub fn attach(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String
     });
     map.insert(spec.job_key.clone(), job.clone());
     drop(map);
-    spawn_ffmpeg(app, spec, job.clone());
+    spawn_ffmpeg(app, spec, job.clone(), helper_permit);
     Ok(job)
 }
 
@@ -738,7 +785,8 @@ pub async fn serve_remux(
                 ua = req.user_agent().unwrap_or("-"),
                 "{e}"
             );
-            let err = HttpResponse::html(503, "Service Unavailable", &e);
+            let mut err = HttpResponse::html(503, "Service Unavailable", &e);
+            err.set("Retry-After", "1");
             crate::socket_write_all(app, sock, &err.bytes_wire(&app.server, &now_imf_date()))
                 .await?;
             return Ok(());
@@ -1148,6 +1196,7 @@ mod tests {
             job_key: format!("42:{key}:{command:?}"),
             cache_key: key.into(),
             src,
+            source_file: None,
             dest: dir.join(format!("{key}.mp4")),
             args: command.into_iter().map(Into::into).collect(),
             remux_p8: false,
@@ -1388,6 +1437,7 @@ mod tests {
             job_key: format!("42:{first_key}:copy"),
             cache_key: first_key.clone(),
             src: src.clone(),
+            source_file: None,
             dest: dest.clone(),
             args: vec![
                 "cp".into(),
@@ -1412,6 +1462,7 @@ mod tests {
             job_key: format!("42:{second_key}:copy"),
             cache_key: second_key,
             src: src.clone(),
+            source_file: None,
             dest: dest.clone(),
             args: vec![
                 "cp".into(),
@@ -1536,6 +1587,7 @@ mod tests {
     fn corrupt_finished_output_is_rejected_before_publish() {
         if std::process::Command::new("ffprobe")
             .arg("-version")
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()

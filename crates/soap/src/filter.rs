@@ -1,4 +1,4 @@
-//! Browse/Search `Filter` → emit bits (`replica.md` §6 / §11).
+//! Browse/Search `Filter` to emitted-field bits.
 
 use rusty_dlna_protocol::soap::{DIDL_SCHEMAS, DLNA_NAMESPACE, PV_NAMESPACE, SEC_NAMESPACE};
 

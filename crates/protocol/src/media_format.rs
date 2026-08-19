@@ -209,16 +209,6 @@ pub fn wildcard_protocol_info_entries() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn oracle(name: &str) -> String {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("docs/oracle")
-            .join(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
-    }
 
     #[test]
     fn every_entry_resolves_without_octet_stream() {
@@ -234,31 +224,31 @@ mod tests {
     }
 
     #[test]
-    fn admitted_extensions_and_classes_match_scanner_oracle() {
-        let utils = oracle("utils-media.c");
+    fn admitted_extensions_and_classes_are_complete_and_unique() {
+        let mut extensions = std::collections::HashSet::new();
         for format in MEDIA_FORMATS {
             assert!(
-                utils.contains(&format!("\".{}\"", format.extension)),
-                "MiniDLNA scanner oracle does not admit .{}",
+                extensions.insert(format.extension),
+                "duplicate .{}",
                 format.extension
             );
+            assert!(
+                format.video_mime.is_some()
+                    || format.audio_mime.is_some()
+                    || format.image_mime.is_some()
+            );
         }
-
-        let scanner = oracle("scanner-classification.c");
         for class in [
             MediaKind::Video.upnp_class(),
             MediaKind::Audio.upnp_class(),
             MediaKind::Image.upnp_class(),
         ] {
-            assert!(scanner.contains(class), "scanner oracle missing {class}");
+            assert!(class.starts_with("item."), "invalid UPnP class {class}");
         }
-        assert!(scanner.contains("TYPE_PLAYLIST"));
-        assert!(scanner.contains("Fall back to audio"));
     }
 
     #[test]
-    fn advertised_wildcards_cover_reference_protocol_info_core() {
-        let reference = oracle("upnpglobalvars.h");
+    fn advertised_wildcards_cover_inherited_protocol_info_core() {
         let generated = wildcard_protocol_info_entries();
         for mime in [
             "image/jpeg",
@@ -280,10 +270,6 @@ mod tests {
             "video/webm",
         ] {
             let entry = format!("http-get:*:{mime}:*");
-            assert!(
-                reference.contains(&format!("http-get:*:{mime}:")),
-                "reference missing protocol-info MIME {mime}"
-            );
             assert!(generated.contains(&entry), "generated list missing {entry}");
         }
     }

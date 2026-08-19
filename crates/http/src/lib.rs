@@ -92,7 +92,7 @@ pub fn persist_for_route(
     conn_close: bool,
     conn_keep: bool,
 ) -> bool {
-    if route == HttpRoute::MediaItem || route == HttpRoute::Transcode || route == HttpRoute::Soap {
+    if route == HttpRoute::MediaItem || route == HttpRoute::Transcode {
         return false;
     }
     http_should_persist(httpver, conn_close, conn_keep)
@@ -277,10 +277,21 @@ pub struct HttpResponse {
     pub persist: bool,
     /// When set, `body` is empty and the accept loop streams this file range
     /// (inclusive). Used so an 80 GiB remux is never slurp'd into RAM.
-    pub file_range: Option<(std::path::PathBuf, u64, u64)>,
+    pub file_range: Option<OpenFileRange>,
     /// When set, accept loop starts/attaches a background remux and streams
     /// the growing (or finished) dest. Probe disconnect must not kill ffmpeg.
     pub remux_job: Option<RemuxJobSpec>,
+}
+
+/// A response range backed by an already validated/open descriptor. Keeping
+/// the descriptor in the response prevents symlink replacement between route
+/// authorization, header generation, and body streaming.
+#[derive(Clone, Debug)]
+pub struct OpenFileRange {
+    pub file: std::sync::Arc<std::fs::File>,
+    pub path: std::path::PathBuf,
+    pub start: u64,
+    pub end: u64,
 }
 
 /// One `/Transcode/{id}` serve: ffmpeg writes `dest` (via `args`) in the
@@ -293,6 +304,9 @@ pub struct RemuxJobSpec {
     /// Source/plan/tool digest stored beside the finished cache file.
     pub cache_key: String,
     pub src: std::path::PathBuf,
+    /// Root-validated source descriptor. Production jobs always set this;
+    /// `None` is retained for synthetic command lifecycle tests.
+    pub source_file: Option<std::sync::Arc<std::fs::File>>,
     pub dest: std::path::PathBuf,
     pub args: Vec<std::ffi::OsString>,
     /// Try `dovi_tool` P8.1 convert first; `args` is the hdr10 fallback.
@@ -509,6 +523,40 @@ mod tests {
         assert!(persist_for_route(
             HttpRoute::RootDesc,
             Some("HTTP/1.1"),
+            false,
+            false
+        ));
+        assert!(!persist_for_route(
+            HttpRoute::Transcode,
+            Some("HTTP/1.1"),
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn soap_uses_normal_http_persistence() {
+        assert!(persist_for_route(
+            HttpRoute::Soap,
+            Some("HTTP/1.1"),
+            false,
+            false
+        ));
+        assert!(!persist_for_route(
+            HttpRoute::Soap,
+            Some("HTTP/1.1"),
+            true,
+            true
+        ));
+        assert!(persist_for_route(
+            HttpRoute::Soap,
+            Some("HTTP/1.0"),
+            false,
+            true
+        ));
+        assert!(!persist_for_route(
+            HttpRoute::Soap,
+            Some("HTTP/1.0"),
             false,
             false
         ));

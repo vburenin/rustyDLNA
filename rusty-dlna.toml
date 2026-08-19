@@ -19,6 +19,11 @@ scan_command_timeout_secs = 30
 # Physical files are probed and have artwork prepared concurrently. Database
 # publication remains ordered and single-writer safe.
 scan_workers = 16
+# One fair process-wide budget covers scan probes, image generation, FFmpeg,
+# FFprobe, and remux. Excess work waits in a bounded FIFO queue.
+helper_max_jobs = 16
+helper_queue_capacity = 64
+helper_queue_timeout_secs = 30
 # Recently Added uses filesystem mtime, newest first, with inode deduplication.
 recent_limit = 200
 # recent_days = 90 # omitted means no age window

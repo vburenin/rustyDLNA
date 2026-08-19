@@ -33,12 +33,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
         libavformat-dev \
-        libavcodec-dev \
-        libavutil-dev \
-        libavfilter-dev \
-        libavdevice-dev \
-        libswscale-dev \
-        libswresample-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

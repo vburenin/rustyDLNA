@@ -198,7 +198,7 @@ pub fn msearch_replies(
         .collect()
 }
 
-/// Second NOTIFY-alive pass waits 150–250 ms (`replica.md` §1).
+/// Second NOTIFY-alive pass waits 150–250 ms per the inherited behavior.
 pub const ALIVE_DUP_DELAY_MS: std::ops::RangeInclusive<u64> = 150..=250;
 
 /// M-SEARCH reply jitter: 13–30 ms for `ssdp:all`, 13–20 ms for a specific ST.
@@ -210,7 +210,7 @@ pub fn msearch_jitter_ms_range(ssdp_all: bool) -> std::ops::RangeInclusive<u64> 
     }
 }
 
-/// Inbound renderer NOTIFY (`replica.md` §1). Only used to pre-fill the client cache.
+/// Inbound renderer NOTIFY. Only used to pre-fill the client cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboundNotify {
     pub location: String,
@@ -287,16 +287,6 @@ pub fn jitter_ms(range: std::ops::RangeInclusive<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn oracle(name: &str) -> String {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("docs/oracle")
-            .join(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
-    }
 
     #[test]
     fn alive_has_six_notifies_and_rootdesc() {
@@ -342,19 +332,10 @@ mod tests {
     }
 
     #[test]
-    fn all_ssdp_wire_variants_match_reference_shapes() {
-        let reference = oracle("minissdp-wire.c");
+    fn all_ssdp_wire_variants_match_inherited_shapes() {
         let uuid = "uuid:00000000-0000-4000-8000-000000000001";
         let types = rusty_dlna_protocol::ssdp::known_service_types(uuid);
         assert_eq!(types.len(), 6);
-        for service_type in &types[1..] {
-            let stem = service_type.strip_suffix('1').unwrap_or(service_type);
-            assert!(
-                reference.contains(stem),
-                "reference service table missing {service_type}"
-            );
-        }
-
         let alive = notify_alive(uuid, "192.0.2.10", 8200, 895, "reference-server");
         let byebye = notify_byebye(uuid);
         let search = (0..types.len())
@@ -383,18 +364,16 @@ mod tests {
             ("LOCATION: http://", &search[0]),
             ("Content-Length: 0", &search[0]),
         ] {
-            assert!(reference.contains(needle), "reference missing {needle}");
             assert!(
                 generated.contains(needle),
                 "generated packet missing {needle}"
             );
         }
-        assert!(reference.contains("_usleep(150000, 250000)"));
         assert_eq!(ALIVE_DUP_DELAY_MS, 150..=250);
     }
 
     #[test]
-    fn jitter_ranges_match_replica() {
+    fn jitter_ranges_match_inherited_contract() {
         assert_eq!(*ALIVE_DUP_DELAY_MS.start(), 150);
         assert_eq!(*ALIVE_DUP_DELAY_MS.end(), 250);
         assert_eq!(msearch_jitter_ms_range(true), 13..=30);

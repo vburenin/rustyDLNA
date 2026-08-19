@@ -89,6 +89,14 @@ pub struct Config {
     /// Bounded concurrency for libav probing and thumbnail/artwork preparation.
     #[serde(default = "rusty_dlna_scan::default_scan_workers")]
     pub scan_workers: usize,
+    /// Process-wide ceiling shared by scan probes, image derivation, remux,
+    /// FFmpeg, and FFprobe work.
+    #[serde(default = "default_helper_max_jobs")]
+    pub helper_max_jobs: usize,
+    #[serde(default = "default_helper_queue_capacity")]
+    pub helper_queue_capacity: usize,
+    #[serde(default = "default_helper_queue_timeout")]
+    pub helper_queue_timeout_secs: u64,
     #[serde(default = "default_recent_limit")]
     pub recent_limit: usize,
     /// Optional mtime window; omitted means no age cutoff.
@@ -168,6 +176,9 @@ impl Default for Config {
             cache_min_free_mb: default_cache_min_free_mb(),
             scan_command_timeout_secs: default_scan_timeout(),
             scan_workers: rusty_dlna_scan::default_scan_workers(),
+            helper_max_jobs: default_helper_max_jobs(),
+            helper_queue_capacity: default_helper_queue_capacity(),
+            helper_queue_timeout_secs: default_helper_queue_timeout(),
             recent_limit: default_recent_limit(),
             recent_days: None,
             wide_links: false,
@@ -311,6 +322,18 @@ fn default_encoder() -> String {
 }
 fn default_jobs() -> u32 {
     16
+}
+
+fn default_helper_max_jobs() -> usize {
+    rusty_dlna_scan::default_scan_workers()
+}
+
+fn default_helper_queue_capacity() -> usize {
+    64
+}
+
+fn default_helper_queue_timeout() -> u64 {
+    30
 }
 
 fn default_transcode_runtime() -> u64 {
@@ -527,6 +550,15 @@ pub(crate) fn validate_http_config(cfg: &Config) -> Result<(), ConfigValidationE
     if !(1..=64).contains(&cfg.scan_workers) {
         return Err("scan_workers must be between 1 and 64".into());
     }
+    if !(1..=64).contains(&cfg.helper_max_jobs) {
+        return Err("helper_max_jobs must be between 1 and 64".into());
+    }
+    if !(1..=4096).contains(&cfg.helper_queue_capacity) {
+        return Err("helper_queue_capacity must be between 1 and 4096".into());
+    }
+    if !(1..=600).contains(&cfg.helper_queue_timeout_secs) {
+        return Err("helper_queue_timeout_secs must be between 1 and 600".into());
+    }
     if !(1..=10_000).contains(&cfg.recent_limit) {
         return Err("recent_limit must be between 1 and 10000".into());
     }
@@ -565,8 +597,13 @@ pub(crate) fn validate_http_config(cfg: &Config) -> Result<(), ConfigValidationE
 }
 
 pub(crate) fn command_version(name: &str) -> Result<String, ConfigValidationError> {
-    let output = std::process::Command::new(name)
+    let mut command = std::process::Command::new(name);
+    if name == "ffmpeg" {
+        command.arg("-nostdin");
+    }
+    let output = command
         .arg("-version")
+        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| format!("required executable {name:?} is unavailable: {error}"))?;
     if !output.status.success() {
@@ -611,7 +648,8 @@ pub fn validate_transcode_tools(
     let ffmpeg = command_version("ffmpeg")?;
     let ffprobe = command_version("ffprobe")?;
     let output = std::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-encoders"])
+        .args(["-nostdin", "-hide_banner", "-encoders"])
+        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| format!("cannot query ffmpeg encoders: {error}"))?;
     if !output.status.success() {
@@ -667,6 +705,7 @@ pub fn validate_transcode_tools(
         if hardware_encoder(encoder) {
             let status = std::process::Command::new("ffmpeg")
                 .args([
+                    "-nostdin",
                     "-v",
                     "error",
                     "-f",
@@ -681,6 +720,7 @@ pub fn validate_transcode_tools(
                     "null",
                     "-",
                 ])
+                .stdin(std::process::Stdio::null())
                 .status()
                 .map_err(|error| {
                     format!("cannot exercise hardware encoder {encoder:?}: {error}")
@@ -702,6 +742,7 @@ pub fn validate_transcode_tools(
             Some(path) => {
                 let output = std::process::Command::new(&path)
                     .arg("--version")
+                    .stdin(std::process::Stdio::null())
                     .output()
                     .map_err(|error| {
                         format!("cannot run dovi_tool at {}: {error}", path.display())

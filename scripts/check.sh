@@ -26,21 +26,13 @@ run_component() {
 	fi
 }
 
-test -f replica.md
-test -f docs/replica.md
-test -f docs/ARCHITECTURE.md
 test -f docs/TRANSCODE.md
 test -f docs/COMPATIBILITY.md
 test -f docs/DISTRIBUTION.md
 test -x restart.sh
 test ! -e improvement_plan.md
-test ! -e improvements_plan.md
 test ! -d testdata/cache
 test ! -e testdata/testdata/cache/files.db
-grep -F -q '/rootDesc.xml' replica.md
-grep -F -q '239.255.255.250' replica.md
-grep -F -q 'FLAG_SKIP_DLNA_PN' replica.md
-cmp replica.md docs/replica.md
 (bash -n restart.sh)
 ! RUSTY_DLNA_CACHE_VOLUME='invalid,volume' ./restart.sh >/dev/null 2>&1
 ! RUSTY_DLNA_START_TIMEOUT=0 ./restart.sh >/dev/null 2>&1
@@ -52,7 +44,7 @@ if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; 
 fi
 (cd testdata && sha256sum --check SHA256SUMS)
 ! grep -Eqi 'disconnect kills|kill-on-disconnect|as a live fragmented-MP4 pipe|Transcoded GETs \(live pipe\)|OP=00 \(live pipe\)' \
-	README.md docs/ARCHITECTURE.md docs/TRANSCODE.md
+	README.md docs/TRANSCODE.md
 run_component fmt --all -- --check
 run_component clippy --workspace --all-targets --all-features -- -D warnings
 run_cargo test --workspace --locked

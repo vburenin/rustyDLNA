@@ -1,28 +1,32 @@
 # Distribution and reproducibility
 
-rustyDLNA is GPL-2.0-only. The release binary links Rust dependencies and
-FFmpeg libraries, while the production image also contains Debian's FFmpeg
-command-line package and the pinned MIT-licensed `dovi_tool`. Distributors are
-responsible for satisfying all corresponding-source and notice obligations;
-publishing only an opaque container image is not sufficient.
+rustyDLNA is GPL-2.0-only. The official release artifact is the multi-architecture
+OCI image. A bare ELF is deliberately not published: the scanner links Debian's
+FFmpeg libraries and such a file would not be portable without an exact runtime
+dependency contract. The image contains those libraries, Debian's FFmpeg command,
+and the pinned MIT-licensed `dovi_tool`. Distributors are responsible for all
+corresponding-source and notice obligations; an opaque image alone is insufficient.
 
 ## Release contract
 
 For a `v*` tag, GitHub Actions:
 
-1. builds with the exact `rust-toolchain.toml` toolchain and `Cargo.lock`;
-2. creates a versioned binary archive containing GPL and third-party notices;
-3. emits CycloneDX SBOMs and SHA-256 checksums;
-4. attests the binary provenance;
-5. builds the digest-pinned, snapshot-repository image and pushes immutable
-   tag/version/SHA references to GHCR;
-6. scans the image for HIGH/CRITICAL known vulnerabilities; and
-7. signs the pushed image digest keylessly with Sigstore/cosign.
+1. rejects a tag that does not exactly match the Cargo version/changelog and
+   pinned latest-stable Rust toolchain;
+2. passes the full quality and dependency-policy gates;
+3. builds and runtime-smokes the image on amd64 and arm64;
+4. builds the final multi-architecture image once and pushes only a unique
+   staging reference;
+5. runtime-smokes and scans that exact digest before promotion;
+6. emits BuildKit SBOM/provenance plus a GitHub provenance attestation;
+7. signs the tested digest keylessly with Sigstore/cosign; and
+8. promotes that same digest to version, minor, and immutable SHA tags, then
+   creates a draft source-and-image release.
 
 The Docker build accepts `BUILD_VERSION`, `VCS_REF`, `BUILD_DATE`, and
 `SOURCE_DATE_EPOCH`; the release workflow derives them from the signed tag
-commit. Base images, Debian snapshot timestamp, `dovi_tool` version, archive
-checksums, GitHub Actions, Cargo lockfile, and Rust toolchain are pinned.
+commit. Base images, Debian snapshot timestamp, `dovi_tool` version/checksums,
+GitHub Actions, Cargo lockfile, and Rust toolchain are pinned.
 
 ## Corresponding source
 
@@ -42,7 +46,7 @@ their chosen codecs. This document is engineering guidance, not legal advice.
 ## Verification
 
 ```sh
-docker run --rm --entrypoint sh IMAGE -c \
+docker run --rm --entrypoint sh IMAGE@DIGEST -c \
   'rusty-dlna --version; ffmpeg -version; dovi_tool --version; \
    test -r /usr/share/doc/rusty-dlna/LICENSE; \
    test -r /usr/share/doc/rusty-dlna/THIRD_PARTY_NOTICES.md; \
@@ -52,7 +56,12 @@ cosign verify \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com IMAGE@DIGEST
 ```
 
-Before publishing, record a green `scripts/check.sh`, container smoke test,
-Trivy result, and SBOM generation in the release run. Rollback means deploying
-the previous signed digest; the SQLite startup path backs up before migrations
-and supports `database check`/`database rebuild` for recovery.
+Before publishing, the release run records a green `scripts/check.sh`, dependency
+policy, per-architecture container smoke, exact-digest smoke, Trivy result, SBOM,
+attestation, and signature. A failure before promotion leaves only a uniquely
+named staging tag; delete it after investigation. A failure after promotion is
+handled by moving deployments back to the previous signed digest, never by
+overwriting that digest. Remove or correct mutable version/minor tags in GHCR and
+keep the GitHub release as a draft until the incident is resolved. The SQLite
+startup path backs up before migrations and supports `database check`/`database
+rebuild` for recovery.

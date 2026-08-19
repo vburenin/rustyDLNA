@@ -142,7 +142,7 @@ def browse(host: str, port: int, path: str, oid: str, start: int = 0, count: int
 
 
 def unescape_didl(soap_xml: str) -> str:
-    # SOAP Result is escaped DIDL (replica.md).
+    # SOAP Result contains escaped DIDL.
     try:
         root = ET.fromstring(soap_xml)
     except ET.ParseError as e:

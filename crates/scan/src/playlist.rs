@@ -1,14 +1,16 @@
 //! Bounded M3U/M3U8/PLS ingestion and stable playlist object views.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rusty_dlna_protocol::object_id::{IMAGE_PLIST_ID, MUSIC_PLIST_ID, VIDEO_PLIST_ID};
 
 use crate::db::LibraryDb;
 use crate::{
-    display_os_name, file_mtime_unix, inode_key, is_skipped_dir, path_excluded, path_from_db,
-    path_is_allowed_dir, path_is_allowed_file, path_to_db, scan_io, ScanConfig, ScanResult,
+    display_os_name, file_mtime_unix, inode_key, is_skipped_dir, open_allowed_file, path_excluded,
+    path_from_db, path_is_allowed_dir, path_is_allowed_file, path_to_db, scan_io, ScanConfig,
+    ScanResult,
 };
 
 const MAX_PLAYLIST_BYTES: u64 = 1024 * 1024;
@@ -172,12 +174,39 @@ fn desired_playlists(db: &LibraryDb, cfg: &ScanConfig) -> ScanResult<Vec<Desired
     }
     let mut output = Vec::new();
     for path in paths {
-        let metadata = std::fs::metadata(&path).map_err(|error| scan_io(&path, error))?;
+        let mut opened = match open_allowed_file(&path, cfg) {
+            Ok(opened) => opened,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(scan_io(&path, error)),
+        };
+        let metadata = opened
+            .file
+            .metadata()
+            .map_err(|error| scan_io(&path, error))?;
         if metadata.len() > MAX_PLAYLIST_BYTES {
             tracing::warn!(path = %path.display(), bytes = metadata.len(), "oversized playlist rejected");
             continue;
         }
-        let bytes = std::fs::read(&path).map_err(|error| scan_io(&path, error))?;
+        let mut bytes = Vec::with_capacity(metadata.len().min(MAX_PLAYLIST_BYTES) as usize);
+        opened
+            .file
+            .by_ref()
+            .take(MAX_PLAYLIST_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| scan_io(&path, error))?;
+        if bytes.len() as u64 > MAX_PLAYLIST_BYTES {
+            tracing::warn!(path = %path.display(), "growing playlist exceeded size limit");
+            continue;
+        }
         let text = match decode_playlist(&path, &bytes) {
             Ok(text) => text,
             Err(error) => {
@@ -190,13 +219,13 @@ fn desired_playlists(db: &LibraryDb, cfg: &ScanConfig) -> ScanResult<Vec<Desired
             let Some(candidate) = entry_path(&path, &raw) else {
                 continue;
             };
-            if !path_is_allowed_file(&candidate, cfg) {
+            let Ok(candidate_file) = open_allowed_file(&candidate, cfg) else {
                 continue;
-            }
-            let canonical = candidate
-                .canonicalize()
-                .unwrap_or_else(|_| candidate.clone());
-            if let Some(detail_id) = details.get(&canonical).or_else(|| details.get(&candidate)) {
+            };
+            if let Some(detail_id) = details
+                .get(&candidate_file.resolved_path)
+                .or_else(|| details.get(&candidate))
+            {
                 detail_ids.push(*detail_id);
             }
         }

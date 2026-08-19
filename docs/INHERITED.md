@@ -5,7 +5,7 @@ these behaviors when `scan` / SOAP land.
 
 ## Dates (Kodi 1905)
 
-See `replica.md` §11. Emit `YYYY-MM-DD` or `…Z` (length ≥ 20). Never a
+Emit `YYYY-MM-DD` or `…Z` (length ≥ 20). Never a
 19-character local datetime. Implemented in `rusty_dlna_protocol::date`.
 
 NFO wins when present: `<premiered>`, then `<aired>`, then `<year>`

@@ -11,12 +11,11 @@ use std::time::{Duration, Instant};
 use rusty_dlna_http::{
     caption_info_sec_url, dlna_get_header_invalid, dlna_org_features, dlna_strict, gen_root_desc,
     interactive_on_non_image, is_chunked, live_transcode_response, media_response, now_imf_date,
-    parse_byte_range, persist_for_route, protocol_info, read_file_range,
-    realtime_interactive_invalid, route, scpd_connection_manager, scpd_content_directory,
-    scpd_registrar, set_caption_info_sec, streaming_on_image, timeseek_without_range,
-    valid_host_header, wants_caption_info_sec, wants_content_language, ByteRange, HttpRequest,
-    HttpResponse, HttpRoute, MediaResponseOptions, RangeError, RemuxAudio, RemuxJobSpec,
-    RootDescOpts,
+    parse_byte_range, persist_for_route, protocol_info, realtime_interactive_invalid, route,
+    scpd_connection_manager, scpd_content_directory, scpd_registrar, set_caption_info_sec,
+    streaming_on_image, timeseek_without_range, valid_host_header, wants_caption_info_sec,
+    wants_content_language, ByteRange, HttpRequest, HttpResponse, HttpRoute, MediaResponseOptions,
+    OpenFileRange, RangeError, RemuxAudio, RemuxJobSpec, RootDescOpts,
 };
 use rusty_dlna_protocol::isolation::collides_with_live_ports;
 use rusty_dlna_protocol::paths::{
@@ -35,8 +34,8 @@ use rusty_dlna_scan::{
     build_media_roots, caption_http_mime, load_and_persist_media_root_mappings,
     load_catalog_with_policy, load_existing, monitor, repair_objects_if_needed,
     repair_video_titles_if_needed, run_inotify_until, scan, Catalog, CatalogChild,
-    Container as CatalogContainer, LibraryDb, MediaItem, MediaTypes, ScanConfig, ScanDelta,
-    ScanProgress, ScanResult, SourceProbe, WatchTelemetry,
+    Container as CatalogContainer, HelperGate, LibraryDb, MediaItem, MediaTypes, ScanConfig,
+    ScanDelta, ScanProgress, ScanResult, SourceProbe, WatchTelemetry,
 };
 
 pub use rusty_dlna_scan::{ensure_pattern_fixture, ensure_show_fixture};
@@ -53,8 +52,9 @@ use rusty_dlna_ssdp::{
 };
 use rusty_dlna_transcode::{
     cache_dest_for_key, cache_part, decide_for_with_default_encoder, ffmpeg_grow_os_args,
-    hdr10_fallback_plan, pick_audio_index_from_streams, probe_to_source, source_identity,
-    transcode_cache_key, AudioAction, Decision, JobGate, RecodeAction, RemapRule, TranscodePlan,
+    hdr10_fallback_plan, pick_audio_index_from_streams, probe_to_source, source_identity_file,
+    transcode_cache_key_file, AudioAction, Decision, JobGate, RecodeAction, RemapRule,
+    TranscodePlan,
 };
 
 mod catalog_query;
@@ -129,6 +129,7 @@ pub struct App {
     pub cache_dir: PathBuf,
     pub update_id: AtomicU32,
     pub jobs: JobGate,
+    pub(crate) helpers: Arc<HelperGate>,
     pub(crate) remuxes: Mutex<HashMap<String, Arc<remux::RemuxJob>>>,
     pub(crate) remux_metrics: remux::RemuxMetrics,
     events: Arc<Mutex<events::EventHub>>,
@@ -420,6 +421,10 @@ impl App {
             .iter()
             .fold(MediaTypes::none(), |all, root| all.union(root.types));
         let scan_progress = Arc::new(ScanProgress::default());
+        let helpers = Arc::new(HelperGate::new(
+            cfg.helper_max_jobs,
+            cfg.helper_queue_capacity,
+        ));
         let scan_cfg = ScanConfig {
             media_roots,
             media_dirs,
@@ -444,6 +449,8 @@ impl App {
             db_path: Some(db_path),
             wide_links: cfg.wide_links,
             progress: Some(scan_progress),
+            helper_gate: Some(Arc::clone(&helpers)),
+            helper_queue_timeout: Duration::from_secs(cfg.helper_queue_timeout_secs),
         };
         if cfg.wide_links {
             tracing::warn!(
@@ -535,6 +542,7 @@ impl App {
             cache_dir,
             update_id: AtomicU32::new(update_id),
             jobs: JobGate::new(max_jobs),
+            helpers,
             remuxes: Mutex::new(HashMap::new()),
             remux_metrics: remux::RemuxMetrics::default(),
             events,
@@ -684,7 +692,7 @@ impl App {
             HttpRoute::Resized => self.resized(req),
             HttpRoute::NotFound => HttpResponse::html(404, "Not Found", "not found"),
         };
-        if r == HttpRoute::MediaItem || r == HttpRoute::Transcode || r == HttpRoute::Soap {
+        if r == HttpRoute::MediaItem || r == HttpRoute::Transcode {
             resp.persist = false;
         } else {
             resp.persist = persist && !is_chunked(req);
@@ -734,7 +742,7 @@ impl App {
         HttpResponse::xml(200, xml, true)
     }
 
-    /// GENA subscribe/unsubscribe (`replica.md` §9). Peer IPv4 is required
+    /// GENA subscribe/unsubscribe. Peer IPv4 is required
     /// so CALLBACK cannot point at a third host.
     fn gena(&self, req: &HttpRequest, persist: bool, peer: SocketAddr) -> HttpResponse {
         let method = req.method.to_ascii_uppercase();
@@ -1865,15 +1873,20 @@ impl App {
             } else {
                 let src_path =
                     rusty_dlna_scan::rebase_media_path_for_config(&item.path, &self.scan_cfg);
-                if !rusty_dlna_scan::path_is_allowed_file(&src_path, &self.scan_cfg) {
-                    tracing::error!(path = %src_path.display(), title = %item.title, "media missing");
-                    return HttpResponse::html(404, "Not Found", "missing file");
-                }
+                let opened = match rusty_dlna_scan::open_allowed_file(&src_path, &self.scan_cfg) {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        tracing::error!(path = %src_path.display(), title = %item.title, %error, "media missing");
+                        return HttpResponse::html(404, "Not Found", "missing file");
+                    }
+                };
                 let mut plan = plan;
                 plan.audio_index =
                     pick_audio_index_from_streams(&probe.audio_streams, &probe.audio);
                 let remux_p8 = plan.action == RecodeAction::RemuxP8;
-                let Some(cache_key) = transcode_cache_key(&src_path, &plan, remux_p8) else {
+                let Some(cache_key) =
+                    transcode_cache_key_file(&opened.file, &opened.resolved_path, &plan, remux_p8)
+                else {
                     return HttpResponse::html(
                         500,
                         "Internal Server Error",
@@ -1900,14 +1913,15 @@ impl App {
                     dest = %dest.display(),
                     "transcode GET"
                 );
-                let args = ffmpeg_grow_os_args(&src_path, &part, &grow_plan);
+                let args = ffmpeg_grow_os_args(Path::new("/proc/self/fd/3"), &part, &grow_plan);
                 let job_key = format!("{}:{cache_key}:{args:?}", item.detail_id);
                 let mut r = live_transcode_response("video/mp4");
                 r.remux_job = Some(RemuxJobSpec {
                     detail_id: item.detail_id,
                     job_key,
                     cache_key,
-                    src: src_path.clone(),
+                    src: opened.resolved_path.clone(),
+                    source_file: Some(Arc::new(opened.file)),
                     dest: dest.clone(),
                     args,
                     remux_p8,
@@ -1931,9 +1945,6 @@ impl App {
         let pn = if skip { None } else { item.dlna_pn.clone() };
         let ci = 0u8;
         let path = rusty_dlna_scan::rebase_media_path_for_config(&item.path, &self.scan_cfg);
-        if path.exists() && !rusty_dlna_scan::path_is_allowed_file(&path, &self.scan_cfg) {
-            return HttpResponse::html(403, "Forbidden", "path escaped media dir");
-        }
         let strict = dlna_strict(req);
         let samsung = client.flags.contains(ClientFlags::SAMSUNG);
         if streaming_on_image(req, &mime) {
@@ -1942,10 +1953,20 @@ impl App {
         if interactive_on_non_image(req, &mime, samsung, strict) {
             return HttpResponse::html(406, "Not Acceptable", "Interactive not allowed");
         }
-        let size = match std::fs::metadata(&path) {
-            Ok(m) => m.len(),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), %e, "media missing");
+        let mut opened = match rusty_dlna_scan::open_allowed_file(&path, &self.scan_cfg) {
+            Ok(opened) => opened,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return HttpResponse::html(403, "Forbidden", "path escaped media dir");
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "media missing");
+                return HttpResponse::html(404, "Not Found", "missing file");
+            }
+        };
+        let size = match opened.file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "media metadata failed");
                 return HttpResponse::html(404, "Not Found", "missing file");
             }
         };
@@ -2012,10 +2033,15 @@ impl App {
             if let Some(url) = caption_sec.as_deref() {
                 set_caption_info_sec(&mut r, url);
             }
-            r.file_range = Some((path, start, end));
+            r.file_range = Some(OpenFileRange {
+                file: Arc::new(opened.file),
+                path,
+                start,
+                end,
+            });
             return r;
         }
-        let body = match read_file_range(&path, start, end) {
+        let body = match read_open_file_range(&mut opened.file, start, end) {
             Ok(b) => b,
             Err(e) => return HttpResponse::html(500, "Internal Server Error", &e.to_string()),
         };
@@ -2140,9 +2166,17 @@ impl App {
         } else {
             return HttpResponse::html(404, "Not Found", "nothing to resize");
         };
-        if !rusty_dlna_scan::path_is_allowed_file(&src, &self.scan_cfg) {
+        let opened = rusty_dlna_scan::open_allowed_file(&src, &self.scan_cfg).or_else(|_| {
+            rusty_dlna_scan::open_file_under_roots(
+                &src,
+                std::slice::from_ref(&self.cache_dir),
+                false,
+            )
+        });
+        let Ok(opened) = opened else {
             return HttpResponse::html(404, "Not Found", "resize source escaped");
-        }
+        };
+        let stable_src = opened.proc_path();
         let pixels = u64::from(w).checked_mul(u64::from(h));
         if w > self.cfg.derived_image_max_dimension
             || h > self.cfg.derived_image_max_dimension
@@ -2150,21 +2184,7 @@ impl App {
         {
             return HttpResponse::html(400, "Bad Request", "resize exceeds configured limits");
         }
-        let Some(source_pixels) = rusty_dlna_scan::probe_image_with_timeout(
-            &src,
-            Duration::from_secs(self.cfg.derived_image_timeout_secs),
-        )
-        .and_then(|image| u64::from(image.probe.width).checked_mul(u64::from(image.probe.height))) else {
-            return HttpResponse::html(404, "Not Found", "resize source is not a valid image");
-        };
-        if source_pixels == 0 || source_pixels > self.cfg.derived_image_max_pixels {
-            return HttpResponse::html(
-                413,
-                "Payload Too Large",
-                "source image exceeds pixel limit",
-            );
-        }
-        let Some(identity) = source_identity(&src) else {
+        let Some(identity) = source_identity_file(&opened.file, &opened.resolved_path) else {
             return HttpResponse::html(404, "Not Found", "resize source missing");
         };
         let key = derived_image_key(
@@ -2189,9 +2209,41 @@ impl App {
         let _guard = self.derived_image_locks[stripe]
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if !dest.is_file()
-            && !rusty_dlna_scan::scale_jpeg_with_options_result(
-                &src,
+        if !dest.is_file() {
+            let _helper_permit = match self
+                .helpers
+                .acquire_timeout(Duration::from_secs(self.cfg.helper_queue_timeout_secs))
+            {
+                Ok(permit) => permit,
+                Err(error) => {
+                    tracing::warn!(%error, key, "derived-image helper admission rejected");
+                    let mut response = HttpResponse::html(
+                        503,
+                        "Service Unavailable",
+                        "media helper capacity exhausted",
+                    );
+                    response.set("Retry-After", "1");
+                    return response;
+                }
+            };
+            let Some(source_pixels) = rusty_dlna_scan::probe_image_with_timeout(
+                &stable_src,
+                Duration::from_secs(self.cfg.derived_image_timeout_secs),
+            )
+            .and_then(|image| {
+                u64::from(image.probe.width).checked_mul(u64::from(image.probe.height))
+            }) else {
+                return HttpResponse::html(404, "Not Found", "resize source is not a valid image");
+            };
+            if source_pixels == 0 || source_pixels > self.cfg.derived_image_max_pixels {
+                return HttpResponse::html(
+                    413,
+                    "Payload Too Large",
+                    "source image exceeds pixel limit",
+                );
+            }
+            if !rusty_dlna_scan::scale_jpeg_file_with_options_result(
+                &opened.file,
                 &dest,
                 w,
                 h,
@@ -2200,8 +2252,9 @@ impl App {
                 self.cfg.derived_image_memory_mb * 1024 * 1024,
             )
             .unwrap_or(false)
-        {
-            return HttpResponse::html(404, "Not Found", "resize failed");
+            {
+                return HttpResponse::html(404, "Not Found", "resize failed");
+            }
         }
         if let Err(error) = prune_derived_image_cache(
             &derived_dir,
@@ -2258,41 +2311,55 @@ impl App {
 
     /// Art / captions: regular file under media_dir or cache_dir, size-capped.
     fn read_sidecar(&self, path: &Path) -> Result<Vec<u8>, Box<HttpResponse>> {
-        let allowed_media = rusty_dlna_scan::path_is_allowed_file(path, &self.scan_cfg);
-        let allowed_cache =
-            rusty_dlna_scan::path_is_under_roots(path, std::slice::from_ref(&self.cache_dir));
-        if !allowed_media && !allowed_cache {
-            return Err(Box::new(HttpResponse::html(
-                404,
-                "Not Found",
-                "sidecar escaped",
-            )));
-        }
-        let meta = match std::fs::metadata(path) {
-            Ok(m) => m,
-            Err(_) => {
-                return Err(Box::new(HttpResponse::html(
+        let opened = rusty_dlna_scan::open_allowed_file(path, &self.scan_cfg)
+            .or_else(|_| {
+                rusty_dlna_scan::open_file_under_roots(
+                    path,
+                    std::slice::from_ref(&self.cache_dir),
+                    false,
+                )
+            })
+            .map_err(|_| {
+                Box::new(HttpResponse::html(
                     404,
                     "Not Found",
-                    "sidecar missing",
-                )))
-            }
-        };
-        if meta.len() > rusty_dlna_scan::MAX_SIDECAR_BYTES {
+                    "sidecar escaped or missing",
+                ))
+            })?;
+        if opened
+            .file
+            .metadata()
+            .map(|metadata| metadata.len() > rusty_dlna_scan::MAX_SIDECAR_BYTES)
+            .unwrap_or(true)
+        {
             return Err(Box::new(HttpResponse::html(
                 413,
                 "Payload Too Large",
                 "sidecar too large",
             )));
         }
-        match std::fs::read(path) {
-            Ok(b) => Ok(b),
-            Err(_) => Err(Box::new(HttpResponse::html(
+        use std::io::Read;
+        let mut body = Vec::new();
+        if opened
+            .file
+            .take(rusty_dlna_scan::MAX_SIDECAR_BYTES + 1)
+            .read_to_end(&mut body)
+            .is_err()
+        {
+            return Err(Box::new(HttpResponse::html(
                 404,
                 "Not Found",
                 "sidecar missing",
-            ))),
+            )));
         }
+        if body.len() as u64 > rusty_dlna_scan::MAX_SIDECAR_BYTES {
+            return Err(Box::new(HttpResponse::html(
+                413,
+                "Payload Too Large",
+                "sidecar too large",
+            )));
+        }
+        Ok(body)
     }
 }
 
@@ -2786,13 +2853,8 @@ fn client_wants_art_profile(client: &ClientProfile) -> bool {
 fn soap_to_http(out: SoapOutcome, persist: bool) -> HttpResponse {
     match out {
         SoapOutcome::Ok(xml) => HttpResponse::xml(200, xml, persist),
-        SoapOutcome::Fault {
-            http,
-            code,
-            desc,
-            persist: fault_persist,
-        } => {
-            let mut r = fault_resp(soap_fault(code, desc), fault_persist);
+        SoapOutcome::Fault { http, code, desc } => {
+            let mut r = fault_resp(soap_fault(code, desc), persist);
             r.status = http;
             if http == 500 {
                 r.reason = "Internal Server Error".into();
@@ -4100,8 +4162,15 @@ async fn handle_conn(
         }
         let wire = resp.bytes_wire(&app.server, &now_imf_date());
         socket_write_all(&app, &mut sock, &wire).await?;
-        if let Some((path, start, end)) = resp.file_range.clone() {
-            stream_file_range(&app, &mut sock, &path, start, end).await?;
+        if let Some(range) = resp.file_range.as_ref() {
+            stream_open_file_range(
+                &app,
+                &mut sock,
+                range.file.try_clone()?,
+                range.start,
+                range.end,
+            )
+            .await?;
         }
         if !resp.persist || persist_left == 0 {
             break;
@@ -4132,8 +4201,19 @@ pub(crate) async fn stream_file_range(
     start: u64,
     end: u64,
 ) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    stream_open_file_range(app, sock, file, start, end).await
+}
+
+pub(crate) async fn stream_open_file_range(
+    app: &App,
+    sock: &mut tokio::net::TcpStream,
+    file: std::fs::File,
+    start: u64,
+    end: u64,
+) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut f = tokio::fs::File::open(path).await?;
+    let mut f = tokio::fs::File::from_std(file);
     f.seek(std::io::SeekFrom::Start(start)).await?;
     let mut left = end.saturating_sub(start).saturating_add(1);
     let mut buf = vec![0u8; 64 * 1024];
@@ -4147,6 +4227,24 @@ pub(crate) async fn stream_file_range(
         left -= got as u64;
     }
     Ok(())
+}
+
+fn read_open_file_range(
+    file: &mut std::fs::File,
+    start: u64,
+    end: u64,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek};
+
+    file.seek(std::io::SeekFrom::Start(start))?;
+    let length = end
+        .saturating_sub(start)
+        .saturating_add(1)
+        .try_into()
+        .map_err(|_| std::io::Error::other("range does not fit memory"))?;
+    let mut body = vec![0; length];
+    file.read_exact(&mut body)?;
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -4313,6 +4411,9 @@ thumbnail_width = 640
 thumbnail_quality = 5
 scan_command_timeout_secs = 9
 scan_workers = 16
+helper_max_jobs = 8
+helper_queue_capacity = 32
+helper_queue_timeout_secs = 7
 bookmark_retention_days = 90
 album_art_names = ["AlbumArt.jpg", "{stem}-cover.png"]
 "#,
@@ -4323,6 +4424,9 @@ album_art_names = ["AlbumArt.jpg", "{stem}-cover.png"]
         assert!(parsed.thumbnail_filmstrip);
         assert_eq!(parsed.thumbnail_width, 640);
         assert_eq!(parsed.scan_workers, 16);
+        assert_eq!(parsed.helper_max_jobs, 8);
+        assert_eq!(parsed.helper_queue_capacity, 32);
+        assert_eq!(parsed.helper_queue_timeout_secs, 7);
         assert_eq!(parsed.bookmark_retention_days, 90);
         assert!(validate_http_config(&parsed).is_ok());
 
@@ -4357,6 +4461,24 @@ album_art_names = ["AlbumArt.jpg", "{stem}-cover.png"]
             .unwrap_err()
             .to_string()
             .contains("scan_workers"));
+        invalid = Config::default();
+        invalid.helper_max_jobs = 0;
+        assert!(validate_http_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("helper_max_jobs"));
+        invalid = Config::default();
+        invalid.helper_queue_capacity = 0;
+        assert!(validate_http_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("helper_queue_capacity"));
+        invalid = Config::default();
+        invalid.helper_queue_timeout_secs = 0;
+        assert!(validate_http_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("helper_queue_timeout_secs"));
         invalid = Config::default();
         invalid.bookmark_retention_days = 36_501;
         assert!(validate_http_config(&invalid)
@@ -5150,6 +5272,170 @@ encoder = "rusty_encoder_that_does_not_exist"
         let _ = std::fs::remove_file(&link);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn large_media_response_streams_the_validated_descriptor_after_retarget() {
+        use std::io::{Read, Seek};
+
+        let mut app = testdata_app();
+        let tree = TestTree::new("media-descriptor-race");
+        let root = tree.path().join("media");
+        let outside = tree.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let inside = root.join("inside.mkv");
+        let secret = outside.join("secret.mkv");
+        std::fs::write(&inside, b"allowed-media").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&inside)
+            .unwrap()
+            .set_len(8 * 1024 * 1024 + 1)
+            .unwrap();
+        std::fs::write(&secret, b"outside-secret").unwrap();
+        let alias = root.join("movie.mkv");
+        std::os::unix::fs::symlink(&inside, &alias).unwrap();
+        app.scan_cfg.media_dirs = vec![root];
+
+        let mut item = movie_fixture(&app);
+        item.detail_id = 9_100_002;
+        item.object_id = "descriptor-race-object".into();
+        item.path = alias.clone();
+        item.size = std::fs::metadata(&inside).unwrap().len();
+        {
+            let mut catalog = app.catalog.write().unwrap();
+            catalog
+                .by_detail
+                .insert(item.detail_id, item.object_id.clone());
+            catalog.items.insert(item.object_id.clone(), item.clone());
+        }
+        let request = req(&format!(
+            "GET /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n\r\n",
+            item.detail_id
+        ));
+        let response = app.handle(&request);
+        assert_eq!(response.status, 200);
+        let range = response.file_range.expect("large response descriptor");
+
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&secret, &alias).unwrap();
+        let mut opened = range.file.try_clone().unwrap();
+        opened.seek(std::io::SeekFrom::Start(range.start)).unwrap();
+        let mut prefix = [0u8; 13];
+        opened.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"allowed-media");
+        assert_eq!(app.handle(&request).status, 403);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_retarget_never_returns_outside_bytes() {
+        let mut app = testdata_app();
+        let tree = TestTree::new("sidecar-descriptor-race");
+        let root = tree.path().join("media");
+        let outside = tree.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let inside = root.join("inside.srt");
+        let secret = outside.join("secret.srt");
+        std::fs::write(&inside, b"allowed subtitle").unwrap();
+        std::fs::write(&secret, b"outside secret subtitle").unwrap();
+        let alias = root.join("movie.srt");
+        std::os::unix::fs::symlink(&inside, &alias).unwrap();
+        app.scan_cfg.media_dirs = vec![root.clone()];
+
+        for index in 0..200 {
+            let next = root.join(format!("sidecar-next-{index}"));
+            let target = if index % 2 == 0 { &inside } else { &secret };
+            std::os::unix::fs::symlink(target, &next).unwrap();
+            std::fs::rename(&next, &alias).unwrap();
+            if let Ok(body) = app.read_sidecar(&alias) {
+                assert_eq!(body, b"allowed subtitle");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resized_request_keeps_the_authorized_source_descriptor_during_queue_wait() {
+        let mut app = testdata_app();
+        let tree = TestTree::new("resize-descriptor-race");
+        let root = tree.path().join("media");
+        let outside = tree.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let inside = root.join("inside.jpg");
+        let secret = outside.join("secret.jpg");
+        let existing_art = {
+            let catalog = read_recover(&app.catalog);
+            catalog
+                .album_art_paths
+                .values()
+                .next()
+                .cloned()
+                .expect("fixture album art")
+        };
+        std::fs::copy(existing_art, &inside).unwrap();
+        std::fs::write(&secret, b"outside secret is not an image").unwrap();
+        let alias = root.join("queued.jpg");
+        std::os::unix::fs::symlink(&inside, &alias).unwrap();
+        app.scan_cfg.media_dirs = vec![root.clone()];
+        app.helpers = Arc::new(HelperGate::new(1, 4));
+        app.cfg.helper_queue_timeout_secs = 2;
+
+        let mut item = movie_fixture(&app);
+        item.detail_id = 9_100_003;
+        item.object_id = "resize-descriptor-race-object".into();
+        item.path = alias.clone();
+        item.mime = "image/jpeg".into();
+        item.ext = "jpg".into();
+        item.size = std::fs::metadata(&inside).unwrap().len();
+        {
+            let mut catalog = write_recover(&app.catalog);
+            catalog
+                .by_detail
+                .insert(item.detail_id, item.object_id.clone());
+            catalog.items.insert(item.object_id.clone(), item);
+        }
+
+        let held = app.helpers.try_acquire().unwrap();
+        let app = Arc::new(app);
+        let worker_app = Arc::clone(&app);
+        let worker = std::thread::spawn(move || {
+            worker_app.handle(&req(&get(
+                "/Resized/9100003.jpg?width=48,height=48",
+                "RaceTest/1.0",
+            )))
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while app.helpers.metrics().queued != 1 {
+            assert!(
+                Instant::now() < deadline,
+                "resize did not enter helper queue"
+            );
+            std::thread::yield_now();
+        }
+        let replacement = root.join("replacement-link");
+        std::os::unix::fs::symlink(&secret, &replacement).unwrap();
+        std::fs::rename(replacement, &alias).unwrap();
+        drop(held);
+
+        let response = worker.join().unwrap();
+        assert_eq!(
+            response.status, 200,
+            "authorized descriptor must remain usable"
+        );
+        assert!(response.body.starts_with(&[0xff, 0xd8, 0xff]));
+        let later = app.handle(&req(&get(
+            "/Resized/9100003.jpg?width=49,height=49",
+            "RaceTest/1.0",
+        )));
+        assert_eq!(
+            later.status, 404,
+            "retargeted outside source must be rejected"
+        );
+    }
+
     fn soap_action(app: &App, action: &str, inner: &str, ua: &str) -> (u16, String) {
         let body = format!(
             r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:{action} xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">{inner}</u:{action}></s:Body></s:Envelope>"#
@@ -5349,7 +5635,9 @@ encoder = "rusty_encoder_that_does_not_exist"
 
     #[test]
     fn album_art_get_and_didl() {
-        let app = testdata_app();
+        let mut app = testdata_app();
+        app.helpers = Arc::new(HelperGate::new(1, 1));
+        app.cfg.helper_queue_timeout_secs = 1;
         let (st, items) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
         assert_eq!(st, 200);
         assert!(
@@ -5416,7 +5704,8 @@ encoder = "rusty_encoder_that_does_not_exist"
         assert_eq!(thumb.status, 200, "native thumb uses album art");
         assert_eq!(resp_header(&thumb, "Content-Type"), Some("image/jpeg"));
         let ffmpeg_ok = std::process::Command::new("ffmpeg")
-            .arg("-version")
+            .args(["-nostdin", "-version"])
+            .stdin(std::process::Stdio::null())
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false);
@@ -5443,6 +5732,16 @@ encoder = "rusty_encoder_that_does_not_exist"
                 feats.contains("DLNA.ORG_CI=1"),
                 "contentFeatures CI=1: {feats}"
             );
+
+            let held = app.helpers.try_acquire().unwrap();
+            let overloaded = app.handle(&req(&get(
+                &format!("/Resized/{detail_id}.jpg?width=161,height=161"),
+                "Kodi/21.0",
+            )));
+            assert_eq!(overloaded.status, 503);
+            assert_eq!(resp_header(&overloaded, "Retry-After"), Some("1"));
+            assert_eq!(app.helpers.metrics().timed_out_total, 1);
+            drop(held);
         }
 
         let xbox = app.handle(&req(&get(
@@ -5863,6 +6162,78 @@ encoder = "rusty_encoder_that_does_not_exist"
                 String::from_utf8_lossy(&response)
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn soap_successes_and_faults_follow_http_keepalive() {
+        let app = Arc::new(testdata_app());
+        let body = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:GetSystemUpdateID xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"/></s:Body></s:Envelope>"#;
+        let first = format!(
+            "POST /ctl/ContentDir HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nSOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#GetSystemUpdateID\"\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let second = format!(
+            "POST /ignored HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nSOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#GetSystemUpdateID\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let success_pipeline = format!("{first}{second}");
+        let response = raw_connection(app.clone(), success_pipeline.as_bytes(), true).await;
+        let text = String::from_utf8_lossy(&response);
+        assert_eq!(
+            text.matches("HTTP/1.1 200 OK").count(),
+            2,
+            "SOAP success did not persist: {text}"
+        );
+        assert!(
+            text.contains("Connection: keep-alive"),
+            "first SOAP response was not persistent: {text}"
+        );
+
+        let fault = concat!(
+            "POST /ignored HTTP/1.1\r\n",
+            "Host: 127.0.0.1:18200\r\n",
+            "SOAPAction: \"urn:x#NoSuchAction\"\r\n",
+            "Content-Length: 0\r\n\r\n"
+        );
+        let fault_pipeline = format!("{fault}{second}");
+        let response = raw_connection(app.clone(), fault_pipeline.as_bytes(), true).await;
+        let text = String::from_utf8_lossy(&response);
+        assert_eq!(
+            text.matches("HTTP/1.1 500 Internal Server Error").count(),
+            1
+        );
+        assert_eq!(text.matches("HTTP/1.1 200 OK").count(), 1);
+        assert!(text.contains("Connection: keep-alive"));
+
+        let http10_keep = HttpRequest::parse_headers(&format!(
+            "POST /ignored HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\nSOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#GetSystemUpdateID\"\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        ))
+        .unwrap();
+        let mut http10_keep = http10_keep;
+        http10_keep.body = body.as_bytes().to_vec();
+        assert!(app.handle(&http10_keep).persist);
+
+        let mut http10_close = http10_keep.clone();
+        http10_close
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case("Connection"));
+        assert!(!app.handle(&http10_close).persist);
+
+        let rejected_chunked = raw_connection(
+            app,
+            b"POST /ignored HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            true,
+        )
+        .await;
+        assert!(rejected_chunked.starts_with(b"HTTP/1.1 400 Bad Request"));
+        assert_eq!(
+            String::from_utf8_lossy(&rejected_chunked)
+                .matches("HTTP/1.1")
+                .count(),
+            1,
+            "unsupported chunked request must close the connection"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6560,14 +6931,19 @@ audio_out = "to-aac"
         let app = testdata_app();
         let movie = movie_fixture(&app);
         let kodi_oid = format!("{}/", movie.object_id.replace('$', "%24"));
-        let new_tags =
-            "&lt;upnp:lastPlaybackPosition&gt;00:02:00&lt;/upnp:lastPlaybackPosition&gt;";
+        // Kodi's SaveFileState always sends the opaque xbmc:lastPlayerState
+        // extension beside a changed resume point. The opaque content must not
+        // be interpreted as part of the writable DIDL property list.
+        let current_tags = "&lt;upnp:lastPlaybackPosition&gt;0&lt;/upnp:lastPlaybackPosition&gt;,\
+                            &lt;xbmc:lastPlayerState&gt;&amp;opaque-current;,old&lt;/xbmc:lastPlayerState&gt;";
+        let new_tags = "&lt;upnp:lastPlaybackPosition&gt;00:02:00&lt;/upnp:lastPlaybackPosition&gt;,\
+                        &lt;xbmc:lastPlayerState&gt;&amp;opaque-new;,new&lt;/xbmc:lastPlayerState&gt;";
         let kodi_ua = "UPnP/1.0 DLNADOC/1.50 Platinum/1.0.5.13";
         let (status, xml) = soap_action(
             &app,
             "UpdateObject",
             &format!(
-                "<ObjectID>{kodi_oid}</ObjectID><CurrentTagValue></CurrentTagValue><NewTagValue>{new_tags}</NewTagValue>"
+                "<ObjectID>{kodi_oid}</ObjectID><CurrentTagValue>{current_tags}</CurrentTagValue><NewTagValue>{new_tags}</NewTagValue>"
             ),
             kodi_ua,
         );
@@ -7151,6 +7527,7 @@ audio_out = "to-aac"
             job_key: format!("{}:{cache_key}:fixture", dvp7.detail_id),
             cache_key: cache_key.clone(),
             src: src.clone(),
+            source_file: None,
             dest: dest.clone(),
             args: vec!["ffmpeg".into(), "-version".into()],
             remux_p8: true,
@@ -7338,15 +7715,8 @@ audio_out = "to-aac"
         assert!(new.exists());
     }
 
-    fn soap_fault_persist(out: SoapOutcome) -> bool {
-        match out {
-            SoapOutcome::Fault { persist, .. } => persist,
-            SoapOutcome::Ok(_) => panic!("expected Fault persist bit"),
-        }
-    }
-
     #[test]
-    fn soap_faults_are_500_upnperror_with_outcome_persist() {
+    fn soap_faults_are_500_upnperror_with_request_persistence() {
         let app = testdata_app();
 
         let body = r#"<s:Envelope><s:Body><u:Browse></u:Browse></s:Body></s:Envelope>"#;
@@ -7359,7 +7729,7 @@ audio_out = "to-aac"
         let xml402 = String::from_utf8_lossy(&r402.body);
         assert!(xml402.contains("UPnPError"), "{xml402}");
         assert!(xml402.contains("<errorCode>402</errorCode>"), "{xml402}");
-        assert_eq!(r402.persist, soap_fault_persist(SoapOutcome::fault402()));
+        assert!(r402.persist);
 
         let r401 = app.handle(&req_from(
             "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nSOAPAction: \"urn:x#Nope\"\r\nContent-Length: 0\r\n\r\n",
@@ -7369,7 +7739,7 @@ audio_out = "to-aac"
         let xml401 = String::from_utf8_lossy(&r401.body);
         assert!(xml401.contains("UPnPError"), "{xml401}");
         assert!(xml401.contains("<errorCode>401</errorCode>"), "{xml401}");
-        assert_eq!(r401.persist, soap_fault_persist(SoapOutcome::fault401()));
+        assert!(r401.persist);
 
         let (st701, xml701) = soap_browse(&app, "no-such-object", "BrowseMetadata", "Kodi/21.0");
         assert_eq!(st701, 500);
@@ -7385,7 +7755,7 @@ audio_out = "to-aac"
             req.body = body.into_bytes();
             app.handle(&req)
         };
-        assert_eq!(r701.persist, soap_fault_persist(SoapOutcome::fault701()));
+        assert!(r701.persist);
     }
 
     #[test]
@@ -7603,6 +7973,10 @@ audio_out = "to-aac"
         assert!(value["database"]["quick_check"].is_string());
         assert!(value["transcode"]["cache_bytes"].is_u64());
         assert!(value["transcode"]["required_tools_ready"].is_boolean());
+        assert!(value["helpers"]["active"].is_u64());
+        assert!(value["helpers"]["queued"].is_u64());
+        assert!(value["helpers"]["rejected_total"].is_u64());
+        assert!(value["helpers"]["timed_out_total"].is_u64());
         assert!(value["scanner"]["files_seen"].is_u64());
         assert!(value["catalog"]["estimated_memory_bytes"].is_u64());
         assert!(value["catalog"]["projected_memory_bytes"]["objects_10000"].is_u64());
@@ -8299,7 +8673,7 @@ audio_out = "to-aac"
                     response
                         .file_range
                         .as_ref()
-                        .map(|(path, _, _)| path.as_path()),
+                        .map(|range| range.path.as_path()),
                     Some(item.path.as_path())
                 );
             }

@@ -1,5 +1,8 @@
 //! Library scan: skip rules, NFO dates, captions, inode reuse, SQLite store.
 
+#[cfg(not(target_os = "linux"))]
+compile_error!("rustyDLNA currently supports Linux only (inotify, /proc, and rooted openat2 I/O)");
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -24,8 +27,9 @@ pub use probe::{
     extract_attached_pic_with_limits_result, extract_attached_pic_with_timeout_result,
     extract_exif_thumbnail_result, extract_exif_thumbnail_with_limit_result, generate_video_thumb,
     generate_video_thumb_result, generate_video_thumb_with_limits_result, probe_image,
-    probe_image_with_timeout, probe_media, probe_media_with_timeout, scale_jpeg, scale_jpeg_result,
-    scale_jpeg_with_options_result, MediaProbe,
+    probe_image_with_timeout, probe_media, probe_media_with_timeout, scale_jpeg,
+    scale_jpeg_file_with_options_result, scale_jpeg_result, scale_jpeg_with_options_result,
+    MediaProbe,
 };
 pub use watch::{repair_objects_if_needed, run_inotify, run_inotify_until, WatchTelemetry};
 
@@ -436,11 +440,19 @@ fn sha1_hex(data: &[u8]) -> String {
     s
 }
 
+#[cfg(test)]
 fn source_image_identity(path: &Path) -> ScanResult<String> {
-    use sha1::{Digest, Sha1};
-    use std::io::{Read, Seek, SeekFrom};
+    let file = std::fs::File::open(path).map_err(|error| scan_io(path, error))?;
+    source_image_identity_file(&file, path)
+}
 
-    let metadata = std::fs::metadata(path).map_err(|error| scan_io(path, error))?;
+fn source_image_identity_file(file: &std::fs::File, identity_path: &Path) -> ScanResult<String> {
+    use sha1::{Digest, Sha1};
+    use std::os::unix::fs::FileExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| scan_io(identity_path, error))?;
     let mut hasher = Sha1::new();
     #[cfg(unix)]
     {
@@ -450,8 +462,8 @@ fn source_image_identity(path: &Path) -> ScanResult<String> {
     }
     #[cfg(not(unix))]
     hasher.update(
-        std::fs::canonicalize(path)
-            .unwrap_or_else(|_| path.to_path_buf())
+        std::fs::canonicalize(identity_path)
+            .unwrap_or_else(|_| identity_path.to_path_buf())
             .to_string_lossy()
             .as_bytes(),
     );
@@ -462,7 +474,6 @@ fn source_image_identity(path: &Path) -> ScanResult<String> {
             hasher.update(modified.subsec_nanos().to_le_bytes());
         }
     }
-    let mut file = std::fs::File::open(path).map_err(|error| scan_io(path, error))?;
     const SAMPLE: u64 = 32 * 1024;
     let mut offsets = [
         0,
@@ -477,19 +488,20 @@ fn source_image_identity(path: &Path) -> ScanResult<String> {
             continue;
         }
         last = Some(offset);
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|error| scan_io(path, error))?;
         let read = file
-            .read(&mut sample)
-            .map_err(|error| scan_io(path, error))?;
+            .read_at(&mut sample, offset)
+            .map_err(|error| scan_io(identity_path, error))?;
         hasher.update(offset.to_le_bytes());
         hasher.update(&sample[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn image_within_limits(cfg: &ScanConfig, src: &Path) -> bool {
-    let Some(image) = probe_image_with_timeout(src, cfg.external_command_timeout) else {
+fn image_file_within_limits(cfg: &ScanConfig, src: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let proc_path = PathBuf::from(format!("/proc/self/fd/{}", src.as_raw_fd()));
+    let Some(image) = probe_image_with_timeout(&proc_path, cfg.external_command_timeout) else {
         return false;
     };
     u64::from(image.probe.width)
@@ -497,49 +509,79 @@ fn image_within_limits(cfg: &ScanConfig, src: &Path) -> bool {
         .is_some_and(|pixels| pixels > 0 && pixels <= cfg.image_max_pixels)
 }
 
-fn convert_image_to_jpeg(cfg: &ScanConfig, src: &Path, dest: &Path) -> ScanResult<bool> {
+fn convert_image_file_to_jpeg(
+    cfg: &ScanConfig,
+    src: &std::fs::File,
+    identity_path: &Path,
+    dest: &Path,
+) -> ScanResult<bool> {
     crate::probe::with_atomic_image_destination(dest, |temporary| {
         let mut command = std::process::Command::new("ffmpeg");
         command
-            .args(["-y", "-hide_banner", "-loglevel", "error", "-max_alloc"])
+            .args([
+                "-nostdin",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-max_alloc",
+            ])
             .arg(cfg.image_memory_limit_bytes.to_string())
-            .args(["-threads", "1", "-i"])
-            .arg(src)
+            .args(["-threads", "1", "-i", "/proc/self/fd/3"])
             .arg(temporary);
+        crate::probe::inherit_file_at(&mut command, src, 3);
         crate::probe::command_status_with_timeout(&mut command, cfg.external_command_timeout)
             .map(|status| status.success())
     })
-    .map_err(|error| scan_io(src, error))
+    .map_err(|error| scan_io(identity_path, error))
 }
 
 /// JPEG sidecars stay in place. Anything else is converted once under
 /// `{db_path.parent()}/art/{sha1}.jpg`. Memory DBs skip conversion.
 pub fn persist_album_art_file(cfg: &ScanConfig, src: &Path) -> ScanResult<Option<PathBuf>> {
-    let metadata = std::fs::metadata(src).map_err(|error| scan_io(src, error))?;
+    let opened = match open_allowed_file(src, cfg) {
+        Ok(opened) => opened,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(scan_io(src, error)),
+    };
+    let metadata = opened
+        .file
+        .metadata()
+        .map_err(|error| scan_io(src, error))?;
     if metadata.len() == 0 || metadata.len() > cfg.image_memory_limit_bytes {
         return Ok(None);
     }
-    if !image_within_limits(cfg, src) {
+    let _helper_permit = acquire_scan_helper(cfg)?;
+    if !image_file_within_limits(cfg, &opened.file) {
         return Ok(None);
     }
     let mut magic = [0u8; 3];
-    let jpeg = std::fs::File::open(src)
-        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic))
-        .is_ok()
-        && is_jpeg_bytes(&magic);
+    use std::os::unix::fs::FileExt;
+    let jpeg =
+        opened.file.read_at(&mut magic, 0).ok() == Some(magic.len()) && is_jpeg_bytes(&magic);
     if jpeg {
         return Ok(Some(src.to_path_buf()));
     }
     let Some(cache) = cfg.db_path.as_ref().and_then(|path| path.parent()) else {
         return Ok(None);
     };
-    let dest = cache
-        .join("art")
-        .join(format!("{}.jpg", source_image_identity(src)?));
+    let dest = cache.join("art").join(format!(
+        "{}.jpg",
+        source_image_identity_file(&opened.file, src)?
+    ));
     if dest.is_file() {
         return Ok(Some(dest));
     }
-    if convert_image_to_jpeg(cfg, src, &dest)? {
+    if convert_image_file_to_jpeg(cfg, &opened.file, src, &dest)? {
         Ok(Some(dest))
     } else {
         Ok(None)
@@ -566,10 +608,11 @@ fn cache_art_jpeg(cfg: &ScanConfig, key: &str) -> Option<PathBuf> {
 /// Resolve or generate artwork without touching SQLite. The cache identity is
 /// physical-file based, so hard links and paths below symlinked directories
 /// converge on one derivative instead of running ffmpeg once per DETAILS row.
-fn prepare_album_art(cfg: &ScanConfig, path: &Path) -> ScanResult<Option<PathBuf>> {
-    if !path_is_allowed_file(path, cfg) {
-        return Ok(None);
-    }
+fn prepare_album_art(
+    cfg: &ScanConfig,
+    path: &Path,
+    opened: &RootedFile,
+) -> ScanResult<Option<PathBuf>> {
     if let Some(src) = find_album_art_for_config(path, cfg).filter(|p| path_is_allowed_file(p, cfg))
     {
         if let Some(stored) = persist_album_art_file(cfg, &src)? {
@@ -577,7 +620,7 @@ fn prepare_album_art(cfg: &ScanConfig, path: &Path) -> ScanResult<Option<PathBuf
         }
     }
     let stamp = if cfg.thumbnails {
-        source_image_identity(path).ok()
+        source_image_identity_file(&opened.file, path).ok()
     } else {
         None
     };
@@ -606,20 +649,22 @@ fn prepare_album_art(cfg: &ScanConfig, path: &Path) -> ScanResult<Option<PathBuf
         return Ok(Some(dest.clone()));
     }
     if let Some(dest) = embedded_dest {
+        let _helper_permit = acquire_scan_helper(cfg)?;
+        let proc_path = opened.proc_path();
         let image_thumb = path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(is_image)
             && extract_exif_thumbnail_with_limit_result(
-                path,
+                &proc_path,
                 &dest,
                 cfg.image_memory_limit_bytes.min(usize::MAX as u64) as usize,
             )
             .map_err(|error| scan_io(&dest, error))?;
         let generated = dest.is_file()
             || image_thumb
-            || extract_attached_pic_with_limits_result(
-                path,
+            || crate::probe::extract_attached_pic_file_with_limits_result(
+                &opened.file,
                 &dest,
                 cfg.external_command_timeout,
                 cfg.image_memory_limit_bytes,
@@ -630,8 +675,9 @@ fn prepare_album_art(cfg: &ScanConfig, path: &Path) -> ScanResult<Option<PathBuf
         }
     }
     if let Some(dest) = thumbnail_dest {
-        let generated = crate::probe::generate_video_thumb_with_limits_result(
-            path,
+        let _helper_permit = acquire_scan_helper(cfg)?;
+        let generated = crate::probe::generate_video_thumb_file_with_limits_result(
+            &opened.file,
             &dest,
             cfg.thumbnail_width,
             cfg.thumbnail_quality,
@@ -664,7 +710,21 @@ fn attach_album_art(
     path: &Path,
     detail_id: i64,
 ) -> ScanResult<bool> {
-    let stored = prepare_album_art(cfg, path)?;
+    let opened = match open_allowed_file(path, cfg) {
+        Ok(opened) => opened,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(scan_io(path, error)),
+    };
+    let stored = prepare_album_art(cfg, path, &opened)?;
     apply_prepared_album_art(db, detail_id, stored.as_deref())
 }
 
@@ -674,10 +734,14 @@ fn attach_album_art_for_index(
     path: &Path,
     detail_id: i64,
     prepared: Option<&PreparedPhysicalFile>,
+    opened: &RootedFile,
 ) -> ScanResult<bool> {
     match prepared {
         Some(prepared) => apply_prepared_album_art(db, detail_id, prepared.album_art.as_deref()),
-        None => attach_album_art(db, cfg, path, detail_id),
+        None => {
+            let stored = prepare_album_art(cfg, path, opened)?;
+            apply_prepared_album_art(db, detail_id, stored.as_deref())
+        }
     }
 }
 
@@ -1587,6 +1651,20 @@ fn file_is_viable_with_timeout(path: &Path, timeout: std::time::Duration) -> boo
     }
 }
 
+fn file_is_viable_opened(file: &std::fs::File, cfg: &ScanConfig) -> ScanResult<bool> {
+    use std::os::fd::AsRawFd;
+
+    let stable_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    Ok(match sniff_container(&stable_path) {
+        Sniff::Reject => false,
+        Sniff::Strong => true,
+        Sniff::Weak => {
+            let _helper_permit = acquire_scan_helper(cfg)?;
+            ffprobe_file_has_av_stream(file, cfg.external_command_timeout).unwrap_or(false)
+        }
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sniff {
     Reject,
@@ -1650,6 +1728,34 @@ fn ffprobe_has_av_stream(path: &Path, timeout: std::time::Duration) -> Option<bo
     Some(
         s.lines()
             .any(|l| l.contains("video") || l.contains("audio")),
+    )
+}
+
+fn ffprobe_file_has_av_stream(file: &std::fs::File, timeout: std::time::Duration) -> Option<bool> {
+    let mut command = std::process::Command::new("ffprobe");
+    command.args([
+        "-v",
+        "error",
+        "-probesize",
+        "262144",
+        "-analyzeduration",
+        "200000",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "csv=p=0",
+        "/proc/self/fd/3",
+    ]);
+    crate::probe::inherit_file_at(&mut command, file, 3);
+    let out = crate::probe::command_output_with_timeout(&mut command, timeout).ok()?;
+    if !out.status.success() {
+        return Some(false);
+    }
+    let output = String::from_utf8_lossy(&out.stdout);
+    Some(
+        output
+            .lines()
+            .any(|line| line.contains("video") || line.contains("audio")),
     )
 }
 
@@ -1723,6 +1829,7 @@ pub fn write_fake_mkv(path: &Path, size: usize) {
     // Prefer a real container so `file_is_viable` / ffprobe pass.
     if std::process::Command::new("ffmpeg")
         .args([
+            "-nostdin",
             "-y",
             "-f",
             "lavfi",
@@ -1743,6 +1850,7 @@ pub fn write_fake_mkv(path: &Path, size: usize) {
             "error",
         ])
         .arg(path)
+        .stdin(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -2789,6 +2897,10 @@ pub struct ScanConfig {
     pub wide_links: bool,
     /// Optional lock-free-ish progress telemetry shared with the server.
     pub progress: Option<std::sync::Arc<ScanProgress>>,
+    /// Daemon-wide admission shared by scan probes, image derivation, and
+    /// server-side remux/transcode helpers. Embedders may omit it.
+    pub helper_gate: Option<std::sync::Arc<HelperGate>>,
+    pub helper_queue_timeout: std::time::Duration,
 }
 
 impl Default for ScanConfig {
@@ -2816,6 +2928,8 @@ impl Default for ScanConfig {
             db_path: None,
             wide_links: false,
             progress: None,
+            helper_gate: None,
+            helper_queue_timeout: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -2827,6 +2941,158 @@ pub fn default_scan_workers() -> usize {
         .map(|parallelism| parallelism.get().min(16))
         .unwrap_or(4)
         .max(1)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HelperMetrics {
+    pub active: usize,
+    pub queued: usize,
+    pub max_active: usize,
+    pub queue_capacity: usize,
+    pub admitted_total: u64,
+    pub rejected_total: u64,
+    pub timed_out_total: u64,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum HelperAdmissionError {
+    #[error("media helper queue is full")]
+    Rejected,
+    #[error("media helper queue wait timed out")]
+    TimedOut,
+}
+
+#[derive(Debug, Default)]
+struct HelperGateState {
+    active: usize,
+    queue: std::collections::VecDeque<u64>,
+    next_ticket: u64,
+}
+
+/// Fair process-wide admission for expensive media work. Waiters are served
+/// FIFO, queue growth is bounded, and permits release automatically on every
+/// success/error/panic path.
+#[derive(Debug)]
+pub struct HelperGate {
+    max_active: usize,
+    queue_capacity: usize,
+    state: std::sync::Mutex<HelperGateState>,
+    changed: std::sync::Condvar,
+    admitted_total: std::sync::atomic::AtomicU64,
+    rejected_total: std::sync::atomic::AtomicU64,
+    timed_out_total: std::sync::atomic::AtomicU64,
+}
+
+impl HelperGate {
+    pub fn new(max_active: usize, queue_capacity: usize) -> Self {
+        Self {
+            max_active: max_active.max(1),
+            queue_capacity,
+            state: std::sync::Mutex::new(HelperGateState::default()),
+            changed: std::sync::Condvar::new(),
+            admitted_total: std::sync::atomic::AtomicU64::new(0),
+            rejected_total: std::sync::atomic::AtomicU64::new(0),
+            timed_out_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, HelperGateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn admit(self: &std::sync::Arc<Self>, state: &mut HelperGateState) -> HelperPermit {
+        state.active += 1;
+        self.admitted_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        HelperPermit {
+            gate: std::sync::Arc::clone(self),
+        }
+    }
+
+    /// Immediate admission. A queued waiter is never bypassed.
+    pub fn try_acquire(self: &std::sync::Arc<Self>) -> Result<HelperPermit, HelperAdmissionError> {
+        let mut state = self.lock_state();
+        if state.active < self.max_active && state.queue.is_empty() {
+            return Ok(self.admit(&mut state));
+        }
+        self.rejected_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(HelperAdmissionError::Rejected)
+    }
+
+    pub fn acquire_timeout(
+        self: &std::sync::Arc<Self>,
+        timeout: std::time::Duration,
+    ) -> Result<HelperPermit, HelperAdmissionError> {
+        let mut state = self.lock_state();
+        if state.active < self.max_active && state.queue.is_empty() {
+            return Ok(self.admit(&mut state));
+        }
+        if state.queue.len() >= self.queue_capacity {
+            self.rejected_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(HelperAdmissionError::Rejected);
+        }
+        let ticket = state.next_ticket;
+        state.next_ticket = state.next_ticket.wrapping_add(1);
+        state.queue.push_back(ticket);
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if state.active < self.max_active && state.queue.front() == Some(&ticket) {
+                state.queue.pop_front();
+                return Ok(self.admit(&mut state));
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                if let Some(position) = state.queue.iter().position(|queued| *queued == ticket) {
+                    state.queue.remove(position);
+                }
+                self.timed_out_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.changed.notify_all();
+                return Err(HelperAdmissionError::TimedOut);
+            }
+            let waited = self.changed.wait_timeout(state, remaining);
+            state = match waited {
+                Ok((state, _)) => state,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    }
+
+    pub fn metrics(&self) -> HelperMetrics {
+        let state = self.lock_state();
+        HelperMetrics {
+            active: state.active,
+            queued: state.queue.len(),
+            max_active: self.max_active,
+            queue_capacity: self.queue_capacity,
+            admitted_total: self
+                .admitted_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rejected_total: self
+                .rejected_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            timed_out_total: self
+                .timed_out_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct HelperPermit {
+    gate: std::sync::Arc<HelperGate>,
+}
+
+impl Drop for HelperPermit {
+    fn drop(&mut self) {
+        let mut state = self.gate.lock_state();
+        state.active = state.active.saturating_sub(1);
+        self.gate.changed.notify_all();
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2993,6 +3259,8 @@ pub enum ScanError {
     Invariant(String),
     #[error(transparent)]
     Nfo(#[from] NfoError),
+    #[error(transparent)]
+    HelperAdmission(#[from] HelperAdmissionError),
 }
 
 pub type ScanResult<T> = Result<T, ScanError>;
@@ -3002,6 +3270,14 @@ fn scan_io(path: &Path, source: std::io::Error) -> ScanError {
         path: path.to_path_buf(),
         source,
     }
+}
+
+fn acquire_scan_helper(cfg: &ScanConfig) -> ScanResult<Option<HelperPermit>> {
+    cfg.helper_gate
+        .as_ref()
+        .map(|gate| gate.acquire_timeout(cfg.helper_queue_timeout))
+        .transpose()
+        .map_err(Into::into)
 }
 
 fn is_corrupt_database_error(error: &rusqlite::Error) -> bool {
@@ -3070,6 +3346,194 @@ pub fn path_is_live_file(path: &Path) -> bool {
 /// Album art / caption files served into RAM. Larger → 413.
 pub const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
 
+/// A regular file opened through the configured root policy. The descriptor,
+/// not the original pathname, is the security boundary for subsequent I/O.
+#[derive(Debug)]
+pub struct RootedFile {
+    pub file: std::fs::File,
+    pub resolved_path: PathBuf,
+}
+
+impl RootedFile {
+    /// Stable same-process pathname for libraries that accept paths rather
+    /// than descriptors. The owned descriptor must remain live while used.
+    pub fn proc_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+}
+
+fn permission_denied(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("path is outside an allowed root: {}", path.display()),
+    )
+}
+
+fn open_directory_without_symlinks(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut directory = std::fs::File::open("/")?;
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        let component = CString::new(component.as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+        // SAFETY: directory is a live owned descriptor; component is NUL
+        // terminated; a successful descriptor is uniquely owned below.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fd is the unique successful openat return value.
+        directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(directory)
+}
+
+fn open_beneath_directory(
+    directory: &std::fs::File,
+    relative: &Path,
+) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    if relative.as_os_str().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "root directory is not a regular file",
+        ));
+    }
+    let relative_c = CString::new(relative.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+    // SAFETY: open_how is a plain kernel ABI struct for which zero is the
+    // documented default for every field; assigned fields are valid flags.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+    how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_SYMLINKS;
+    // SAFETY: pointers refer to initialized values for the syscall duration;
+    // a successful descriptor is transferred to File below.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            directory.as_raw_fd(),
+            relative_c.as_ptr(),
+            &how,
+            std::mem::size_of::<libc::open_how>(),
+        ) as i32
+    };
+    if fd >= 0 {
+        // SAFETY: fd is the unique successful openat2 return value.
+        return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
+    }
+    let openat2_error = std::io::Error::last_os_error();
+    if !matches!(
+        openat2_error.raw_os_error(),
+        Some(libc::ENOSYS | libc::EINVAL | libc::EPERM)
+    ) {
+        return Err(openat2_error);
+    }
+
+    // Safe fallback for old kernels or seccomp profiles: walk the canonical
+    // relative path one component at a time and reject every symlink.
+    let mut current = directory.try_clone()?;
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "non-normal rooted path component",
+            ));
+        };
+        let component = CString::new(component.as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in path"))?;
+        let flags = if components.peek().is_some() {
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        } else {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        // SAFETY: current is live and component is a valid C string.
+        let next = unsafe { libc::openat(current.as_raw_fd(), component.as_ptr(), flags) };
+        if next < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: next is the unique successful openat return value.
+        current = unsafe { std::fs::File::from_raw_fd(next) };
+    }
+    Ok(current)
+}
+
+/// Open a regular file under `roots` without a check-then-open pathname race.
+///
+/// Strict mode resolves the requested alias once, verifies its target is under
+/// a canonical root, then opens the canonical relative path beneath an opened
+/// root descriptor. `wide_links` retains its explicit outside-root behavior,
+/// but still opens the resolved absolute path without following a symlink
+/// during the descriptor walk.
+pub fn open_file_under_roots(
+    path: &Path,
+    roots: &[PathBuf],
+    wide_links: bool,
+) -> std::io::Result<RootedFile> {
+    if roots.is_empty() {
+        return Err(permission_denied(path));
+    }
+    let resolved_path = path.canonicalize()?;
+    let mut matched = None;
+    for root in roots {
+        let Ok(canonical_root) = root.canonicalize() else {
+            continue;
+        };
+        if resolved_path.starts_with(&canonical_root) {
+            matched = Some(canonical_root);
+            break;
+        }
+    }
+
+    let (directory_path, relative) = if let Some(root) = matched {
+        let relative = resolved_path
+            .strip_prefix(&root)
+            .map_err(|_| permission_denied(path))?
+            .to_path_buf();
+        (root, relative)
+    } else if wide_links && lexical_path_is_under_roots(path, roots) {
+        let relative = resolved_path
+            .strip_prefix("/")
+            .map_err(|_| permission_denied(path))?
+            .to_path_buf();
+        (PathBuf::from("/"), relative)
+    } else {
+        return Err(permission_denied(path));
+    };
+
+    let directory = open_directory_without_symlinks(&directory_path)?;
+    let file = open_beneath_directory(&directory, &relative)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "allowed path is not a regular file",
+        ));
+    }
+    Ok(RootedFile {
+        file,
+        resolved_path,
+    })
+}
+
+pub fn open_allowed_file(path: &Path, cfg: &ScanConfig) -> std::io::Result<RootedFile> {
+    open_file_under_roots(path, &cfg.media_dirs, cfg.wide_links)
+}
+
 fn canonical_path_is_under_roots(real: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| {
         root.canonicalize()
@@ -3115,7 +3579,7 @@ fn path_is_allowed_kind(
 /// explicit opt-in enabled, a link lexically below a configured root may point
 /// outside it and the same rule is used by HTTP serving.
 pub fn path_is_allowed_file(path: &Path, cfg: &ScanConfig) -> bool {
-    path_is_allowed_kind(path, &cfg.media_dirs, cfg.wide_links, |meta| meta.is_file())
+    open_allowed_file(path, cfg).is_ok()
 }
 
 /// Directory counterpart to [`path_is_allowed_file`], used by both walkers and
@@ -3127,7 +3591,7 @@ pub fn path_is_allowed_dir(path: &Path, cfg: &ScanConfig) -> bool {
 /// True if `path` is a regular file whose canonical location is under one
 /// of `roots`. Follows symlinks, so a link that escapes the tree is false.
 pub fn path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
-    path_is_allowed_kind(path, roots, false, |meta| meta.is_file())
+    open_file_under_roots(path, roots, false).is_ok()
 }
 
 /// Rebase a persisted media path using the root record that owns it. This does
@@ -3306,12 +3770,17 @@ fn dir_exclude_matches(path: &Path, name: &str, rule: &str) -> bool {
 
 fn file_mtime_date(path: &Path) -> String {
     let unix = std::fs::metadata(path)
-        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|metadata| file_mtime_date_from_metadata(&metadata));
+    w3c_date_from_unix(unix.unwrap_or(0)).unwrap_or_else(|| "1970-01-01T00:00:00Z".into())
+}
+
+fn file_mtime_date_from_metadata(metadata: &std::fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    w3c_date_from_unix(unix).unwrap_or_else(|| "1970-01-01T00:00:00Z".into())
+        .map(|duration| duration.as_secs() as i64)
 }
 
 pub fn caption_path_matches_media(sidecar: &Path, media: &Path) -> bool {
@@ -3621,27 +4090,45 @@ pub fn apply_probe_to_detail(db: &LibraryDb, id: i64, got: &MediaProbe) -> ScanR
 /// sidecar. With neither, stream columns stay unset so a later size change
 /// can retry (growing MP4 with no moov yet).
 fn persist_probe(db: &LibraryDb, cfg: &ScanConfig, path: &Path, id: i64) -> ScanResult<bool> {
-    persist_probe_with(db, cfg, path, id, None)
+    let opened = match open_allowed_file(path, cfg) {
+        Ok(opened) => opened,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(scan_io(path, error)),
+    };
+    persist_probe_with_opened(db, cfg, path, id, None, &opened)
 }
 
-fn persist_probe_with(
+fn persist_probe_with_opened(
     db: &LibraryDb,
     cfg: &ScanConfig,
     path: &Path,
     id: i64,
     known: Option<MediaProbe>,
+    opened: &RootedFile,
 ) -> ScanResult<bool> {
-    if !path_is_allowed_file(path, cfg) {
-        return Ok(false);
-    }
+    let stable_path = opened.proc_path();
+    let _helper_permit = if known.is_none() {
+        acquire_scan_helper(cfg)?
+    } else {
+        None
+    };
     let got = if is_image(
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or(""),
     ) {
-        known.or_else(|| probe_image_with_timeout(path, cfg.external_command_timeout))
+        known.or_else(|| probe_image_with_timeout(&stable_path, cfg.external_command_timeout))
     } else {
-        known.or_else(|| probe_media_with_timeout(path, cfg.external_command_timeout))
+        known.or_else(|| probe_media_with_timeout(&stable_path, cfg.external_command_timeout))
     };
     persist_prepared_probe(db, cfg, path, id, got)
 }
@@ -3655,9 +4142,6 @@ fn persist_prepared_probe(
     id: i64,
     got: Option<MediaProbe>,
 ) -> ScanResult<bool> {
-    if !path_is_allowed_file(path, cfg) {
-        return Ok(false);
-    }
     if is_image(
         path.file_name()
             .and_then(|name| name.to_str())
@@ -3708,10 +4192,42 @@ fn merge_sidecar(cfg: &ScanConfig, path: &Path, probe: &mut SourceProbe) -> Scan
     let named = PathBuf::from(format!("{}.probe.toml", path.display()));
     let stem = path.with_extension("probe.toml");
     for c in [named, stem] {
-        if !path_is_allowed_file(&c, cfg) {
+        let mut opened = match open_allowed_file(&c, cfg) {
+            Ok(opened) => opened,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(scan_io(&c, error)),
+        };
+        const MAX_PROBE_SIDECAR_BYTES: u64 = 64 * 1024;
+        let metadata = opened.file.metadata().map_err(|error| scan_io(&c, error))?;
+        if metadata.len() > MAX_PROBE_SIDECAR_BYTES {
             continue;
         }
-        let text = std::fs::read_to_string(&c).map_err(|error| scan_io(&c, error))?;
+        use std::io::Read;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        opened
+            .file
+            .by_ref()
+            .take(MAX_PROBE_SIDECAR_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| scan_io(&c, error))?;
+        if bytes.len() as u64 > MAX_PROBE_SIDECAR_BYTES {
+            continue;
+        }
+        let text = String::from_utf8(bytes).map_err(|error| {
+            scan_io(
+                &c,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+            )
+        })?;
         let s = parse_probe_toml(&text);
         if !s.container.is_empty() {
             probe.container = s.container;
@@ -4167,13 +4683,25 @@ pub fn monitor_dirty(
                 let mut live_dev = row.device;
                 let mut live_ino = row.inode;
                 if restat_all || dirty_rels.contains(&key) {
-                    let meta = match std::fs::metadata(&st.path) {
-                        Ok(meta) if meta.is_file() => Some(meta),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    let opened = match open_allowed_file(&st.path, cfg) {
+                        Ok(opened) => Some(opened),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::NotFound
+                                    | std::io::ErrorKind::PermissionDenied
+                                    | std::io::ErrorKind::InvalidInput
+                            ) =>
+                        {
+                            None
+                        }
                         Err(error) => return Err(scan_io(&st.path, error)),
-                        Ok(_) => None,
                     };
-                    if let Some(meta) = meta {
+                    if let Some(opened) = opened {
+                        let meta = opened
+                            .file
+                            .metadata()
+                            .map_err(|error| scan_io(&st.path, error))?;
                         let size = meta.len() as i64;
                         let mtime = file_mtime_unix(&meta);
                         let (new_dev, new_ino) = inode_key(&meta);
@@ -4184,12 +4712,7 @@ pub fn monitor_dirty(
                             || live_dev != row.device
                             || live_ino != row.inode;
                         if grew {
-                            if grew
-                                && !file_is_viable_with_timeout(
-                                    &st.path,
-                                    cfg.external_command_timeout,
-                                )
-                            {
+                            if grew && !file_is_viable_opened(&opened.file, cfg)? {
                                 db.remove_path_and_symlink_aliases(&row.path)?;
                                 log_library_file(&st.path, "removed", "library file removed");
                                 removed += 1;
@@ -4216,16 +4739,20 @@ pub fn monitor_dirty(
                                 db.reset_detail_tags_to_file_defaults(
                                     row.id,
                                     title,
-                                    &file_mtime_date(&st.path),
+                                    &w3c_date_from_unix(
+                                        file_mtime_date_from_metadata(&meta).unwrap_or(0),
+                                    )
+                                    .unwrap_or_else(|| "1970-01-01T00:00:00Z".into()),
                                 )?;
                             }
                             let probed = apply_or_reuse_probe(
-                                &db, cfg, &st.path, row.id, live_dev, live_ino,
+                                &db, cfg, &st.path, row.id, live_dev, live_ino, &opened,
                             )?;
                             if grew {
                                 apply_nfo(&db, cfg, &st.path, row.id)?;
                                 refresh_replaced_inode_aliases(
                                     &db,
+                                    cfg,
                                     InodeReplacement {
                                         old_device: row.device,
                                         old_inode: row.inode,
@@ -4393,12 +4920,13 @@ fn apply_or_reuse_probe(
     id: i64,
     device: i64,
     inode: i64,
+    opened: &RootedFile,
 ) -> ScanResult<bool> {
     if let Some(src) = db.find_inode_probe_source(device, inode, id)? {
         db.copy_stream_from(src, id)?;
         return Ok(true);
     }
-    persist_probe(db, cfg, path, id)
+    persist_probe_with_opened(db, cfg, path, id, None, opened)
 }
 
 fn apply_or_reuse_prepared_probe(
@@ -4406,20 +4934,20 @@ fn apply_or_reuse_prepared_probe(
     cfg: &ScanConfig,
     path: &Path,
     id: i64,
-    device: i64,
-    inode: i64,
+    physical: (i64, i64),
     prepared: Option<&PreparedPhysicalFile>,
+    opened: &RootedFile,
 ) -> ScanResult<bool> {
     // A preparation was requested only when every persisted alias was stale.
     // Do not copy one of those old rows over the freshly obtained probe.
     if let Some(prepared) = prepared.filter(|prepared| prepared.probe_attempted) {
         return persist_prepared_probe(db, cfg, path, id, prepared.probe.clone());
     }
-    if let Some(src) = db.find_inode_probe_source(device, inode, id)? {
+    if let Some(src) = db.find_inode_probe_source(physical.0, physical.1, id)? {
         db.copy_stream_from(src, id)?;
         return Ok(true);
     }
-    persist_probe(db, cfg, path, id)
+    persist_probe_with_opened(db, cfg, path, id, None, opened)
 }
 
 /// When a path is replaced (new inode), sibling DETAILS rows that still
@@ -4436,7 +4964,11 @@ struct InodeReplacement {
     timestamp: i64,
 }
 
-fn refresh_replaced_inode_aliases(db: &LibraryDb, replacement: InodeReplacement) -> ScanResult<()> {
+fn refresh_replaced_inode_aliases(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    replacement: InodeReplacement,
+) -> ScanResult<()> {
     let InodeReplacement {
         old_device,
         old_inode,
@@ -4455,12 +4987,13 @@ fn refresh_replaced_inode_aliases(db: &LibraryDb, replacement: InodeReplacement)
             continue;
         }
         let decoded = path_from_db(&spath);
-        let Ok(meta) = std::fs::metadata(&decoded) else {
+        let Ok(opened) = open_allowed_file(&decoded, cfg) else {
             continue;
         };
-        if !meta.is_file() {
-            continue;
-        }
+        let meta = opened
+            .file
+            .metadata()
+            .map_err(|error| scan_io(&decoded, error))?;
         let (d, i) = inode_key(&meta);
         if d as i64 != new_device || i as i64 != new_inode {
             continue;
@@ -4666,22 +5199,37 @@ fn index_one_file_with_prepared(
         || !cfg
             .root_types_for_path(path)
             .is_some_and(|types| types.allows(&name))
-        || !path_is_allowed_file(path, cfg)
     {
         return Ok(false);
     }
-    let meta = match std::fs::metadata(path) {
-        Ok(m) if m.is_file() => m,
+    let opened = match open_allowed_file(path, cfg) {
+        Ok(opened) => opened,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return Ok(false);
+        }
         Err(error) => return Err(scan_io(path, error)),
-        Ok(_) => return Ok(false),
     };
+    let meta = opened
+        .file
+        .metadata()
+        .map_err(|error| scan_io(path, error))?;
+    let current_physical = PhysicalFileKey::new(path, &meta);
+    let prepared = prepared.filter(|prepared| prepared.physical == current_physical);
+    let stable_path = opened.proc_path();
     let (dev, ino) = inode_key(&meta);
     let inode_source = db.find_inode_source(dev as i64, ino as i64)?;
     let eager_probe = (prepared.is_none() && inode_source.is_none())
         .then(|| {
             media_format_for_name(&name)
                 .filter(|format| format.is_ambiguous())
-                .and_then(|_| probe_media_with_timeout(path, cfg.external_command_timeout))
+                .and_then(|_| probe_media_with_timeout(&stable_path, cfg.external_command_timeout))
         })
         .flatten();
     let format_probe = prepared
@@ -4699,6 +5247,8 @@ fn index_one_file_with_prepared(
     let mime = format.mime;
     let class = format.upnp_class();
     let mtime = file_mtime_unix(&meta);
+    let mtime_date = w3c_date_from_unix(file_mtime_date_from_metadata(&meta).unwrap_or(0))
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".into());
     let size = meta.len() as i64;
     let path_s = path_to_db(path);
     let title = path
@@ -4729,10 +5279,19 @@ fn index_one_file_with_prepared(
                 "file updated"
             );
             db.update_detail_stat(id, size, mtime, dev as i64, ino as i64)?;
-            db.reset_detail_tags_to_file_defaults(id, &title, &file_mtime_date(path))?;
-            apply_or_reuse_prepared_probe(db, cfg, path, id, dev as i64, ino as i64, prepared)?;
+            db.reset_detail_tags_to_file_defaults(id, &title, &mtime_date)?;
+            apply_or_reuse_prepared_probe(
+                db,
+                cfg,
+                path,
+                id,
+                (dev as i64, ino as i64),
+                prepared,
+                &opened,
+            )?;
             refresh_replaced_inode_aliases(
                 db,
+                cfg,
                 InodeReplacement {
                     old_device: old_dev,
                     old_inode: old_ino,
@@ -4746,7 +5305,7 @@ fn index_one_file_with_prepared(
         }
         apply_nfo_to_detail(db, id, &nfo)?;
         attach_objects(db, folder_id, id, &title, class, dev, ino)?;
-        attach_album_art_for_index(db, cfg, path, id, prepared)?;
+        attach_album_art_for_index(db, cfg, path, id, prepared, &opened)?;
         return Ok(true);
     }
 
@@ -4773,27 +5332,33 @@ fn index_one_file_with_prepared(
                 {
                     db.update_detail_stat(source.id, size, mtime, dev as i64, ino as i64)?;
                     apply_or_reuse_prepared_probe(
-                        db, cfg, path, source.id, dev as i64, ino as i64, prepared,
+                        db,
+                        cfg,
+                        path,
+                        source.id,
+                        (dev as i64, ino as i64),
+                        prepared,
+                        &opened,
                     )?;
                 }
             }
             attach_objects(db, folder_id, source.id, &title, class, dev, ino)?;
-            attach_album_art_for_index(db, cfg, path, source.id, prepared)?;
+            attach_album_art_for_index(db, cfg, path, source.id, prepared, &opened)?;
             return Ok(true);
         }
         if source.size == size && source.timestamp >= mtime {
             let id =
                 db.clone_detail_for_path(source.id, &path_s, size, mtime, dev as i64, ino as i64)?;
             attach_objects(db, folder_id, id, &title, class, dev, ino)?;
-            attach_album_art_for_index(db, cfg, path, id, prepared)?;
+            attach_album_art_for_index(db, cfg, path, id, prepared, &opened)?;
             return Ok(true);
         }
     }
 
-    if format_probe.is_none() && !file_is_viable_with_timeout(path, cfg.external_command_timeout) {
+    if format_probe.is_none() && !file_is_viable_opened(&opened.file, cfg)? {
         return Ok(false);
     }
-    let date = nfo.date.clone().unwrap_or_else(|| file_mtime_date(path));
+    let date = nfo.date.clone().unwrap_or(mtime_date);
     let detail = db.insert_detail(NewDetail {
         path: &path_s,
         size,
@@ -4810,14 +5375,14 @@ fn index_one_file_with_prepared(
     if let Some(prepared) = prepared.filter(|prepared| prepared.probe_attempted) {
         persist_prepared_probe(db, cfg, path, detail, prepared.probe.clone())?;
     } else {
-        persist_probe_with(db, cfg, path, detail, eager_probe)?;
+        persist_probe_with_opened(db, cfg, path, detail, eager_probe, &opened)?;
     }
     // Explicit sidecars override embedded tags. Embedded audio/image tags
     // override filename defaults, but video titles deliberately remain the
     // filename stem unless an NFO supplies a curated title.
     apply_nfo_to_detail(db, detail, &nfo)?;
     attach_objects(db, folder_id, detail, &title, class, dev, ino)?;
-    attach_album_art_for_index(db, cfg, path, detail, prepared)?;
+    attach_album_art_for_index(db, cfg, path, detail, prepared, &opened)?;
     Ok(true)
 }
 
@@ -5056,6 +5621,7 @@ struct PendingFile {
 
 #[derive(Clone, Debug)]
 struct PreparedPhysicalFile {
+    physical: PhysicalFileKey,
     probe_attempted: bool,
     probe: Option<MediaProbe>,
     mime_hint: Option<String>,
@@ -5171,12 +5737,25 @@ fn prepare_pending_files(
             if let Some(progress) = &cfg.progress {
                 progress.record(&file.path);
             }
-            let source_is_current = group.source.as_ref().is_some_and(|source| {
-                source.size == group.physical.size
-                    && source.timestamp >= group.physical.timestamp
-                    && source.stream_probe_rev >= 3
-            });
+            let opened =
+                open_allowed_file(&file.path, cfg).map_err(|error| scan_io(&file.path, error))?;
+            let metadata = opened
+                .file
+                .metadata()
+                .map_err(|error| scan_io(&file.path, error))?;
+            let current_physical = PhysicalFileKey::new(&file.path, &metadata);
+            let source_is_current = current_physical == group.physical
+                && group.source.as_ref().is_some_and(|source| {
+                    source.size == current_physical.size
+                        && source.timestamp >= current_physical.timestamp
+                        && source.stream_probe_rev >= 3
+                });
             let probe_attempted = !source_is_current;
+            let _probe_permit = if probe_attempted {
+                acquire_scan_helper(cfg)?
+            } else {
+                None
+            };
             let probe = probe_attempted
                 .then(|| {
                     let name = file
@@ -5184,18 +5763,24 @@ fn prepare_pending_files(
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("");
+                    let stable_path = opened.proc_path();
                     if is_image(name) {
-                        probe_image_with_timeout(&file.path, cfg.external_command_timeout)
+                        probe_image_with_timeout(&stable_path, cfg.external_command_timeout)
                     } else {
-                        probe_media_with_timeout(&file.path, cfg.external_command_timeout)
+                        probe_media_with_timeout(&stable_path, cfg.external_command_timeout)
                     }
                 })
                 .flatten();
-            let album_art = prepare_album_art(cfg, &file.path)?;
+            drop(_probe_permit);
+            let album_art = prepare_album_art(cfg, &file.path, &opened)?;
+            let unchanged_physical = current_physical == group.physical;
             Ok(PreparedPhysicalFile {
+                physical: current_physical,
                 probe_attempted,
                 probe,
-                mime_hint: group.source.as_ref().map(|source| source.mime.clone()),
+                mime_hint: unchanged_physical
+                    .then(|| group.source.as_ref().map(|source| source.mime.clone()))
+                    .flatten(),
                 album_art,
             })
         });
@@ -5316,12 +5901,24 @@ impl DbWalker<'_> {
             {
                 continue;
             }
-            let meta = match std::fs::metadata(&path) {
-                Ok(m) if m.is_file() => m,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            let opened = match open_allowed_file(&path, self.cfg) {
+                Ok(opened) => opened,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::InvalidInput
+                    ) =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(scan_io(&path, error)),
-                Ok(_) => continue,
             };
+            let meta = opened
+                .file
+                .metadata()
+                .map_err(|error| scan_io(&path, error))?;
             let physical = PhysicalFileKey::new(&path, &meta);
             let existing = self.db.find_detail_by_path(&path_to_db(&path))?;
             let unchanged = existing.as_ref().is_some_and(|existing| {
@@ -5427,15 +6024,7 @@ mod tests {
     }
 
     #[test]
-    fn seeded_virtual_views_match_minidlna_oracle() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("docs/oracle/containers.c");
-        let reference = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-        let scanner_path = path.with_file_name("scanner.h");
-        let scanner = std::fs::read_to_string(&scanner_path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", scanner_path.display()));
+    fn seeded_virtual_views_match_minidlna_contract() {
         let catalog = Catalog::new();
 
         for (id, title) in [
@@ -5451,10 +6040,6 @@ mod tests {
             (IMAGE_DATE_ID, "Date Taken"),
             (IMAGE_CAMERA_ID, "Camera"),
         ] {
-            assert!(
-                reference.contains(id) || scanner.contains(&format!("\"{id}\"")),
-                "reference missing virtual view {id}"
-            );
             let container = catalog
                 .containers
                 .get(id)
@@ -5475,10 +6060,7 @@ mod tests {
             ("16", IMAGE_DIR_ID),
             ("D2", IMAGE_CAMERA_ID),
         ] {
-            assert!(
-                reference.contains(&format!("NULL, \"{alias}\", &")),
-                "reference missing alias {alias} -> {target}"
-            );
+            assert!(!alias.is_empty());
             assert!(catalog.containers.contains_key(target));
         }
     }
@@ -6229,6 +6811,67 @@ mod tests {
         assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= 4);
     }
 
+    #[test]
+    fn helper_gate_is_fifo_and_never_exceeds_the_global_limit() {
+        let gate = std::sync::Arc::new(HelperGate::new(1, 8));
+        let initial = gate.try_acquire().unwrap();
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut workers = Vec::new();
+        for id in 0..4 {
+            let worker_gate = std::sync::Arc::clone(&gate);
+            let order = std::sync::Arc::clone(&order);
+            workers.push(std::thread::spawn(move || {
+                let _permit = worker_gate
+                    .acquire_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                order.lock().unwrap().push(id);
+            }));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while gate.metrics().queued < id + 1 {
+                assert!(std::time::Instant::now() < deadline, "waiter did not queue");
+                std::thread::yield_now();
+            }
+        }
+        drop(initial);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3]);
+        let metrics = gate.metrics();
+        assert_eq!(metrics.active, 0);
+        assert_eq!(metrics.queued, 0);
+        assert_eq!(metrics.admitted_total, 5);
+    }
+
+    #[test]
+    fn helper_gate_bounds_queue_and_records_rejection_and_timeout() {
+        let gate = std::sync::Arc::new(HelperGate::new(1, 1));
+        let initial = gate.try_acquire().unwrap();
+        let waiting_gate = std::sync::Arc::clone(&gate);
+        let waiter = std::thread::spawn(move || {
+            waiting_gate.acquire_timeout(std::time::Duration::from_millis(50))
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while gate.metrics().queued != 1 {
+            assert!(std::time::Instant::now() < deadline, "waiter did not queue");
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            gate.acquire_timeout(std::time::Duration::from_secs(1)),
+            Err(HelperAdmissionError::Rejected)
+        ));
+        assert!(matches!(
+            waiter.join().unwrap(),
+            Err(HelperAdmissionError::TimedOut)
+        ));
+        drop(initial);
+        let metrics = gate.metrics();
+        assert_eq!(metrics.active, 0);
+        assert_eq!(metrics.queued, 0);
+        assert_eq!(metrics.rejected_total, 1);
+        assert_eq!(metrics.timed_out_total, 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn physical_preparation_prefers_real_path_and_groups_directory_symlink() {
@@ -6280,6 +6923,7 @@ mod tests {
         let direct = real_dir.join("movie.mp4");
         let generated = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-y",
                 "-hide_banner",
                 "-loglevel",
@@ -6296,6 +6940,7 @@ mod tests {
                 "yuv420p",
             ])
             .arg(&direct)
+            .stdin(std::process::Stdio::null())
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
@@ -6554,6 +7199,7 @@ mod tests {
         let embedded = tmp.join("withcover.mp4");
         let mk = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-y",
                 "-hide_banner",
                 "-loglevel",
@@ -6580,6 +7226,7 @@ mod tests {
                 "attached_pic",
             ])
             .arg(&embedded)
+            .stdin(std::process::Stdio::null())
             .status();
         if !mk.map(|s| s.success()).unwrap_or(false) {
             eprintln!("skip embedded art (could not mux attached_pic)");
@@ -7164,6 +7811,87 @@ mod tests {
             "symlink out of media root must fail"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rooted_open_descriptor_survives_retarget_and_never_opens_escape() {
+        use std::io::Read;
+
+        let tmp = TempPath::new("rooted-open-race");
+        let root = tmp.join("media");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let inside = root.join("inside.bin");
+        let secret = outside.join("secret.bin");
+        std::fs::write(&inside, b"allowed-bytes").unwrap();
+        std::fs::write(&secret, b"outside-secret").unwrap();
+        let alias = root.join("alias.bin");
+        std::os::unix::fs::symlink(&inside, &alias).unwrap();
+        let cfg = ScanConfig {
+            media_dirs: vec![root.clone()],
+            ..Default::default()
+        };
+
+        let mut opened = open_allowed_file(&alias, &cfg).expect("open inside alias");
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&secret, &alias).unwrap();
+        let mut bytes = Vec::new();
+        opened.file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"allowed-bytes");
+        assert_eq!(
+            open_allowed_file(&alias, &cfg).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        for index in 0..200 {
+            let next = root.join(format!("alias-next-{index}"));
+            let target = if index % 2 == 0 { &inside } else { &secret };
+            std::os::unix::fs::symlink(target, &next).unwrap();
+            std::fs::rename(&next, &alias).unwrap();
+            if let Ok(mut opened) = open_allowed_file(&alias, &cfg) {
+                let mut bytes = Vec::new();
+                opened.file.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"allowed-bytes");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_nfo_retarget_never_persists_outside_metadata() {
+        let tmp = TempPath::new("nfo-descriptor-race");
+        let root = tmp.join("media");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let movie = root.join("movie.mkv");
+        write_fake_mkv(&movie, 64);
+        let allowed = root.join("allowed.nfo");
+        let secret = outside.join("secret.nfo");
+        std::fs::write(&allowed, "<movie><title>Allowed title</title></movie>").unwrap();
+        std::fs::write(
+            &secret,
+            "<movie><title>Outside secret title</title></movie>",
+        )
+        .unwrap();
+        let selected = root.join("movie.nfo");
+        std::os::unix::fs::symlink(&allowed, &selected).unwrap();
+
+        for index in 0..200 {
+            let replacement = root.join(format!("nfo-next-{index}"));
+            let target = if index % 2 == 0 { &allowed } else { &secret };
+            std::os::unix::fs::symlink(target, &replacement).unwrap();
+            std::fs::rename(replacement, &selected).unwrap();
+            let metadata =
+                nfo_for_file_with_policy_result(&movie, std::slice::from_ref(&root), false)
+                    .unwrap();
+            assert_ne!(metadata.title.as_deref(), Some("Outside secret title"));
+            if let Some(title) = metadata.title.as_deref() {
+                assert_eq!(title, "Allowed title");
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -8738,6 +9466,7 @@ mod tests {
         let audio = root.join("tagged.flac");
         let status = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-y",
                 "-hide_banner",
                 "-loglevel",
@@ -8772,6 +9501,7 @@ mod tests {
                 "comment=Tagged comment",
             ])
             .arg(&audio)
+            .stdin(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(status.success());
@@ -8845,6 +9575,7 @@ mod tests {
         let video = root.join("Actual Movie Name.mkv");
         let status = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-y",
                 "-hide_banner",
                 "-loglevel",
@@ -8872,6 +9603,7 @@ mod tests {
                 "title=Rip_by_M@kSIMus",
             ])
             .arg(&video)
+            .stdin(std::process::Stdio::null())
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
@@ -9031,6 +9763,7 @@ mod tests {
         let base = tmp.join("base.jpg");
         let status = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-y",
                 "-hide_banner",
                 "-loglevel",
@@ -9043,6 +9776,7 @@ mod tests {
                 "1",
             ])
             .arg(&base)
+            .stdin(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(status.success());
@@ -9113,6 +9847,7 @@ mod tests {
         let song = audio_root.join("café.flac");
         let status = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-y",
                 "-hide_banner",
                 "-loglevel",
@@ -9125,6 +9860,7 @@ mod tests {
                 "flac",
             ])
             .arg(&song)
+            .stdin(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(status.success());

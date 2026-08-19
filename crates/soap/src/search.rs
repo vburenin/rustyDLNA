@@ -1,4 +1,4 @@
-//! `SearchCriteria` parse + match (`replica.md` Search / GetSearchCapabilities).
+//! `SearchCriteria` parsing and matching.
 
 /// A single dialect clause. Unknown properties match nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]

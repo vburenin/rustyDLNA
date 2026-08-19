@@ -1,4 +1,4 @@
-//! 25-slot IPv4 client cache (`docs/oracle/clients.c` SearchClientCache / AddClientCache).
+//! 25-slot IPv4 client cache matching MiniDLNA's SearchClientCache/AddClientCache behavior.
 
 use std::net::Ipv4Addr;
 

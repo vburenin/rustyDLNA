@@ -8,7 +8,7 @@ use rusty_dlna_ssdp::notify_alive;
 use tracing::info;
 
 #[derive(Parser, Debug)]
-#[command(name = "rusty-dlna", about = "Multithreaded DLNA server")]
+#[command(name = "rusty-dlna", about = "Multithreaded DLNA server", version)]
 struct Args {
     /// Config file (TOML). Living-room paths belong in a gitignored local file.
     #[arg(short, long)]
@@ -162,6 +162,10 @@ fn run_check(app: &App, server: &str) -> Result<(), Box<dyn std::error::Error>> 
     println!(
         "  transcode     enable={} encoder={} max_jobs={}",
         cfg.transcode.enable, cfg.transcode.encoder, cfg.transcode.max_jobs
+    );
+    println!(
+        "  helpers       max_jobs={} queue={} timeout={}s",
+        cfg.helper_max_jobs, cfg.helper_queue_capacity, cfg.helper_queue_timeout_secs
     );
     println!("  ifaces        {:?}", cfg.network_interface);
     println!("  media_dir     {:?}", cfg.media_dir);

@@ -1,8 +1,8 @@
 //! rustyDLNA on-the-wire protocol dialect.
 //!
-//! Constants and helpers here are the contract documented in
-//! `docs/replica.md`. A rewrite that changes these without a client reason
-//! will break TVs that already work.
+//! Constants and helpers here are the executable MiniDLNA compatibility
+//! contract. A rewrite that changes these without a client reason will break
+//! TVs that already work.
 
 pub mod client_cache;
 pub mod clients;
@@ -16,7 +16,7 @@ pub mod soap;
 pub mod ssdp;
 
 #[cfg(test)]
-mod oracle;
+mod contract;
 
 pub use client_cache::{ClientCache, ClientCacheEntry, CLIENT_CACHE_SLOTS, CLIENT_CACHE_TTL_SECS};
 pub use clients::{

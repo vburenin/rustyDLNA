@@ -5,111 +5,183 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
-  id-token: write
-  packages: write
+  contents: read
 
 jobs:
-  release:
+  validate:
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      revision: ${{ steps.release.outputs.revision }}
+      epoch: ${{ steps.release.outputs.epoch }}
+      date: ${{ steps.release.outputs.date }}
+      image: ${{ steps.release.outputs.image }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
-      - run: rustup toolchain install 1.97.1 --profile minimal && rustup default 1.97.1
-      - name: Reproducible build metadata
-        id: build
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavformat-dev ffmpeg curl
+      - name: Pinned latest stable Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy && rustup default 1.97.1
+      - name: Validate release tag, package, changelog, and toolchain
+        run: scripts/release-contract.sh "$GITHUB_REF_NAME"
+      - name: Full quality gate
+        run: scripts/check.sh
+      - name: Global media-helper load limits
+        run: scripts/helper-load.sh
+      - name: Dependency policy
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo audit --deny warnings
+          cargo deny check
+      - name: Reproducible release metadata
+        id: release
         run: |
           {
+            echo "version=${GITHUB_REF_NAME#v}"
+            echo "revision=$(git rev-parse HEAD)"
             echo "epoch=$(git show -s --format=%ct HEAD)"
             echo "date=$(git show -s --format=%cI HEAD)"
-            echo "revision=$(git rev-parse HEAD)"
             echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
           } >> "$GITHUB_OUTPUT"
-      - name: Build release binary
-        env:
-          SOURCE_DATE_EPOCH: ${{ steps.build.outputs.epoch }}
-        run: cargo build --locked --release -p rusty-dlna
-      - name: Package binary, notices, checksum, and SBOM
-        env:
-          SOURCE_DATE_EPOCH: ${{ steps.build.outputs.epoch }}
+
+  architecture-smoke:
+    needs: validate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            suffix: amd64
+          - platform: linux/arm64
+            suffix: arm64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+      - name: Build the architecture image locally
         run: |
-          mkdir dist
-          cp target/release/rusty-dlna LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md dist/
-          cp docs/DISTRIBUTION.md docs/COMPATIBILITY.md dist/
-          cargo install cargo-cyclonedx --version 0.5.9 --locked
-          cargo cyclonedx --manifest-path crates/server/Cargo.toml --all --format json
-          # cargo-cyclonedx emits beside each workspace manifest. Package the
-          # server SBOM, which includes all six transitive workspace crates.
-          cp crates/server/rusty-dlna.cdx.json dist/rusty-dlna.cdx.json
-          test -s dist/rusty-dlna.cdx.json
-          archive="rustydlna-${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
-          checksums="rustydlna-${GITHUB_REF_NAME}-SHA256SUMS"
-          tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
-            -C dist -cf - rusty-dlna LICENSE THIRD_PARTY_NOTICES.md CHANGELOG.md \
-            DISTRIBUTION.md COMPATIBILITY.md rusty-dlna.cdx.json \
-            | gzip -n > "$archive"
-          sha256sum "$archive" > "$checksums"
-      - name: Sign build provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
-        with:
-          subject-path: rustydlna-${{ github.ref_name }}-linux-x86_64.tar.gz
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+          docker buildx build \
+            --platform '${{ matrix.platform }}' \
+            --load \
+            --tag 'rusty-dlna:release-${{ matrix.suffix }}' \
+            --build-arg 'BUILD_VERSION=${{ github.ref_name }}' \
+            --build-arg 'VCS_REF=${{ needs.validate.outputs.revision }}' \
+            --build-arg 'BUILD_DATE=${{ needs.validate.outputs.date }}' \
+            --build-arg 'SOURCE_DATE_EPOCH=${{ needs.validate.outputs.epoch }}' \
+            .
+      - name: Scan, Browse, media, tools, labels, and shutdown smoke
+        env:
+          DOCKER_DEFAULT_PLATFORM: ${{ matrix.platform }}
+          RUSTY_DLNA_SMOKE_IMAGE: rusty-dlna:release-${{ matrix.suffix }}
+          RUSTY_DLNA_EXPECT_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_IMAGE: rusty-dlna:release-${{ matrix.suffix }}
+          RELEASE_REVISION: ${{ needs.validate.outputs.revision }}
+        run: |
+          scripts/release-contract.sh '${{ github.ref_name }}'
+          scripts/compose-smoke.sh
+
+  publish:
+    needs: [validate, architecture-smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      packages: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
       - name: Log in to GHCR
         uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Image metadata
-        id: meta
-        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf
-        with:
-          images: ${{ steps.build.outputs.image }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=long
-      - name: Build and push multi-architecture image
+      - name: Build once and push only an immutable staging reference
         id: image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ needs.validate.outputs.image }}:staging-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.revision }}
+            org.opencontainers.image.created=${{ needs.validate.outputs.date }}
           build-args: |
             BUILD_VERSION=${{ github.ref_name }}
-            VCS_REF=${{ steps.build.outputs.revision }}
-            BUILD_DATE=${{ steps.build.outputs.date }}
-            SOURCE_DATE_EPOCH=${{ steps.build.outputs.epoch }}
+            VCS_REF=${{ needs.validate.outputs.revision }}
+            BUILD_DATE=${{ needs.validate.outputs.date }}
+            SOURCE_DATE_EPOCH=${{ needs.validate.outputs.epoch }}
           provenance: mode=max
           sbom: true
-      - name: Scan published image
+      - name: Smoke the exact staged digest on both architectures
+        env:
+          IMAGE: ${{ needs.validate.outputs.image }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          REVISION: ${{ needs.validate.outputs.revision }}
+        run: |
+          for arch in amd64 arm64; do
+            docker pull --platform "linux/$arch" "$IMAGE@$DIGEST"
+            docker tag "$IMAGE@$DIGEST" "rusty-dlna:staged-$arch"
+            DOCKER_DEFAULT_PLATFORM="linux/$arch" \
+              RUSTY_DLNA_SMOKE_IMAGE="rusty-dlna:staged-$arch" \
+              RUSTY_DLNA_EXPECT_VERSION="$VERSION" \
+              scripts/compose-smoke.sh
+            DOCKER_DEFAULT_PLATFORM="linux/$arch" \
+              RELEASE_IMAGE="rusty-dlna:staged-$arch" \
+              RELEASE_REVISION="$REVISION" \
+              scripts/release-contract.sh "$GITHUB_REF_NAME"
+          done
+      - name: Scan the exact staged image digest
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
-          image-ref: ${{ steps.build.outputs.image }}@${{ steps.image.outputs.digest }}
+          image-ref: ${{ needs.validate.outputs.image }}@${{ steps.image.outputs.digest }}
           format: table
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
           version: v0.70.0
+      - name: Attest the tested image digest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-name: ${{ needs.validate.outputs.image }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
         with:
           cosign-release: v3.0.6
-      - name: Sign image digest
+      - name: Sign the tested image digest
         env:
-          IMAGE: ${{ steps.build.outputs.image }}
+          IMAGE: ${{ needs.validate.outputs.image }}
           DIGEST: ${{ steps.image.outputs.digest }}
         run: cosign sign --yes "$IMAGE@$DIGEST"
-      - uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631
+      - name: Promote the tested digest to release, minor, and SHA tags
+        env:
+          IMAGE: ${{ needs.validate.outputs.image }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          REVISION: ${{ needs.validate.outputs.revision }}
+        run: |
+          minor=${VERSION%.*}
+          docker buildx imagetools create \
+            --tag "$IMAGE:$VERSION" \
+            --tag "$IMAGE:$minor" \
+            --tag "$IMAGE:sha-$REVISION" \
+            "$IMAGE@$DIGEST"
+      - name: Create a draft source-and-image release
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631
         with:
           draft: true
           generate_release_notes: true
-          files: |
-            rustydlna-*-linux-x86_64.tar.gz
-            rustydlna-*-SHA256SUMS
+          body: |
+            Official artifact: `${{ needs.validate.outputs.image }}@${{ steps.image.outputs.digest }}`
+
+            The container digest was tested on linux/amd64 and linux/arm64,
+            vulnerability-scanned, SBOM/provenance-attested, and signed before
+            its release tags were promoted. Source is the repository tag.

@@ -1,155 +1,106 @@
 # rustyDLNA
 
-A **Rust** DLNA / UPnP MediaServer. The wire dialect (SSDP, DIDL, client
-quirks, Kodi dates) is locked in [`replica.md`](replica.md). Do not invent
-new object IDs, SOAP names, or Samsung MIME lies without updating that file.
+A DLNA / UPnP media server for a local library. It advertises your
+video, music, and pictures on the LAN so TVs, Kodi, game consoles, and
+phones can browse and play them. There is no account, no cloud, and no
+companion app.
 
-This tree is GPLv2.
+The browse tree, object IDs, and client quirks match MiniDLNA, so a
+ReadyMedia library should look familiar after a switch. rustyDLNA is
+GPLv2.
 
-## What is here
+## Capabilities
 
-| Path | Role |
-|---|---|
-| `replica.md` | Full wire spec |
-| `docs/specs/` | Official UPnP Forum PDFs (UDA, MediaServer, CDS, CMS). IEC 62481 / DLNA Guidelines are not redistributable — see that README |
-| `docs/ARCHITECTURE.md` | Threads, tasks, process model |
-| `docs/TRANSCODE.md` | When to transcode; HDR10 vs Dolby Vision |
-| `docs/COMPATIBILITY.md` | Supported product scope and intentional MiniDLNA differences |
-| `docs/DISTRIBUTION.md` | Release reproducibility, notices, and source obligations |
-| `docs/INHERITED.md` | Product behavior to keep (dates, NFO, inodes, skips) |
-| `docs/oracle/` | Locked C header snippets used by dialect tests |
-| `crates/protocol` | Paths, clients, `dc:date`, persist, SOAP names |
-| `crates/ssdp` | NOTIFY / M-SEARCH packet builders |
-| `crates/soap` | Envelope / Browse Result |
-| `crates/http` | URL map, Host 400, media never Keep-Alive |
-| `crates/scan` | Junk / sample / unfinished skip rules |
-| `crates/transcode` | Client×source decision + ffmpeg argv |
-| `crates/server` | `rusty-dlna` binary: accept loop, SOAP/Browse, media GET, SSDP |
-| `Dockerfile` | multi-stage Debian / ffmpeg build |
-| `docker-compose.yaml` | live daemon, host network (required for SSDP) |
-| `docker-compose.test.yaml` | isolated bridge tests; no published 8200/1900 |
-| `docker-compose.override.yaml.example` | template for host paths (copy, do not commit) |
-| `.env.example` | template for media / cache-volume / conf settings |
-| `rusty-dlna.live.toml.example` | template for uuid, advertise_ip, remaps |
-| `restart.sh` | `docker compose build && up -d` |
+**Discovery and playback.** Clients find the server over IPv4 SSDP
+(UDP 1900) and stream over HTTP (TCP 8200 by default). Original files
+are served with byte-range seek. Several network interfaces can
+announce at once; each subnet gets a matching address.
 
-The accept loop, SQLite library (`files.db`), inotify scan, and remux
-path are implemented. Transcode is a **growing fMP4 file cache** (not a
-live ffmpeg stdout pipe). `remux-p8` uses `dovi_tool` when present and
-falls back to HDR10. Video Browse includes Series (`2$E`) and Genre
-(`2$9`) from NFO. The live daemon uses TCP **8200** and UDP **1900**.
+**Video.** Scans configured folders, watches for changes, and builds
+Movie / Series / Genre / folder / Recently Added views. Kodi-style NFO
+supplies titles, show names, dates, and genres. Sidecar posters, fanart,
+and subtitles (`.srt`, `.ass`, `.ssa`, `.vtt`, `.sub`, `.smi`) are
+first-class. Resume position and play count are stored for Kodi.
 
-Scan policy is explicit in TOML. `exclude_file` entries are basename globs
-with ASCII case-insensitive `*`/`?` matching. Dot-prefixed paths stay private
-unless `include_hidden=true`; subtitles and generated thumbnails can be
-disabled independently. `album_art_names` adds literal folder-art basenames
-or `{stem}`/`%s` templates. Thumbnail width (16–4096), JPEG quality (2–31),
-optional four-frame filmstrip mode, and the 1–600 second libav/ffmpeg/ffprobe
-deadline are configurable. `scan_workers` (1–64) bounds concurrent libav and
-thumbnail/artwork preparation; its hardware-aware default is the available
-CPU count capped at 16, while SQLite publication remains ordered on one
-thread. Hard links and paths reached through directory symlinks are grouped by
-device/inode and reuse one probe and one generated-artwork cache entry. The
-shipped defaults are shown in
-[`rusty-dlna.toml`](rusty-dlna.toml).
+**Music.** Tagged files (FLAC, MP3, and the other declared audio types)
+appear under Artist, Album Artist, Album, Genre, Composer, Contributing
+Artist, Rating, Recently Added, folders, and playlists. NFO overrides
+only the fields it actually contains.
 
-`Recently Added` is ordered by filesystem mtime (not metadata date), dedupes
-hard-link/symlink aliases by device/inode, and defaults to 200 items with no
-age window. Set `recent_limit` and optional `recent_days` to reproduce a
-smaller, time-bounded deployment; future clock-skewed mtimes remain eligible.
+**Pictures.** JPEG libraries with EXIF date, camera, orientation,
+rating, and album, plus Date / Camera / Album / Rating / Recent /
+folder / playlist views. Oriented thumbnails are generated when needed.
 
-## Isolation from the live daemon
+**Playlists.** M3U, M3U8, and PLS, limited to files under allowed media
+roots, and refreshed when the playlist file changes.
 
-Tests and `docker-compose.test.yaml` must not steal 8200/1900
-([`docs/CHECKLIST.md`](docs/CHECKLIST.md)).
+**Library hygiene.** Incomplete downloads, sample/trailer junk, recycle
+bins, and Synology `@eaDir` trees are skipped. Basename exclude globs,
+directory excludes, and hidden-file policy are configurable. Hard links
+and directory-symlink aliases share one probe and one artwork cache
+entry. Recently Added is filesystem mtime, newest first, with optional
+size and age caps.
 
-| Allowed | Not allowed |
-|---|---|
-| Host `cargo test` (no listen) | `network_mode: host` on **test** containers |
-| `docker-compose.test.yaml` (bridge, **no** `ports:`) | Publishing 8200 or 1900 from test compose |
-| Listen tests on **18200** / **11900** | Binding test listeners to 8200 / 1900 |
-| `./scripts/prove.sh` |  |
+**Renderer awareness.** The server identifies Kodi, Samsung, Xbox, Sony,
+LG, Panasonic, Cast/Chromecast, BubbleUPnP, and generic DLNA clients,
+and applies the matching MIME and browse quirks so those devices accept
+the listing.
 
-## Build / test
+**Optional remux / transcode.** Default is to serve the original.
+`[[remap]]` rules match container, video codec, HDR, audio, and *which
+player asked* — not titles. Actions are leave it, remux Dolby Vision
+Profile 7 to Profile 8.1, encode HDR10, or convert audio to AC3. Empty
+rules means nobody is remuxed, including Cast.
 
-Needs Rust 1.83+. This MSRV permits the patched XML parser required by the
-RustSec policy gate.
+**Operations.** TOML configuration with unknown keys rejected.
+`--check` validates the file and the transcode tools on the host.
+`--print-effective-config` shows the resolved settings. Logs go to
+stderr (`RUST_LOG`). A `/health` endpoint is safe for Compose
+healthchecks (no multicast). The Docker image runs unprivileged (uid
+10001, capabilities dropped).
 
-```bash
-./scripts/check.sh
-./scripts/prove.sh
-```
+## Not in this product
 
-Image: `rusty-dlna:local`. Live container name: `rusty-dlna`. Test container: `rusty-dlna-test`.
+These are intentional, not missing todos. See
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for the full matrix.
 
-## Docker
+- PNG, WebP, and HEIF/HEIC as library pictures
+- IPv6, mDNS/Avahi, TiVo, MiniSSDPd
+- Online sources, plugins, a web player, or remote access
+- Upload / import APIs — media enters through read-only configured roots
+- Transcoding everything so an old TV can play any file. Remaps are
+  explicit. There is no live “make it MPEG-TS” profile pack yet.
 
-SSDP is multicast `239.255.255.250:1900`. The **live** compose file
-**must** use `network_mode: host`. Publishing port 8200 on a bridge
-is not enough for clients to discover the server.
+## Run it
 
-`docker-compose.test.yaml` stays on a bridge with no published ports.
-
-Stop any other process bound to 8200/1900 before starting the container.
-
-Host-specific paths and identity belong in **gitignored** files:
+SSDP is multicast. The live container **must** use host networking.
+Publishing port 8200 on a bridge is not enough for clients to discover
+the server. Stop anything else bound to 8200/1900 first.
 
 ```bash
 cp .env.example .env
-# set RUSTY_DLNA_MEDIA; the persistent rusty-dlna-cache volume is automatic
+# set RUSTY_DLNA_MEDIA to the host folder that should appear as the library
+
 cp rusty-dlna.live.toml.example rusty-dlna.live.toml
-# set advertise_ip, uuid, remaps
+# set advertise_ip (or network_interface) when the LAN address is ambiguous
 # .env: RUSTY_DLNA_CONF=./rusty-dlna.live.toml
-./restart.sh
+
+docker compose up -d --build
 curl -sI http://127.0.0.1:8200/ | head
 ```
 
-On first start rustyDLNA chooses a usable LAN address and persists a unique
-UUID below the cache directory. If address selection is ambiguous it exits
-with a configuration error; set `advertise_ip` or `network_interface` in that
-case. The image runs as unprivileged uid/gid 10001 with all capabilities
-dropped and `no-new-privileges`; custom cache bind mounts must be writable by
-that identity. The default Compose deployment instead uses the persistent
-Docker-managed volume named by `RUSTY_DLNA_CACHE_VOLUME` (default
-`rusty-dlna-cache`). `restart.sh` reuses it, repairs its ownership, proves uid
-10001 can write, and waits for container health. The Compose healthcheck reads
-the machine-readable `/health` endpoint locally and sends no
-multicast traffic.
+On first start the server picks a usable LAN address and persists a
+UUID under the cache volume. If several addresses look equally valid it
+exits; set `advertise_ip` or `network_interface`. Cache and the SQLite
+library (including Kodi bookmarks) live in the Docker volume named by
+`RUSTY_DLNA_CACHE_VOLUME` (default `rusty-dlna-cache`).
+`bookmark_retention_days = 0` keeps resume state forever; a positive
+value expires it that many days after the last update.
 
-Kodi resume positions and play counts live in that persistent `files.db`.
-`bookmark_retention_days = 0` keeps them indefinitely; a positive value
-expires state that many 24-hour days after its last position or play-count
-update. Expiration is checked during startup and periodic full library
-reconciliation. The live example uses `90` days (three months).
+Do not commit `.env`, `rusty-dlna.live.toml`, or
+`docker-compose.override.yaml`.
 
-Run `./scripts/compose-smoke.sh` for a disposable bridge-only image/start/scan/
-HTTP/shutdown test. It never publishes the production ports.
-For multi-homed SSDP, list every desired interface name/address in
-`network_interface`; rustyDLNA joins and announces on each address and replies
-from the subnet-facing address with a matching `LOCATION`. Root or
-`CAP_NET_ADMIN` can run `./scripts/ssdp-netns-e2e.sh`, which proves this across
-two isolated veth networks.
-
-`docker-compose.override.yaml` is also gitignored if you prefer extra
-bind mounts over env vars. Do not commit `.env`, `rusty-dlna.live.toml`,
-or `docker-compose.override.yaml`.
-
-## Design in one paragraph
-
-Keep the locked **bytes** (SSDP, DIDL, client quirks, Kodi dates).
-One multi-thread Tokio process: SSDP and SOAP on the async runtime,
-original-file reads as ranged file I/O, remux/transcode as a growing
-fragmented-MP4 cache (the first fragment is served while the job continues in
-the background). Parallel readers share one supervised job; the default
-policy lets a job finish after a probe disconnect, while shutdown, deadline,
-invalidation, and explicit `continue_after_disconnect=false` cancellation
-terminate and reap it. A remap row adds a `/Transcode/` `<res>` only when the
-source matches (DV P7, TrueHD, …). HDR10 color signaling is preserved, but
-Dolby Vision Profile 7 cannot stay dual-layer and exact mastering-display /
-MaxCLL preservation is not claimed.
-
-Music, video, JPEG pictures, playlists, subtitles, and NFO metadata are
-first-class supported library content. PNG/WebP/HEIF library images, TiVo,
-mDNS/MiniSSDPd, and IPv6 are intentionally outside the current support
-contract; see [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for the complete
-matrix.
+Shipped defaults are in [`rusty-dlna.toml`](rusty-dlna.toml). Remap
+examples and HDR notes are in [`docs/TRANSCODE.md`](docs/TRANSCODE.md).
+Release and source obligations are in
+[`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md).

@@ -1,5 +1,6 @@
 //! Structured NFO parse (MiniDLNA / Kodi tags) and `tvshow.nfo` inherit.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rusty_dlna_protocol::w3c_normalize_date;
@@ -345,9 +346,18 @@ fn read_nfo_bytes(
     roots: &[PathBuf],
     wide_links: bool,
 ) -> Result<Option<Vec<u8>>, NfoError> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    let mut opened = match crate::open_file_under_roots(path, roots, wide_links) {
+        Ok(opened) => opened,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return Ok(None);
+        }
         Err(source) => {
             return Err(NfoError {
                 path: path.to_path_buf(),
@@ -355,16 +365,27 @@ fn read_nfo_bytes(
             })
         }
     };
-    if !crate::path_is_allowed_kind(path, roots, wide_links, |meta| meta.is_file()) {
-        return Ok(None);
-    }
-    if !metadata.is_file() || nfo_too_large(metadata.len()) {
-        return Ok(None);
-    }
-    std::fs::read(path).map(Some).map_err(|source| NfoError {
+    let metadata = opened.file.metadata().map_err(|source| NfoError {
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    if nfo_too_large(metadata.len()) {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().min(NFO_MAX_BYTES) as usize);
+    opened
+        .file
+        .by_ref()
+        .take(NFO_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| NfoError {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 > NFO_MAX_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 fn is_media_root_dir(dir: &Path, roots: &[PathBuf]) -> bool {

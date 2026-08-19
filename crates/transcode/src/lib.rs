@@ -529,6 +529,7 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
         "-hide_banner".into(),
         "-nostats".into(),
         "-y".into(),
+        "-nostdin".into(),
         "-i".into(),
         src_path.into(),
         "-map".into(),
@@ -566,8 +567,8 @@ pub fn ffmpeg_grow_os_args(
         .into_iter()
         .map(OsString::from)
         .collect();
-    // The string builder always places input at argv[5] and output last.
-    args[5] = src_path.as_os_str().to_os_string();
+    // The string builder always places input at argv[6] and output last.
+    args[6] = src_path.as_os_str().to_os_string();
     if let Some(output) = args.last_mut() {
         *output = dst_path.as_os_str().to_os_string();
     }
@@ -583,7 +584,10 @@ fn live_frag_tail(out: &str) -> Vec<String> {
         "-f".into(),
         "mp4".into(),
         "-movflags".into(),
-        "frag_keyframe+empty_moov+default_base_moof".into(),
+        // AC-3-in-MP4 cannot write its sample entry into an immediate empty
+        // moov. Delaying that initialization until the first packets arrive
+        // keeps the output streamable and works for copied/AAC audio too.
+        "frag_keyframe+empty_moov+delay_moov+default_base_moof".into(),
         out.into(),
     ]
 }
@@ -664,16 +668,26 @@ pub fn cache_stamp_path(dest: &std::path::Path) -> std::path::PathBuf {
 /// movie. It covers the canonical path, nanosecond mtime, Unix device/inode,
 /// length, and samples from the beginning, middle, and end of the file.
 pub fn source_identity(src: &std::path::Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+    let file = std::fs::File::open(&canonical).ok()?;
+    source_identity_file(&file, &canonical)
+}
+
+/// Descriptor-backed source fingerprint. `identity_path` is the resolved path
+/// recorded at authorization time; all metadata and samples come from `file`.
+pub fn source_identity_file(
+    file: &std::fs::File,
+    identity_path: &std::path::Path,
+) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let canonical = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
-    let metadata = std::fs::metadata(&canonical).ok()?;
+    let metadata = file.metadata().ok()?;
     let modified = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
     let mut hasher = Sha1::new();
-    hasher.update(canonical.to_string_lossy().as_bytes());
+    hasher.update(identity_path.to_string_lossy().as_bytes());
     hasher.update(metadata.len().to_le_bytes());
     if let Some(modified) = modified {
         hasher.update(modified.as_secs().to_le_bytes());
@@ -686,7 +700,7 @@ pub fn source_identity(src: &std::path::Path) -> Option<String> {
         hasher.update(metadata.ino().to_le_bytes());
     }
 
-    let mut file = std::fs::File::open(&canonical).ok()?;
+    let mut file = file.try_clone().ok()?;
     const SAMPLE: u64 = 64 * 1024;
     let end = metadata.len().saturating_sub(SAMPLE);
     let middle = metadata.len().saturating_div(2).saturating_sub(SAMPLE / 2);
@@ -729,6 +743,20 @@ pub fn transcode_cache_key(
     remux_p8: bool,
 ) -> Option<String> {
     let source = source_identity(src)?;
+    Some(transcode_cache_key_from_identity(&source, plan, remux_p8))
+}
+
+pub fn transcode_cache_key_file(
+    file: &std::fs::File,
+    identity_path: &std::path::Path,
+    plan: &TranscodePlan,
+    remux_p8: bool,
+) -> Option<String> {
+    let source = source_identity_file(file, identity_path)?;
+    Some(transcode_cache_key_from_identity(&source, plan, remux_p8))
+}
+
+fn transcode_cache_key_from_identity(source: &str, plan: &TranscodePlan, remux_p8: bool) -> String {
     let ffmpeg = tool_version(std::path::Path::new("ffmpeg"));
     let dovi = if remux_p8 {
         dovi_tool_path()
@@ -748,7 +776,7 @@ pub fn transcode_cache_key(
     );
     let mut hasher = Sha1::new();
     hasher.update(signature.as_bytes());
-    Some(format!("{:x}", hasher.finalize()))
+    format!("{:x}", hasher.finalize())
 }
 
 pub fn write_cache_stamp_for_key(dest: &std::path::Path, cache_key: &str) -> std::io::Result<()> {
@@ -806,10 +834,33 @@ pub fn hdr10_fallback_plan(from: &TranscodePlan) -> TranscodePlan {
     }
 }
 
+fn inherit_source_fd(command: &mut std::process::Command, source_fd: Option<std::os::fd::RawFd>) {
+    use std::os::unix::process::CommandExt;
+
+    let Some(source_fd) = source_fd else {
+        return;
+    };
+    const CHILD_SOURCE_FD: libc::c_int = 3;
+    // SAFETY: only async-signal-safe dup2/fcntl calls run after fork. The
+    // caller keeps the source File alive through child completion.
+    unsafe {
+        command.pre_exec(move || {
+            if source_fd != CHILD_SOURCE_FD && libc::dup2(source_fd, CHILD_SOURCE_FD) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(CHILD_SOURCE_FD, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 fn run_cmd_controlled(
     args: &[String],
     deadline: std::time::Instant,
     cancelled: &std::sync::atomic::AtomicBool,
+    source_fd: Option<std::os::fd::RawFd>,
 ) -> Result<(), String> {
     use std::io::Read;
     use std::sync::atomic::Ordering;
@@ -817,11 +868,14 @@ fn run_cmd_controlled(
     if args.is_empty() {
         return Err("empty command".into());
     }
-    let mut child = std::process::Command::new(&args[0])
+    let mut command = std::process::Command::new(&args[0]);
+    command
         .args(&args[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    inherit_source_fd(&mut command, source_fd);
+    let mut child = command
         .spawn()
         .map_err(|e| format!("spawn {}: {e}", args[0]))?;
     let stderr = child.stderr.take();
@@ -883,6 +937,36 @@ pub fn run_remux_p8_controlled(
     deadline: std::time::Instant,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<(), String> {
+    run_remux_p8_impl(src, None, dest_part, plan, deadline, cancelled)
+}
+
+pub fn run_remux_p8_file_controlled(
+    src: &std::fs::File,
+    identity_path: &std::path::Path,
+    dest_part: &std::path::Path,
+    plan: &TranscodePlan,
+    deadline: std::time::Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    run_remux_p8_impl(
+        identity_path,
+        Some(src.as_raw_fd()),
+        dest_part,
+        plan,
+        deadline,
+        cancelled,
+    )
+}
+
+fn run_remux_p8_impl(
+    src: &std::path::Path,
+    source_fd: Option<std::os::fd::RawFd>,
+    dest_part: &std::path::Path,
+    plan: &TranscodePlan,
+    deadline: std::time::Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
     let dovi = dovi_tool_path().ok_or_else(|| "dovi_tool not on PATH".to_string())?;
     if let Some(parent) = dest_part.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -891,13 +975,19 @@ pub fn run_remux_p8_controlled(
     let p8 = dest_part.with_extension("p8.hevc");
     let _ = std::fs::remove_file(&hevc);
     let _ = std::fs::remove_file(&p8);
+    let source_arg = if source_fd.is_some() {
+        "/proc/self/fd/3".to_string()
+    } else {
+        src.to_string_lossy().into_owned()
+    };
     let extract = vec![
         "ffmpeg".into(),
         "-hide_banner".into(),
         "-nostats".into(),
         "-y".into(),
+        "-nostdin".into(),
         "-i".into(),
-        src.to_string_lossy().into_owned(),
+        source_arg.clone(),
         "-map".into(),
         "0:v:0".into(),
         "-c:v".into(),
@@ -924,12 +1014,13 @@ pub fn run_remux_p8_controlled(
         "-hide_banner".into(),
         "-nostats".into(),
         "-y".into(),
+        "-nostdin".into(),
         "-fflags".into(),
         "+genpts".into(),
         "-i".into(),
         p8.to_string_lossy().into_owned(),
         "-i".into(),
-        src.to_string_lossy().into_owned(),
+        source_arg,
         "-map".into(),
         "0:v:0".into(),
         "-map".into(),
@@ -949,9 +1040,9 @@ pub fn run_remux_p8_controlled(
         }
     }
     mux.extend(live_frag_tail(&dest_part.to_string_lossy()));
-    let result = run_cmd_controlled(&extract, deadline, cancelled)
-        .and_then(|_| run_cmd_controlled(&convert, deadline, cancelled))
-        .and_then(|_| run_cmd_controlled(&mux, deadline, cancelled));
+    let result = run_cmd_controlled(&extract, deadline, cancelled, source_fd)
+        .and_then(|_| run_cmd_controlled(&convert, deadline, cancelled, None))
+        .and_then(|_| run_cmd_controlled(&mux, deadline, cancelled, source_fd));
     let _ = std::fs::remove_file(&hevc);
     let _ = std::fs::remove_file(&p8);
     result
@@ -1295,6 +1386,7 @@ action = "audio-ac3"
         assert!(!grow.iter().any(|s| s == "pipe:1"));
         assert!(!grow.iter().any(|s| s.contains("faststart")));
         assert!(grow.iter().any(|s| s.contains("frag_keyframe")));
+        assert!(grow.iter().any(|s| s.contains("delay_moov")));
     }
 
     #[cfg(unix)]
@@ -1305,14 +1397,19 @@ action = "audio-ac3"
         let src = std::path::PathBuf::from(OsString::from_vec(b"/media/movie-\x80.mkv".to_vec()));
         let dst = std::path::PathBuf::from(OsString::from_vec(b"/cache/movie-\x81.part".to_vec()));
         let args = ffmpeg_grow_os_args(&src, &dst, &TranscodePlan::default());
-        assert_eq!(args[5].as_bytes(), src.as_os_str().as_bytes());
+        assert_eq!(args[6].as_bytes(), src.as_os_str().as_bytes());
         assert_eq!(args.last().unwrap().as_bytes(), dst.as_os_str().as_bytes());
     }
 
     #[test]
     fn grow_file_emits_ftyp_before_process_exits() {
         use std::process::{Command, Stdio};
-        if Command::new("ffmpeg").arg("-version").output().is_err() {
+        if Command::new("ffmpeg")
+            .args(["-nostdin", "-version"])
+            .stdin(Stdio::null())
+            .output()
+            .is_err()
+        {
             eprintln!("skip grow file (no ffmpeg)");
             return;
         }
@@ -1322,6 +1419,7 @@ action = "audio-ac3"
         let mk = Command::new("ffmpeg")
             .args([
                 "-y",
+                "-nostdin",
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -1341,6 +1439,7 @@ action = "audio-ac3"
                 "aac",
                 src.to_str().unwrap(),
             ])
+            .stdin(Stdio::null())
             .status();
         if !mk.map(|s| s.success()).unwrap_or(false) {
             let _ = std::fs::remove_file(&src);

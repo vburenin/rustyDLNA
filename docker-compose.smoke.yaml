@@ -5,7 +5,7 @@ services:
   rusty-dlna-smoke:
     build:
       context: .
-    image: rusty-dlna:smoke
+    image: ${RUSTY_DLNA_SMOKE_IMAGE:-rusty-dlna:smoke}
     init: true
     environment:
       RUST_LOG: info

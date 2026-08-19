@@ -97,6 +97,7 @@ fn status_value(app: &App) -> (Health, Value) {
             .map(|name| name.to_string_lossy().into_owned())
     });
     let remux = remux::runtime_status(app);
+    let helpers = app.helpers.metrics();
     let events = app.notify_dispatcher.metrics();
     let subscribers = app
         .events
@@ -190,6 +191,15 @@ fn status_value(app: &App) -> (Health, Value) {
             "max_jobs": app.cfg.transcode.max_jobs,
             "required_tools_ready": app.required_tools_ready,
         },
+        "helpers": {
+            "active": helpers.active,
+            "queued": helpers.queued,
+            "max_active": helpers.max_active,
+            "queue_capacity": helpers.queue_capacity,
+            "admitted_total": helpers.admitted_total,
+            "rejected_total": helpers.rejected_total,
+            "timed_out_total": helpers.timed_out_total,
+        },
         "events": {
             "subscribers": subscribers,
             "queued_total": events.queued,
@@ -220,6 +230,7 @@ pub fn status_json(app: &App, health_only: bool) -> (u16, String) {
                 "last_error": value["scanner"]["last_error"],
             },
             "cache": value["cache"],
+            "helpers": value["helpers"],
         });
     }
     (
@@ -233,6 +244,7 @@ pub fn status_html(app: &App) -> String {
     let catalog = &status["catalog"];
     let scanner = &status["scanner"];
     let transcode = &status["transcode"];
+    let helpers = &status["helpers"];
     format!(
         "<html><head><title>{name}</title><meta http-equiv=\"refresh\" content=\"20\"></head><body>\
          <h1>{name}</h1><p>Health: {health}</p><table>\
@@ -241,6 +253,7 @@ pub fn status_html(app: &App) -> String {
          <tr><td>UpdateID</td><td>{update_id}</td></tr>\
          <tr><td>Scan phase</td><td>{phase}</td></tr><tr><td>Inotify watches</td><td>{watches}</td></tr>\
          <tr><td>Transcodes active</td><td>{active}</td></tr><tr><td>Transcodes queued</td><td>{queued}</td></tr>\
+         <tr><td>Media helpers active</td><td>{helper_active}</td></tr><tr><td>Media helpers queued</td><td>{helper_queued}</td></tr>\
          <tr><td>Transcode cache bytes</td><td>{cache_bytes}</td></tr></table>\
          <p><a href=\"/api/status\">Machine-readable status</a></p></body></html>",
         name = html_esc(&app.cfg.friendly_name),
@@ -254,6 +267,8 @@ pub fn status_html(app: &App) -> String {
         watches = scanner["watch_count"],
         active = transcode["active"],
         queued = transcode["queued"],
+        helper_active = helpers["active"],
+        helper_queued = helpers["queued"],
         cache_bytes = transcode["cache_bytes"],
     )
 }

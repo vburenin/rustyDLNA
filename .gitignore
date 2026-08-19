@@ -18,3 +18,5 @@ testdata/cache/
 rusty-dlna.local.toml
 rusty-dlna.live.toml
 docker-compose.override.yaml
+# local experiments (converters, generated mappings)
+/dev/

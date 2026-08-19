@@ -1,4 +1,4 @@
-//! `SortCriteria` parse (`replica.md` Sort / GetSortCapabilities).
+//! `SortCriteria` parsing and `GetSortCapabilities` behavior.
 
 use rusty_dlna_protocol::ClientFlags;
 use rusty_dlna_protocol::ClientProfile;

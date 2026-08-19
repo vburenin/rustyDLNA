@@ -14,6 +14,9 @@ thumbnail_quality = 2
 thumbnail_filmstrip = false
 scan_command_timeout_secs = 30
 scan_workers = 16
+helper_max_jobs = 16
+helper_queue_capacity = 64
+helper_queue_timeout_secs = 30
 recent_limit = 200
 # recent_days = 90 # optional filesystem-mtime age window
 # Set true only if outside-root symlink targets are intentionally public.

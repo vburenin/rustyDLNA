@@ -368,16 +368,6 @@ pub fn scpd_registrar() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn oracle(name: &str) -> String {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("docs/oracle")
-            .join(name);
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
-    }
 
     #[test]
     fn mediaserver_and_three_services() {
@@ -501,8 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn root_desc_and_scpd_match_reference_contract() {
-        let reference = oracle("upnpdescgen-root.c");
+    fn root_desc_and_scpd_match_inherited_contract() {
         let root = gen_root_desc(&RootDescOpts::default());
         for literal in [
             "urn:schemas-upnp-org:device:MediaServer:1",
@@ -516,7 +505,6 @@ mod tests {
             "/icons/lrg.png",
             "/icons/lrg.jpg",
         ] {
-            assert!(reference.contains(literal), "reference missing {literal}");
             assert!(
                 root.contains(literal),
                 "generated rootDesc missing {literal}"
@@ -549,10 +537,6 @@ mod tests {
             ),
         ] {
             for action in actions {
-                assert!(
-                    reference.contains(action),
-                    "reference missing action {action}"
-                );
                 assert!(
                     document.contains(&format!("<name>{action}</name>")),
                     "generated SCPD missing action {action}"

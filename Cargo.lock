@@ -273,17 +273,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
-name = "ffmpeg-next"
-version = "8.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7c4bd5ab1ac61f29c634df1175d350ded29cf74c3c6d4f7030431a5ae3c7d5d"
-dependencies = [
- "bitflags",
- "ffmpeg-sys-next",
- "libc",
-]
-
-[[package]]
 name = "ffmpeg-sys-next"
 version = "8.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -751,7 +740,6 @@ dependencies = [
 name = "rusty-dlna-scan"
 version = "0.1.0"
 dependencies = [
- "ffmpeg-next",
  "ffmpeg-sys-next",
  "inotify",
  "kamadak-exif",
@@ -786,6 +774,7 @@ dependencies = [
 name = "rusty-dlna-transcode"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rusty-dlna-protocol",
  "serde",
  "sha1",
