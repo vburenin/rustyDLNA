@@ -4,19 +4,61 @@
 //! (needs a timezone, length >= 20, or a 10-character day). A failed parse
 //! clears the date and Kodi shows year 1905.
 
-use time::OffsetDateTime;
+/// UTC calendar fields derived from a Unix timestamp.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UtcDateTime {
+    /// Proleptic Gregorian year.
+    pub year: i64,
+    /// Month in `1..=12`.
+    pub month: u8,
+    /// Day of month in `1..=31`.
+    pub day: u8,
+    /// Hour in `0..=23`.
+    pub hour: u8,
+    /// Minute in `0..=59`.
+    pub minute: u8,
+    /// Second in `0..=59`.
+    pub second: u8,
+    /// Weekday index where Sunday is zero.
+    pub weekday_from_sunday: u8,
+}
+
+/// Convert a Unix timestamp to UTC without accepting or parsing untrusted text.
+///
+/// The civil-date transform is Howard Hinnant's era-based Gregorian algorithm.
+/// Euclidean division keeps timestamps before 1970 correct as well.
+pub fn utc_date_time(unix: i64) -> UtcDateTime {
+    let days = unix.div_euclid(86_400);
+    let seconds = unix.rem_euclid(86_400);
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+
+    UtcDateTime {
+        year,
+        month: month as u8,
+        day: day as u8,
+        hour: (seconds / 3_600) as u8,
+        minute: ((seconds % 3_600) / 60) as u8,
+        second: (seconds % 60) as u8,
+        weekday_from_sunday: (days + 4).rem_euclid(7) as u8,
+    }
+}
 
 /// UTC `YYYY-MM-DDTHH:MM:SSZ` from a Unix timestamp (`w3c_date_from_time`).
 pub fn w3c_date_from_unix(unix: i64) -> Option<String> {
-    let t = OffsetDateTime::from_unix_timestamp(unix).ok()?;
+    let t = utc_date_time(unix);
     Some(format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        t.year(),
-        u8::from(t.month()),
-        t.day(),
-        t.hour(),
-        t.minute(),
-        t.second()
+        t.year, t.month, t.day, t.hour, t.minute, t.second
     ))
 }
 
@@ -77,6 +119,30 @@ mod tests {
         let s = w3c_date_from_unix(0).unwrap();
         assert_eq!(s, "1970-01-01T00:00:00Z");
         assert_eq!(s.len(), 20);
+    }
+
+    #[test]
+    fn unix_conversion_handles_boundaries_and_negative_values() {
+        assert_eq!(
+            utc_date_time(-1),
+            UtcDateTime {
+                year: 1969,
+                month: 12,
+                day: 31,
+                hour: 23,
+                minute: 59,
+                second: 59,
+                weekday_from_sunday: 3,
+            }
+        );
+        assert_eq!(
+            w3c_date_from_unix(951_782_400).unwrap(),
+            "2000-02-29T00:00:00Z"
+        );
+        assert_eq!(
+            w3c_date_from_unix(1_704_067_199).unwrap(),
+            "2023-12-31T23:59:59Z"
+        );
     }
 
     #[test]

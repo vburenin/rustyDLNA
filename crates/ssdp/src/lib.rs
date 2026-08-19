@@ -139,19 +139,21 @@ pub fn parse_msearch(packet: &str) -> Result<MSearch, MSearchReject> {
             mx = Some(val.to_string());
         }
     }
-    let st = st.filter(|s| !s.is_empty()).ok_or(MSearchReject::MissingSt)?;
+    let st = st
+        .filter(|s| !s.is_empty())
+        .ok_or(MSearchReject::MissingSt)?;
     match man {
         Some(m) if man_is_discover(&m) => {}
         _ => return Err(MSearchReject::BadMan),
     }
     let mx = match mx {
-        None => 1,
+        None => return Err(MSearchReject::BadMx),
         Some(s) => s.parse::<i32>().map_err(|_| MSearchReject::BadMx)?,
     };
     if mx < 0 {
         return Err(MSearchReject::BadMx);
     }
-    Ok(MSearch { st, mx })
+    Ok(MSearch { st, mx: mx.min(5) })
 }
 
 fn st_matches(known: &str, client_st: &str) -> bool {
@@ -214,6 +216,7 @@ pub struct InboundNotify {
     pub location: String,
     pub server: String,
     pub nt: String,
+    pub usn: Option<String>,
 }
 
 pub fn parse_inbound_notify(packet: &str) -> Option<InboundNotify> {
@@ -227,6 +230,7 @@ pub fn parse_inbound_notify(packet: &str) -> Option<InboundNotify> {
     let mut nt = None;
     let mut location = None;
     let mut server = None;
+    let mut usn = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -244,6 +248,8 @@ pub fn parse_inbound_notify(packet: &str) -> Option<InboundNotify> {
             location = Some(val.to_string());
         } else if key.eq_ignore_ascii_case("SERVER") {
             server = Some(val.to_string());
+        } else if key.eq_ignore_ascii_case("USN") {
+            usn = (!val.is_empty()).then(|| val.to_string());
         }
     }
     if nts.as_deref() != Some("ssdp:alive") {
@@ -265,6 +271,7 @@ pub fn parse_inbound_notify(packet: &str) -> Option<InboundNotify> {
         location,
         server,
         nt,
+        usn,
     })
 }
 
@@ -280,6 +287,16 @@ pub fn jitter_ms(range: std::ops::RangeInclusive<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn oracle(name: &str) -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("docs/oracle")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    }
 
     #[test]
     fn alive_has_six_notifies_and_rootdesc() {
@@ -325,6 +342,58 @@ mod tests {
     }
 
     #[test]
+    fn all_ssdp_wire_variants_match_reference_shapes() {
+        let reference = oracle("minissdp-wire.c");
+        let uuid = "uuid:00000000-0000-4000-8000-000000000001";
+        let types = rusty_dlna_protocol::ssdp::known_service_types(uuid);
+        assert_eq!(types.len(), 6);
+        for service_type in &types[1..] {
+            let stem = service_type.strip_suffix('1').unwrap_or(service_type);
+            assert!(
+                reference.contains(stem),
+                "reference service table missing {service_type}"
+            );
+        }
+
+        let alive = notify_alive(uuid, "192.0.2.10", 8200, 895, "reference-server");
+        let byebye = notify_byebye(uuid);
+        let search = (0..types.len())
+            .map(|index| {
+                msearch_ok(
+                    uuid,
+                    index,
+                    "192.0.2.10",
+                    8200,
+                    895,
+                    "reference-server",
+                    "Tue, 18 Aug 2026 00:00:00 GMT",
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(alive.len(), 6);
+        assert_eq!(byebye.len(), 6);
+        assert_eq!(search.len(), 6);
+
+        for (needle, generated) in [
+            ("NOTIFY * HTTP/1.1", &alive[0]),
+            ("NTS:ssdp:alive", &alive[0]),
+            ("NTS:ssdp:byebye", &byebye[0]),
+            ("HTTP/1.1 200 OK", &search[0]),
+            ("CACHE-CONTROL: max-age=", &search[0]),
+            ("LOCATION: http://", &search[0]),
+            ("Content-Length: 0", &search[0]),
+        ] {
+            assert!(reference.contains(needle), "reference missing {needle}");
+            assert!(
+                generated.contains(needle),
+                "generated packet missing {needle}"
+            );
+        }
+        assert!(reference.contains("_usleep(150000, 250000)"));
+        assert_eq!(ALIVE_DUP_DELAY_MS, 150..=250);
+    }
+
+    #[test]
     fn jitter_ranges_match_replica() {
         assert_eq!(*ALIVE_DUP_DELAY_MS.start(), 150);
         assert_eq!(*ALIVE_DUP_DELAY_MS.end(), 250);
@@ -353,16 +422,18 @@ mod tests {
         assert_eq!(parse_msearch(ok).unwrap().st, "ssdp:all");
         let kodi = "M-SEARCH * HTTP/1.1\nHOST: 239.255.255.250:1900\nMAN: \"ssdp:discover\"\nMX: 5\nST: upnp:rootdevice\nUser-Agent: UPnP/1.0 DLNADOC/1.50 Platinum/1.0.5.13\n\n";
         assert_eq!(parse_msearch(kodi).unwrap().st, "upnp:rootdevice");
+        let missing_mx = "M-SEARCH * HTTP/1.1\r\nMAN: \"ssdp:discover\"\r\nST: ssdp:all\r\n\r\n";
+        assert_eq!(parse_msearch(missing_mx), Err(MSearchReject::BadMx));
+        let huge_mx =
+            "M-SEARCH * HTTP/1.1\r\nMAN: \"ssdp:discover\"\r\nMX: 999999\r\nST: ssdp:all\r\n\r\n";
+        assert_eq!(parse_msearch(huge_mx).unwrap().mx, 5);
     }
 
     #[test]
     fn ssdp_all_is_six_specific_is_one() {
         let uuid = "uuid:00000000-0000-0000-0000-000000000000";
         assert_eq!(msearch_reply_indices(uuid, "ssdp:all").len(), 6);
-        assert_eq!(
-            msearch_reply_indices(uuid, "upnp:rootdevice").len(),
-            1
-        );
+        assert_eq!(msearch_reply_indices(uuid, "upnp:rootdevice").len(), 1);
         assert!(msearch_reply_indices(uuid, "urn:foo:bar").is_empty());
         let cd = "urn:schemas-upnp-org:service:ContentDirectory:1";
         assert_eq!(msearch_reply_indices(uuid, cd).len(), 1);

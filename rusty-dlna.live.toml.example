@@ -3,6 +3,21 @@
 friendly_name = "rustyDLNA"
 media_dir = ["V,/storage/video"]
 exclude_dir = ["incomplete"]
+# ASCII case-insensitive basename globs (`*` and `?`).
+# exclude_file = ["*-extra.*"]
+include_hidden = false
+# album_art_names = ["AlbumArt.jpg", "{stem}-cover.jpg"]
+subtitles = true
+thumbnails = true
+thumbnail_width = 320
+thumbnail_quality = 2
+thumbnail_filmstrip = false
+scan_command_timeout_secs = 30
+scan_workers = 16
+recent_limit = 200
+# recent_days = 90 # optional filesystem-mtime age window
+# Set true only if outside-root symlink targets are intentionally public.
+wide_links = false
 root_container = "V"
 listen_ip = "0.0.0.0"
 # LAN address written into SSDP LOCATION and description URLs.
@@ -10,7 +25,9 @@ advertise_ip = "192.168.1.10"
 cache_dir = "/var/cache/rusty-dlna"
 db_dir = "/var/cache/rusty-dlna"
 notify_interval = 180
-rescan_secs = 30
+rescan_secs = 86400
+# 0 means indefinitely; this deployment keeps Kodi state for three months.
+bookmark_retention_days = 90
 # Generate a stable uuid so clients do not see a new device every rebuild.
 # uuid = "uuid:xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx"
 

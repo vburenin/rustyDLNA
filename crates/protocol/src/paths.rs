@@ -19,6 +19,8 @@ pub const RESIZED_PREFIX: &str = "/Resized/";
 pub const ICONS_PREFIX: &str = "/icons/";
 pub const CAPTIONS_PREFIX: &str = "/Captions/";
 pub const STATUS_PATH: &str = "/status";
+pub const HEALTH_PATH: &str = "/health";
+pub const API_STATUS_PATH: &str = "/api/status";
 
 /// dialect `strtoll(object, NULL, 10)` — leading integer, ignore any suffix
 /// (so `/MediaItems/{id}.{ext}` treats `{ext}` as decorative).
@@ -126,7 +128,10 @@ mod tests {
         assert_eq!(media_item_id_from_path("/MediaItems/42.mkv"), Some(42));
         assert_eq!(media_item_id_from_path("/MediaItems/042.mp4"), Some(42));
         assert_eq!(media_item_id_from_path("/MediaItems/7"), Some(7));
-        assert_eq!(media_item_id_from_path("/MediaItems/9.mkv?albumArt=true"), Some(9));
+        assert_eq!(
+            media_item_id_from_path("/MediaItems/9.mkv?albumArt=true"),
+            Some(9)
+        );
         assert_eq!(media_item_id_from_path("/Captions/1.srt"), None);
         assert_eq!(caption_from_path("/Captions/9/1.srt"), Some((9, 1)));
         assert_eq!(caption_from_path("/Captions/9.srt"), Some((9, 0)));

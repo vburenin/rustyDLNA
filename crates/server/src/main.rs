@@ -8,10 +8,7 @@ use rusty_dlna_ssdp::notify_alive;
 use tracing::info;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "rusty-dlna",
-    about = "Multithreaded DLNA server"
-)]
+#[command(name = "rusty-dlna", about = "Multithreaded DLNA server")]
 struct Args {
     /// Config file (TOML). Living-room paths belong in a gitignored local file.
     #[arg(short, long)]
@@ -19,6 +16,18 @@ struct Args {
     /// Print dialect / self-check and exit.
     #[arg(long)]
     check: bool,
+    /// Print the resolved, secret-free configuration and exit.
+    #[arg(long)]
+    print_effective_config: bool,
+    /// Reconcile the media library once and exit.
+    #[arg(long)]
+    rescan: bool,
+    /// Rebuild database objects from the configured media roots and exit.
+    #[arg(long)]
+    rebuild_database: bool,
+    /// Run SQLite quick_check/migrations and exit.
+    #[arg(long)]
+    database_check: bool,
     /// HTTP port. Overridden by `RUSTY_DLNA_HTTP_PORT`.
     #[arg(short, long, default_value_t = 8200)]
     port: u16,
@@ -35,7 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let (cfg, cfg_dir) = if let Some(p) = &args.config {
         let cfg = load_config(p)?;
-        let dir = p.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
+        let dir = p
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
         (cfg, dir)
     } else {
         (Config::default(), std::env::current_dir()?)
@@ -44,13 +56,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_port = resolve_http_port(args.port);
     let ssdp_port = resolve_ssdp_port();
     let server = server_header("Linux");
+    let app = App::try_from_config(cfg, http_port, ssdp_port, &cfg_dir)
+        .map_err(|error| format!("configuration error: {error}"))?;
 
-    if args.check {
-        run_check(&cfg, http_port, &server);
+    if args.print_effective_config {
+        println!("{:#?}", app.cfg);
+        println!("http_port = {}", app.http_port);
+        println!("ssdp_port = {}", app.ssdp_port);
+        println!("listen_ip = {}", app.listen_ip);
+        println!("advertise_ip = {}", app.advertise_ip);
+        println!("cache_dir = {}", app.cache_dir.display());
+        println!(
+            "database = {}",
+            app.scan_cfg
+                .db_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "memory".into())
+        );
         return Ok(());
     }
 
-    let app = App::from_config(cfg, http_port, ssdp_port, &cfg_dir);
+    if args.database_check {
+        let path = app
+            .scan_cfg
+            .db_path
+            .as_deref()
+            .ok_or("database is disabled")?;
+        let db = rusty_dlna_scan::LibraryDb::open(path)?;
+        let check = db.quick_check()?;
+        if check != "ok" {
+            return Err(format!("database quick_check failed: {check}").into());
+        }
+        println!("database OK: {}", path.display());
+        return Ok(());
+    }
+
+    if args.rebuild_database {
+        let catalog = rusty_dlna_scan::rebuild_objects(&app.scan_cfg)?;
+        println!("database rebuilt: {} catalog objects", catalog.items.len());
+        return Ok(());
+    }
+
+    if args.rescan {
+        let (_, delta) = rusty_dlna_scan::monitor(&app.scan_cfg)?;
+        println!(
+            "rescan complete: added={} removed={} changed={}",
+            delta.added, delta.removed, delta.changed
+        );
+        return Ok(());
+    }
+
+    if args.check {
+        run_check(&app, &server)?;
+        return Ok(());
+    }
+
     info!(
         %server,
         http = app.http_port,
@@ -69,9 +130,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_check(cfg: &Config, port: u16, server: &str) {
-    let uuid = "uuid:00000000-0000-0000-0000-000000000000";
-    let pkts = notify_alive(uuid, "127.0.0.1", port, 895, server);
+fn run_check(app: &App, server: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = &app.cfg;
+    let pkts = notify_alive(
+        &app.uuid,
+        &app.advertise_ip,
+        app.http_port,
+        app.notify_interval,
+        server,
+    );
     assert_eq!(pkts.len(), 6);
     assert!(pkts[0].contains("/rootDesc.xml"));
     assert!(pkts[0].contains("ssdp:alive"));
@@ -85,7 +152,10 @@ fn run_check(cfg: &Config, port: u16, server: &str) {
     println!("rustyDLNA check OK");
     println!("  server        {server}");
     println!("  friendly_name {}", cfg.friendly_name);
-    println!("  port          {port}");
+    println!("  uuid          {}", app.uuid);
+    println!("  listen        {}", app.listen_ip);
+    println!("  advertise     {}", app.advertise_ip);
+    println!("  port          {}", app.http_port);
     println!("  ssdp notifies {}", pkts.len());
     println!("  kodi          {:?}", kodi.kind);
     println!("  dc:date       {date}");
@@ -95,8 +165,16 @@ fn run_check(cfg: &Config, port: u16, server: &str) {
     );
     println!("  ifaces        {:?}", cfg.network_interface);
     println!("  media_dir     {:?}", cfg.media_dir);
-    println!("  remaps        {}", cfg.remap.len());
-    for r in &cfg.remap {
+    println!("  wide_links    {}", cfg.wide_links);
+    for note in rusty_dlna::validate_transcode_tools(
+        cfg.transcode.enable,
+        &cfg.transcode.encoder,
+        &app.remaps,
+    )? {
+        println!("  tool          {note}");
+    }
+    println!("  remaps        {}", app.remaps.len());
+    for r in &app.remaps {
         println!(
             "    - {} client={:?} hdr={:?} video={:?} audio={:?} action={:?}",
             r.name.as_deref().unwrap_or("unnamed"),
@@ -107,4 +185,5 @@ fn run_check(cfg: &Config, port: u16, server: &str) {
             r.action
         );
     }
+    Ok(())
 }

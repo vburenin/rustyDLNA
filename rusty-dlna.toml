@@ -5,10 +5,31 @@
 friendly_name = "rustyDLNA"
 media_dir = ["V,/storage/video"]
 exclude_dir = ["incomplete"]
+# Basename globs are ASCII case-insensitive; `*` and `?` are supported.
+# exclude_file = ["*-extra.*", "sample?.mkv"]
+include_hidden = false
+# Extra folder art names; `{stem}` or `%s` expands to the media filename stem.
+# album_art_names = ["AlbumArt.jpg", "{stem}-cover.jpg"]
+subtitles = true
+thumbnails = true
+thumbnail_width = 320
+thumbnail_quality = 2
+thumbnail_filmstrip = false
+scan_command_timeout_secs = 30
+# Physical files are probed and have artwork prepared concurrently. Database
+# publication remains ordered and single-writer safe.
+scan_workers = 16
+# Recently Added uses filesystem mtime, newest first, with inode deduplication.
+recent_limit = 200
+# recent_days = 90 # omitted means no age window
+# Security default: do not follow symlinks whose target leaves media_dir.
+wide_links = false
 root_container = "V"
 listen_ip = "0.0.0.0"
 cache_dir = "/var/cache/rusty-dlna"
 db_dir = "/var/cache/rusty-dlna"
+# Kodi resume positions/play counts: 0 = retain indefinitely.
+bookmark_retention_days = 0
 
 [transcode]
 enable = false

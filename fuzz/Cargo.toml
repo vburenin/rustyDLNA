@@ -1,0 +1,68 @@
+[package]
+name = "rusty-dlna-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+rusty-dlna-http = { path = "../crates/http" }
+rusty-dlna-protocol = { path = "../crates/protocol" }
+rusty-dlna-scan = { path = "../crates/scan" }
+rusty-dlna-soap = { path = "../crates/soap" }
+rusty-dlna-ssdp = { path = "../crates/ssdp" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_range"
+path = "fuzz_targets/http_range.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssdp"
+path = "fuzz_targets/ssdp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "soap_xml"
+path = "fuzz_targets/soap_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nfo"
+path = "fuzz_targets/nfo.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url_ids"
+path = "fuzz_targets/url_ids.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sidecars"
+path = "fuzz_targets/sidecars.rs"
+test = false
+doc = false
+bench = false

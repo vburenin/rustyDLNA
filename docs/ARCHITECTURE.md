@@ -1,8 +1,8 @@
 # Architecture
 
 A classic select-loop file server plus `fork` per media GET is a sound
-**file server**. It is the wrong shape for a RAM window, an encoder, and
-kill-on-disconnect.
+**file server**. It is the wrong shape for a shared growing cache, supervised
+encoders, and multiple readers attaching to one job.
 
 rustyDLNA keeps the dialect in `replica.md` and changes the process.
 
@@ -37,9 +37,11 @@ SQLite handle and the cache maps.
 
 - `protocol` — the dialect. No I/O.
 - `ssdp` / `soap` / `http` — packet and route helpers, then sockets.
-- `scan` — skip rules, inode reuse, NFO, Series/Genre trees, embedded art.
+- `scan` — coordinator, SQLite pool/query layer, probes, playlists, NFO,
+  sidecars, watch reconciliation, and virtual views.
 - `transcode` — `decide(client, source)` then ffmpeg argv.
-- `server` — config, runtime, wiring.
+- `server` — validated config, catalog/DIDL mapping, media serving, SSDP/GENA
+  runtime, health/status, and supervised remux wiring.
 
 A client profile is resolved **once** per TCP peer via `ClientCache`
 (25 IPv4 slots, 1 hour TTL; same MAC extends another hour). Later
@@ -52,7 +54,7 @@ and HTTP MIME lies match.
 
 Two `<res>` rows when `decide` says `Recode` (remap match):
 
-1. Transcode URL first, `DLNA.ORG_CI=1`, `OP=00` (live pipe), mime
+1. Transcode URL first, `DLNA.ORG_CI=1`, `OP=00` (growing representation), mime
    `video/mp4`.
 2. Original listed **second** as a fallback.
 
@@ -66,9 +68,18 @@ says the client cannot play the source.
 
 Original files: `Accept-Ranges: bytes`, `DLNA.ORG_OP=01`, same as the dialect.
 
-Remux / transcode **serve path** is a live fragmented-MP4 pipe
-(`OP=00`, no `Content-Length`). Do not wait for a finished cache file
-before the first byte.
+Remux / transcode **serve path** follows job state. While the `.part` file is
+growing it is streamed with `OP=00` and no `Content-Length`; the handler waits
+only for the initial fragment, not the finished file. After ffprobe validation
+and atomic rename, the completed cache is served with byte Range,
+`Content-Length`, `Accept-Ranges`, and `OP=01`.
+
+Several HTTP readers can attach to the same immutable job key. By default a
+probe disconnect does not cancel useful work (`continue_after_disconnect =
+true`). An operator can choose immediate last-reader cancellation instead.
+Every job has a wall-clock deadline; source replacement and shutdown cancel
+jobs, terminate their process groups, and reap their children. Cache quota,
+age, and minimum-free-space maintenance protect storage.
 
 ## Database
 
@@ -93,6 +104,7 @@ network_interface = ["eth0"]
 notify_interval = 895
 media_dir = ["/media/video"]
 exclude_dir = ["incomplete"]
+scan_workers = 16
 
 [transcode]
 enable = true
@@ -101,3 +113,11 @@ max_jobs = 2
 ```
 
 Host paths stay in `rusty-dlna.local.toml` (gitignored).
+
+Initial and rebuild scans first discover paths, group them by physical
+device/inode, and prefer a canonical non-symlink path as the preparation
+source. A bounded worker pool performs libav probing and generated-artwork
+work once per physical source. Results are then applied to SQLite in discovery
+order on the scanner's single writer, so concurrency cannot make object IDs or
+transactions nondeterministic. Alias DETAILS rows copy the physical source's
+stream metadata and artwork instead of launching duplicate probe/ffmpeg work.

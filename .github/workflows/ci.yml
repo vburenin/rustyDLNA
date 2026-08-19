@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavcodec-dev libavformat-dev libavutil-dev libswscale-dev ffmpeg curl
+      - name: Pinned Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy && rustup default 1.97.1
+      - name: Full quality gate
+        run: scripts/check.sh
+
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+      - name: Declared MSRV 1.83
+        run: rustup toolchain install 1.83.0 --profile minimal && cargo +1.83.0 check --workspace --locked
+
+  docker-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: docker build --pull --tag rustydlna-ci .
+      - run: RUN_DOCKER_SMOKE=1 scripts/compose-smoke.sh
+      - name: Container vulnerability scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: rustydlna-ci
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          version: v0.70.0
+
+  dependency-policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: rustup toolchain install 1.97.1 --profile minimal && rustup default 1.97.1
+      - run: cargo install cargo-audit --version 0.22.2 --locked && cargo install cargo-deny --version 0.20.2 --locked
+      - run: cargo audit --deny warnings
+      - run: cargo deny check
+
+  coverage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavcodec-dev libavformat-dev libavutil-dev libswscale-dev ffmpeg
+      - run: rustup toolchain install 1.97.1 --profile minimal --component llvm-tools-preview && rustup default 1.97.1
+      - run: cargo install cargo-llvm-cov --version 0.9.0 --locked
+      - name: Coverage floor
+        run: cargo llvm-cov --workspace --fail-under-lines 80
+
+  fuzz-build-and-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+      - run: rustup toolchain install nightly-2026-08-01 --profile minimal && cargo +nightly-2026-08-01 install cargo-fuzz --version 0.13.2 --locked
+      - run: cargo +nightly-2026-08-01 fuzz build
+      - name: Bounded parser fuzz smoke
+        run: |
+          for target in http_request http_range ssdp soap_xml nfo url_ids sidecars; do
+            cargo +nightly-2026-08-01 fuzz run "$target" -- -max_total_time=10 -timeout=5
+          done

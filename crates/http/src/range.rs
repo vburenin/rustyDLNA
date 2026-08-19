@@ -91,11 +91,7 @@ pub fn range_len(r: ByteRange) -> u64 {
 }
 
 /// Read `[start, end]` inclusive from `path`. This is the GET body path.
-pub fn read_file_range(
-    path: &std::path::Path,
-    start: u64,
-    end: u64,
-) -> std::io::Result<Vec<u8>> {
+pub fn read_file_range(path: &std::path::Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path)?;
     f.seek(SeekFrom::Start(start))?;
@@ -114,9 +110,21 @@ mod tests {
         let r = parse_byte_range("bytes=0-99", 1000).unwrap().unwrap();
         assert_eq!(r, ByteRange { start: 0, end: 99 });
         let r = parse_byte_range("bytes=100-", 1000).unwrap().unwrap();
-        assert_eq!(r, ByteRange { start: 100, end: 999 });
+        assert_eq!(
+            r,
+            ByteRange {
+                start: 100,
+                end: 999
+            }
+        );
         let r = parse_byte_range("bytes=-10", 1000).unwrap().unwrap();
-        assert_eq!(r, ByteRange { start: 990, end: 999 });
+        assert_eq!(
+            r,
+            ByteRange {
+                start: 990,
+                end: 999
+            }
+        );
         assert_eq!(
             parse_byte_range("bytes=1000-2000", 1000),
             Err(RangeError::Unsatisfiable)
@@ -132,5 +140,42 @@ mod tests {
         assert_eq!(parse_open_range("bytes=0-1").unwrap(), (0, Some(1)));
         assert_eq!(parse_open_range("bytes=100-").unwrap(), (100, None));
         assert_eq!(parse_open_range("bytes=50-10"), Err(RangeError::Invalid));
+    }
+
+    #[test]
+    fn range_arithmetic_properties_hold_exhaustively_for_small_files() {
+        for size in 1_u64..=128 {
+            for start in 0..size {
+                for requested_end in start..=size.saturating_add(8) {
+                    let raw = format!("bytes={start}-{requested_end}");
+                    let range = parse_byte_range(&raw, size).unwrap().unwrap();
+                    assert_eq!(range.start, start);
+                    assert_eq!(range.end, requested_end.min(size - 1));
+                    assert!(range.start <= range.end);
+                    assert!(range.end < size);
+                    assert_eq!(range_len(range), range.end - range.start + 1);
+                }
+
+                let open = parse_byte_range(&format!("bytes={start}-"), size)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    open,
+                    ByteRange {
+                        start,
+                        end: size - 1
+                    }
+                );
+                assert_eq!(range_len(open), size - start);
+            }
+
+            for suffix in 1..=size.saturating_add(8) {
+                let range = parse_byte_range(&format!("bytes=-{suffix}"), size)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(range.end, size - 1);
+                assert_eq!(range_len(range), suffix.min(size));
+            }
+        }
     }
 }

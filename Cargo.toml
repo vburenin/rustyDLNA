@@ -9,28 +9,33 @@ members = [
     "crates/transcode",
     "crates/server",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-only"
 repository = "https://github.com/vburenin/rustyDLNA"
-rust-version = "1.80"
+rust-version = "1.83"
 
 [workspace.dependencies]
-rusty-dlna-protocol = { path = "crates/protocol" }
-rusty-dlna-ssdp = { path = "crates/ssdp" }
-rusty-dlna-soap = { path = "crates/soap" }
-rusty-dlna-http = { path = "crates/http" }
-rusty-dlna-scan = { path = "crates/scan" }
-rusty-dlna-transcode = { path = "crates/transcode" }
+rusty-dlna-protocol = { path = "crates/protocol", version = "0.1.0" }
+rusty-dlna-ssdp = { path = "crates/ssdp", version = "0.1.0" }
+rusty-dlna-soap = { path = "crates/soap", version = "0.1.0" }
+rusty-dlna-http = { path = "crates/http", version = "0.1.0" }
+rusty-dlna-scan = { path = "crates/scan", version = "0.1.0" }
+rusty-dlna-transcode = { path = "crates/transcode", version = "0.1.0" }
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "process", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 bitflags = "2"
-time = { version = "0.3", features = ["formatting", "parsing"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+roxmltree = "0.21.1"
+quick-xml = { version = "0.41.0", features = ["encoding"] }
+uuid = { version = "1.18.1", features = ["v4"] }
+sha1 = "0.10"

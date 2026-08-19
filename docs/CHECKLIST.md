@@ -124,6 +124,8 @@ container (not the host).
 - [x] `GetProtocolInfo`, `GetSortCapabilities`, `GetSearchCapabilities` — `cargo test -p rusty-dlna --lib soap_caps_and_unknown_path_browse`
 - [x] `X_GetFeatureList` ids `1`/`2`/`3` or `A`/`V`/`I` for DCM10 — `cargo test -p rusty-dlna --lib client_matrix_handlers`
 - [x] `X_SetBookmark` + `FLAG_CONVERT_MS` — `cargo test -p rusty-dlna-soap bookmark_convert_ms`
+- [x] Search requires `ContainerID`/`ObjectID`; missing scope → 402 — `cargo test -p rusty-dlna --lib search_missing_container_id_is_402`
+- [x] `GetCurrentConnectionInfo` missing/malformed ID → 402, nonzero → 701; registrar authorization requires `DeviceID` — `cargo test -p rusty-dlna --lib connection_and_registrar_required_arguments_reach_http_faults`
 - [x] Unknown method → HTTP 500 + UPnPError 401 — `cargo test -p rusty-dlna --lib missing_objectid_is_402_unknown_is_401`
 
 **Verify** scripted SOAP against container `:18200`.
@@ -140,6 +142,10 @@ container (not the host).
 - [x] Inode reuse for symlink aliases — `cargo test -p rusty-dlna-scan inode_reuse_for_hardlink_alias`
 - [x] NFO year → `dc:date` — `cargo test -p rusty-dlna-scan nfo_year_becomes_ten_char_date`
 - [x] Multi-caption `/Captions/{id}/{n}.ext` — scan test plus `caption_from_path` in protocol
+- [x] Per-root `V,`/`A,`/`P,` admission and root-qualified identity —
+      `per_root_masks_keys_and_persisted_relocation_survive_reconcile`
+- [x] Valid tagged FLAC/MP3/MP4/MKV/JPEG fixtures and checksums —
+      `checked_fixtures_match_minidlna_scan_didl_and_get_contract`
 - [x] No scan of host library paths from the test container unless a
       **fixture** tree is copied in (never mount the live video dataset
       read-write) — `testdata/rusty-dlna.test.toml` `media_dir = ["library"]`
@@ -170,8 +176,13 @@ container (not the host).
 - [x] Kodi + DV MKV → `ServeOriginal` (already unit-tested) — `cargo test -p rusty-dlna-transcode kodi_ignores_cast_only_rule`
 - [x] `CrKey` + DV MKV / TrueHD → `Transcode`, drop DV, keep HDR10 flags — `cargo test -p rusty-dlna-transcode cast_p7_hits_hdr10_remap`
 - [x] `CrKey` + HDR10 MP4 AC-3 → original — `cargo test -p rusty-dlna-transcode cast_p8_is_not_p7` (P8/HDR10 not matching `hdr = "dv-p7"`)
-- [x] ffmpeg supervisor: `Drop` kills the process; `max_jobs` cap — `cargo test -p rusty-dlna-transcode drop_kills_ffmpeg_job_and_max_jobs_caps`
-- [x] Background remux: growing fMP4 `.part`, shared job across Kodi’s parallel GETs, first fragment then stream (`transcode_get_is_live_pipe_not_full_file`, `grow_file_emits_ftyp_before_process_exits`). HTTP 4xx/5xx and ffmpeg stderr at **error**.
+- [x] ffmpeg supervisor: cancellation/deadline/shutdown terminate and reap the
+      process group; `max_jobs` caps titles — remux supervisor tests.
+- [x] Background remux: growing fMP4 `.part`, shared job across Kodi’s parallel
+      GETs, first fragment before completion
+      (`transcode_get_serves_growing_file_before_completion`,
+      `grow_file_emits_ftyp_before_process_exits`). A probe disconnect follows
+      the explicit `continue_after_disconnect` policy.
 - [x] Transcode URL **first** in DIDL for `NEED_SAFE_VIDEO` only — `cargo test -p rusty-dlna --lib crkey_dvp7_remap_first_kodi_original`
 - [x] `[[remap]]` matches codec/hdr/audio/client; first row wins
 - [x] CUDA decode not required (software decode + NVENC) — test remap uses `copy` / `libx264`
@@ -227,7 +238,9 @@ Phase 9 is done. rustyDLNA is the LAN daemon. Tests stay on 18200/11900.
 
 - [x] Sidecar `{stem}-poster.jpg` / folder `poster.jpg` indexed into `ALBUM_ART` / `DETAILS.ALBUM_ART`; inode clone copies art id; art files skipped as library items — `cargo test -p rusty-dlna-scan art_sidecar_indexed_and_cloned`
 - [x] `GET /AlbumArt/{artId}-{detailId}.jpg` 200 `image/jpeg`; Browse extra JPEG_TN `<res>` or `albumArtURI` — `cargo test -p rusty-dlna --lib album_art_get_and_didl`
-- [x] Xbox `?albumArt=true`, Streaming/Range on image → 406; `/Thumbnails/` and `/Resized/` stay 404 (covered by the same lib test)
+- [x] Xbox `?albumArt=true` and image Streaming/Range rejection; bounded,
+      oriented `/Thumbnails/` and `/Resized/` derivatives have identity-aware
+      cache keys, atomic publication, quotas, and decoder limits.
 
 **Verify** fixture `testdata/library/video/movie.mkv` + `movie-poster.jpg`.
 
@@ -262,6 +275,13 @@ Phase 9 is done. rustyDLNA is the LAN daemon. Tests stay on 18200/11900.
 - [x] `CONVERT_MS` dialect — `cargo test -p rusty-dlna-soap bookmark_convert_ms`
 - [x] `X_SetBookmark` then Browse `upnp:lastPlaybackPosition` — `cargo test -p rusty-dlna --lib setbookmark_then_browse_position`
 - [x] `UpdateObject` playCount / lastPlaybackPosition — `cargo test -p rusty-dlna --lib updateobject_playcount_and_position`
+- [x] Missing `PosSecond` returns 402 without clearing an existing bookmark — `cargo test -p rusty-dlna --lib setbookmark_missing_position_is_402_without_clearing_state`
+- [x] `UpdateObject` rejects missing/malformed/read-only/mismatched tag lists with 402/702/703/705/706 — `cargo test -p rusty-dlna --lib updateobject_rejects_missing_malformed_and_unsupported_tag_arguments`
+- [x] `CurrentTagValue` is an atomic optimistic-concurrency guard; stale updates return 702 without mutation — `cargo test -p rusty-dlna --lib updateobject_current_value_is_an_optimistic_concurrency_guard`
+- [x] Kodi Platinum percent-encoded/trailing-slash `UpdateObject` round trip — `cargo test -p rusty-dlna --lib kodi_encoded_updateobject_persists_and_browses_resume_position`
+- [x] Failed SQLite writes return UPnP 501 without catalog drift — `cargo test -p rusty-dlna --lib bookmark_database_failure_returns_action_failed_without_catalog_drift`
+- [x] Bookmark writes advance `SystemUpdateID` and emit every affected parent through `ContainerUpdateIDs`, invalidating Kodi's Platinum Browse cache — `cargo test -p rusty-dlna --lib kodi_bookmark_update_invalidates_every_cached_parent_container`
+- [x] Configurable indefinite/90-day retention, migration timestamp, and full-reconcile publication — `cargo test -p rusty-dlna-scan bookmark`
 
 ---
 
@@ -276,8 +296,15 @@ Phase 9 is done. rustyDLNA is the LAN daemon. Tests stay on 18200/11900.
 
 ## Phase 15 — Real Search + SortCriteria
 
-- [x] `dc:title contains` — `cargo test -p rusty-dlna-soap search_title_contains`
-- [x] `upnp:class derivedfrom object.item.videoItem` returns no folders — `cargo test -p rusty-dlna-soap search_class_derivedfrom_video`
+- [x] Parsed boolean Search supports `contains`, `doesNotContain`, `=`, `!=`,
+      `<`, `<=`, `>`, `>=`, `derivedfrom`, `exists`, parentheses, AND/OR,
+      escaped quotes, and explicit 708 failures — SOAP parser and large-catalog
+      query tests.
+- [x] `upnp:class derivedfrom object.item.videoItem` returns no folders —
+      `search_class_derivedfrom_video`
+- [x] Case-insensitive parsed Filter controls every optional DIDL element and
+      attribute while required fields and client exceptions remain explicit —
+      filter unit tests plus `browse_listed_filter_omits_res_size`.
 - [x] Unparseable SortCriteria + `FLAG_DLNA` → 709 — `cargo test -p rusty-dlna-soap bad_sort_is_709_for_dlna`
 - [x] `FLAG_FORCE_SORT` Browse track order — `cargo test -p rusty-dlna --lib browse_force_sort_track_order`
 
@@ -306,6 +333,9 @@ Phase 9 is done. rustyDLNA is the LAN daemon. Tests stay on 18200/11900.
 
 - [x] Byebye six packets, no LOCATION — `cargo test -p rusty-dlna-ssdp byebye_has_six_no_location`
 - [x] Byebye on drop — `RUSTY_DLNA_HTTP_PORT=18200 RUSTY_DLNA_SSDP_PORT=11900 cargo test -p rusty-dlna --test listen_e2e ssdp_byebye_on_drop`
+- [x] Join/announce/reply on every selected IPv4 interface with matching
+      source and `LOCATION`; ambiguous named interfaces are rejected — unit
+      selection tests and `scripts/ssdp-netns-e2e.sh`.
 
 **Prove** host `:8200`/`:1900` still only the live daemon. Tests do not join `239.255.255.250`.
 
@@ -359,7 +389,7 @@ cargo test -p rusty-dlna-transcode cache_stamp_invalidates_on_source_change
 
 ## Phase 21 — Remux seek / first-play contract
 
-File-cache, not a live pipe. Document and lock it.
+Growing-file cache, not a stdout pipe. Document and lock it.
 
 | State | Headers | Seek |
 |---|---|---|
@@ -376,7 +406,7 @@ File-cache, not a live pipe. Document and lock it.
 
 ```bash
 cargo test -p rusty-dlna --lib remux_finished_range_and_stale_rebuild
-cargo test -p rusty-dlna --lib transcode_get_is_live_pipe_not_full_file
+cargo test -p rusty-dlna --lib transcode_get_serves_growing_file_before_completion
 ```
 
 ---
@@ -387,7 +417,8 @@ Priority: sidecar → embedded attached pic → one-shot thumbnail.
 
 - [x] Extract `AV_DISPOSITION_ATTACHED_PIC` to `cache/art/{sha1}.jpg`
 - [x] Else `ffmpeg -ss 1 -frames:v 1` thumbnail (fail closed)
-- [x] Sidecar still wins; `/Thumbnails/` and `/Resized/` stay 404
+- [x] Sidecar still wins; `/Thumbnails/` and `/Resized/` use the selected art
+      or image source, apply EXIF orientation, and enforce configured limits.
 
 **Verify**
 

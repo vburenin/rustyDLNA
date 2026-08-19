@@ -9,6 +9,17 @@ use rusty_dlna_protocol::soap::{DIDL_SCHEMAS, DLNA_NAMESPACE, PV_NAMESPACE, SEC_
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FilterBits {
     pub dc_date: bool,
+    pub dc_creator: bool,
+    pub dc_description: bool,
+    pub upnp_artist: bool,
+    pub upnp_actor: bool,
+    pub upnp_album: bool,
+    pub upnp_genre: bool,
+    pub upnp_track: bool,
+    pub upnp_episode: bool,
+    pub upnp_album_art: bool,
+    pub upnp_last_playback: bool,
+    pub upnp_playback_count: bool,
     /// `sec:CaptionInfoEx` + `sec:dcmInfo` + `xmlns:sec`.
     pub sec: bool,
     /// `pv:subtitle*` on the primary `<res>` + `xmlns:pv`.
@@ -30,6 +41,17 @@ impl FilterBits {
     pub fn standard() -> Self {
         Self {
             dc_date: true,
+            dc_creator: true,
+            dc_description: true,
+            upnp_artist: true,
+            upnp_actor: true,
+            upnp_album: true,
+            upnp_genre: true,
+            upnp_track: true,
+            upnp_episode: true,
+            upnp_album_art: true,
+            upnp_last_playback: true,
+            upnp_playback_count: true,
             sec: false,
             pv: false,
             dlna_ns: false,
@@ -64,6 +86,17 @@ pub fn parse_filter(filter: Option<&str>, samsung: bool) -> FilterBits {
     if raw.is_empty() || raw == "*" {
         return FilterBits {
             dc_date: true,
+            dc_creator: true,
+            dc_description: true,
+            upnp_artist: true,
+            upnp_actor: true,
+            upnp_album: true,
+            upnp_genre: true,
+            upnp_track: true,
+            upnp_episode: true,
+            upnp_album_art: true,
+            upnp_last_playback: true,
+            upnp_playback_count: true,
             sec: samsung,
             pv: false,
             dlna_ns: samsung,
@@ -76,13 +109,37 @@ pub fn parse_filter(filter: Option<&str>, samsung: bool) -> FilterBits {
             res_channels: true,
         };
     }
-    let has = |tok: &str| raw.contains(tok);
+    let tokens: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let has = |wanted: &str| {
+        let wanted = wanted.to_ascii_lowercase();
+        tokens.iter().any(|token| token == &wanted)
+    };
+    let has_prefix = |wanted: &str| {
+        let wanted = wanted.to_ascii_lowercase();
+        tokens.iter().any(|token| token.starts_with(&wanted))
+    };
     FilterBits {
         dc_date: has("dc:date"),
+        dc_creator: has("dc:creator"),
+        dc_description: has("dc:description"),
+        upnp_artist: has("upnp:artist"),
+        upnp_actor: has("upnp:actor"),
+        upnp_album: has("upnp:album"),
+        upnp_genre: has("upnp:genre"),
+        upnp_track: has("upnp:originalTrackNumber"),
+        upnp_episode: has("upnp:episodeSeason") || has("upnp:episodeNumber"),
+        upnp_album_art: has("upnp:albumArtURI") || has_prefix("upnp:albumarturi@"),
+        upnp_last_playback: has("upnp:lastPlaybackPosition"),
+        upnp_playback_count: has("upnp:playbackCount"),
         sec: has("sec:CaptionInfoEx") || has("sec:dcmInfo"),
         pv: has("pv:subtitleFileType") || has("pv:subtitleFileUri"),
-        dlna_ns: has("dlna") || samsung,
-        res: has("res"),
+        dlna_ns: has_prefix("dlna:") || samsung,
+        res: has("res") || has_prefix("res@"),
         res_size: has("res@size"),
         res_duration: has("res@duration"),
         res_bitrate: has("res@bitrate"),
@@ -181,5 +238,18 @@ mod tests {
         let sec = xmlns.find("xmlns:sec=").unwrap();
         assert!(dlna < pv && pv < sec, "{xmlns}");
         assert!(xmlns.contains("http://purl.org/dc/elements/1.1/"));
+    }
+
+    #[test]
+    fn listed_filter_is_case_insensitive_and_token_exact() {
+        let bits = parse_filter(
+            Some(" DC:CREATOR , UpNp:AlbumArtURI@dlna:profileID , RES@SIZE "),
+            false,
+        );
+        assert!(bits.dc_creator && bits.upnp_album_art);
+        assert!(bits.res && bits.res_size);
+        assert!(!bits.dc_description && !bits.dc_date && !bits.upnp_album);
+        let misleading = parse_filter(Some("xres@size,dc:datetime"), false);
+        assert!(!misleading.res && !misleading.res_size && !misleading.dc_date);
     }
 }

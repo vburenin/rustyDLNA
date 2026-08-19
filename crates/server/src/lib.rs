@@ -4,17 +4,19 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use rusty_dlna_http::{
-    caption_info_sec_url, dlna_get_header_invalid, dlna_org_features, dlna_strict,
-    gen_root_desc, interactive_on_non_image, is_chunked, live_transcode_response, media_response,
-    now_imf_date, parse_byte_range, persist_for_route, protocol_info, read_file_range,
+    caption_info_sec_url, dlna_get_header_invalid, dlna_org_features, dlna_strict, gen_root_desc,
+    interactive_on_non_image, is_chunked, live_transcode_response, media_response, now_imf_date,
+    parse_byte_range, persist_for_route, protocol_info, read_file_range,
     realtime_interactive_invalid, route, scpd_connection_manager, scpd_content_directory,
     scpd_registrar, set_caption_info_sec, streaming_on_image, timeseek_without_range,
     valid_host_header, wants_caption_info_sec, wants_content_language, ByteRange, HttpRequest,
-    HttpResponse, HttpRoute, RangeError, RemuxJobSpec, RootDescOpts,
+    HttpResponse, HttpRoute, MediaResponseOptions, RangeError, RemuxAudio, RemuxJobSpec,
+    RootDescOpts,
 };
 use rusty_dlna_protocol::isolation::collides_with_live_ports;
 use rusty_dlna_protocol::paths::{
@@ -30,146 +32,84 @@ use rusty_dlna_protocol::{
     CLIENTS,
 };
 use rusty_dlna_scan::{
-    caption_http_mime, collect_media_dirs, load_existing, monitor, repair_objects_if_needed,
-    run_inotify, scan, Catalog, CatalogChild, LibraryDb, MediaItem, ScanConfig, ScanDelta,
-    SourceProbe,
+    build_media_roots, caption_http_mime, load_and_persist_media_root_mappings,
+    load_catalog_with_policy, load_existing, monitor, repair_objects_if_needed,
+    repair_video_titles_if_needed, run_inotify_until, scan, Catalog, CatalogChild,
+    Container as CatalogContainer, LibraryDb, MediaItem, MediaTypes, ScanConfig, ScanDelta,
+    ScanProgress, ScanResult, SourceProbe, WatchTelemetry,
 };
 
 pub use rusty_dlna_scan::{ensure_pattern_fixture, ensure_show_fixture};
 use rusty_dlna_soap::{
-    apply_title_hack, bookmark_seconds, build_browse, default_order, dispatch_simple,
-    empty_cd_response, extra_ci1_protocol_infos, magic_object_id, parse_filter,
-    parse_search_criteria, parse_soap_call, parse_update_object_tags, row_matches, soap_fault,
-    sort_or_709, DefaultOrder, DidlCaption, DidlObject, DidlRes, FilterBits, SearchRow, SoapCall,
-    SoapOutcome, SortKey, SortSpec,
+    apply_title_hack, bookmark_seconds, build_browse_bounded, default_order, dispatch_simple,
+    empty_cd_response, extra_ci1_protocol_infos, magic_object_id, parse_filter, parse_soap_call,
+    parse_update_object_tags, soap_fault, sort_or_709, try_parse_search_criteria,
+    try_parse_soap_call, DefaultOrder, DidlCaption, DidlObject, DidlRes, FilterBits, SoapCall,
+    SoapOutcome, UpdateObjectParseError,
 };
 use rusty_dlna_ssdp::{
     jitter_ms, msearch_jitter_ms_range, msearch_replies, notify_byebye, parse_inbound_notify,
     parse_msearch, ALIVE_DUP_DELAY_MS,
 };
 use rusty_dlna_transcode::{
-    cache_dest, cache_part, decide_for, ffmpeg_grow_args, hdr10_fallback_plan,
-    pick_audio_index, probe_to_source, Decision, JobGate, RecodeAction,
-    RemapRule,
+    cache_dest_for_key, cache_part, decide_for_with_default_encoder, ffmpeg_grow_os_args,
+    hdr10_fallback_plan, pick_audio_index_from_streams, probe_to_source, source_identity,
+    transcode_cache_key, AudioAction, Decision, JobGate, RecodeAction, RemapRule, TranscodePlan,
 };
 
+mod catalog_query;
+mod config;
 mod events;
 mod remux;
 mod status;
 
-#[derive(Debug, serde::Deserialize)]
-pub struct Config {
-    #[serde(default = "default_name")]
-    pub friendly_name: String,
-    #[serde(default)]
-    pub network_interface: Vec<String>,
-    #[serde(default)]
-    pub media_dir: Vec<String>,
-    #[serde(default)]
-    pub exclude_dir: Vec<String>,
-    #[serde(default)]
-    pub exclude_file: Vec<String>,
-    #[serde(default)]
-    pub transcode: TranscodeCfg,
-    #[serde(default)]
-    pub remap: Vec<RemapRule>,
-    #[serde(default)]
-    pub uuid: Option<String>,
-    #[serde(default)]
-    pub cache_dir: Option<String>,
-    #[serde(default)]
-    pub advertise_ip: Option<String>,
-    /// Bind address. Default `0.0.0.0`. Set to a LAN IP (e.g. `192.0.2.20`).
-    #[serde(default)]
-    pub listen_ip: Option<String>,
-    #[serde(default)]
-    pub notify_interval: Option<u32>,
-    #[serde(default)]
-    pub serial: Option<String>,
-    #[serde(default)]
-    pub root_container: Option<String>,
-    /// Database directory. Default: `cache_dir`. File is `files.db`.
-    #[serde(default)]
-    pub db_dir: Option<String>,
-    /// Seconds between library rescans (new/changed/deleted files). 0 = off.
-    #[serde(default = "default_rescan")]
-    pub rescan_secs: u64,
+use catalog_query::*;
+#[cfg(test)]
+use config::normalize_uuid;
+use config::{command_version, load_or_create_uuid, validate_http_config};
+pub use config::{
+    load_config, resolve_http_port, resolve_ssdp_port, validate_transcode_tools, Config,
+    ConfigLoadError, ConfigValidationError, TranscodeCfg,
+};
+#[cfg(test)]
+use rusty_dlna_scan::{
+    CatalogDefaultOrder, CatalogQuery, CatalogQueryClause, CatalogQueryField, CatalogQueryOp,
+    CatalogQuerySort,
+};
+#[cfg(test)]
+use rusty_dlna_soap::{SortKey, SortSpec};
+
+/// Shared-state poison policy: log the invariant breach and recover the inner
+/// value so one panicking request cannot take the daemon down. Callers still
+/// validate DB/catalog generations before publishing externally visible data.
+pub(crate) fn lock_recover<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        tracing::error!(
+            resource = std::any::type_name::<T>(),
+            "recovering poisoned mutex"
+        );
+        poisoned.into_inner()
+    })
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            friendly_name: default_name(),
-            network_interface: Vec::new(),
-            media_dir: Vec::new(),
-            exclude_dir: Vec::new(),
-            exclude_file: Vec::new(),
-            transcode: TranscodeCfg::default(),
-            remap: Vec::new(),
-            uuid: None,
-            cache_dir: None,
-            advertise_ip: None,
-            listen_ip: None,
-            notify_interval: None,
-            serial: None,
-            root_container: None,
-            db_dir: None,
-            rescan_secs: default_rescan(),
-        }
-    }
+fn read_recover<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        tracing::error!(
+            resource = std::any::type_name::<T>(),
+            "recovering poisoned read lock"
+        );
+        poisoned.into_inner()
+    })
 }
 
-fn default_rescan() -> u64 {
-    30
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct TranscodeCfg {
-    #[serde(default)]
-    pub enable: bool,
-    #[serde(default = "default_encoder")]
-    pub encoder: String,
-    #[serde(default = "default_jobs")]
-    pub max_jobs: u32,
-}
-
-impl Default for TranscodeCfg {
-    fn default() -> Self {
-        Self {
-            enable: false,
-            encoder: default_encoder(),
-            max_jobs: default_jobs(),
-        }
-    }
-}
-
-fn default_name() -> String {
-    "rustyDLNA".into()
-}
-fn default_encoder() -> String {
-    "libx264".into()
-}
-fn default_jobs() -> u32 {
-    16
-}
-
-pub fn load_config(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
-    let text = std::fs::read_to_string(path)?;
-    Ok(toml::from_str(&text)?)
-}
-
-pub fn resolve_http_port(cli: u16) -> u16 {
-    std::env::var("RUSTY_DLNA_HTTP_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(cli)
-}
-
-pub fn resolve_ssdp_port() -> u16 {
-    std::env::var("RUSTY_DLNA_SSDP_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(rusty_dlna_protocol::ssdp::SSDP_PORT)
+fn write_recover<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|poisoned| {
+        tracing::error!(
+            resource = std::any::type_name::<T>(),
+            "recovering poisoned write lock"
+        );
+        poisoned.into_inner()
+    })
 }
 
 pub struct App {
@@ -183,91 +123,403 @@ pub struct App {
     pub ssdp_port: u16,
     pub advertise_ip: String,
     pub listen_ip: std::net::Ipv4Addr,
+    /// Selected SSDP egress addresses and their subnet masks.
+    pub ssdp_interfaces: Vec<(Ipv4Addr, Ipv4Addr)>,
     pub notify_interval: u32,
     pub cache_dir: PathBuf,
     pub update_id: AtomicU32,
     pub jobs: JobGate,
-    pub(crate) remuxes: Mutex<HashMap<i64, Arc<remux::RemuxJob>>>,
-    events: Mutex<events::EventHub>,
+    pub(crate) remuxes: Mutex<HashMap<String, Arc<remux::RemuxJob>>>,
+    pub(crate) remux_metrics: remux::RemuxMetrics,
+    events: Arc<Mutex<events::EventHub>>,
+    notify_dispatcher: events::NotifyDispatcher,
+    derived_image_locks: Vec<Mutex<()>>,
     pub(crate) client_cache: Mutex<ClientCache>,
+    scan_control: Arc<ScanControl>,
+    scan_telemetry: Arc<WatchTelemetry>,
+    db_pool: Option<DbPool>,
+    required_tools_ready: bool,
+    #[cfg(test)]
+    test_tree: Option<TestTree>,
 }
 
-struct DidlSnap {
-    child: CatalogChild,
-    child_count: Option<u32>,
-    child_container_count: Option<u32>,
+/// Failure while validating configuration and constructing the runtime state.
+///
+/// Variants retain the affected path or value and preserve concrete source
+/// errors where one exists, so startup failures are actionable without parsing
+/// an unstructured string.
+#[derive(Debug, thiserror::Error)]
+pub enum AppInitError {
+    #[error(transparent)]
+    Config(#[from] ConfigValidationError),
+    #[error("HTTP and SSDP ports must be non-zero")]
+    ZeroPort,
+    #[error("invalid media-root configuration: {message}")]
+    MediaRoots { message: String },
+    #[error("cannot update media-root identity mappings in {path}: {message}")]
+    MediaRootMappings { path: PathBuf, message: String },
+    #[error("cannot load or create server identity in {path}: {message}")]
+    Identity { path: PathBuf, message: String },
+    #[error("cannot maintain transcode cache {path}: {source}")]
+    TranscodeCache {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("listen_ip/advertise_ip is not a valid IPv4 address: {value}")]
+    ListenAddress { value: String },
+    #[error("cannot select advertisement network: {message}")]
+    Advertisement { message: String },
+    #[error("cannot select SSDP interfaces: {message}")]
+    SsdpInterfaces { message: String },
+    #[error("cannot open {role} database connection {path}: {source}")]
+    DatabaseOpen {
+        role: &'static str,
+        path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error("cannot read database update ID from {path}: {source}")]
+    DatabaseUpdateId {
+        path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error("cannot create bounded GENA notification workers: {source}")]
+    NotificationWorkers {
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+#[cfg(test)]
+struct TestTree(PathBuf);
+
+#[cfg(test)]
+impl TestTree {
+    fn new(label: &str) -> Self {
+        static SEQUENCE: AtomicU32 = AtomicU32::new(0);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rusty-dlna-server-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create test temporary directory");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ScanRuntimeState {
+    phase: String,
+    started_unix: Option<u64>,
+    finished_unix: Option<u64>,
+    duration_ms: Option<u64>,
+    last_success_unix: Option<u64>,
+    last_error: Option<String>,
+    next_reconcile_unix: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct ScanControl {
+    stopping: AtomicBool,
+    gate: Mutex<()>,
+    sleep: Mutex<()>,
+    wake: std::sync::Condvar,
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    state: Mutex<ScanRuntimeState>,
+}
+
+struct DbPool {
+    readers: Mutex<Vec<LibraryDb>>,
+    reader_available: std::sync::Condvar,
+    writer: Mutex<LibraryDb>,
+}
+
+impl DbPool {
+    fn open(path: &Path, readers: usize) -> Result<Self, AppInitError> {
+        let writer = LibraryDb::open(path).map_err(|source| AppInitError::DatabaseOpen {
+            role: "writer",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let readers = (0..readers.max(1))
+            .map(|_| {
+                LibraryDb::open_read_only(path).map_err(|source| AppInitError::DatabaseOpen {
+                    role: "read-only",
+                    path: path.to_path_buf(),
+                    source,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            readers: Mutex::new(readers),
+            reader_available: std::sync::Condvar::new(),
+            writer: Mutex::new(writer),
+        })
+    }
+
+    fn read<T>(
+        &self,
+        query: impl FnOnce(&LibraryDb) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        let mut available = self
+            .readers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while available.is_empty() {
+            available = self
+                .reader_available
+                .wait(available)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        let db = loop {
+            if let Some(db) = available.pop() {
+                break db;
+            }
+            available = self
+                .reader_available
+                .wait(available)
+                .unwrap_or_else(|error| error.into_inner());
+        };
+        drop(available);
+        let result = query(&db);
+        let mut available = self
+            .readers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        available.push(db);
+        drop(available);
+        self.reader_available.notify_one();
+        result
+    }
+
+    fn write<T>(
+        &self,
+        query: impl FnOnce(&LibraryDb) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        let db = self
+            .writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        query(&db)
+    }
+}
+
+/// MiniDLNA refuses to grow a SOAP response past roughly two MiB.  Keep the
+/// candidate page finite too: `RequestedCount=0` means "as many as possible",
+/// not permission to materialize an entire library before applying the byte
+/// ceiling.
+const MAX_SOAP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SOAP_PAGE_OBJECTS: usize = 4096;
+
+#[derive(Clone, Copy)]
+enum CatalogChildRef<'a> {
+    Container(&'a CatalogContainer),
+    Item(&'a MediaItem),
+}
+
+/// Kodi's Platinum UPnP stack URI-encodes `$` in `UpdateObject` IDs and
+/// appends a slash. MiniDLNA normalizes that wire form before catalog lookup.
+fn normalize_soap_object_id(raw: &str) -> Option<String> {
+    if raw.len() > 1024 {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let hi = *bytes.get(index + 1)?;
+        let lo = *bytes.get(index + 2)?;
+        let nibble = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        };
+        decoded.push(nibble(hi)? << 4 | nibble(lo)?);
+        index += 3;
+    }
+    if decoded.iter().any(|byte| *byte < b' ' || *byte == 0x7f) {
+        return None;
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    Some(decoded.strip_suffix('/').unwrap_or(&decoded).to_string())
+}
+
+impl CatalogChildRef<'_> {
+    fn to_owned(self) -> CatalogChild {
+        match self {
+            Self::Container(value) => CatalogChild::Container(value.clone()),
+            Self::Item(value) => CatalogChild::Item(Box::new(value.clone())),
+        }
+    }
 }
 
 impl App {
-    pub fn from_config(
+    pub fn from_config(cfg: Config, http_port: u16, ssdp_port: u16, config_dir: &Path) -> Self {
+        Self::try_from_config(cfg, http_port, ssdp_port, config_dir)
+            .unwrap_or_else(|error| panic!("invalid rustyDLNA configuration: {error}"))
+    }
+
+    pub fn try_from_config(
         mut cfg: Config,
         http_port: u16,
         ssdp_port: u16,
         config_dir: &Path,
-    ) -> Self {
-        let (raw_dirs, types) = collect_media_dirs(&cfg.media_dir);
-        let media_dirs: Vec<PathBuf> = raw_dirs
-            .into_iter()
-            .map(|pb| {
-                if pb.is_absolute() {
-                    pb
-                } else {
-                    config_dir.join(pb)
-                }
-            })
+    ) -> Result<Self, AppInitError> {
+        validate_http_config(&cfg)?;
+        if http_port == 0 || ssdp_port == 0 {
+            return Err(AppInitError::ZeroPort);
+        }
+        let resolve_dir = |configured: Option<&String>, fallback: PathBuf| {
+            configured
+                .map(|value| {
+                    let path = PathBuf::from(value);
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        config_dir.join(path)
+                    }
+                })
+                .unwrap_or(fallback)
+        };
+        let cache_dir = resolve_dir(cfg.cache_dir.as_ref(), config_dir.join("cache"));
+        let db_dir = resolve_dir(cfg.db_dir.as_ref(), cache_dir.clone());
+        let db_path = db_dir.join("files.db");
+        let mut media_roots = build_media_roots(&cfg.media_dir, config_dir)
+            .map_err(|message| AppInitError::MediaRoots { message })?;
+        load_and_persist_media_root_mappings(&mut media_roots, &db_path).map_err(|message| {
+            AppInitError::MediaRootMappings {
+                path: db_path.clone(),
+                message,
+            }
+        })?;
+        let media_dirs = media_roots
+            .iter()
+            .map(|root| root.configured_path.clone())
             .collect();
-        let cache_dir = cfg
-            .cache_dir
-            .as_ref()
-            .or(cfg.db_dir.as_ref())
-            .map(|p| {
-                let pb = PathBuf::from(p);
-                if pb.is_absolute() {
-                    pb
-                } else {
-                    config_dir.join(pb)
-                }
-            })
-            .unwrap_or_else(|| config_dir.join("cache"));
-        let db_path = cache_dir.join("files.db");
+        let legacy_type_union = media_roots
+            .iter()
+            .fold(MediaTypes::none(), |all, root| all.union(root.types));
+        let scan_progress = Arc::new(ScanProgress::default());
         let scan_cfg = ScanConfig {
+            media_roots,
             media_dirs,
             exclude_dirs: cfg.exclude_dir.clone(),
             exclude_files: cfg.exclude_file.clone(),
-            types,
+            include_hidden: cfg.include_hidden,
+            album_art_names: cfg.album_art_names.clone(),
+            subtitles: cfg.subtitles,
+            thumbnails: cfg.thumbnails,
+            thumbnail_width: cfg.thumbnail_width,
+            thumbnail_quality: cfg.thumbnail_quality,
+            thumbnail_filmstrip: cfg.thumbnail_filmstrip,
+            image_max_pixels: cfg.derived_image_max_pixels,
+            image_memory_limit_bytes: cfg.derived_image_memory_mb * 1024 * 1024,
+            external_command_timeout: Duration::from_secs(cfg.scan_command_timeout_secs),
+            scan_workers: cfg.scan_workers,
+            recent_limit: cfg.recent_limit,
+            recent_days: cfg.recent_days,
+            bookmark_retention_days: cfg.bookmark_retention_days,
+            // Compatibility summary only. Per-root masks are authoritative.
+            types: legacy_type_union,
             db_path: Some(db_path),
+            wide_links: cfg.wide_links,
+            progress: Some(scan_progress),
         };
+        if cfg.wide_links {
+            tracing::warn!(
+                "wide_links=true: symlinks below media roots may expose outside files over DLNA"
+            );
+        }
         let catalog = load_existing(&scan_cfg);
         let remaps = std::mem::take(&mut cfg.remap);
-        let uuid = cfg
-            .uuid
-            .clone()
-            .unwrap_or_else(|| "uuid:00000000-0000-4000-8000-000000000001".into());
-        let listen_ip: std::net::Ipv4Addr = cfg
-            .listen_ip
-            .as_deref()
-            .or(cfg.advertise_ip.as_deref())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
-        let advertise_ip = cfg
-            .advertise_ip
-            .clone()
-            .unwrap_or_else(|| {
-                if !listen_ip.is_unspecified() {
-                    listen_ip.to_string()
-                } else {
-                    "127.0.0.1".into()
-                }
-            });
+        let uuid = load_or_create_uuid(&cache_dir, cfg.uuid.as_deref()).map_err(|message| {
+            AppInitError::Identity {
+                path: cache_dir.clone(),
+                message,
+            }
+        })?;
+        remux::maintain_transcode_cache(
+            &cache_dir,
+            cfg.transcode.cache_max_mb.saturating_mul(1024 * 1024),
+            cfg.transcode.cache_max_age_days,
+            cfg.cache_min_free_mb.saturating_mul(1024 * 1024),
+            &std::collections::HashSet::new(),
+            true,
+        )
+        .map_err(|source| AppInitError::TranscodeCache {
+            path: cache_dir.clone(),
+            source,
+        })?;
+        let listen_ip: std::net::Ipv4Addr =
+            match cfg.listen_ip.as_deref().or(cfg.advertise_ip.as_deref()) {
+                Some(raw) => raw.parse().map_err(|_| AppInitError::ListenAddress {
+                    value: raw.to_owned(),
+                })?,
+                None => std::net::Ipv4Addr::UNSPECIFIED,
+            };
+        let interfaces = active_ipv4_interfaces();
+        let advertise_ip_addr = select_advertise_ip(
+            cfg.advertise_ip.as_deref(),
+            listen_ip,
+            &cfg.network_interface,
+            ssdp_port,
+            &interfaces,
+            default_route_interface().as_deref(),
+        )
+        .map_err(|message| AppInitError::Advertisement { message })?;
+        let ssdp_interfaces = select_ssdp_interfaces(
+            &cfg.network_interface,
+            advertise_ip_addr,
+            ssdp_port,
+            &interfaces,
+        )
+        .map_err(|message| AppInitError::SsdpInterfaces { message })?;
+        let advertise_ip = advertise_ip_addr.to_string();
         let notify_interval = cfg.notify_interval.unwrap_or(895);
         let max_jobs = cfg.transcode.max_jobs.max(1) as usize;
-        let update_id = scan_cfg
+        let required_tools_ready = !cfg.transcode.enable
+            || (command_version("ffmpeg").is_ok() && command_version("ffprobe").is_ok());
+        let db_pool = scan_cfg
             .db_path
             .as_ref()
-            .and_then(|p| LibraryDb::open(p).ok())
-            .map(|db| db.get_update_id())
+            .map(|path| DbPool::open(path, 4))
+            .transpose()?;
+        let update_id = db_pool
+            .as_ref()
+            .map(|pool| pool.read(LibraryDb::get_update_id))
+            .transpose()
+            .map_err(|source| AppInitError::DatabaseUpdateId {
+                path: scan_cfg
+                    .db_path
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("files.db")),
+                source,
+            })?
             .unwrap_or(1);
-        Self {
+        let events = Arc::new(Mutex::new(events::EventHub::new()));
+        let notify_dispatcher = events::NotifyDispatcher::new(Arc::clone(&events))
+            .map_err(|source| AppInitError::NotificationWorkers { source })?;
+        Ok(Self {
             cfg,
             catalog: RwLock::new(catalog),
             remaps,
@@ -278,14 +530,24 @@ impl App {
             ssdp_port,
             advertise_ip,
             listen_ip,
+            ssdp_interfaces,
             notify_interval,
             cache_dir,
             update_id: AtomicU32::new(update_id),
             jobs: JobGate::new(max_jobs),
             remuxes: Mutex::new(HashMap::new()),
-            events: Mutex::new(events::EventHub::new()),
+            remux_metrics: remux::RemuxMetrics::default(),
+            events,
+            notify_dispatcher,
+            derived_image_locks: (0..64).map(|_| Mutex::new(())).collect(),
             client_cache: Mutex::new(ClientCache::new()),
-        }
+            scan_control: Arc::new(ScanControl::default()),
+            scan_telemetry: Arc::new(WatchTelemetry::default()),
+            db_pool,
+            required_tools_ready,
+            #[cfg(test)]
+            test_tree: None,
+        })
     }
 
     pub fn isolation_ok(&self) -> Result<(), String> {
@@ -299,7 +561,10 @@ impl App {
     }
 
     pub fn identify(&self, req: &HttpRequest) -> &'static ClientProfile {
-        self.identify_peer(req, "127.0.0.1:9".parse().unwrap())
+        self.identify_peer(
+            req,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)),
+        )
     }
 
     pub fn identify_peer(&self, req: &HttpRequest, peer: SocketAddr) -> &'static ClientProfile {
@@ -318,7 +583,7 @@ impl App {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mac = lookup_arp_mac(ip);
-        let mut cache = self.client_cache.lock().expect("client cache");
+        let mut cache = lock_recover(&self.client_cache);
         if let Some(p) = specific {
             cache.remember(ip, p, mac, now)
         } else if let Some(p) = cache.search(ip, now, mac) {
@@ -351,7 +616,9 @@ impl App {
         if let Some(r) = host_rebinding_reject(req) {
             return r;
         }
-        if rusty_dlna_http::http_body_too_large(req.body.len()) {
+        if rusty_dlna_http::http_body_too_large(req.body.len())
+            || req.body.len() > self.cfg.max_request_body_bytes
+        {
             return HttpResponse::html(413, "Payload Too Large", "body too large");
         }
         if timeseek_without_range(req) {
@@ -398,6 +665,21 @@ impl App {
                 r.set("Content-Length", r.body.len());
                 r
             }
+            HttpRoute::Health | HttpRoute::ApiStatus => {
+                let (status_code, body) = status::status_json(self, r == HttpRoute::Health);
+                let mut response = HttpResponse::new(
+                    status_code,
+                    if status_code == 200 {
+                        "OK"
+                    } else {
+                        "Service Unavailable"
+                    },
+                );
+                response.set("Content-Type", "application/json");
+                response.body = body.into_bytes();
+                response.set("Content-Length", response.body.len());
+                response
+            }
             HttpRoute::Thumbnail => self.thumbnail(req),
             HttpRoute::Resized => self.resized(req),
             HttpRoute::NotFound => HttpResponse::html(404, "Not Found", "not found"),
@@ -412,6 +694,10 @@ impl App {
         }
         if method.eq_ignore_ascii_case("HEAD") {
             resp.body.clear();
+            // The accept loop sends these payloads after `bytes_wire`, so a
+            // HEAD response must suppress them explicitly as well.
+            resp.file_range = None;
+            resp.remux_job = None;
         }
         if resp.status >= 400 && r != HttpRoute::Soap {
             tracing::error!(
@@ -439,15 +725,8 @@ impl App {
             manufacturer: "Justin Maggard".into(),
             model_name: "Windows Media Connect compatible (rustyDLNA)".into(),
             model_description: "rustyDLNA on Linux".into(),
-            serial: self
-                .cfg
-                .serial
-                .clone()
-                .unwrap_or_else(|| "1".into()),
-            presentation_url: Some(format!(
-                "http://{}:{}/",
-                self.advertise_ip, self.http_port
-            )),
+            serial: self.cfg.serial.clone().unwrap_or_else(|| "1".into()),
+            presentation_url: Some(format!("http://{}:{}/", self.advertise_ip, self.http_port)),
             xbox: client.kind == ClientKind::Xbox,
             samsung_dcm10: client.flags.contains(ClientFlags::SAMSUNG_DCM10),
         };
@@ -468,11 +747,7 @@ impl App {
             let Some(sid) = sid_hdr else {
                 return HttpResponse::html(412, "Precondition Failed", "missing SID");
             };
-            let res = self
-                .events
-                .lock()
-                .expect("events")
-                .unsubscribe(sid);
+            let res = lock_recover(&self.events).unsubscribe(sid);
             return match res {
                 Ok(()) => {
                     let mut r = HttpResponse::new(200, "OK");
@@ -490,11 +765,10 @@ impl App {
             return HttpResponse::html(400, "Bad Request", "SID and Callback");
         }
         if let Some(raw_cb) = cb_hdr {
-            let nt = req.header("NT").map(str::trim).filter(|s| !s.is_empty());
-            if nt.is_none() {
+            let Some(nt) = req.header("NT").map(str::trim).filter(|s| !s.is_empty()) else {
                 return HttpResponse::html(400, "Bad Request", "missing NT");
-            }
-            if !nt.unwrap().eq_ignore_ascii_case("upnp:event") {
+            };
+            if !nt.eq_ignore_ascii_case("upnp:event") {
                 return HttpResponse::html(412, "Precondition Failed", "NT");
             }
             let Some(cb) = events::parse_callback(raw_cb) else {
@@ -509,21 +783,10 @@ impl App {
             let Some(service) = events::service_from_path(&req.path) else {
                 return HttpResponse::html(412, "Precondition Failed", "service");
             };
-            let timeout = req
-                .header("Timeout")
-                .and_then(|t| {
-                    t.split("Second-")
-                        .nth(1)
-                        .and_then(|s| s.trim().parse::<u32>().ok())
-                })
-                .filter(|n| *n > 0)
-                .unwrap_or(events::DEFAULT_TIMEOUT_SECS);
-            let sid = format!(
-                "uuid:{}",
-                uuid_v4_like(self.update_id.load(Ordering::Relaxed))
-            );
+            let timeout = events::parse_timeout(req.header("Timeout"));
+            let sid = format!("uuid:{}", uuid::Uuid::new_v4());
             let job = {
-                let mut hub = self.events.lock().expect("events");
+                let mut hub = lock_recover(&self.events);
                 match hub.subscribe_new(sid.clone(), cb.as_url(), service, timeout) {
                     Ok(job) => job,
                     Err(st) => {
@@ -532,7 +795,8 @@ impl App {
                 }
             };
             let update_id = self.update_id.load(Ordering::Relaxed);
-            events::spawn_notify(job, events::propertyset(service, update_id));
+            self.notify_dispatcher
+                .enqueue(job, events::propertyset(service, update_id));
             let mut r = HttpResponse::new(200, "OK");
             r.set("SID", sid);
             r.set("Timeout", format!("Second-{timeout}"));
@@ -541,7 +805,8 @@ impl App {
             return r;
         }
         if let Some(sid) = sid_hdr {
-            return match self.events.lock().expect("events").renew(sid) {
+            let timeout = events::parse_timeout(req.header("Timeout"));
+            return match lock_recover(&self.events).renew(sid, timeout) {
                 Ok(timeout) => {
                     let mut r = HttpResponse::new(200, "OK");
                     r.set("SID", sid);
@@ -559,7 +824,19 @@ impl App {
     fn soap(&self, req: &HttpRequest, persist: bool, peer: SocketAddr) -> HttpResponse {
         let action = req.header("SOAPAction").unwrap_or("");
         let body = String::from_utf8_lossy(&req.body);
-        let call = parse_soap_call(action, &body);
+        let call = match try_parse_soap_call(action, &body) {
+            Ok(call) => call,
+            Err(error) => {
+                tracing::warn!(%error, "malformed SOAP request");
+                let fallback = parse_soap_call(action, "");
+                return soap_fault_logged(
+                    SoapOutcome::fault402(),
+                    persist,
+                    &fallback,
+                    req.user_agent().unwrap_or("-"),
+                );
+            }
+        };
         let client = self.identify_peer(req, peer);
         let filter_bits = parse_filter(
             call.filter.as_deref(),
@@ -577,7 +854,12 @@ impl App {
             return self.soap_set_bookmark(&call, client, persist, req.user_agent().unwrap_or("-"));
         }
         if call.method == Some("UpdateObject") {
-            return self.soap_update_object(&call, client, persist, req.user_agent().unwrap_or("-"));
+            return self.soap_update_object(
+                &call,
+                client,
+                persist,
+                req.user_agent().unwrap_or("-"),
+            );
         }
         if let Some(out) = dispatch_simple(
             &call,
@@ -628,15 +910,52 @@ impl App {
             let ua = req.user_agent();
             let start = call.starting_index as usize;
             let take = if call.requested_count == 0 {
-                usize::MAX
+                MAX_SOAP_PAGE_OBJECTS
             } else {
-                call.requested_count as usize
+                (call.requested_count as usize).min(MAX_SOAP_PAGE_OBJECTS)
             };
-            let prepared = {
-                let cat = self.catalog.read().expect("catalog");
-                let (page, total) = if flag == "BrowseMetadata" {
+            let direct_sort = if flag == "BrowseDirectChildren" {
+                match sort_or_709(call.sort_criteria.as_deref(), client) {
+                    Ok(sort) => Some(sort),
+                    Err(709) => {
+                        return soap_fault_logged(
+                            SoapOutcome::fault709(),
+                            persist,
+                            &call,
+                            req.user_agent().unwrap_or("-"),
+                        );
+                    }
+                    Err(_) => Some(Vec::new()),
+                }
+            } else {
+                None
+            };
+            let order = default_order(client);
+            let db_page = direct_sort.as_ref().and_then(|sort| {
+                query_db_children(
+                    self.db_pool.as_ref(),
+                    self.scan_cfg.db_path.as_deref(),
+                    &oid,
+                    sort,
+                    order,
+                    start,
+                    take,
+                )
+            });
+            let (mut didl, total) = {
+                let cat = read_recover(&self.catalog);
+                if flag == "BrowseMetadata" {
                     match cat.metadata(&oid) {
-                        Some(ch) => (vec![ch], 1u32),
+                        Some(ch) => (
+                            vec![self.to_didl_ref(
+                                catalog_child_as_ref(&ch),
+                                &cat,
+                                client,
+                                ua,
+                                &filter_bits,
+                            )],
+                            1u32,
+                        ),
                         None => {
                             return soap_fault_logged(
                                 SoapOutcome::fault701(),
@@ -647,73 +966,101 @@ impl App {
                         }
                     }
                 } else {
-                    let sort = match sort_or_709(call.sort_criteria.as_deref(), client) {
-                        Ok(s) => s,
-                        Err(709) => {
-                            return soap_fault_logged(
-                                SoapOutcome::fault709(),
-                                persist,
-                                &call,
-                                req.user_agent().unwrap_or("-"),
-                            );
-                        }
-                        Err(_) => Vec::new(),
-                    };
-                    match cat.page_children(&oid, 0, usize::MAX) {
-                        Some((mut all, _)) => {
-                            let order = default_order(client);
-                            // Empty SortCriteria + folders-first already matches
-                            // page_children (and Recent mtime-desc). Re-sort only
-                            // for client keys or FORCE_SORT / LG defaults.
-                            if !sort.is_empty() || order != DefaultOrder::FoldersFirst {
-                                sort_catalog_children(&mut all, &sort, order);
+                    let sort = direct_sort.as_deref().unwrap_or_default();
+                    let displayed_total = cat.page_children(&oid, 0, 0).map(|(_, total)| total);
+                    if let Some((objects, total)) = db_page.as_ref().and_then(|page| {
+                        (Some(page.total) == displayed_total)
+                            .then(|| {
+                                materialize_db_page(&cat, page).map(|items| (items, page.total))
+                            })
+                            .flatten()
+                    }) {
+                        (
+                            objects
+                                .into_iter()
+                                .map(|child| {
+                                    self.to_didl_ref(child, &cat, client, ua, &filter_bits)
+                                })
+                                .collect(),
+                            total,
+                        )
+                    } else if sort.is_empty() && order == DefaultOrder::FoldersFirst {
+                        match cat.page_children(&oid, start, take) {
+                            Some((objects, total)) => (
+                                objects
+                                    .iter()
+                                    .map(|child| {
+                                        self.to_didl_ref(
+                                            catalog_child_as_ref(child),
+                                            &cat,
+                                            client,
+                                            ua,
+                                            &filter_bits,
+                                        )
+                                    })
+                                    .collect(),
+                                total,
+                            ),
+                            None => {
+                                return soap_fault_logged(
+                                    SoapOutcome::fault701(),
+                                    persist,
+                                    &call,
+                                    req.user_agent().unwrap_or("-"),
+                                );
                             }
-                            let total = all.len() as u32;
-                            let page: Vec<_> = all.into_iter().skip(start).take(take).collect();
-                            (page, total)
                         }
-                        None => {
-                            return soap_fault_logged(
-                                SoapOutcome::fault701(),
-                                persist,
-                                &call,
-                                req.user_agent().unwrap_or("-"),
-                            );
+                    } else {
+                        match sorted_child_page(&cat, &oid, start, take, sort, order) {
+                            Some((objects, total)) => (
+                                objects
+                                    .iter()
+                                    .map(|child| {
+                                        self.to_didl_ref(
+                                            catalog_child_as_ref(child),
+                                            &cat,
+                                            client,
+                                            ua,
+                                            &filter_bits,
+                                        )
+                                    })
+                                    .collect(),
+                                total,
+                            ),
+                            None => {
+                                return soap_fault_logged(
+                                    SoapOutcome::fault701(),
+                                    persist,
+                                    &call,
+                                    req.user_agent().unwrap_or("-"),
+                                );
+                            }
                         }
                     }
-                };
-                let slice: Vec<_> = page
-                    .iter()
-                    .map(|ch| self.snapshot_didl(ch, &cat))
-                    .collect();
-                (slice, total)
+                }
             };
-            let (slice, total) = prepared;
-            let didl: Vec<DidlObject> = slice
-                .into_iter()
-                .map(|snap| {
-                    let mut o = self.to_didl_snap(snap, client, ua, &filter_bits);
+            if remapped_root {
+                for object in &mut didl {
                     // rustyDLNA magic container parentid_sql = "0": children of
                     // remapped root are advertised with parentID of the requested id.
-                    if remapped_root {
-                        o.parent_id = oid_raw.to_string();
-                    }
-                    o
-                })
-                .collect();
-            let xml = build_browse(
+                    object.parent_id = oid_raw.to_string();
+                }
+            }
+            let (xml, returned) = build_browse_bounded(
                 false,
                 &didl,
-                didl.len() as u32,
                 total,
                 self.update_id.load(Ordering::Relaxed),
                 &filter_bits,
+                MAX_SOAP_RESPONSE_BYTES,
             );
             tracing::info!(
                 ua = req.user_agent().unwrap_or("-"),
                 oid = oid_raw,
                 flag,
-                n = didl.len(),
+                n = returned,
+                candidates = didl.len(),
+                total,
                 "SOAP Browse"
             );
             // rustyDLNA closes SOAP; libupnp keep-alive + our parser has
@@ -730,6 +1077,14 @@ impl App {
                 req.user_agent().unwrap_or("-"),
             );
         }
+        let Some(scope_raw) = call.object_id.as_deref().filter(|id| !id.is_empty()) else {
+            return soap_fault_logged(
+                SoapOutcome::fault402(),
+                persist,
+                &call,
+                req.user_agent().unwrap_or("-"),
+            );
+        };
         let ua = req.user_agent();
         let sort = match sort_or_709(call.sort_criteria.as_deref(), client) {
             Ok(s) => s,
@@ -743,90 +1098,105 @@ impl App {
             }
             Err(_) => Vec::new(),
         };
-        let clauses = parse_search_criteria(call.search_criteria.as_deref());
+        let clauses = match try_parse_search_criteria(call.search_criteria.as_deref()) {
+            Ok(clauses) => clauses,
+            Err(error) => {
+                tracing::info!(%error, "invalid SearchCriteria");
+                return soap_fault_logged(
+                    SoapOutcome::fault708(),
+                    persist,
+                    &call,
+                    req.user_agent().unwrap_or("-"),
+                );
+            }
+        };
         let start = call.starting_index as usize;
         let take = if call.requested_count == 0 {
-            usize::MAX
+            MAX_SOAP_PAGE_OBJECTS
         } else {
-            call.requested_count as usize
+            (call.requested_count as usize).min(MAX_SOAP_PAGE_OBJECTS)
         };
-        let (slice, total) = {
-            let cat = self.catalog.read().expect("catalog");
-            let scope = self.remap_object_id(call.object_id.as_deref().unwrap_or("0"), client);
-            let scoped = search_scope(&cat, &scope);
-            let mut hits: Vec<CatalogChild> = Vec::new();
-            for c in cat.containers.values() {
-                if c.object_id == rusty_dlna_protocol::object_id::ROOT_ID {
-                    continue;
+        let scope = self.remap_object_id(scope_raw, client);
+        let order = default_order(client);
+        let query = catalog_query(&clauses, &sort, order);
+        let db_page = query_db_search(
+            self.db_pool.as_ref(),
+            self.scan_cfg.db_path.as_deref(),
+            &scope,
+            &query,
+            start,
+            take,
+        );
+        let (didl, total) = {
+            let cat = read_recover(&self.catalog);
+            if let Some(page) = db_page.as_ref() {
+                if let Some(objects) = materialize_db_page(&cat, page) {
+                    let didl = objects
+                        .into_iter()
+                        .map(|child| self.to_didl_ref(child, &cat, client, ua, &filter_bits))
+                        .collect();
+                    (didl, page.total)
+                } else {
+                    search_memory_page(
+                        self,
+                        &cat,
+                        &scope,
+                        &clauses,
+                        &sort,
+                        order,
+                        start,
+                        take,
+                        client,
+                        ua,
+                        &filter_bits,
+                    )
                 }
-                if !scoped.contains(&c.object_id) {
-                    continue;
-                }
-                let row = container_search_row(c);
-                if row_matches(&clauses, &row) {
-                    hits.push(CatalogChild::Container(c.clone()));
-                }
+            } else {
+                search_memory_page(
+                    self,
+                    &cat,
+                    &scope,
+                    &clauses,
+                    &sort,
+                    order,
+                    start,
+                    take,
+                    client,
+                    ua,
+                    &filter_bits,
+                )
             }
-            for it in cat.items.values() {
-                if !item_in_scope(it, &scoped) {
-                    continue;
-                }
-                let row = item_search_row(it);
-                if row_matches(&clauses, &row) {
-                    hits.push(CatalogChild::Item(it.clone()));
-                }
-            }
-            sort_catalog_children(&mut hits, &sort, default_order(client));
-            let total = hits.len() as u32;
-            let page: Vec<_> = hits
-                .into_iter()
-                .skip(start)
-                .take(take)
-                .map(|ch| self.snapshot_didl(&ch, &cat))
-                .collect();
-            (page, total)
         };
-        let didl: Vec<DidlObject> = slice
-            .into_iter()
-            .map(|snap| self.to_didl_snap(snap, client, ua, &filter_bits))
-            .collect();
-        let xml = build_browse(
+        let (xml, returned) = build_browse_bounded(
             true,
             &didl,
-            didl.len() as u32,
             total,
             self.update_id.load(Ordering::Relaxed),
             &filter_bits,
+            MAX_SOAP_RESPONSE_BYTES,
+        );
+        tracing::info!(
+            ua = req.user_agent().unwrap_or("-"),
+            n = returned,
+            candidates = didl.len(),
+            total,
+            "SOAP Search"
         );
         let mut r = HttpResponse::xml(200, xml, false);
         r.persist = false;
         r
     }
 
-    fn snapshot_didl(&self, ch: &CatalogChild, cat: &Catalog) -> DidlSnap {
-        match ch {
-            CatalogChild::Container(c) => DidlSnap {
-                child: ch.clone(),
-                child_count: Some(cat.displayed_child_count(&c.object_id)),
-                child_container_count: Some(cat.displayed_container_count(&c.object_id)),
-            },
-            CatalogChild::Item(_) => DidlSnap {
-                child: ch.clone(),
-                child_count: None,
-                child_container_count: None,
-            },
-        }
-    }
-
-    fn to_didl_snap(
+    fn to_didl_ref(
         &self,
-        snap: DidlSnap,
+        child: CatalogChildRef<'_>,
+        cat: &Catalog,
         client: &ClientProfile,
         ua: Option<&str>,
         bits: &FilterBits,
     ) -> DidlObject {
-        match snap.child {
-            CatalogChild::Container(c) => {
+        match child {
+            CatalogChildRef::Container(c) => {
                 let av = match c.object_id.chars().next() {
                     Some('1') => Some('M'),
                     Some('2') => Some('V'),
@@ -843,15 +1213,15 @@ impl App {
                     vec![]
                 };
                 DidlObject {
-                    id: c.object_id,
-                    parent_id: c.parent_id,
-                    title: c.title,
-                    class: c.class,
+                    id: c.object_id.clone(),
+                    parent_id: c.parent_id.clone(),
+                    title: c.title.clone(),
+                    class: c.class.clone(),
                     date: None,
                     restricted: true,
                     searchable: Some(c.searchable),
-                    child_count: snap.child_count,
-                    child_container_count: snap.child_container_count,
+                    child_count: Some(cat.displayed_child_count(&c.object_id)),
+                    child_container_count: Some(cat.displayed_container_count(&c.object_id)),
                     is_container: true,
                     resources: vec![],
                     album_art_uri: None,
@@ -874,10 +1244,15 @@ impl App {
                     av_media_class: av,
                 }
             }
-            CatalogChild::Item(it) => {
+            CatalogChildRef::Item(it) => {
                 let date = w3c_normalize_date(&it.date);
                 let art_url = (it.album_art > 0).then(|| {
-                    album_art_url(&self.advertise_ip, self.http_port, it.album_art, it.detail_id)
+                    album_art_url(
+                        &self.advertise_ip,
+                        self.http_port,
+                        it.album_art,
+                        it.detail_id,
+                    )
                 });
                 let audio = it.class.contains("audio");
                 let video = it.class.contains("video");
@@ -903,15 +1278,9 @@ impl App {
                 };
                 let last_playback_position = (it.bookmark_sec > 0).then_some(pos);
                 let playback_count = (it.watch_count > 0).then_some(it.watch_count);
-                let dcm_info = (bits.sec && it.bookmark_sec > 0).then(|| {
-                    format!("CREATIONDATE=0,FOLDER={},BM={}", it.title, pos)
-                });
-                let title = apply_title_hack(
-                    &it.title,
-                    &it.ext,
-                    client,
-                    !it.captions.is_empty(),
-                );
+                let dcm_info = (bits.sec && it.bookmark_sec > 0)
+                    .then(|| format!("CREATIONDATE=0,FOLDER={},BM={}", it.title, pos));
+                let title = apply_title_hack(&it.title, &it.ext, client, !it.captions.is_empty());
                 DidlObject {
                     id: it.object_id.clone(),
                     parent_id: it.parent_id.clone(),
@@ -923,7 +1292,7 @@ impl App {
                     child_count: None,
                     child_container_count: None,
                     is_container: false,
-                    resources: self.item_resources(&it, client, ua, bits),
+                    resources: self.item_resources(it, client, ua, bits),
                     album_art_uri: if audio { art_url } else { None },
                     album_art_profile: audio && client_wants_art_profile(client),
                     creator: it.creator.clone(),
@@ -957,12 +1326,30 @@ impl App {
         let Some(oid) = call.object_id.as_deref().filter(|s| !s.is_empty()) else {
             return soap_fault_logged(SoapOutcome::fault402(), persist, call, ua);
         };
+        let Some(pos) = call.pos_second else {
+            return soap_fault_logged(SoapOutcome::fault402(), persist, call, ua);
+        };
         let Some(detail_id) = self.resolve_detail_id(oid, client) else {
             return soap_fault_logged(SoapOutcome::fault701(), persist, call, ua);
         };
-        let pos = call.pos_second.unwrap_or(0);
         let sec = bookmark_seconds(pos, client.flags.contains(ClientFlags::CONVERT_MS));
-        self.persist_bookmark(detail_id, Some(sec), None);
+        if let Err(error) = self.persist_bookmark(detail_id, Some(sec), None) {
+            tracing::error!(
+                target: "rusty_dlna",
+                %error,
+                detail_id,
+                action = "X_SetBookmark",
+                "playback bookmark persistence failed"
+            );
+            return soap_fault_logged(SoapOutcome::fault501(), persist, call, ua);
+        }
+        tracing::info!(
+            target: "rusty_dlna",
+            detail_id,
+            position_seconds = sec,
+            client = client.name,
+            "playback bookmark updated"
+        );
         soap_outcome_http(
             SoapOutcome::Ok(empty_cd_response("X_SetBookmark")),
             persist,
@@ -981,20 +1368,81 @@ impl App {
         let Some(oid) = call.object_id.as_deref().filter(|s| !s.is_empty()) else {
             return soap_fault_logged(SoapOutcome::fault402(), persist, call, ua);
         };
+        let (Some(current), Some(new)) = (
+            call.current_tag_value.as_deref(),
+            call.new_tag_value.as_deref(),
+        ) else {
+            return soap_fault_logged(SoapOutcome::fault402(), persist, call, ua);
+        };
         let Some(detail_id) = self.resolve_detail_id(oid, client) else {
             return soap_fault_logged(SoapOutcome::fault701(), persist, call, ua);
         };
-        let tags = parse_update_object_tags(
-            call.current_tag_value.as_deref(),
-            call.new_tag_value.as_deref(),
-        );
+        let tags = match parse_update_object_tags(current, new) {
+            Ok(tags) => tags,
+            Err(UpdateObjectParseError::InvalidCurrent) => {
+                return soap_fault_logged(SoapOutcome::fault702(), persist, call, ua);
+            }
+            Err(UpdateObjectParseError::InvalidNew) => {
+                return soap_fault_logged(SoapOutcome::fault703(), persist, call, ua);
+            }
+            Err(UpdateObjectParseError::ReadOnlyTag) => {
+                return soap_fault_logged(SoapOutcome::fault705(), persist, call, ua);
+            }
+            Err(UpdateObjectParseError::ParameterMismatch) => {
+                return soap_fault_logged(SoapOutcome::fault706(), persist, call, ua);
+            }
+        };
         let convert_ms = client.flags.contains(ClientFlags::CONVERT_MS);
         // -1 / values < 30 store as 0 (clear). Do not map -1 to None —
         // that leaves BOOKMARKS.SEC unchanged.
+        // CurrentTagValue is a concurrency token, so only unit conversion is
+        // valid here. Applying the under-30-seconds storage normalization
+        // would incorrectly make stale values such as 1 match stored zero.
+        let expected_sec = tags.last_playback_position.map(|value| {
+            if convert_ms {
+                value.current / 1000
+            } else {
+                value.current
+            }
+        });
         let sec = tags
             .last_playback_position
-            .map(|pos| bookmark_seconds(pos, convert_ms));
-        self.persist_bookmark(detail_id, sec, tags.playback_count);
+            .map(|value| bookmark_seconds(value.new, convert_ms));
+        let expected_watch = tags.playback_count.map(|value| value.current);
+        let watch = tags.playback_count.map(|value| value.new);
+        match self.persist_bookmark_if_current(detail_id, expected_sec, sec, expected_watch, watch)
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    target: "rusty_dlna",
+                    detail_id,
+                    position_seconds = ?expected_sec,
+                    playback_count = ?expected_watch,
+                    client = client.name,
+                    "UpdateObject rejected stale CurrentTagValue"
+                );
+                return soap_fault_logged(SoapOutcome::fault702(), persist, call, ua);
+            }
+            Err(error) => {
+                tracing::error!(
+                    target: "rusty_dlna",
+                    %error,
+                    detail_id,
+                    action = "UpdateObject",
+                    "playback bookmark persistence failed"
+                );
+                return soap_fault_logged(SoapOutcome::fault501(), persist, call, ua);
+            }
+        }
+        tracing::info!(
+            target: "rusty_dlna",
+            detail_id,
+            position_seconds = ?sec,
+            playback_count = ?watch,
+            client = client.name,
+            "playback bookmark updated"
+        );
         soap_outcome_http(
             SoapOutcome::Ok(empty_cd_response("UpdateObject")),
             persist,
@@ -1028,43 +1476,130 @@ impl App {
 
     /// Catalog item by object id, `REF_ID` alias, magic container, or detail id.
     fn resolve_detail_id(&self, oid_raw: &str, client: &ClientProfile) -> Option<i64> {
-        let oid = magic_object_id(oid_raw, client);
-        let cat = self.catalog.read().ok()?;
-        if let Some(it) = cat.items.get(oid_raw).or_else(|| cat.items.get(&oid)) {
+        let normalized = normalize_soap_object_id(oid_raw)?;
+        let oid = magic_object_id(&normalized, client);
+        let cat = read_recover(&self.catalog);
+        if let Some(it) = cat.items.get(&normalized).or_else(|| cat.items.get(&oid)) {
             return Some(it.detail_id);
         }
-        match cat.metadata(oid_raw).or_else(|| cat.metadata(&oid)) {
+        match cat.metadata(&normalized).or_else(|| cat.metadata(&oid)) {
             Some(CatalogChild::Item(it)) => Some(it.detail_id),
             _ => None,
         }
     }
 
-    fn persist_bookmark(&self, detail_id: i64, sec: Option<i64>, watch: Option<i64>) {
+    fn persist_bookmark(
+        &self,
+        detail_id: i64,
+        sec: Option<i64>,
+        watch: Option<i64>,
+    ) -> rusqlite::Result<()> {
         if sec.is_none() && watch.is_none() {
-            return;
+            return Ok(());
         }
-        if let Some(path) = self.scan_cfg.db_path.as_ref() {
-            if let Ok(db) = LibraryDb::open(path) {
+        // Serialize bookmark publication with catalog replacement so the
+        // catalog, persisted SystemUpdateID, and event body describe one
+        // generation. Kodi caches Browse results and invalidates them from
+        // ContainerUpdateIDs rather than SystemUpdateID alone.
+        let mut cat = write_recover(&self.catalog);
+        let update_id = self.update_id.load(Ordering::Relaxed).saturating_add(1);
+        if let Some(pool) = self.db_pool.as_ref() {
+            pool.write(|db| {
+                let transaction = db.transaction()?;
+                db.update_bookmark(detail_id, sec, watch)?;
+                db.set_update_id(update_id)?;
+                transaction.commit()
+            })?;
+        }
+        let mut parent_ids = std::collections::BTreeSet::new();
+        for it in cat.items.values_mut() {
+            if it.detail_id == detail_id {
+                parent_ids.insert(it.parent_id.clone());
                 if let Some(s) = sec {
-                    let _ = db.set_bookmark(detail_id, s);
+                    it.bookmark_sec = s;
                 }
                 if let Some(w) = watch {
-                    let _ = db.set_watch_count(detail_id, w);
+                    it.watch_count = w;
                 }
             }
         }
-        if let Ok(mut cat) = self.catalog.write() {
-            for it in cat.items.values_mut() {
-                if it.detail_id == detail_id {
-                    if let Some(s) = sec {
-                        it.bookmark_sec = s;
-                    }
-                    if let Some(w) = watch {
-                        it.watch_count = w;
-                    }
+        self.update_id.store(update_id, Ordering::Relaxed);
+        drop(cat);
+        let parent_ids = parent_ids.into_iter().collect::<Vec<_>>();
+        events::notify_content_dir_containers(
+            &self.events,
+            &self.notify_dispatcher,
+            update_id,
+            &parent_ids,
+        );
+        Ok(())
+    }
+
+    /// Atomically apply Kodi's `UpdateObject` values only when every supplied
+    /// current value still matches the persisted state.
+    fn persist_bookmark_if_current(
+        &self,
+        detail_id: i64,
+        expected_sec: Option<i64>,
+        sec: Option<i64>,
+        expected_watch: Option<i64>,
+        watch: Option<i64>,
+    ) -> rusqlite::Result<bool> {
+        let mut cat = write_recover(&self.catalog);
+        let update_id = self.update_id.load(Ordering::Relaxed).saturating_add(1);
+        if let Some(pool) = self.db_pool.as_ref() {
+            let applied = pool.write(|db| {
+                let transaction = db.transaction()?;
+                let (current_sec, current_watch) = db.get_bookmark(detail_id)?.unwrap_or((0, 0));
+                if expected_sec.is_some_and(|expected| expected != current_sec)
+                    || expected_watch.is_some_and(|expected| expected != current_watch)
+                {
+                    return Ok(false);
+                }
+                db.update_bookmark(detail_id, sec, watch)?;
+                db.set_update_id(update_id)?;
+                transaction.commit()?;
+                Ok(true)
+            })?;
+            if !applied {
+                return Ok(false);
+            }
+        } else {
+            let current = cat
+                .items
+                .values()
+                .find(|item| item.detail_id == detail_id)
+                .map(|item| (item.bookmark_sec, item.watch_count))
+                .unwrap_or((0, 0));
+            if expected_sec.is_some_and(|expected| expected != current.0)
+                || expected_watch.is_some_and(|expected| expected != current.1)
+            {
+                return Ok(false);
+            }
+        }
+
+        let mut parent_ids = std::collections::BTreeSet::new();
+        for item in cat.items.values_mut() {
+            if item.detail_id == detail_id {
+                parent_ids.insert(item.parent_id.clone());
+                if let Some(sec) = sec {
+                    item.bookmark_sec = sec;
+                }
+                if let Some(watch) = watch {
+                    item.watch_count = watch;
                 }
             }
         }
+        self.update_id.store(update_id, Ordering::Relaxed);
+        drop(cat);
+        let parent_ids = parent_ids.into_iter().collect::<Vec<_>>();
+        events::notify_content_dir_containers(
+            &self.events,
+            &self.notify_dispatcher,
+            update_id,
+            &parent_ids,
+        );
+        Ok(true)
     }
 
     /// Browse and GET /Transcode: DETAILS row only. No ffprobe, no cache toml.
@@ -1085,12 +1620,7 @@ impl App {
             it.creator.as_deref(),
             it.dlna_pn.as_deref(),
         );
-        let orig_url = media_item_url(
-            &self.advertise_ip,
-            self.http_port,
-            it.detail_id,
-            &it.ext,
-        );
+        let orig_url = media_item_url(&self.advertise_ip, self.http_port, it.detail_id, &it.ext);
         let dlna = client.flags.contains(ClientFlags::DLNA);
         let skip = client.flags.contains(ClientFlags::SKIP_DLNA_PN);
         let mut bitrate = it.bitrate;
@@ -1118,7 +1648,7 @@ impl App {
             probe.width,
             probe.height,
         );
-        let plan = decide_for(client, ua, &src, &self.remaps);
+        let plan = self.transcode_plan(client, ua, &src);
         if plan.decision == Decision::Recode {
             tracing::debug!(
                 title = %it.title,
@@ -1225,18 +1755,11 @@ impl App {
         if plan.decision != Decision::Recode {
             // Extra CI=1 rows inspect the stored mime/PN. Sony BDP HTTP remaps
             // mkv/mpeg → divx after this, so do not pass the remapped type here.
-            for (emime, info) in extra_ci1_protocol_infos(
-                client.kind,
-                &it.mime,
-                it.dlna_pn.as_deref(),
-            ) {
+            for (emime, info) in
+                extra_ci1_protocol_infos(client.kind, &it.mime, it.dlna_pn.as_deref())
+            {
                 res.push(DidlRes {
-                    url: media_item_url(
-                        &self.advertise_ip,
-                        self.http_port,
-                        it.detail_id,
-                        &it.ext,
-                    ),
+                    url: media_item_url(&self.advertise_ip, self.http_port, it.detail_id, &it.ext),
                     protocol_info: format!("http-get:*:{emime}:{info}"),
                     size: Some(it.size),
                     duration: it.duration.clone(),
@@ -1306,13 +1829,7 @@ impl App {
         let Some(id) = id else {
             return HttpResponse::html(404, "Not Found", "bad id");
         };
-        let Some(item) = self
-            .catalog
-            .read()
-            .expect("catalog")
-            .get_item_by_detail(id)
-            .cloned()
-        else {
+        let Some(item) = read_recover(&self.catalog).get_item_by_detail(id).cloned() else {
             return HttpResponse::html(404, "Not Found", "no such object");
         };
         let client = self.identify_peer(req, peer);
@@ -1335,7 +1852,7 @@ impl App {
                 probe.width,
                 probe.height,
             );
-            let plan = decide_for(client, req.user_agent(), &src, &self.remaps);
+            let plan = self.transcode_plan(client, req.user_agent(), &src);
             if plan.decision != Decision::Recode {
                 // Same DETAILS row as Browse. Serve original instead of 404
                 // if a client still has a leftover /Transcode/ URL.
@@ -1346,47 +1863,62 @@ impl App {
                     "transcode GET serves original"
                 );
             } else {
-            let src_path = rusty_dlna_scan::rebase_media_path(&item.path, &self.scan_cfg.media_dirs);
-            if !src_path.is_file() {
-                tracing::error!(path = %src_path.display(), title = %item.title, "media missing");
-                return HttpResponse::html(404, "Not Found", "missing file");
-            }
-            let mut plan = plan;
-            plan.audio_index = pick_audio_index(&probe.audio);
-            let dest = cache_dest(&self.cache_dir, item.detail_id, plan.action);
-            let part = cache_part(&dest);
-            let remux_p8 = plan.action == RecodeAction::RemuxP8;
-            let grow_plan = if remux_p8 {
-                hdr10_fallback_plan(&plan)
-            } else {
-                plan.clone()
-            };
-            tracing::info!(
-                title = %item.title,
-                hdr = %probe.hdr,
-                rule = plan.rule.as_deref().unwrap_or("-"),
-                remux_p8,
-                audio_index = plan.audio_index,
-                method = %req.method,
-                range = req.header("Range").unwrap_or("-"),
-                ua = req.user_agent().unwrap_or("-"),
-                dest = %dest.display(),
-                "transcode GET"
-            );
-            let mut r = live_transcode_response("video/mp4");
-            r.remux_job = Some(RemuxJobSpec {
-                detail_id: item.detail_id,
-                src: src_path.clone(),
-                dest: dest.clone(),
-                args: ffmpeg_grow_args(
-                    &src_path.to_string_lossy(),
-                    &part.to_string_lossy(),
-                    &grow_plan,
-                ),
-                remux_p8,
-                audio_index: plan.audio_index,
-            });
-            return r;
+                let src_path =
+                    rusty_dlna_scan::rebase_media_path_for_config(&item.path, &self.scan_cfg);
+                if !rusty_dlna_scan::path_is_allowed_file(&src_path, &self.scan_cfg) {
+                    tracing::error!(path = %src_path.display(), title = %item.title, "media missing");
+                    return HttpResponse::html(404, "Not Found", "missing file");
+                }
+                let mut plan = plan;
+                plan.audio_index =
+                    pick_audio_index_from_streams(&probe.audio_streams, &probe.audio);
+                let remux_p8 = plan.action == RecodeAction::RemuxP8;
+                let Some(cache_key) = transcode_cache_key(&src_path, &plan, remux_p8) else {
+                    return HttpResponse::html(
+                        500,
+                        "Internal Server Error",
+                        "cannot fingerprint transcode source",
+                    );
+                };
+                let dest =
+                    cache_dest_for_key(&self.cache_dir, item.detail_id, plan.action, &cache_key);
+                let part = cache_part(&dest);
+                let grow_plan = if remux_p8 {
+                    hdr10_fallback_plan(&plan)
+                } else {
+                    plan.clone()
+                };
+                tracing::info!(
+                    title = %item.title,
+                    hdr = %probe.hdr,
+                    rule = plan.rule.as_deref().unwrap_or("-"),
+                    remux_p8,
+                    audio_index = plan.audio_index,
+                    method = %req.method,
+                    range = req.header("Range").unwrap_or("-"),
+                    ua = req.user_agent().unwrap_or("-"),
+                    dest = %dest.display(),
+                    "transcode GET"
+                );
+                let args = ffmpeg_grow_os_args(&src_path, &part, &grow_plan);
+                let job_key = format!("{}:{cache_key}:{args:?}", item.detail_id);
+                let mut r = live_transcode_response("video/mp4");
+                r.remux_job = Some(RemuxJobSpec {
+                    detail_id: item.detail_id,
+                    job_key,
+                    cache_key,
+                    src: src_path.clone(),
+                    dest: dest.clone(),
+                    args,
+                    remux_p8,
+                    audio_index: plan.audio_index,
+                    audio: match plan.audio {
+                        AudioAction::Copy => RemuxAudio::Copy,
+                        AudioAction::ToAc3 => RemuxAudio::Ac3,
+                        AudioAction::ToAac => RemuxAudio::Aac,
+                    },
+                });
+                return r;
             }
         }
         let mime = remap_mime_full(
@@ -1398,9 +1930,8 @@ impl App {
         let skip = client.flags.contains(ClientFlags::SKIP_DLNA_PN);
         let pn = if skip { None } else { item.dlna_pn.clone() };
         let ci = 0u8;
-        let path = rusty_dlna_scan::rebase_media_path(&item.path, &self.scan_cfg.media_dirs);
-        if path.exists() && !rusty_dlna_scan::path_is_under_roots(&path, &self.scan_cfg.media_dirs)
-        {
+        let path = rusty_dlna_scan::rebase_media_path_for_config(&item.path, &self.scan_cfg);
+        if path.exists() && !rusty_dlna_scan::path_is_allowed_file(&path, &self.scan_cfg) {
             return HttpResponse::html(403, "Forbidden", "path escaped media dir");
         }
         let strict = dlna_strict(req);
@@ -1451,17 +1982,33 @@ impl App {
         } else {
             None
         };
-        if span > RAM_CAP {
-            let mut r = media_response(
-                &self.server,
-                &now_imf_date(),
-                &mime,
+        if req.method.eq_ignore_ascii_case("HEAD") {
+            let mut r = media_response(MediaResponseOptions {
+                server: &self.server,
+                date: &now_imf_date(),
+                mime: &mime,
                 size,
                 range,
-                Vec::new(),
-                pn.as_deref(),
+                body: Vec::new(),
+                pn: pn.as_deref(),
                 ci,
-            );
+            });
+            if let Some(url) = caption_sec.as_deref() {
+                set_caption_info_sec(&mut r, url);
+            }
+            return r;
+        }
+        if span > RAM_CAP {
+            let mut r = media_response(MediaResponseOptions {
+                server: &self.server,
+                date: &now_imf_date(),
+                mime: &mime,
+                size,
+                range,
+                body: Vec::new(),
+                pn: pn.as_deref(),
+                ci,
+            });
             if let Some(url) = caption_sec.as_deref() {
                 set_caption_info_sec(&mut r, url);
             }
@@ -1472,20 +2019,38 @@ impl App {
             Ok(b) => b,
             Err(e) => return HttpResponse::html(500, "Internal Server Error", &e.to_string()),
         };
-        let mut r = media_response(
-            &self.server,
-            &now_imf_date(),
-            &mime,
+        let mut r = media_response(MediaResponseOptions {
+            server: &self.server,
+            date: &now_imf_date(),
+            mime: &mime,
             size,
             range,
             body,
-            pn.as_deref(),
+            pn: pn.as_deref(),
             ci,
-        );
+        });
         if let Some(url) = caption_sec.as_deref() {
             set_caption_info_sec(&mut r, url);
         }
         r
+    }
+
+    fn transcode_plan(
+        &self,
+        client: &ClientProfile,
+        ua: Option<&str>,
+        src: &rusty_dlna_transcode::SourceMedia,
+    ) -> TranscodePlan {
+        if !self.cfg.transcode.enable {
+            return TranscodePlan::default();
+        }
+        decide_for_with_default_encoder(
+            client,
+            ua,
+            src,
+            &self.remaps,
+            Some(&self.cfg.transcode.encoder),
+        )
     }
 
     fn album_art(&self, req: &HttpRequest) -> HttpResponse {
@@ -1506,16 +2071,16 @@ impl App {
             return HttpResponse::html(406, "Not Acceptable", "Streaming not allowed on image");
         }
         let path = {
-            let cat = self.catalog.read().expect("catalog");
+            let cat = read_recover(&self.catalog);
             cat.album_art_paths.get(&art_id).cloned()
         };
         let Some(path) = path else {
             return HttpResponse::html(404, "Not Found", "no such art");
         };
-        let path = rusty_dlna_scan::rebase_media_path(&path, &self.scan_cfg.media_dirs);
+        let path = rusty_dlna_scan::rebase_media_path_for_config(&path, &self.scan_cfg);
         let body = match self.read_sidecar(&path) {
             Ok(b) => b,
-            Err(r) => return r,
+            Err(r) => return *r,
         };
         let mut r = HttpResponse::new(200, "OK");
         r.set("Content-Type", "image/jpeg");
@@ -1537,13 +2102,7 @@ impl App {
         if req.header("Range").is_some() || streaming_on_image(req, "image/jpeg") {
             return HttpResponse::html(406, "Not Acceptable", "Streaming/Range on image");
         }
-        let Some(item) = self
-            .catalog
-            .read()
-            .expect("catalog")
-            .get_item_by_detail(id)
-            .cloned()
-        else {
+        let Some(item) = read_recover(&self.catalog).get_item_by_detail(id).cloned() else {
             return HttpResponse::html(404, "Not Found", "no item");
         };
         if item.album_art <= 0 {
@@ -1564,35 +2123,100 @@ impl App {
             return HttpResponse::html(406, "Not Acceptable", "Streaming/Range on image");
         }
         let (w, h) = parse_resize_query(&req.query);
-        let Some(item) = self
-            .catalog
-            .read()
-            .expect("catalog")
-            .get_item_by_detail(id)
-            .cloned()
-        else {
+        let Some(item) = read_recover(&self.catalog).get_item_by_detail(id).cloned() else {
             return HttpResponse::html(404, "Not Found", "no item");
         };
         let src = if item.mime.starts_with("image/") {
-            rusty_dlna_scan::rebase_media_path(&item.path, &self.scan_cfg.media_dirs)
+            rusty_dlna_scan::rebase_media_path_for_config(&item.path, &self.scan_cfg)
         } else if item.album_art > 0 {
             let p = {
-                let cat = self.catalog.read().expect("catalog");
+                let cat = read_recover(&self.catalog);
                 cat.album_art_paths.get(&item.album_art).cloned()
             };
             let Some(p) = p else {
                 return HttpResponse::html(404, "Not Found", "no art");
             };
-            rusty_dlna_scan::rebase_media_path(&p, &self.scan_cfg.media_dirs)
+            rusty_dlna_scan::rebase_media_path_for_config(&p, &self.scan_cfg)
         } else {
             return HttpResponse::html(404, "Not Found", "nothing to resize");
         };
-        let dest = self.cache_dir.join(format!("resized-{id}-{w}x{h}.jpg"));
-        if !dest.is_file() && !rusty_dlna_scan::scale_jpeg(&src, &dest, w, h) {
+        if !rusty_dlna_scan::path_is_allowed_file(&src, &self.scan_cfg) {
+            return HttpResponse::html(404, "Not Found", "resize source escaped");
+        }
+        let pixels = u64::from(w).checked_mul(u64::from(h));
+        if w > self.cfg.derived_image_max_dimension
+            || h > self.cfg.derived_image_max_dimension
+            || matches!(pixels, Some(pixels) if pixels > self.cfg.derived_image_max_pixels)
+        {
+            return HttpResponse::html(400, "Bad Request", "resize exceeds configured limits");
+        }
+        let Some(source_pixels) = rusty_dlna_scan::probe_image_with_timeout(
+            &src,
+            Duration::from_secs(self.cfg.derived_image_timeout_secs),
+        )
+        .and_then(|image| u64::from(image.probe.width).checked_mul(u64::from(image.probe.height))) else {
+            return HttpResponse::html(404, "Not Found", "resize source is not a valid image");
+        };
+        if source_pixels == 0 || source_pixels > self.cfg.derived_image_max_pixels {
+            return HttpResponse::html(
+                413,
+                "Payload Too Large",
+                "source image exceeds pixel limit",
+            );
+        }
+        let Some(identity) = source_identity(&src) else {
+            return HttpResponse::html(404, "Not Found", "resize source missing");
+        };
+        let key = derived_image_key(
+            &identity,
+            w,
+            h,
+            self.cfg.derived_image_quality,
+            item.rotation.unwrap_or(0),
+        );
+        let derived_dir = self.cache_dir.join("derived-images");
+        if let Err(error) = prune_derived_image_cache(
+            &derived_dir,
+            self.cfg.derived_image_cache_mb * 1024 * 1024,
+            self.cfg.derived_image_cache_age_days,
+            self.cfg.cache_min_free_mb * 1024 * 1024,
+        ) {
+            tracing::warn!(%error, "cannot maintain derived-image cache");
+            return HttpResponse::html(507, "Insufficient Storage", "image cache limits");
+        }
+        let dest = derived_dir.join(format!("{key}.jpg"));
+        let stripe = derived_image_lock_index(&key, self.derived_image_locks.len());
+        let _guard = self.derived_image_locks[stripe]
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !dest.is_file()
+            && !rusty_dlna_scan::scale_jpeg_with_options_result(
+                &src,
+                &dest,
+                w,
+                h,
+                self.cfg.derived_image_quality,
+                Duration::from_secs(self.cfg.derived_image_timeout_secs),
+                self.cfg.derived_image_memory_mb * 1024 * 1024,
+            )
+            .unwrap_or(false)
+        {
             return HttpResponse::html(404, "Not Found", "resize failed");
+        }
+        if let Err(error) = prune_derived_image_cache(
+            &derived_dir,
+            self.cfg.derived_image_cache_mb * 1024 * 1024,
+            self.cfg.derived_image_cache_age_days,
+            self.cfg.cache_min_free_mb * 1024 * 1024,
+        ) {
+            tracing::warn!(%error, "derived-image cache remains above a configured limit");
+            return HttpResponse::html(507, "Insufficient Storage", "image cache limits");
         }
         match std::fs::read(&dest) {
             Ok(body) => {
+                if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&dest) {
+                    let _ = file.set_modified(std::time::SystemTime::now());
+                }
                 let pn = jpeg_pn_for_size(w, h);
                 let mut r = HttpResponse::new(200, "OK");
                 r.set("Content-Type", "image/jpeg");
@@ -1613,19 +2237,13 @@ impl App {
         let Some((id, idx)) = caption_from_path(&req.path) else {
             return HttpResponse::html(404, "Not Found", "bad caption");
         };
-        let Some(item) = self
-            .catalog
-            .read()
-            .expect("catalog")
-            .get_item_by_detail(id)
-            .cloned()
-        else {
+        let Some(item) = read_recover(&self.catalog).get_item_by_detail(id).cloned() else {
             return HttpResponse::html(404, "Not Found", "no item");
         };
         let Some(cap) = item.captions.iter().find(|c| c.index == idx) else {
             return HttpResponse::html(404, "Not Found", "no caption");
         };
-        let cap_path = rusty_dlna_scan::rebase_media_path(&cap.path, &self.scan_cfg.media_dirs);
+        let cap_path = rusty_dlna_scan::rebase_media_path_for_config(&cap.path, &self.scan_cfg);
         match self.read_sidecar(&cap_path) {
             Ok(body) => {
                 let mut r = HttpResponse::new(200, "OK");
@@ -1634,27 +2252,46 @@ impl App {
                 r.body = body;
                 r
             }
-            Err(r) => r,
+            Err(r) => *r,
         }
     }
 
     /// Art / captions: regular file under media_dir or cache_dir, size-capped.
-    fn read_sidecar(&self, path: &Path) -> Result<Vec<u8>, HttpResponse> {
-        let mut roots = self.scan_cfg.media_dirs.clone();
-        roots.push(self.cache_dir.clone());
-        if !rusty_dlna_scan::path_is_under_roots(path, &roots) {
-            return Err(HttpResponse::html(404, "Not Found", "sidecar escaped"));
+    fn read_sidecar(&self, path: &Path) -> Result<Vec<u8>, Box<HttpResponse>> {
+        let allowed_media = rusty_dlna_scan::path_is_allowed_file(path, &self.scan_cfg);
+        let allowed_cache =
+            rusty_dlna_scan::path_is_under_roots(path, std::slice::from_ref(&self.cache_dir));
+        if !allowed_media && !allowed_cache {
+            return Err(Box::new(HttpResponse::html(
+                404,
+                "Not Found",
+                "sidecar escaped",
+            )));
         }
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
-            Err(_) => return Err(HttpResponse::html(404, "Not Found", "sidecar missing")),
+            Err(_) => {
+                return Err(Box::new(HttpResponse::html(
+                    404,
+                    "Not Found",
+                    "sidecar missing",
+                )))
+            }
         };
         if meta.len() > rusty_dlna_scan::MAX_SIDECAR_BYTES {
-            return Err(HttpResponse::html(413, "Payload Too Large", "sidecar too large"));
+            return Err(Box::new(HttpResponse::html(
+                413,
+                "Payload Too Large",
+                "sidecar too large",
+            )));
         }
         match std::fs::read(path) {
             Ok(b) => Ok(b),
-            Err(_) => Err(HttpResponse::html(404, "Not Found", "sidecar missing")),
+            Err(_) => Err(Box::new(HttpResponse::html(
+                404,
+                "Not Found",
+                "sidecar missing",
+            ))),
         }
     }
 }
@@ -1706,212 +2343,222 @@ fn lookup_arp_mac(ip: Ipv4Addr) -> Option<[u8; 6]> {
     None
 }
 
-fn container_search_row(c: &rusty_dlna_scan::Container) -> SearchRow<'_> {
-    SearchRow {
-        title: &c.title,
-        class: &c.class,
-        id: &c.object_id,
-        parent_id: &c.parent_id,
-        is_container: true,
-        ..SearchRow::default()
-    }
+const MAX_RENDERER_DESCRIPTION_BYTES: usize = 256 * 1024;
+const MAX_RENDERER_HEADER_BYTES: usize = 16 * 1024;
+
+#[derive(Default)]
+struct RendererFetchLimiter {
+    recent_keys: HashMap<String, std::time::Instant>,
+    sender_windows: HashMap<Ipv4Addr, std::collections::VecDeque<std::time::Instant>>,
 }
 
-fn item_search_row(it: &MediaItem) -> SearchRow<'_> {
-    SearchRow {
-        title: &it.title,
-        creator: it.creator.as_deref().unwrap_or(""),
-        date: &it.date,
-        class: &it.class,
-        artist: it.artist.as_deref().unwrap_or(""),
-        genre: it.genre.as_deref().unwrap_or(""),
-        album: it.album.as_deref().unwrap_or(""),
-        id: &it.object_id,
-        parent_id: &it.parent_id,
-        ref_id: it.ref_id.as_deref(),
-        is_container: false,
-        ..SearchRow::default()
-    }
-}
+impl RendererFetchLimiter {
+    fn allow(&mut self, sender: Ipv4Addr, key: &str, now: std::time::Instant) -> bool {
+        const KEY_TTL: Duration = Duration::from_secs(10 * 60);
+        const SENDER_WINDOW: Duration = Duration::from_secs(60);
+        const MAX_PER_SENDER: usize = 4;
 
-fn search_scope(cat: &Catalog, root: &str) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
-    if root.is_empty() || root == rusty_dlna_protocol::object_id::ROOT_ID {
-        for c in cat.containers.keys() {
-            out.insert(c.clone());
+        self.recent_keys
+            .retain(|_, seen| now.saturating_duration_since(*seen) < KEY_TTL);
+        if self.recent_keys.contains_key(key) {
+            return false;
         }
-        for it in cat.items.keys() {
-            out.insert(it.clone());
+        let sender_requests = self.sender_windows.entry(sender).or_default();
+        while sender_requests
+            .front()
+            .is_some_and(|seen| now.saturating_duration_since(*seen) >= SENDER_WINDOW)
+        {
+            sender_requests.pop_front();
         }
-        return out;
-    }
-    let mut stack = vec![root.to_string()];
-    while let Some(id) = stack.pop() {
-        if !out.insert(id.clone()) {
-            continue;
+        if sender_requests.len() >= MAX_PER_SENDER {
+            return false;
         }
-        if let Some(c) = cat.containers.get(&id) {
-            for ch in &c.children {
-                stack.push(ch.clone());
-            }
+        sender_requests.push_back(now);
+        self.recent_keys.insert(key.to_owned(), now);
+        true
+    }
+}
+
+#[derive(Default)]
+struct SsdpReplyLimiter {
+    senders: HashMap<Ipv4Addr, (std::time::Instant, usize)>,
+}
+
+impl SsdpReplyLimiter {
+    fn allow(&mut self, sender: Ipv4Addr, datagrams: usize, now: std::time::Instant) -> bool {
+        const WINDOW: Duration = Duration::from_secs(1);
+        const MAX_DATAGRAMS: usize = 12;
+        self.senders
+            .retain(|_, (start, _)| now.saturating_duration_since(*start) < WINDOW * 2);
+        let entry = self.senders.entry(sender).or_insert((now, 0));
+        if now.saturating_duration_since(entry.0) >= WINDOW {
+            *entry = (now, 0);
         }
-    }
-    for it in cat.items.values() {
-        if out.contains(&it.parent_id) {
-            out.insert(it.object_id.clone());
+        if entry.1.saturating_add(datagrams) > MAX_DATAGRAMS {
+            return false;
         }
-        if let Some(r) = &it.ref_id {
-            if out.contains(r) {
-                out.insert(it.object_id.clone());
-            }
-        }
-    }
-    out
-}
-
-fn item_in_scope(it: &MediaItem, scoped: &std::collections::HashSet<String>) -> bool {
-    scoped.contains(&it.object_id)
-        || scoped.contains(&it.parent_id)
-        || it.ref_id.as_ref().is_some_and(|r| scoped.contains(r))
-}
-
-fn sort_catalog_children(children: &mut [CatalogChild], specs: &[SortSpec], default: DefaultOrder) {
-    children.sort_by(|a, b| cmp_children(a, b, specs, default));
-}
-
-fn cmp_children(
-    a: &CatalogChild,
-    b: &CatalogChild,
-    specs: &[SortSpec],
-    default: DefaultOrder,
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    if !specs.is_empty() {
-        for spec in specs {
-            let ord = cmp_sort_key(a, b, spec.key);
-            let ord = if spec.descending { ord.reverse() } else { ord };
-            if ord != Ordering::Equal {
-                return ord;
-            }
-        }
-        return Ordering::Equal;
-    }
-    match default {
-        DefaultOrder::FoldersFirst => match (is_folder(a), is_folder(b)) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            _ => cmp_ci(child_title(a), child_title(b)),
-        },
-        DefaultOrder::Lg => {
-            let c = cmp_ci(child_class(a), child_class(b));
-            if c != Ordering::Equal {
-                return c;
-            }
-            cmp_ci(child_title(a), child_title(b))
-        }
-        DefaultOrder::ForceSort => {
-            let c = cmp_ci(child_class(a), child_class(b));
-            if c != Ordering::Equal {
-                return c;
-            }
-            let c = child_disc(a).cmp(&child_disc(b));
-            if c != Ordering::Equal {
-                return c;
-            }
-            let c = child_track(a).cmp(&child_track(b));
-            if c != Ordering::Equal {
-                return c;
-            }
-            cmp_ci(child_title(a), child_title(b))
-        }
+        entry.1 += datagrams;
+        true
     }
 }
 
-fn is_folder(ch: &CatalogChild) -> bool {
-    matches!(ch, CatalogChild::Container(_))
+fn ipv4_masked(addr: Ipv4Addr, mask: Ipv4Addr) -> u32 {
+    u32::from(addr) & u32::from(mask)
 }
 
-fn child_title(ch: &CatalogChild) -> &str {
-    match ch {
-        CatalogChild::Container(c) => &c.title,
-        CatalogChild::Item(i) => &i.title,
-    }
+fn renderer_sender_is_on_link(sender: Ipv4Addr, interfaces: &[InterfaceV4]) -> bool {
+    usable_lan_ipv4(sender)
+        && interfaces.iter().any(|interface| {
+            usable_lan_ipv4(interface.addr)
+                && !interface.netmask.is_unspecified()
+                && ipv4_masked(sender, interface.netmask)
+                    == ipv4_masked(interface.addr, interface.netmask)
+        })
 }
 
-fn child_class(ch: &CatalogChild) -> &str {
-    match ch {
-        CatalogChild::Container(c) => &c.class,
-        CatalogChild::Item(i) => &i.class,
-    }
-}
-
-fn child_date(ch: &CatalogChild) -> &str {
-    match ch {
-        CatalogChild::Container(_) => "",
-        CatalogChild::Item(i) => &i.date,
-    }
-}
-
-fn child_album(ch: &CatalogChild) -> &str {
-    match ch {
-        CatalogChild::Container(_) => "",
-        CatalogChild::Item(i) => i.album.as_deref().unwrap_or(""),
-    }
-}
-
-fn child_disc(ch: &CatalogChild) -> i64 {
-    match ch {
-        CatalogChild::Container(_) => 0,
-        CatalogChild::Item(i) => i.disc.unwrap_or(0),
-    }
-}
-
-fn child_track(ch: &CatalogChild) -> i64 {
-    match ch {
-        CatalogChild::Container(_) => 0,
-        CatalogChild::Item(i) => i.track.unwrap_or(0),
-    }
-}
-
-fn cmp_ci(a: &str, b: &str) -> std::cmp::Ordering {
-    a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
-}
-
-fn cmp_sort_key(a: &CatalogChild, b: &CatalogChild, key: SortKey) -> std::cmp::Ordering {
-    match key {
-        SortKey::Title => cmp_ci(child_title(a), child_title(b)),
-        SortKey::Date => child_date(a).cmp(child_date(b)),
-        SortKey::Class => cmp_ci(child_class(a), child_class(b)),
-        SortKey::Album => cmp_ci(child_album(a), child_album(b)),
-        SortKey::EpisodeNumber | SortKey::Track => child_track(a).cmp(&child_track(b)),
-    }
-}
-
-fn sniff_renderer_location(url: &str, server: &str, app: &App) {
-    let Some((host, port, path)) = split_http_url(url) else {
-        return;
-    };
+fn trusted_renderer_location(
+    url: &str,
+    sender: SocketAddr,
+    interfaces: &[InterfaceV4],
+) -> Option<(Ipv4Addr, u16, String)> {
+    let (host, port, path) = split_http_url(url)?;
     let Ok(ip) = host.parse::<Ipv4Addr>() else {
-        return;
+        return None;
     };
+    let SocketAddr::V4(sender) = sender else {
+        return None;
+    };
+    if ip != *sender.ip() || !renderer_sender_is_on_link(ip, interfaces) {
+        return None;
+    }
+    Some((ip, port, path))
+}
+
+fn renderer_xml_body(response: &[u8]) -> Option<&[u8]> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?
+        + 4;
+    if header_end > MAX_RENDERER_HEADER_BYTES {
+        return None;
+    }
+    let headers = std::str::from_utf8(&response[..header_end]).ok()?;
+    let mut lines = headers.split("\r\n");
+    let status = lines.next()?;
+    let mut status_parts = status.split_whitespace();
+    if !matches!(status_parts.next(), Some("HTTP/1.0" | "HTTP/1.1"))
+        || status_parts.next() != Some("200")
+    {
+        return None;
+    }
+    let mut content_type = None;
+    let mut content_length = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line.split_once(':')?;
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("Content-Type") {
+            content_type = Some(value.to_ascii_lowercase());
+        } else if name.eq_ignore_ascii_case("Content-Length") {
+            let parsed = value.parse::<usize>().ok()?;
+            if content_length.is_some_and(|previous| previous != parsed) {
+                return None;
+            }
+            content_length = Some(parsed);
+        } else if name.eq_ignore_ascii_case("Transfer-Encoding") {
+            return None;
+        }
+    }
+    let content_type = content_type?;
+    let mime = content_type.split(';').next()?.trim();
+    if mime != "text/xml" && mime != "application/xml" && !mime.ends_with("+xml") {
+        return None;
+    }
+    let body = &response[header_end..];
+    let body = match content_length {
+        Some(length) if length <= MAX_RENDERER_DESCRIPTION_BYTES && body.len() >= length => {
+            &body[..length]
+        }
+        Some(_) => return None,
+        None if body.len() <= MAX_RENDERER_DESCRIPTION_BYTES => body,
+        None => return None,
+    };
+    Some(body)
+}
+
+fn fetch_renderer_description(ip: Ipv4Addr, port: u16, path: &str) -> Option<String> {
     let Ok(mut sock) = std::net::TcpStream::connect_timeout(
         &SocketAddr::from((ip, port)),
-        std::time::Duration::from_millis(400),
+        Duration::from_millis(400),
     ) else {
-        return;
+        return None;
     };
-    let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(600)));
-    let req = format!(
-        "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    );
+    let _ = sock.set_write_timeout(Some(Duration::from_millis(400)));
+    let deadline = std::time::Instant::now() + Duration::from_millis(1200);
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {ip}\r\nConnection: close\r\n\r\n");
     use std::io::{Read, Write};
     if sock.write_all(req.as_bytes()).is_err() {
-        return;
+        return None;
     }
-    let mut buf = String::new();
-    let _ = sock.read_to_string(&mut buf);
-    let friendly = xml_tag_loose(&buf, "friendlyName");
-    let model = xml_tag_loose(&buf, "modelName");
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let _ = sock.set_read_timeout(Some(remaining));
+        match sock.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                response.extend_from_slice(&chunk[..read]);
+                if response.len() > MAX_RENDERER_HEADER_BYTES + MAX_RENDERER_DESCRIPTION_BYTES {
+                    return None;
+                }
+                if let Some(header_end) = response
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4)
+                {
+                    if header_end > MAX_RENDERER_HEADER_BYTES {
+                        return None;
+                    }
+                    let headers = std::str::from_utf8(&response[..header_end]).ok()?;
+                    if let Some(length) = headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("Content-Length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    }) {
+                        if length > MAX_RENDERER_DESCRIPTION_BYTES {
+                            return None;
+                        }
+                        if response.len() >= header_end + length {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    let body = renderer_xml_body(&response)?;
+    std::str::from_utf8(body).ok().map(str::to_owned)
+}
+
+fn sniff_renderer_location(url: &str, server: &str, sender: SocketAddr, app: &App) {
+    let Some((ip, port, path)) = trusted_renderer_location(url, sender, &active_ipv4_interfaces())
+    else {
+        tracing::warn!(%sender, location = url, "rejected renderer description target");
+        return;
+    };
+    let Some(description) = fetch_renderer_description(ip, port, &path) else {
+        return;
+    };
+    let friendly = xml_tag_loose(&description, "friendlyName");
+    let model = xml_tag_loose(&description, "modelName");
     let profile = friendly
         .as_deref()
         .and_then(identify_friendly_name_ssdp)
@@ -1925,14 +2572,13 @@ fn sniff_renderer_location(url: &str, server: &str, app: &App) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let _ = app
-        .client_cache
-        .lock()
-        .expect("client cache")
-        .remember(ip, profile, None, now);
+    let _ = lock_recover(&app.client_cache).remember(ip, profile, None, now);
 }
 
 fn split_http_url(url: &str) -> Option<(String, u16, String)> {
+    if url.bytes().any(|byte| byte < b' ' || byte == 0x7f) || url.contains(['#', '@']) {
+        return None;
+    }
     let rest = url.strip_prefix("http://")?;
     let (auth, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -1942,6 +2588,9 @@ fn split_http_url(url: &str) -> Option<(String, u16, String)> {
         Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) => (h.to_string(), p.parse().ok()?),
         _ => (auth.to_string(), 80u16),
     };
+    if host.is_empty() || port == 0 || !path.starts_with('/') {
+        return None;
+    }
     Some((host, port, path.to_string()))
 }
 
@@ -2006,6 +2655,114 @@ fn parse_resize_query(query: &str) -> (u32, u32) {
     (w, h)
 }
 
+fn derived_image_key(
+    identity: &str,
+    width: u32,
+    height: u32,
+    quality: u8,
+    rotation: i64,
+) -> String {
+    use sha1::{Digest, Sha1};
+
+    let mut hasher = Sha1::new();
+    hasher.update(b"rustydlna-derived-image-v2\0");
+    hasher.update(identity.as_bytes());
+    hasher.update(width.to_le_bytes());
+    hasher.update(height.to_le_bytes());
+    hasher.update([quality]);
+    hasher.update(rotation.to_le_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn derived_image_lock_index(key: &str, count: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % count.max(1)
+}
+
+#[cfg(unix)]
+fn available_filesystem_bytes(path: &Path) -> std::io::Result<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in cache path"))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is a live NUL-terminated string and `stats` points to
+    // writable storage for one `statvfs` value. The OS initializes it on 0.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the successful call above initialized the complete structure.
+    let stats = unsafe { stats.assume_init() };
+    Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+}
+
+#[cfg(not(unix))]
+fn available_filesystem_bytes(_path: &Path) -> std::io::Result<u64> {
+    Ok(u64::MAX)
+}
+
+fn prune_derived_image_cache(
+    directory: &Path,
+    quota_bytes: u64,
+    max_age_days: u32,
+    minimum_free_bytes: u64,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(directory)?;
+    let now = std::time::SystemTime::now();
+    let max_age = Duration::from_secs(u64::from(max_age_days).saturating_mul(86_400));
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) if metadata.is_file() => metadata,
+            _ => continue,
+        };
+        if path.extension().and_then(|value| value.to_str()) != Some("jpg") {
+            if path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.contains(".tmp."))
+            {
+                let _ = std::fs::remove_file(path);
+            }
+            continue;
+        }
+        let used = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if now.duration_since(used).unwrap_or_default() > max_age {
+            let _ = std::fs::remove_file(path);
+            continue;
+        }
+        entries.push((used, metadata.len(), path));
+    }
+    entries.sort_by_key(|entry| entry.0);
+    let total = entries
+        .iter()
+        .fold(0u64, |total, entry| total.saturating_add(entry.1));
+    let free = available_filesystem_bytes(directory).unwrap_or(u64::MAX);
+    let reclaim_for_quota = total.saturating_sub(quota_bytes);
+    let reclaim_for_space = minimum_free_bytes.saturating_sub(free);
+    let mut reclaim = reclaim_for_quota.max(reclaim_for_space);
+    for (_, bytes, path) in entries {
+        if reclaim == 0 {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            reclaim = reclaim.saturating_sub(bytes);
+        }
+    }
+    if reclaim > 0 {
+        return Err(std::io::Error::other(
+            "derived-image cache cannot satisfy quota/free-space requirement",
+        ));
+    }
+    Ok(())
+}
+
 fn query_has_album_art(query: &str) -> bool {
     query.split('&').any(|p| {
         let p = p.strip_prefix('?').unwrap_or(p);
@@ -2045,12 +2802,7 @@ fn soap_to_http(out: SoapOutcome, persist: bool) -> HttpResponse {
     }
 }
 
-fn soap_outcome_http(
-    out: SoapOutcome,
-    persist: bool,
-    call: &SoapCall,
-    ua: &str,
-) -> HttpResponse {
+fn soap_outcome_http(out: SoapOutcome, persist: bool, call: &SoapCall, ua: &str) -> HttpResponse {
     if matches!(out, SoapOutcome::Fault { .. }) {
         return soap_fault_logged(out, persist, call, ua);
     }
@@ -2059,12 +2811,7 @@ fn soap_outcome_http(
 
 /// UPnP SOAP faults are HTTP 500. 701 is a client holding a stale
 /// ObjectID (Infuse caches them) — not a server failure.
-fn soap_fault_logged(
-    out: SoapOutcome,
-    persist: bool,
-    call: &SoapCall,
-    ua: &str,
-) -> HttpResponse {
+fn soap_fault_logged(out: SoapOutcome, persist: bool, call: &SoapCall, ua: &str) -> HttpResponse {
     if let SoapOutcome::Fault { code, desc, .. } = &out {
         if *code == 701 {
             tracing::debug!(
@@ -2097,58 +2844,38 @@ fn fault_resp(xml: String, persist: bool) -> HttpResponse {
     r
 }
 
-/// 1×1 PNG (magic `\x89PNG`).
-const ICON_PNG: &[u8] = &[
-    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
-    0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
-    0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8,
-    0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d, 0xb0, 0x00, 0x00, 0x00,
-    0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-];
-
-/// 1×1 JPEG (SOI `FF D8` + JFIF). Must not be PNG bytes.
-const ICON_JPEG: &[u8] = &[
-    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
-    0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06,
-    0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0a, 0x0c, 0x14, 0x0d, 0x0c, 0x0b, 0x0b,
-    0x0c, 0x19, 0x12, 0x13, 0x0f, 0x14, 0x1d, 0x1a, 0x1f, 0x1e, 0x1d, 0x1a, 0x1c, 0x1c, 0x20,
-    0x24, 0x2e, 0x27, 0x20, 0x22, 0x2c, 0x23, 0x1c, 0x1c, 0x28, 0x37, 0x29, 0x2c, 0x30, 0x31,
-    0x34, 0x34, 0x34, 0x1f, 0x27, 0x39, 0x3d, 0x38, 0x32, 0x3c, 0x2e, 0x33, 0x34, 0x32, 0xff,
-    0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xff, 0xc4, 0x00,
-    0x1f, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
-    0xff, 0xc4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00,
-    0x3f, 0x00, 0x7f, 0xff, 0xd9,
-];
+const ICON_SMALL_PNG: &[u8] = include_bytes!("../../../assets/icon-48.png");
+const ICON_SMALL_JPEG: &[u8] = include_bytes!("../../../assets/icon-48.jpg");
+const ICON_LARGE_PNG: &[u8] = include_bytes!("../../../assets/icon-120.png");
+const ICON_LARGE_JPEG: &[u8] = include_bytes!("../../../assets/icon-120.jpg");
 
 fn icon_response(path: &str) -> HttpResponse {
     let lower = path.to_ascii_lowercase();
+    let large = lower.contains("/lrg.");
     let (mime, body) = if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        ("image/jpeg", ICON_JPEG)
+        (
+            "image/jpeg",
+            if large {
+                ICON_LARGE_JPEG
+            } else {
+                ICON_SMALL_JPEG
+            },
+        )
     } else {
-        ("image/png", ICON_PNG)
+        (
+            "image/png",
+            if large {
+                ICON_LARGE_PNG
+            } else {
+                ICON_SMALL_PNG
+            },
+        )
     };
     let mut r = HttpResponse::new(200, "OK");
     r.set("Content-Type", mime);
     r.set("Content-Length", body.len());
     r.body = body.to_vec();
     r
-}
-
-fn uuid_v4_like(n: u32) -> String {
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(n as u64);
-    format!(
-        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
-        (t >> 32) as u32,
-        ((t >> 16) as u16) & 0xffff,
-        (t as u16) & 0x0fff,
-        n as u16 & 0x0fff,
-        t & 0x0000_ffff_ffff
-    )
 }
 
 fn os_version() -> String {
@@ -2171,13 +2898,13 @@ pub async fn serve(app: Arc<App>) -> Result<(), Box<dyn std::error::Error>> {
     let http_addr = SocketAddr::from((app.listen_ip, app.http_port));
     let listener = tokio::net::TcpListener::bind(http_addr).await?;
     tracing::info!(%http_addr, "http listen");
+    spawn_library_watch(app.clone())?;
     let ssdp_app = app.clone();
     let ssdp = tokio::spawn(async move {
         if let Err(e) = ssdp_loop(ssdp_app).await {
             tracing::warn!("ssdp loop: {e}");
         }
     });
-    spawn_library_watch(app.clone());
     tokio::select! {
         _ = accept_loop(listener, app.clone()) => {}
         _ = shutdown_signal() => {
@@ -2185,12 +2912,20 @@ pub async fn serve(app: Arc<App>) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     ssdp.abort();
+    stop_library_watch(&app);
+    remux::cancel_all(&app);
+    remux::wait_for_shutdown(&app, Duration::from_secs(5)).await;
     send_byebye(&app).await;
     Ok(())
 }
 
 async fn accept_loop(listener: tokio::net::TcpListener, app: Arc<App>) {
+    let connections = Arc::new(tokio::sync::Semaphore::new(app.cfg.max_connections));
     loop {
+        let permit = match connections.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         let (sock, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
@@ -2200,6 +2935,7 @@ async fn accept_loop(listener: tokio::net::TcpListener, app: Arc<App>) {
         };
         let app = app.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_conn(app, sock, peer).await {
                 let msg = e.to_string();
                 if msg.contains("Broken pipe") || msg.contains("Connection reset") {
@@ -2216,19 +2952,18 @@ async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     {
-        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = ctrl_c.await;
-                return;
-            }
-        };
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = ctrl_c.await;
+                    return;
+                }
+            };
         tokio::select! {
             _ = ctrl_c => {}
             _ = term.recv() => {}
         }
-        return;
     }
     #[cfg(not(unix))]
     {
@@ -2258,48 +2993,78 @@ fn ssdp_notify_dests(app: &App) -> Vec<(Ipv4Addr, u16)> {
 async fn send_byebye(app: &App) {
     let pkts = notify_byebye(&app.uuid);
     let dests = ssdp_notify_dests(app);
-    let sock = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("byebye socket: {e}");
-            return;
-        }
+    let interfaces = if app.ssdp_port == rusty_dlna_protocol::ssdp::SSDP_PORT {
+        app.ssdp_interfaces
+            .iter()
+            .map(|(address, _)| *address)
+            .collect::<Vec<_>>()
+    } else {
+        vec![Ipv4Addr::UNSPECIFIED]
     };
-    // Six types × 2, no LOCATION/SERVER/CACHE-CONTROL (packet builder).
-    for _ in 0..2 {
-        for p in &pkts {
-            for (ip, port) in &dests {
-                let _ = sock.send_to(p.as_bytes(), (*ip, *port)).await;
+    for interface in &interfaces {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        );
+        let sock = match socket.and_then(|socket| {
+            socket.bind(&socket2::SockAddr::from(SocketAddrV4::new(*interface, 0)))?;
+            if !interface.is_unspecified() {
+                socket.set_multicast_if_v4(interface)?;
+            }
+            socket.set_nonblocking(true)?;
+            let standard: std::net::UdpSocket = socket.into();
+            tokio::net::UdpSocket::from_std(standard)
+        }) {
+            Ok(socket) => socket,
+            Err(error) => {
+                tracing::warn!(%interface, %error, "byebye socket");
+                continue;
+            }
+        };
+        // Six types × 2, no LOCATION/SERVER/CACHE-CONTROL (packet builder).
+        for _ in 0..2 {
+            for packet in &pkts {
+                for (ip, port) in &dests {
+                    let _ = sock.send_to(packet.as_bytes(), (*ip, *port)).await;
+                }
             }
         }
     }
+    tracing::info!(
+        packets = pkts.len() * 2 * interfaces.len(),
+        interfaces = interfaces.len(),
+        "SSDP byebye sent"
+    );
 }
 
-fn persist_update_id(app: &App, id: u32) {
-    let Some(path) = app.scan_cfg.db_path.as_ref() else {
-        return;
+fn persist_update_id(app: &App, id: u32) -> ScanResult<()> {
+    let Some(pool) = app.db_pool.as_ref() else {
+        return Ok(());
     };
-    match LibraryDb::open(path) {
-        Ok(db) => {
-            if let Err(e) = db.set_update_id(id) {
-                tracing::warn!(error = %e, "persist update_id");
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "open db to persist update_id"),
-    }
+    pool.write(|db| db.set_update_id(id)).map_err(Into::into)
 }
 
-fn bump_update_id(app: &App) -> u32 {
-    let id = app.update_id.fetch_add(1, Ordering::Relaxed) + 1;
-    persist_update_id(app, id);
-    id
-}
-
-pub(crate) fn apply_catalog(app: &App, next: Catalog, delta: ScanDelta, why: &'static str) {
+pub(crate) fn apply_catalog(
+    app: &App,
+    next: Catalog,
+    delta: ScanDelta,
+    why: &'static str,
+) -> ScanResult<()> {
     let items = next.items.len();
-    *app.catalog.write().expect("catalog") = next;
-    let id = bump_update_id(app);
-    events::notify_content_dir(&app.events, id);
+    // The catalog write lock serializes publication and update-ID allocation.
+    // Persist first: if SQLite is busy/full/read-only, readers keep seeing the
+    // previous catalog and its matching SystemUpdateID.
+    let mut published = app
+        .catalog
+        .write()
+        .unwrap_or_else(|error| error.into_inner());
+    let id = app.update_id.load(Ordering::Relaxed).saturating_add(1);
+    persist_update_id(app, id)?;
+    *published = next;
+    app.update_id.store(id, Ordering::Relaxed);
+    drop(published);
+    events::notify_content_dir(&app.events, &app.notify_dispatcher, id);
     tracing::info!(
         items,
         added = delta.added,
@@ -2307,114 +3072,322 @@ pub(crate) fn apply_catalog(app: &App, next: Catalog, delta: ScanDelta, why: &'s
         changed = delta.changed,
         "{why}"
     );
+    Ok(())
 }
 
-fn reconcile_library(app: &App, why: &'static str) {
+fn reconcile_library(app: &App, why: &'static str) -> bool {
     match monitor(&app.scan_cfg) {
-        (Some(next), delta) => apply_catalog(app, next, delta, why),
-        _ => {}
+        Ok((Some(next), delta)) => {
+            if let Err(error) = apply_catalog(app, next, delta, why) {
+                tracing::error!(%error, "{why} publication failed; retaining published catalog");
+                false
+            } else {
+                true
+            }
+        }
+        Ok((None, _)) => true,
+        Err(error) => {
+            tracing::error!(%error, "{why} failed; retaining published catalog");
+            false
+        }
     }
 }
 
-fn spawn_library_watch(app: Arc<App>) {
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn scan_phase_started(control: &ScanControl, phase: &str) -> Instant {
+    let mut state = control
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    state.phase = phase.to_string();
+    state.started_unix = Some(unix_now());
+    state.last_error = None;
+    Instant::now()
+}
+
+fn scan_phase_finished(
+    control: &ScanControl,
+    phase: &str,
+    started: Instant,
+    error: Option<String>,
+) {
+    let mut state = control
+        .state
+        .lock()
+        .unwrap_or_else(|failure| failure.into_inner());
+    let now = unix_now();
+    state.phase = phase.to_string();
+    state.finished_unix = Some(now);
+    state.duration_ms = Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+    if let Some(error) = error {
+        state.last_error = Some(error);
+    } else {
+        state.last_success_unix = Some(now);
+        state.last_error = None;
+    }
+}
+
+fn spawn_library_watch(app: Arc<App>) -> std::io::Result<()> {
     let rescan_secs = app.cfg.rescan_secs;
     let inotify_app = app.clone();
-    std::thread::Builder::new()
+    let inotify_handle = std::thread::Builder::new()
         .name("inotify".into())
         .spawn(move || {
             let app = inotify_app;
             let cfg = app.scan_cfg.clone();
-            let empty = app
-                .catalog
-                .read()
-                .map(|c| c.items.is_empty())
-                .unwrap_or(true);
-            if empty {
-                tracing::info!("empty library; full scan from disk");
-                let next = scan(&cfg);
-                let items = next.items.len();
-                *app.catalog.write().expect("catalog") = next;
-                let id = bump_update_id(&app);
-                events::notify_content_dir(&app.events, id);
-                tracing::info!(items, "full scan done");
-            } else {
-                match repair_objects_if_needed(&cfg) {
-                    (Some(next), delta) => {
-                        apply_catalog(&app, next, delta, "library object repair")
+            {
+                let _serial = app
+                    .scan_control
+                    .gate
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let started = scan_phase_started(&app.scan_control, "initializing");
+                let empty = app
+                    .catalog
+                    .read()
+                    .map(|c| c.items.is_empty())
+                    .unwrap_or(true);
+                let mut failure = None;
+                if empty {
+                    tracing::info!("empty library; full scan from disk");
+                    match scan(&cfg) {
+                        Ok(next) => {
+                            let items = next.items.len();
+                            if let Err(error) = apply_catalog(
+                                &app,
+                                next,
+                                ScanDelta {
+                                    added: items,
+                                    ..ScanDelta::default()
+                                },
+                                "full scan done",
+                            ) {
+                                tracing::error!(%error, "full scan publication failed; retaining published catalog");
+                                failure = Some(error.to_string());
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "full scan failed; serving the existing read-only catalog and retrying later");
+                            failure = Some(error.to_string());
+                        }
                     }
-                    _ => {}
+                } else {
+                    match repair_video_titles_if_needed(&cfg) {
+                        Ok((Some(next), delta)) => {
+                            if let Err(error) =
+                                apply_catalog(&app, next, delta, "video title repair")
+                            {
+                                tracing::error!(%error, "video title repair publication failed; retaining published catalog");
+                                failure = Some(error.to_string());
+                            }
+                        }
+                        Ok((None, _)) => {}
+                        Err(error) => {
+                            tracing::error!(%error, "video title repair failed; retaining published catalog");
+                            failure = Some(error.to_string());
+                        }
+                    }
+                    match repair_objects_if_needed(&cfg) {
+                        Ok((Some(next), delta)) => {
+                            if let Err(error) =
+                                apply_catalog(&app, next, delta, "library object repair")
+                            {
+                                tracing::error!(%error, "library object repair publication failed; retaining published catalog");
+                                failure = Some(error.to_string());
+                            }
+                        }
+                        Ok((None, _)) => {}
+                        Err(error) => {
+                            tracing::error!(%error, "library object repair failed; retaining published catalog");
+                            failure = Some(error.to_string());
+                        }
+                    }
+                    if !reconcile_library(&app, "library reconcile") {
+                        failure = Some("initial library reconciliation failed".into());
+                    }
                 }
-                // Drop gone files / empty folders left by inotify path-prefix misses.
-                reconcile_library(&app, "library reconcile");
+                if let Err(error) = fill_missing_av_meta(&app) {
+                    tracing::error!(%error, "stream metadata fill failed; retaining published catalog");
+                    failure = Some(error.to_string());
+                }
+                scan_phase_finished(&app.scan_control, "watching", started, failure);
             }
-            fill_missing_av_meta(&app);
             let watch_app = app.clone();
-            if let Err(e) = run_inotify(cfg, move |next, delta| {
-                apply_catalog(&watch_app, next, delta, "inotify library update");
-            }) {
+            let control = app.scan_control.clone();
+            let telemetry = app.scan_telemetry.clone();
+            if let Err(e) = run_inotify_until(
+                cfg,
+                &control.stopping,
+                Some(&control.gate),
+                Some(&telemetry),
+                move |next, delta| {
+                    let started = scan_phase_started(&watch_app.scan_control, "publishing");
+                    let failure = apply_catalog(
+                        &watch_app,
+                        next,
+                        delta,
+                        "inotify library update",
+                    )
+                    .err()
+                    .map(|error| error.to_string());
+                    scan_phase_finished(&watch_app.scan_control, "watching", started, failure);
+                },
+            ) {
                 tracing::warn!("inotify: {e}");
+                if !control.stopping.load(Ordering::Acquire) {
+                    scan_phase_finished(
+                        &control,
+                        "degraded",
+                        Instant::now(),
+                        Some(e.to_string()),
+                    );
+                }
             }
-        })
-        .expect("inotify thread");
+        })?;
+    app.scan_control
+        .threads
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(inotify_handle);
     if rescan_secs > 0 {
-        std::thread::Builder::new()
+        let periodic_app = app.clone();
+        let periodic = match std::thread::Builder::new()
             .name("rescan".into())
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(rescan_secs));
-                // Skip if a walk is still running. A 30s interval with a
-                // 45s tree walk was stacking +11k "adds" every cycle.
-                reconcile_library(&app, "periodic rescan");
-            })
-            .expect("rescan thread");
+            .spawn(move || {
+                let app = periodic_app;
+                loop {
+                    {
+                        let mut state = app
+                            .scan_control
+                            .state
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        state.next_reconcile_unix = Some(unix_now().saturating_add(rescan_secs));
+                    }
+                    let sleeper = app
+                        .scan_control
+                        .sleep
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let _ = app
+                        .scan_control
+                        .wake
+                        .wait_timeout(sleeper, Duration::from_secs(rescan_secs));
+                    if app.scan_control.stopping.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let _serial = app
+                        .scan_control
+                        .gate
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let started = scan_phase_started(&app.scan_control, "periodic-reconcile");
+                    let ok = reconcile_library(&app, "periodic rescan");
+                    scan_phase_finished(
+                        &app.scan_control,
+                        "watching",
+                        started,
+                        (!ok).then(|| "periodic reconciliation failed".into()),
+                    );
+                }
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                stop_library_watch(&app);
+                return Err(error);
+            }
+        };
+        app.scan_control
+            .threads
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(periodic);
+    }
+    Ok(())
+}
+
+fn stop_library_watch(app: &App) {
+    app.scan_control.stopping.store(true, Ordering::Release);
+    app.scan_control.wake.notify_all();
+    let handles = app
+        .scan_control
+        .threads
+        .lock()
+        .map(|mut handles| handles.drain(..).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for handle in handles {
+        if handle.join().is_err() {
+            tracing::error!("library worker panicked during shutdown");
+        }
     }
 }
 
-fn fill_missing_av_meta(app: &App) {
+fn fill_missing_av_meta(app: &App) -> rusty_dlna_scan::ScanResult<()> {
     let Some(dbp) = app.scan_cfg.db_path.clone() else {
-        return;
+        return Ok(());
     };
-    let Ok(db) = LibraryDb::open(&dbp) else {
-        return;
-    };
-    let rows = db.details_missing_stream_meta().unwrap_or_default();
+    let db = LibraryDb::open(&dbp)?;
+    let transaction = db.transaction()?;
+    let rows = db.details_missing_stream_meta()?;
     let mut filled = 0usize;
     if !rows.is_empty() {
         tracing::info!(n = rows.len(), "filling missing stream metadata from files");
         let mut seen = std::collections::HashSet::new();
         for (id, path) in rows {
-            if path.contains("/incomplete/") {
+            let decoded = rusty_dlna_scan::path_from_db(&path);
+            if rusty_dlna_scan::path_is_unwanted(&decoded, &app.scan_cfg) {
                 continue;
             }
             if !seen.insert(path.clone()) {
                 continue;
             }
-            let live = rusty_dlna_scan::rebase_media_path(
-                std::path::Path::new(&path),
-                &app.scan_cfg.media_dirs,
-            );
+            let live = rusty_dlna_scan::rebase_media_path_for_config(&decoded, &app.scan_cfg);
+            if !rusty_dlna_scan::path_is_allowed_file(&live, &app.scan_cfg) {
+                continue;
+            }
             let Some(got) = rusty_dlna_scan::probe_media(&live) else {
+                // A readable path with an unsupported or malformed stream was
+                // still attempted. Record that fact so startup does not retry
+                // the same unchanged file forever; a stat change resets it.
+                db.clear_detail_stream(id)?;
                 continue;
             };
-            rusty_dlna_scan::apply_probe_to_detail(&db, id, &got);
+            rusty_dlna_scan::apply_probe_to_detail(&db, id, &got)?;
             filled += 1;
-            if filled % 200 == 0 {
+            if filled / 200 * 200 == filled {
                 tracing::info!(filled, "stream metadata progress");
             }
         }
         tracing::info!(filled, "stream metadata fill done");
     }
-    let derived = db.backfill_derived_stream_fields().unwrap_or_else(|e| {
-        tracing::warn!(%e, "derived stream backfill failed");
-        0
-    });
+    let derived = db.backfill_derived_stream_fields()?;
     if derived > 0 {
-        tracing::info!(n = derived, "backfilled DLNA_PN / mpeg4 from stored stream columns");
+        tracing::info!(
+            n = derived,
+            "backfilled DLNA_PN / mpeg4 from stored stream columns"
+        );
     }
+    transaction.commit()?;
     if filled > 0 || derived > 0 {
-        if let Ok(next) = db.load_catalog() {
-            *app.catalog.write().expect("catalog") = next;
-        }
+        let next = load_catalog_with_policy(&db, &app.scan_cfg)?;
+        apply_catalog(
+            app,
+            next,
+            ScanDelta {
+                added: 0,
+                removed: 0,
+                changed: filled + derived,
+            },
+            "stream metadata update",
+        )?;
     }
+    Ok(())
 }
 
 fn bind_udp_reuse(addr: SocketAddrV4) -> std::io::Result<socket2::Socket> {
@@ -2438,9 +3411,7 @@ fn into_std_udp(sock: socket2::Socket) -> std::net::UdpSocket {
 fn ssdp_recv_bind(app: &App) -> std::io::Result<socket2::Socket> {
     let live = app.ssdp_port == rusty_dlna_protocol::ssdp::SSDP_PORT;
     if live {
-        let group: Ipv4Addr = rusty_dlna_protocol::ssdp::SSDP_MCAST_ADDR
-            .parse()
-            .unwrap();
+        let group = Ipv4Addr::new(239, 255, 255, 250);
         // rustyDLNA Linux receive bind: 239.255.255.250:1900 (not the unicast IP).
         // Binding 192.0.2.20:1900 never sees Kodi/VLC multicast M-SEARCH.
         match bind_udp_reuse(SocketAddrV4::new(group, app.ssdp_port)) {
@@ -2457,7 +3428,7 @@ fn ssdp_recv_bind(app: &App) -> std::io::Result<socket2::Socket> {
     bind_udp_reuse(SocketAddrV4::new(app.listen_ip, app.ssdp_port))
 }
 
-async fn send_alive(sock: &tokio::net::UdpSocket, app: &App) {
+async fn send_alive(sock: &tokio::net::UdpSocket, app: &App, interface_ip: Ipv4Addr) {
     if app.ssdp_port != rusty_dlna_protocol::ssdp::SSDP_PORT {
         return;
     }
@@ -2467,7 +3438,7 @@ async fn send_alive(sock: &tokio::net::UdpSocket, app: &App) {
     );
     let pkts = rusty_dlna_ssdp::notify_alive(
         &app.uuid,
-        &app.advertise_ip,
+        &interface_ip.to_string(),
         app.http_port,
         app.notify_interval,
         &app.server,
@@ -2479,33 +3450,81 @@ async fn send_alive(sock: &tokio::net::UdpSocket, app: &App) {
     }
 }
 
-fn configured_iface_addrs(names: &[String]) -> Vec<Ipv4Addr> {
-    let mut out = Vec::new();
-    for name in names {
-        let name = name.trim();
-        if name.is_empty() {
-            continue;
-        }
-        if let Ok(ip) = name.parse::<Ipv4Addr>() {
-            out.push(ip);
-            continue;
-        }
-        if let Some(ip) = ipv4_for_iface(name) {
-            out.push(ip);
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InterfaceV4 {
+    name: String,
+    addr: Ipv4Addr,
+    netmask: Ipv4Addr,
+}
+
+fn usable_lan_ipv4(addr: Ipv4Addr) -> bool {
+    !addr.is_unspecified()
+        && !addr.is_loopback()
+        && !addr.is_multicast()
+        && !addr.is_broadcast()
+        && !addr.is_link_local()
+}
+
+fn select_ssdp_interfaces(
+    configured: &[String],
+    primary: Ipv4Addr,
+    ssdp_port: u16,
+    interfaces: &[InterfaceV4],
+) -> Result<Vec<(Ipv4Addr, Ipv4Addr)>, String> {
+    let live = ssdp_port == rusty_dlna_protocol::ssdp::SSDP_PORT;
+    let mut selected = Vec::new();
+    if configured.is_empty() {
+        selected.extend(
+            interfaces
+                .iter()
+                .filter(|interface| interface.addr == primary)
+                .map(|interface| (interface.addr, interface.netmask)),
+        );
+    } else {
+        for token in configured {
+            let token = token.trim();
+            let parsed = token.parse::<Ipv4Addr>().ok();
+            selected.extend(
+                interfaces
+                    .iter()
+                    .filter(|interface| {
+                        parsed.is_some_and(|address| address == interface.addr)
+                            || interface.name == token
+                    })
+                    .map(|interface| (interface.addr, interface.netmask)),
+            );
         }
     }
-    out
+    selected.retain(|(address, _)| usable_lan_ipv4(*address) || (!live && address.is_loopback()));
+    selected.sort_unstable();
+    selected.dedup();
+    if selected.is_empty() {
+        selected.push((primary, Ipv4Addr::new(255, 255, 255, 255)));
+    } else if !selected.iter().any(|(address, _)| *address == primary) {
+        let mask = interfaces
+            .iter()
+            .find(|interface| interface.addr == primary)
+            .map(|interface| interface.netmask)
+            .unwrap_or(Ipv4Addr::new(255, 255, 255, 255));
+        selected.push((primary, mask));
+        selected.sort_unstable();
+        selected.dedup();
+    }
+    Ok(selected)
 }
 
 #[cfg(unix)]
-fn ipv4_for_iface(name: &str) -> Option<Ipv4Addr> {
+fn active_ipv4_interfaces() -> Vec<InterfaceV4> {
+    // SAFETY: `getifaddrs` initializes a linked list on success. Each node and
+    // sockaddr is inspected only while that list is live, family checks guard
+    // IPv4 casts, and `freeifaddrs` is called exactly once before returning.
     unsafe {
         let mut ifa = std::ptr::null_mut();
         if libc::getifaddrs(&mut ifa) != 0 {
-            return None;
+            return Vec::new();
         }
         let mut cur = ifa;
-        let mut found = None;
+        let mut found = Vec::new();
         while !cur.is_null() {
             let entry = &*cur;
             let cname = if entry.ifa_name.is_null() {
@@ -2515,26 +3534,208 @@ fn ipv4_for_iface(name: &str) -> Option<Ipv4Addr> {
                     .to_str()
                     .unwrap_or("")
             };
-            if cname == name {
+            if entry.ifa_flags & libc::IFF_UP as u32 != 0 {
                 if let Some(addr) = entry.ifa_addr.as_ref() {
                     if addr.sa_family as i32 == libc::AF_INET {
                         let sin = &*(entry.ifa_addr as *const libc::sockaddr_in);
-                        let oct = u32::from_be(sin.sin_addr.s_addr);
-                        found = Some(Ipv4Addr::from(oct));
-                        break;
+                        let octets = u32::from_be(sin.sin_addr.s_addr);
+                        found.push(InterfaceV4 {
+                            name: cname.to_owned(),
+                            addr: Ipv4Addr::from(octets),
+                            netmask: entry
+                                .ifa_netmask
+                                .as_ref()
+                                .filter(|netmask| netmask.sa_family as i32 == libc::AF_INET)
+                                .map(|_| {
+                                    let sin = &*(entry.ifa_netmask as *const libc::sockaddr_in);
+                                    Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))
+                                })
+                                .unwrap_or(Ipv4Addr::UNSPECIFIED),
+                        });
                     }
                 }
             }
             cur = entry.ifa_next;
         }
         libc::freeifaddrs(ifa);
+        found.sort_by(|left, right| left.name.cmp(&right.name).then(left.addr.cmp(&right.addr)));
+        found.dedup();
         found
     }
 }
 
 #[cfg(not(unix))]
-fn ipv4_for_iface(_name: &str) -> Option<Ipv4Addr> {
-    None
+fn active_ipv4_interfaces() -> Vec<InterfaceV4> {
+    Vec::new()
+}
+
+fn default_route_interface() -> Option<String> {
+    let routes = std::fs::read_to_string("/proc/net/route").ok()?;
+    routes
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let columns = line.split_whitespace().collect::<Vec<_>>();
+            if columns.len() < 7 || columns[1] != "00000000" {
+                return None;
+            }
+            let flags = u32::from_str_radix(columns[3], 16).ok()?;
+            if flags & libc::RTF_UP as u32 == 0 {
+                return None;
+            }
+            let metric = columns[6].parse::<u64>().ok()?;
+            Some((metric, columns[0].to_owned()))
+        })
+        .min_by_key(|(metric, _)| *metric)
+        .map(|(_, interface)| interface)
+}
+
+fn route_source_ipv4() -> Option<Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    // UDP connect performs route selection without sending a packet.
+    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    match socket.local_addr().ok()? {
+        SocketAddr::V4(address) if usable_lan_ipv4(*address.ip()) => Some(*address.ip()),
+        _ => None,
+    }
+}
+
+fn select_advertise_ip(
+    configured: Option<&str>,
+    listen_ip: Ipv4Addr,
+    configured_interfaces: &[String],
+    ssdp_port: u16,
+    interfaces: &[InterfaceV4],
+    default_route: Option<&str>,
+) -> Result<Ipv4Addr, String> {
+    let live = ssdp_port == rusty_dlna_protocol::ssdp::SSDP_PORT;
+    for configured_interface in configured_interfaces {
+        let configured_interface = configured_interface.trim();
+        if configured_interface.is_empty() {
+            return Err("network_interface entries must not be empty".into());
+        }
+        let found = configured_interface
+            .parse::<Ipv4Addr>()
+            .ok()
+            .is_some_and(|addr| interfaces.iter().any(|interface| interface.addr == addr))
+            || interfaces
+                .iter()
+                .any(|interface| interface.name == configured_interface);
+        if !found {
+            return Err(format!(
+                "network_interface {configured_interface:?} has no enabled IPv4 address"
+            ));
+        }
+    }
+
+    if let Some(configured) = configured {
+        let addr = configured
+            .parse::<Ipv4Addr>()
+            .map_err(|_| format!("advertise_ip is not a valid IPv4 address: {configured}"))?;
+        if addr.is_unspecified() || addr.is_multicast() || addr.is_broadcast() {
+            return Err(format!(
+                "advertise_ip {addr} is not a usable unicast address"
+            ));
+        }
+        if live && addr.is_loopback() {
+            return Err(format!(
+                "advertise_ip {addr} is loopback and cannot be announced on live SSDP port 1900"
+            ));
+        }
+        if live && !interfaces.iter().any(|interface| interface.addr == addr) {
+            return Err(format!(
+                "advertise_ip {addr} is not assigned to an enabled local interface"
+            ));
+        }
+        return Ok(addr);
+    }
+
+    if !listen_ip.is_unspecified() {
+        if live && !usable_lan_ipv4(listen_ip) {
+            return Err(format!(
+                "listen_ip {listen_ip} is not usable as a live SSDP advertisement address"
+            ));
+        }
+        if live
+            && !interfaces
+                .iter()
+                .any(|interface| interface.addr == listen_ip)
+        {
+            return Err(format!(
+                "listen_ip {listen_ip} is not assigned to an enabled local interface"
+            ));
+        }
+        return Ok(listen_ip);
+    }
+
+    let mut candidates = if configured_interfaces.is_empty() {
+        Vec::new()
+    } else {
+        configured_interfaces
+            .iter()
+            .flat_map(|configured_interface| {
+                let configured_interface = configured_interface.trim();
+                interfaces.iter().filter_map(move |interface| {
+                    let matches = configured_interface
+                        .parse::<Ipv4Addr>()
+                        .is_ok_and(|addr| interface.addr == addr)
+                        || interface.name == configured_interface;
+                    matches.then_some(interface.addr)
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    candidates.retain(|addr| usable_lan_ipv4(*addr));
+    candidates.sort_unstable();
+    candidates.dedup();
+    if candidates.len() == 1 {
+        return Ok(candidates[0]);
+    }
+    if candidates.len() > 1 {
+        if let Some(source) = route_source_ipv4().filter(|source| candidates.contains(source)) {
+            return Ok(source);
+        }
+        // All candidates remain active SSDP endpoints. This value is only the
+        // primary URL for HTTP responses that have no ingress-interface hint.
+        return Ok(candidates[0]);
+    }
+
+    if let Some(default_route) = default_route {
+        let mut route_candidates = interfaces
+            .iter()
+            .filter(|interface| interface.name == default_route)
+            .map(|interface| interface.addr)
+            .filter(|addr| usable_lan_ipv4(*addr))
+            .collect::<Vec<_>>();
+        route_candidates.sort_unstable();
+        route_candidates.dedup();
+        if let Some(source) = route_source_ipv4().filter(|source| route_candidates.contains(source))
+        {
+            return Ok(source);
+        }
+        if route_candidates.len() == 1 {
+            return Ok(route_candidates[0]);
+        }
+    }
+
+    let mut all = interfaces
+        .iter()
+        .map(|interface| interface.addr)
+        .filter(|addr| usable_lan_ipv4(*addr))
+        .collect::<Vec<_>>();
+    all.sort_unstable();
+    all.dedup();
+    match all.as_slice() {
+        [only] => Ok(*only),
+        [] if !live => Ok(Ipv4Addr::LOCALHOST),
+        [] => Err(
+            "no usable LAN IPv4 address found for SSDP; set network_interface or advertise_ip"
+                .into(),
+        ),
+        _ => Err(format!(
+            "multiple LAN IPv4 addresses found {all:?}; set network_interface or advertise_ip"
+        )),
+    }
 }
 
 fn ssdp_iface(app: &App) -> Ipv4Addr {
@@ -2552,21 +3753,30 @@ fn ssdp_iface(app: &App) -> Ipv4Addr {
         .unwrap_or(Ipv4Addr::UNSPECIFIED)
 }
 
+fn reply_interface_for_sender(
+    sender: Ipv4Addr,
+    interfaces: &[(Ipv4Addr, Ipv4Addr)],
+    primary: Ipv4Addr,
+) -> Ipv4Addr {
+    let sender = u32::from(sender);
+    interfaces
+        .iter()
+        .filter(|(address, mask)| {
+            let mask = u32::from(*mask);
+            u32::from(*address) & mask == sender & mask
+        })
+        .max_by_key(|(_, mask)| u32::from(*mask).count_ones())
+        .map(|(address, _)| *address)
+        .unwrap_or(primary)
+}
+
 async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
     let recv_sock = ssdp_recv_bind(&app)?;
     let live = app.ssdp_port == rusty_dlna_protocol::ssdp::SSDP_PORT;
     let iface = ssdp_iface(&app);
     if live {
-        let group: Ipv4Addr = rusty_dlna_protocol::ssdp::SSDP_MCAST_ADDR
-            .parse()
-            .unwrap();
-        let extras = configured_iface_addrs(&app.cfg.network_interface);
-        let join_list: Vec<Ipv4Addr> = if extras.is_empty() {
-            vec![iface]
-        } else {
-            extras
-        };
-        for ip in join_list {
+        let group = Ipv4Addr::new(239, 255, 255, 250);
+        for ip in app.ssdp_interfaces.iter().map(|(address, _)| *address) {
             if let Err(e) = recv_sock.join_multicast_v4(&group, &ip) {
                 tracing::warn!("SSDP IP_ADD_MEMBERSHIP {ip}: {e}");
             } else {
@@ -2578,60 +3788,58 @@ async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
     }
     let recv_std = into_std_udp(recv_sock);
     let recv_addr = recv_std.local_addr()?;
-    let recv = tokio::net::UdpSocket::from_std(recv_std)?;
+    let recv = Arc::new(tokio::net::UdpSocket::from_std(recv_std)?);
 
-    // Kodi/Platinum drops SSDP replies whose UDP source port is not 1900.
-    // Reply from the advertise unicast IP (rustyDLNA used the primary
-    // 192.0.2.10) so LOCATION host and UDP source match.
-    let send = if live {
-        let bind_ip = if iface.is_unspecified() {
-            app.listen_ip
-        } else {
-            iface
-        };
-        let n = match bind_udp_reuse(SocketAddrV4::new(bind_ip, app.ssdp_port)) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    "SSDP reply bind {bind_ip}:{}: {e}; trying 0.0.0.0:{}",
-                    app.ssdp_port,
-                    app.ssdp_port
-                );
-                bind_udp_reuse(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, app.ssdp_port))?
-            }
-        };
-        if !iface.is_unspecified() {
-            let _ = n.set_multicast_if_v4(&iface);
+    // Kodi/Platinum drops replies whose source port is not 1900. Maintain one
+    // egress socket per selected interface so source address and LOCATION
+    // always describe the same reachable endpoint.
+    let mut sends: Vec<(Ipv4Addr, Arc<tokio::net::UdpSocket>)> = Vec::new();
+    if live {
+        for (bind_ip, _) in &app.ssdp_interfaces {
+            let socket = bind_udp_reuse(SocketAddrV4::new(*bind_ip, app.ssdp_port))?;
+            socket.set_multicast_if_v4(bind_ip)?;
+            socket.set_multicast_ttl_v4(4)?;
+            socket.set_multicast_loop_v4(false)?;
+            let socket = into_std_udp(socket);
+            tracing::info!(interface = %bind_ip, addr = %socket.local_addr()?, "SSDP reply/notify socket");
+            sends.push((*bind_ip, Arc::new(tokio::net::UdpSocket::from_std(socket)?)));
         }
-        let _ = n.set_multicast_ttl_v4(4);
-        let _ = n.set_multicast_loop_v4(false);
-        let stdn = into_std_udp(n);
-        tracing::info!(addr = %stdn.local_addr()?, "SSDP reply/notify socket");
-        Some(tokio::net::UdpSocket::from_std(stdn)?)
-    } else {
-        None
-    };
+    }
     tracing::info!(%recv_addr, port = app.ssdp_port, "ssdp listen");
 
-    let send_sock = send.as_ref();
-    if let Some(s) = send_sock {
-        send_alive(s, &app).await;
-        tokio::time::sleep(std::time::Duration::from_millis(jitter_ms(ALIVE_DUP_DELAY_MS))).await;
-        send_alive(s, &app).await;
+    if !sends.is_empty() {
+        for (ip, socket) in &sends {
+            send_alive(socket, &app, *ip).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(jitter_ms(
+            ALIVE_DUP_DELAY_MS,
+        )))
+        .await;
+        for (ip, socket) in &sends {
+            send_alive(socket, &app, *ip).await;
+        }
     }
 
     let mut buf = vec![0u8; 2048];
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(
         app.notify_interval.max(1) as u64,
     ));
+    let renderer_workers = Arc::new(tokio::sync::Semaphore::new(4));
+    let reply_workers = Arc::new(tokio::sync::Semaphore::new(64));
+    let mut renderer_limiter = RendererFetchLimiter::default();
+    let mut reply_limiter = SsdpReplyLimiter::default();
     tick.tick().await;
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                if let Some(s) = send_sock {
-                    send_alive(s, &app).await;
+                if !sends.is_empty() {
+                    for (ip, socket) in &sends {
+                        send_alive(socket, &app, *ip).await;
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(jitter_ms(ALIVE_DUP_DELAY_MS))).await;
-                    send_alive(s, &app).await;
+                    for (ip, socket) in &sends {
+                        send_alive(socket, &app, *ip).await;
+                    }
                 }
             }
             rec = recv.recv_from(&mut buf) => {
@@ -2648,20 +3856,49 @@ async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
                 };
                 let text = String::from_utf8_lossy(&buf[..n]);
                 if let Some(n) = parse_inbound_notify(&text) {
+                    let SocketAddr::V4(sender) = from else {
+                        continue;
+                    };
+                    let loc = n.location;
+                    if trusted_renderer_location(&loc, from, &active_ipv4_interfaces()).is_none() {
+                        tracing::warn!(%from, location = %loc, "rejected renderer NOTIFY location");
+                        continue;
+                    }
+                    let key = format!(
+                        "{}|{}|{loc}",
+                        sender.ip(),
+                        n.usn.as_deref().unwrap_or("-")
+                    );
+                    if !renderer_limiter.allow(*sender.ip(), &key, std::time::Instant::now()) {
+                        tracing::debug!(%from, "renderer fetch rate-limited/deduplicated");
+                        continue;
+                    }
+                    let Ok(permit) = renderer_workers.clone().try_acquire_owned() else {
+                        tracing::debug!(%from, "renderer worker pool full");
+                        continue;
+                    };
                     let app2 = Arc::clone(&app);
-                    let loc = n.location.clone();
-                    let server = n.server.clone();
+                    let server = n.server;
                     tokio::task::spawn_blocking(move || {
-                        sniff_renderer_location(&loc, &server, &app2);
+                        let _permit = permit;
+                        sniff_renderer_location(&loc, &server, from, &app2);
                     });
                     continue;
                 }
                 let Ok(ms) = parse_msearch(&text) else { continue };
+                let SocketAddr::V4(sender) = from else {
+                    continue;
+                };
+                let reply_ip = reply_interface_for_sender(
+                    *sender.ip(),
+                    &app.ssdp_interfaces,
+                    iface,
+                );
                 let date = now_imf_date();
                 let replies = msearch_replies(
                     &app.uuid,
                     &ms.st,
-                    &app.advertise_ip,
+                    &reply_ip.to_string(),
                     app.http_port,
                     app.notify_interval,
                     &app.server,
@@ -2670,22 +3907,33 @@ async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
                 if replies.is_empty() {
                     continue;
                 }
+                if !reply_limiter.allow(*sender.ip(), replies.len(), std::time::Instant::now()) {
+                    tracing::debug!(%from, replies = replies.len(), "M-SEARCH reply rate-limited");
+                    continue;
+                }
+                let Ok(permit) = reply_workers.clone().try_acquire_owned() else {
+                    tracing::debug!(%from, "M-SEARCH scheduler full");
+                    continue;
+                };
                 tracing::info!(%from, st = %ms.st, n = replies.len(), "SSDP M-SEARCH reply");
                 let all = ms.st == rusty_dlna_protocol::ssdp::ST_ALL;
-                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms(
-                    msearch_jitter_ms_range(all),
-                )))
-                .await;
-                let out = send_sock.unwrap_or(&recv);
-                for r in &replies {
-                    if let Err(e) = out.send_to(r.as_bytes(), from).await {
-                        tracing::warn!(%from, "SSDP reply send: {e}");
+                let out = sends
+                    .iter()
+                    .find(|(ip, _)| *ip == reply_ip)
+                    .map(|(_, socket)| Arc::clone(socket))
+                    .unwrap_or_else(|| Arc::clone(&recv));
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    tokio::time::sleep(Duration::from_millis(jitter_ms(
+                        msearch_jitter_ms_range(all),
+                    )))
+                    .await;
+                    for reply in replies {
+                        if let Err(error) = out.send_to(reply.as_bytes(), from).await {
+                            tracing::warn!(%from, %error, "SSDP reply send failed");
+                        }
                     }
-                }
-                // Second copy: Platinum often misses the first datagram.
-                for r in &replies {
-                    let _ = out.send_to(r.as_bytes(), from).await;
-                }
+                });
             }
         }
     }
@@ -2696,53 +3944,164 @@ async fn handle_conn(
     mut sock: tokio::net::TcpStream,
     peer: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
+    const MAX_HEADER_BYTES: usize = 64 * 1024;
+
     let mut persist_left = 100u32;
+    let mut pending = Vec::new();
+    let mut request_number = 0u32;
+    let mut tmp = [0u8; 4096];
     loop {
-        let mut buf = vec![0u8; 0];
-        let mut tmp = [0u8; 4096];
+        let header_wait = if request_number > 0 && pending.is_empty() {
+            app.cfg.keep_alive_timeout_secs
+        } else {
+            app.cfg.header_read_timeout_secs
+        };
+        let header_deadline = tokio::time::Instant::now() + Duration::from_secs(header_wait);
         let header_end = loop {
-            let n = sock.read(&mut tmp).await?;
-            if n == 0 {
+            if let Some(end) = rusty_dlna_http::header_block_complete(&pending) {
+                if end > MAX_HEADER_BYTES {
+                    let response = HttpResponse::html(
+                        431,
+                        "Request Header Fields Too Large",
+                        "headers too large",
+                    );
+                    socket_write_all(
+                        &app,
+                        &mut sock,
+                        &response.bytes_wire(&app.server, &now_imf_date()),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                break end;
+            }
+            if pending.len() > MAX_HEADER_BYTES {
+                let response =
+                    HttpResponse::html(431, "Request Header Fields Too Large", "headers too large");
+                socket_write_all(
+                    &app,
+                    &mut sock,
+                    &response.bytes_wire(&app.server, &now_imf_date()),
+                )
+                .await?;
                 return Ok(());
             }
-            buf.extend_from_slice(&tmp[..n]);
-            if let Some(i) = rusty_dlna_http::header_block_complete(&buf) {
-                break i;
+            let n = match tokio::time::timeout_at(header_deadline, sock.read(&mut tmp)).await {
+                Ok(read) => read?,
+                Err(_) => {
+                    let response = HttpResponse::html(408, "Request Timeout", "header timeout");
+                    let _ = socket_write_all(
+                        &app,
+                        &mut sock,
+                        &response.bytes_wire(&app.server, &now_imf_date()),
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+            if n == 0 {
+                if pending.is_empty() {
+                    return Ok(());
+                }
+                let response = HttpResponse::html(400, "Bad Request", "incomplete headers");
+                socket_write_all(
+                    &app,
+                    &mut sock,
+                    &response.bytes_wire(&app.server, &now_imf_date()),
+                )
+                .await?;
+                return Ok(());
             }
-            if buf.len() > 64 * 1024 {
+            pending.extend_from_slice(&tmp[..n]);
+        };
+        let head = match std::str::from_utf8(&pending[..header_end]) {
+            Ok(head) => head,
+            Err(_) => {
+                let response = HttpResponse::html(400, "Bad Request", "headers are not UTF-8");
+                socket_write_all(
+                    &app,
+                    &mut sock,
+                    &response.bytes_wire(&app.server, &now_imf_date()),
+                )
+                .await?;
                 return Ok(());
             }
         };
-        let head = std::str::from_utf8(&buf[..header_end])?;
-        let mut req = HttpRequest::parse_headers(head).map_err(|e| format!("parse: {e:?}"))?;
-        let need = req.content_length().unwrap_or(0);
-        if rusty_dlna_http::http_body_too_large(need) {
-            let resp = HttpResponse::html(413, "Payload Too Large", "body too large");
-            sock.write_all(&resp.bytes_wire(&app.server, &now_imf_date()))
+        let mut req = match HttpRequest::parse_headers(head) {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(%peer, ?error, "rejected malformed HTTP request");
+                let response = HttpResponse::html(400, "Bad Request", "malformed request");
+                socket_write_all(
+                    &app,
+                    &mut sock,
+                    &response.bytes_wire(&app.server, &now_imf_date()),
+                )
                 .await?;
-            break;
-        }
-        let mut body = buf[header_end..].to_vec();
-        while body.len() < need {
-            let n = sock.read(&mut tmp).await?;
-            if n == 0 {
-                break;
+                return Ok(());
             }
-            body.extend_from_slice(&tmp[..n]);
+        };
+        let need = req.content_length().unwrap_or(0);
+        if rusty_dlna_http::http_body_too_large(need) || need > app.cfg.max_request_body_bytes {
+            let resp = HttpResponse::html(413, "Payload Too Large", "body too large");
+            socket_write_all(
+                &app,
+                &mut sock,
+                &resp.bytes_wire(&app.server, &now_imf_date()),
+            )
+            .await?;
+            return Ok(());
         }
-        body.truncate(need);
-        req.body = body;
-        let resp = app.handle_from(&req, peer);
+        let request_end = header_end
+            .checked_add(need)
+            .ok_or("request length overflow")?;
+        let body_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(app.cfg.body_read_timeout_secs);
+        while pending.len() < request_end {
+            let n = match tokio::time::timeout_at(body_deadline, sock.read(&mut tmp)).await {
+                Ok(read) => read?,
+                Err(_) => {
+                    let response = HttpResponse::html(408, "Request Timeout", "body timeout");
+                    let _ = socket_write_all(
+                        &app,
+                        &mut sock,
+                        &response.bytes_wire(&app.server, &now_imf_date()),
+                    )
+                    .await;
+                    return Ok(());
+                }
+            };
+            if n == 0 {
+                let response = HttpResponse::html(400, "Bad Request", "incomplete body");
+                socket_write_all(
+                    &app,
+                    &mut sock,
+                    &response.bytes_wire(&app.server, &now_imf_date()),
+                )
+                .await?;
+                return Ok(());
+            }
+            pending.extend_from_slice(&tmp[..n]);
+        }
+        req.body = pending[header_end..request_end].to_vec();
+        pending.drain(..request_end);
+        let handler_app = app.clone();
+        let handler_request = req.clone();
+        let resp =
+            tokio::task::spawn_blocking(move || handler_app.handle_from(&handler_request, peer))
+                .await
+                .map_err(|error| format!("request worker failed: {error}"))?;
+        request_number = request_number.saturating_add(1);
         persist_left = persist_left.saturating_sub(1);
         if let Some(spec) = resp.remux_job.clone() {
             remux::serve_remux(&app, &mut sock, &req, spec).await?;
             break;
         }
         let wire = resp.bytes_wire(&app.server, &now_imf_date());
-        sock.write_all(&wire).await?;
+        socket_write_all(&app, &mut sock, &wire).await?;
         if let Some((path, start, end)) = resp.file_range.clone() {
-            stream_file_range(&mut sock, &path, start, end).await?;
+            stream_file_range(&app, &mut sock, &path, start, end).await?;
         }
         if !resp.persist || persist_left == 0 {
             break;
@@ -2751,13 +4110,29 @@ async fn handle_conn(
     Ok(())
 }
 
+pub(crate) async fn socket_write_all(
+    app: &App,
+    sock: &mut tokio::net::TcpStream,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    tokio::time::timeout(
+        Duration::from_secs(app.cfg.write_timeout_secs),
+        sock.write_all(bytes),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "socket write timeout"))?
+}
+
 pub(crate) async fn stream_file_range(
+    app: &App,
     sock: &mut tokio::net::TcpStream,
     path: &std::path::Path,
     start: u64,
     end: u64,
 ) -> std::io::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut f = tokio::fs::File::open(path).await?;
     f.seek(std::io::SeekFrom::Start(start)).await?;
     let mut left = end.saturating_sub(start).saturating_add(1);
@@ -2768,7 +4143,7 @@ pub(crate) async fn stream_file_range(
         if got == 0 {
             break;
         }
-        sock.write_all(&buf[..got]).await?;
+        socket_write_all(app, sock, &buf[..got]).await?;
         left -= got as u64;
     }
     Ok(())
@@ -2781,18 +4156,17 @@ mod tests {
     use rusty_dlna_soap::xml_tag_text;
 
     const TINY_JPEG: &[u8] = &[
-        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
-        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06,
-        0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D,
-        0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12, 0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D,
-        0x1A, 0x1C, 0x1C, 0x20, 0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28,
-        0x37, 0x29, 0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
-        0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01,
-        0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0xFF, 0xC4,
-        0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00,
-        0x3F, 0x00, 0x2A, 0x1F, 0xFF, 0xD9,
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06,
+        0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B,
+        0x0C, 0x19, 0x12, 0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20,
+        0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29, 0x2C, 0x30, 0x31,
+        0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32, 0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF,
+        0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00,
+        0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x08, 0xFF, 0xC4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xDA, 0x00, 0x08,
+        0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x2A, 0x1F, 0xFF, 0xD9,
     ];
 
     fn workspace() -> PathBuf {
@@ -2801,6 +4175,7 @@ mod tests {
 
     fn testdata_app() -> App {
         let root = workspace();
+        let test_tree = TestTree::new("fixtures");
         let lib = root.join("testdata/library");
         ensure_pattern_fixture(&lib);
         rusty_dlna_scan::ensure_show_fixture(&lib);
@@ -2808,7 +4183,10 @@ mod tests {
         if !nfo.exists() {
             let _ = std::fs::create_dir_all(lib.join("video"));
             let _ = std::fs::write(&nfo, "<movie><year>1999</year></movie>\n");
-            let _ = std::fs::write(lib.join("video/movie.srt"), "1\n00:00:00,000 --> 00:00:01,000\nhi\n");
+            let _ = std::fs::write(
+                lib.join("video/movie.srt"),
+                "1\n00:00:00,000 --> 00:00:01,000\nhi\n",
+            );
             let _ = std::fs::write(lib.join("video/movie.en.srt"), "en\n");
         }
         let poster = lib.join("video/movie-poster.jpg");
@@ -2860,14 +4238,8 @@ mod tests {
             friendly_name: "rustyDLNA-test".into(),
             media_dir: vec!["testdata/library".into()],
             exclude_dir: vec!["exclude_me".into()],
-            cache_dir: Some(format!(
-                "testdata/cache/t-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            )),
+            cache_dir: Some(test_tree.path().join("cache").display().to_string()),
+            db_dir: Some(test_tree.path().join("database").display().to_string()),
             rescan_secs: 0,
             remap: rusty_dlna_transcode::parse_remaps_toml(
                 r#"
@@ -2885,12 +4257,14 @@ audio_out = "to-aac"
                 enable: true,
                 encoder: "libx264".into(),
                 max_jobs: 1,
+                ..TranscodeCfg::default()
             },
             ..Config::default()
         };
-        let app = App::from_config(cfg, 18200, 11900, &root);
-        let cat = scan(&app.scan_cfg);
-        *app.catalog.write().expect("catalog") = cat;
+        let mut app = App::from_config(cfg, 18200, 11900, &root);
+        let cat = scan(&app.scan_cfg).unwrap();
+        *write_recover(&app.catalog) = cat;
+        app.test_tree = Some(test_tree);
         app
     }
 
@@ -2899,9 +4273,7 @@ audio_out = "to-aac"
     }
 
     fn get(path: &str, ua: &str) -> String {
-        format!(
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: {ua}\r\n\r\n"
-        )
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: {ua}\r\n\r\n")
     }
 
     fn resp_header<'a>(r: &'a HttpResponse, name: &str) -> Option<&'a str> {
@@ -2928,6 +4300,431 @@ audio_out = "to-aac"
         assert!(!collides_with_live_ports(18200, 11900));
         assert!(collides_with_live_ports(8200, 11900));
         assert!(collides_with_live_ports(18200, 1900));
+    }
+
+    #[test]
+    fn scan_policy_config_defaults_aliases_and_ranges_are_validated() {
+        let parsed: Config = toml::from_str(
+            r#"
+enable_subtitles = false
+enable_thumbnail = false
+enable_thumbnail_filmstrip = true
+thumbnail_width = 640
+thumbnail_quality = 5
+scan_command_timeout_secs = 9
+scan_workers = 16
+bookmark_retention_days = 90
+album_art_names = ["AlbumArt.jpg", "{stem}-cover.png"]
+"#,
+        )
+        .unwrap();
+        assert!(!parsed.subtitles);
+        assert!(!parsed.thumbnails);
+        assert!(parsed.thumbnail_filmstrip);
+        assert_eq!(parsed.thumbnail_width, 640);
+        assert_eq!(parsed.scan_workers, 16);
+        assert_eq!(parsed.bookmark_retention_days, 90);
+        assert!(validate_http_config(&parsed).is_ok());
+
+        let mut invalid = Config {
+            thumbnail_width: 0,
+            ..Config::default()
+        };
+        assert!(validate_http_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("thumbnail_width"));
+        invalid = Config::default();
+        invalid.album_art_names = vec!["../outside.jpg".into()];
+        assert!(validate_http_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("album_art_names"));
+        invalid = Config::default();
+        invalid.scan_command_timeout_secs = 0;
+        assert!(validate_http_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("scan_command_timeout_secs"));
+        invalid = Config::default();
+        invalid.scan_workers = 0;
+        assert!(validate_http_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("scan_workers"));
+        invalid.scan_workers = 65;
+        assert!(validate_http_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("scan_workers"));
+        invalid = Config::default();
+        invalid.bookmark_retention_days = 36_501;
+        assert!(validate_http_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("bookmark_retention_days"));
+        assert!(toml::from_str::<Config>("friendy_name = \"typo\"")
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field"));
+        assert!(toml::from_str::<Config>("[transcode]\nenabel = true")
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field"));
+        assert!(toml::from_str::<Config>("[[remap]]\nacton = \"original\"")
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field"));
+    }
+
+    #[test]
+    fn cache_and_database_directories_are_independent_and_config_relative() {
+        let test_tree = TestTree::new("split-dirs");
+        let tmp = test_tree.path();
+        let app = App::from_config(
+            Config {
+                cache_dir: Some("derived-cache".into()),
+                db_dir: Some("database".into()),
+                rescan_secs: 0,
+                ..Config::default()
+            },
+            18200,
+            11900,
+            tmp,
+        );
+        assert_eq!(app.cache_dir, tmp.join("derived-cache"));
+        assert_eq!(
+            app.scan_cfg.db_path.as_deref(),
+            Some(tmp.join("database/files.db").as_path())
+        );
+        assert!(tmp.join("database/files.db").is_file());
+    }
+
+    #[test]
+    fn transcode_validation_is_actionable_and_disabled_mode_needs_no_tools() {
+        let mut cfg = Config::default();
+        cfg.transcode.enable = true;
+        cfg.transcode.encoder = "copy".into();
+        let error = match App::try_from_config(cfg, 18200, 11900, &workspace()) {
+            Ok(_) => panic!("invalid transcode encoder was accepted"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("must name a video encoder"),
+            "{error}"
+        );
+
+        assert!(validate_transcode_tools(false, "not installed", &[])
+            .unwrap()
+            .is_empty());
+        let missing_encoder = rusty_dlna_transcode::parse_remaps_toml(
+            r#"
+[[remap]]
+hdr = "dv-p7"
+action = "hdr10"
+encoder = "rusty_encoder_that_does_not_exist"
+"#,
+        )
+        .unwrap();
+        let error = validate_transcode_tools(true, "libx264", &missing_encoder).unwrap_err();
+        assert!(error.to_string().contains("ffmpeg -encoders"), "{error}");
+    }
+
+    #[test]
+    fn uuid_is_validated_normalized_unique_and_persisted() {
+        assert_eq!(
+            normalize_uuid("4D696E69-444C-164E-9D41-98B7852028D3").unwrap(),
+            "uuid:4d696e69-444c-164e-9d41-98b7852028d3"
+        );
+        assert_eq!(
+            normalize_uuid("uuid:4d696e69-444c-164e-9d41-98b7852028d3").unwrap(),
+            "uuid:4d696e69-444c-164e-9d41-98b7852028d3"
+        );
+        assert!(normalize_uuid("uuid:not-a-uuid").is_err());
+
+        let test_tree = TestTree::new("uuid");
+        let base = test_tree.path().to_path_buf();
+        let first_dir = base.join("one");
+        let second_dir = base.join("two");
+        let first = load_or_create_uuid(&first_dir, None).unwrap();
+        let again = load_or_create_uuid(&first_dir, None).unwrap();
+        let second = load_or_create_uuid(&second_dir, None).unwrap();
+        assert_eq!(first, again, "UUID must survive restart");
+        assert_ne!(first, second, "independent caches need independent UUIDs");
+        assert_eq!(&first[19..20], "4", "generated UUID must be version 4");
+        assert!(matches!(&first[24..25], "8" | "9" | "a" | "b"));
+        assert_eq!(
+            std::fs::read_to_string(first_dir.join("uuid"))
+                .unwrap()
+                .trim(),
+            first
+        );
+
+        let invalid = Config {
+            uuid: Some("broken".into()),
+            cache_dir: Some(base.join("invalid").display().to_string()),
+            rescan_secs: 0,
+            ..Config::default()
+        };
+        let error = App::try_from_config(invalid, 18200, 11900, &base)
+            .err()
+            .expect("invalid configured UUID");
+        assert!(error.to_string().contains("uuid must be"), "{error}");
+    }
+
+    #[test]
+    fn advertisement_selection_validates_interfaces_and_live_addresses() {
+        let interfaces = vec![
+            InterfaceV4 {
+                name: "eth0".into(),
+                addr: "192.0.2.20".parse().unwrap(),
+                netmask: "255.255.255.0".parse().unwrap(),
+            },
+            InterfaceV4 {
+                name: "eth1".into(),
+                addr: "198.51.100.8".parse().unwrap(),
+                netmask: "255.255.255.0".parse().unwrap(),
+            },
+            InterfaceV4 {
+                name: "lo".into(),
+                addr: Ipv4Addr::LOCALHOST,
+                netmask: "255.0.0.0".parse().unwrap(),
+            },
+        ];
+        let live = rusty_dlna_protocol::ssdp::SSDP_PORT;
+        assert_eq!(
+            select_advertise_ip(
+                Some("192.0.2.20"),
+                Ipv4Addr::UNSPECIFIED,
+                &[],
+                live,
+                &interfaces,
+                None,
+            )
+            .unwrap(),
+            "192.0.2.20".parse::<Ipv4Addr>().unwrap()
+        );
+        assert!(select_advertise_ip(
+            Some("203.0.113.9"),
+            Ipv4Addr::UNSPECIFIED,
+            &[],
+            live,
+            &interfaces,
+            None,
+        )
+        .unwrap_err()
+        .contains("not assigned"));
+        assert!(select_advertise_ip(
+            Some("127.0.0.1"),
+            Ipv4Addr::UNSPECIFIED,
+            &[],
+            live,
+            &interfaces,
+            None,
+        )
+        .unwrap_err()
+        .contains("loopback"));
+        assert_eq!(
+            select_advertise_ip(
+                Some("127.0.0.1"),
+                Ipv4Addr::UNSPECIFIED,
+                &[],
+                11900,
+                &interfaces,
+                None,
+            )
+            .unwrap(),
+            Ipv4Addr::LOCALHOST
+        );
+        assert_eq!(
+            select_advertise_ip(
+                None,
+                Ipv4Addr::UNSPECIFIED,
+                &["eth1".into()],
+                live,
+                &interfaces,
+                None,
+            )
+            .unwrap(),
+            "198.51.100.8".parse::<Ipv4Addr>().unwrap()
+        );
+        assert!(select_advertise_ip(
+            None,
+            Ipv4Addr::UNSPECIFIED,
+            &["missing0".into()],
+            live,
+            &interfaces,
+            None,
+        )
+        .unwrap_err()
+        .contains("no enabled IPv4"));
+        assert_eq!(
+            select_advertise_ip(
+                None,
+                Ipv4Addr::UNSPECIFIED,
+                &[],
+                live,
+                &interfaces,
+                Some("eth0"),
+            )
+            .unwrap(),
+            "192.0.2.20".parse::<Ipv4Addr>().unwrap()
+        );
+        assert!(
+            select_advertise_ip(None, Ipv4Addr::UNSPECIFIED, &[], live, &interfaces, None,)
+                .unwrap_err()
+                .contains("multiple LAN")
+        );
+        assert!(
+            select_advertise_ip(None, Ipv4Addr::UNSPECIFIED, &[], live, &[], None,)
+                .unwrap_err()
+                .contains("no usable LAN")
+        );
+
+        let selected = select_ssdp_interfaces(
+            &["eth0".into(), "eth1".into()],
+            "192.0.2.20".parse().unwrap(),
+            live,
+            &interfaces,
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            reply_interface_for_sender(
+                "198.51.100.77".parse().unwrap(),
+                &selected,
+                "192.0.2.20".parse().unwrap(),
+            ),
+            "198.51.100.8".parse::<Ipv4Addr>().unwrap()
+        );
+        let packets = msearch_replies(
+            "uuid:test",
+            "upnp:rootdevice",
+            "198.51.100.8",
+            8200,
+            900,
+            "Linux/1 UPnP/1.0 rustyDLNA/1",
+            "Tue, 18 Aug 2026 00:00:00 GMT",
+        );
+        assert!(packets[0].contains("LOCATION: http://198.51.100.8:8200/rootDesc.xml"));
+
+        let mut same_name = interfaces.clone();
+        same_name.push(InterfaceV4 {
+            name: "eth0".into(),
+            addr: "192.0.2.21".parse().unwrap(),
+            netmask: "255.255.255.0".parse().unwrap(),
+        });
+        let selected = select_ssdp_interfaces(
+            &["eth0".into()],
+            "192.0.2.20".parse().unwrap(),
+            live,
+            &same_name,
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 2, "all IPv4 addresses on a named interface");
+    }
+
+    #[test]
+    fn renderer_location_policy_blocks_spoofed_and_off_link_targets() {
+        let interfaces = vec![InterfaceV4 {
+            name: "eth0".into(),
+            addr: "192.0.2.20".parse().unwrap(),
+            netmask: "255.255.255.0".parse().unwrap(),
+        }];
+        let sender: SocketAddr = "192.0.2.55:1900".parse().unwrap();
+        assert_eq!(
+            trusted_renderer_location(
+                "http://192.0.2.55:1400/description.xml",
+                sender,
+                &interfaces,
+            ),
+            Some((
+                "192.0.2.55".parse().unwrap(),
+                1400,
+                "/description.xml".into()
+            ))
+        );
+        for url in [
+            "http://192.0.2.99/description.xml",
+            "http://127.0.0.1/description.xml",
+            "http://239.255.255.250/description.xml",
+            "http://192.0.2.55@127.0.0.1/description.xml",
+            "http://192.0.2.55/description.xml\r\nX-Evil: yes",
+        ] {
+            assert!(
+                trusted_renderer_location(url, sender, &interfaces).is_none(),
+                "trusted spoofed URL {url:?}"
+            );
+        }
+        assert!(trusted_renderer_location(
+            "http://198.51.100.55/description.xml",
+            "198.51.100.55:1900".parse().unwrap(),
+            &interfaces,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn renderer_http_response_requires_bounded_successful_xml() {
+        let body = b"<root><friendlyName>Living Room</friendlyName></root>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut valid = response.into_bytes();
+        valid.extend_from_slice(body);
+        assert_eq!(renderer_xml_body(&valid), Some(body.as_slice()));
+
+        for response in [
+            b"HTTP/1.1 404 Not Found\r\nContent-Type: text/xml\r\nContent-Length: 0\r\n\r\n"
+                .as_slice(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: 9999999\r\n\r\n",
+        ] {
+            assert!(renderer_xml_body(response).is_none());
+        }
+        let mut oversized = b"HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n\r\n".to_vec();
+        oversized.resize(oversized.len() + MAX_RENDERER_DESCRIPTION_BYTES + 1, b'x');
+        assert!(renderer_xml_body(&oversized).is_none());
+    }
+
+    #[test]
+    fn renderer_and_msearch_limiters_deduplicate_floods() {
+        let sender: Ipv4Addr = "192.0.2.55".parse().unwrap();
+        let now = std::time::Instant::now();
+        let mut renderer = RendererFetchLimiter::default();
+        assert!(renderer.allow(sender, "one", now));
+        assert!(!renderer.allow(sender, "one", now));
+        assert!(renderer.allow(sender, "two", now));
+        assert!(renderer.allow(sender, "three", now));
+        assert!(renderer.allow(sender, "four", now));
+        assert!(!renderer.allow(sender, "five", now));
+        assert!(renderer.allow(sender, "five", now + Duration::from_secs(61)));
+
+        let mut replies = SsdpReplyLimiter::default();
+        assert!(replies.allow(sender, 6, now));
+        assert!(replies.allow(sender, 6, now));
+        assert!(!replies.allow(sender, 1, now));
+        assert!(replies.allow(sender, 6, now + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn renderer_fetch_has_a_total_slow_response_deadline() {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request);
+            std::thread::sleep(Duration::from_millis(1500));
+        });
+        let started = std::time::Instant::now();
+        assert!(fetch_renderer_description(Ipv4Addr::LOCALHOST, port, "/slow").is_none());
+        assert!(started.elapsed() < Duration::from_millis(1400));
+        server.join().unwrap();
     }
 
     #[test]
@@ -2959,14 +4756,12 @@ audio_out = "to-aac"
         let body = String::from_utf8_lossy(&scpd.body);
         assert!(body.contains("<name>Browse</name>"), "{body}");
         assert!(body.contains("BrowseDirectChildren"), "{body}");
-        let sub = req(
-            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+        let sub = req("SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
              Host: 192.0.2.10:8200\r\n\
              Callback: <http://192.0.2.50:1234/evt>\r\n\
              NT: upnp:event\r\n\
              Timeout: Second-300\r\n\
-             Content-Length: 0\r\n\r\n",
-        );
+             Content-Length: 0\r\n\r\n");
         let peer: SocketAddr = "192.0.2.50:1234".parse().unwrap();
         let r = app.handle_from(&sub, peer);
         assert_eq!(r.status, 200, "Platinum SUBSCRIBE must not 404");
@@ -2980,7 +4775,7 @@ audio_out = "to-aac"
     }
 
     fn accept_notify(listener: &std::net::TcpListener, timeout: std::time::Duration) -> String {
-        use std::io::Read;
+        use std::io::{Read, Write};
         let start = std::time::Instant::now();
         listener.set_nonblocking(true).ok();
         loop {
@@ -2991,7 +4786,34 @@ audio_out = "to-aac"
                     sock.set_read_timeout(Some(std::time::Duration::from_secs(2)))
                         .ok();
                     let mut buf = Vec::new();
-                    let _ = sock.read_to_end(&mut buf);
+                    let mut chunk = [0u8; 2048];
+                    loop {
+                        match sock.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => {
+                                buf.extend_from_slice(&chunk[..read]);
+                                let Some(header_end) =
+                                    buf.windows(4).position(|w| w == b"\r\n\r\n")
+                                else {
+                                    continue;
+                                };
+                                let headers = String::from_utf8_lossy(&buf[..header_end]);
+                                let content_length = headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (name, value) = line.split_once(':')?;
+                                        name.eq_ignore_ascii_case("Content-Length")
+                                            .then(|| value.trim().parse::<usize>().ok())
+                                            .flatten()
+                                    })
+                                    .unwrap_or(0);
+                                if buf.len() >= header_end + 4 + content_length {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let _ = sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                     return String::from_utf8_lossy(&buf).into_owned();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3010,74 +4832,69 @@ audio_out = "to-aac"
         let app = testdata_app();
         let peer50: SocketAddr = "192.0.2.50:1234".parse().unwrap();
         let peer1: SocketAddr = "192.0.2.1:9".parse().unwrap();
-        let new_ok = req(
-            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+        let new_ok = req("SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
              Host: 192.0.2.10:18200\r\n\
              Callback: <http://192.0.2.50:1234/evt>\r\n\
              NT: upnp:event\r\n\
              Timeout: Second-300\r\n\
-             Content-Length: 0\r\n\r\n",
-        );
+             Content-Length: 0\r\n\r\n");
         let r = app.handle_from(&new_ok, peer50);
         assert_eq!(r.status, 200);
         let sid = resp_header(&r, "SID").unwrap_or("");
         assert!(sid.starts_with("uuid:"), "{sid}");
+        assert_eq!(
+            uuid::Uuid::parse_str(sid.trim_start_matches("uuid:"))
+                .unwrap()
+                .get_version_num(),
+            4
+        );
         assert_eq!(resp_header(&r, "Timeout"), Some("Second-300"));
 
-        let inject = req(
-            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+        let inject = "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
              Host: 192.0.2.10:18200\r\n\
              Callback: <http://192.0.2.50:1234/evt\nX-Injected: 1>\r\n\
              NT: upnp:event\r\n\
              Timeout: Second-300\r\n\
-             Content-Length: 0\r\n\r\n",
-        );
-        assert_eq!(app.handle_from(&inject, peer50).status, 412);
+             Content-Length: 0\r\n\r\n";
+        assert!(matches!(
+            HttpRequest::parse_headers(inject),
+            Err(rusty_dlna_http::ParseError::InvalidHeaderValue)
+        ));
 
-        let mismatch = req(
-            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+        let mismatch = req("SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
              Host: 192.0.2.10:18200\r\n\
              Callback: <http://192.0.2.50:1234/evt>\r\n\
              NT: upnp:event\r\n\
              Timeout: Second-300\r\n\
-             Content-Length: 0\r\n\r\n",
-        );
+             Content-Length: 0\r\n\r\n");
         assert_eq!(app.handle_from(&mismatch, peer1).status, 412);
 
-        let both = req(
-            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+        let both = req("SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
              Host: 192.0.2.10:18200\r\n\
              Callback: <http://192.0.2.50:1234/evt>\r\n\
              SID: uuid:already-have-one\r\n\
              NT: upnp:event\r\n\
-             Content-Length: 0\r\n\r\n",
-        );
+             Content-Length: 0\r\n\r\n");
         assert_eq!(app.handle_from(&both, peer50).status, 400);
 
-        let no_nt = req(
-            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+        let no_nt = req("SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
              Host: 192.0.2.10:18200\r\n\
              Callback: <http://192.0.2.50:1234/evt>\r\n\
              Timeout: Second-300\r\n\
-             Content-Length: 0\r\n\r\n",
-        );
+             Content-Length: 0\r\n\r\n");
         assert_eq!(app.handle_from(&no_nt, peer50).status, 400);
 
-        let renew_unknown = req(
-            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+        let renew_unknown = req("SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
              Host: 192.0.2.10:18200\r\n\
              SID: uuid:00000000-0000-4000-8000-ffffffffffff\r\n\
              Timeout: Second-300\r\n\
-             Content-Length: 0\r\n\r\n",
-        );
+             Content-Length: 0\r\n\r\n");
         assert_eq!(app.handle_from(&renew_unknown, peer50).status, 412);
 
-        let unsub_unknown = req(
-            "UNSUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+        let unsub_unknown = req("UNSUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
              Host: 192.0.2.10:18200\r\n\
              SID: uuid:00000000-0000-4000-8000-ffffffffffff\r\n\
-             Content-Length: 0\r\n\r\n",
-        );
+             Content-Length: 0\r\n\r\n");
         assert_eq!(app.handle_from(&unsub_unknown, peer50).status, 412);
 
         let renew = req(&format!(
@@ -3089,8 +4906,14 @@ audio_out = "to-aac"
         ));
         let r = app.handle_from(&renew, peer50);
         assert_eq!(r.status, 200);
-        assert_eq!(resp_header(&r, "Timeout"), Some("Second-300"));
+        assert_eq!(resp_header(&r, "Timeout"), Some("Second-1800"));
         assert_eq!(resp_header(&r, "SID"), Some(sid));
+
+        let renew_low = req(&format!(
+            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\nHost: 192.0.2.10:18200\r\nSID: {sid}\r\nTimeout: Second-1\r\nContent-Length: 0\r\n\r\n"
+        ));
+        let r = app.handle_from(&renew_low, peer50);
+        assert_eq!(resp_header(&r, "Timeout"), Some("Second-30"));
     }
 
     #[test]
@@ -3123,7 +4946,7 @@ audio_out = "to-aac"
             .and_then(|s| s.split('<').next())
             .unwrap_or("");
         let before = app.update_id.load(Ordering::Relaxed);
-        let cat = app.catalog.read().expect("catalog").clone();
+        let cat = read_recover(&app.catalog).clone();
         apply_catalog(
             &app,
             cat,
@@ -3132,7 +4955,8 @@ audio_out = "to-aac"
                 ..ScanDelta::default()
             },
             "test catalog bump",
-        );
+        )
+        .unwrap();
         let after = app.update_id.load(Ordering::Relaxed);
         assert!(after > before, "update_id {before} -> {after}");
         let n1 = accept_notify(&listener, std::time::Duration::from_secs(3));
@@ -3150,8 +4974,46 @@ audio_out = "to-aac"
         }
         if let Some(p) = app.scan_cfg.db_path.as_ref() {
             let db = LibraryDb::open(p).expect("db");
-            assert_eq!(db.get_update_id(), after);
+            assert_eq!(db.get_update_id().unwrap(), after);
         }
+    }
+
+    #[test]
+    fn catalog_publication_failure_keeps_catalog_and_update_id_in_sync() {
+        let app = testdata_app();
+        let path = app.scan_cfg.db_path.as_ref().unwrap().clone();
+        let mut next = app
+            .catalog
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let item_id = next.items.keys().next().expect("fixture item").clone();
+        let old_title = next.items[&item_id].title.clone();
+        next.items.get_mut(&item_id).unwrap().title = "must-not-publish".into();
+        let old_update_id = app.update_id.load(Ordering::Relaxed);
+
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let result = apply_catalog(
+            &app,
+            next,
+            ScanDelta {
+                changed: 1,
+                ..ScanDelta::default()
+            },
+            "injected publication failure",
+        );
+        assert!(result.is_err());
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(app.update_id.load(Ordering::Relaxed), old_update_id);
+        assert_eq!(
+            app.catalog
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .items[&item_id]
+                .title,
+            old_title
+        );
     }
 
     #[test]
@@ -3178,9 +5040,8 @@ audio_out = "to-aac"
             "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\nHost: localhost\r\nCallback: <http://127.0.0.1:9/e>\r\nNT: upnp:event\r\n\r\n",
         );
         assert_eq!(app.handle(&sub_rebind).status, 400);
-        let unsub_rebind = req(
-            "UNSUBSCRIBE /evt/ContentDir HTTP/1.1\r\nHost: evil.test\r\nSID: uuid:x\r\n\r\n",
-        );
+        let unsub_rebind =
+            req("UNSUBSCRIBE /evt/ContentDir HTTP/1.1\r\nHost: evil.test\r\nSID: uuid:x\r\n\r\n");
         assert_eq!(app.handle(&unsub_rebind).status, 400);
     }
 
@@ -3188,7 +5049,7 @@ audio_out = "to-aac"
     fn sidecar_size_and_symlink_jail() {
         let app = testdata_app();
         let (art_id, detail_id) = {
-            let cat = app.catalog.read().expect("catalog");
+            let cat = read_recover(&app.catalog);
             let movie = cat
                 .items
                 .values()
@@ -3198,14 +5059,11 @@ audio_out = "to-aac"
         };
         assert!(art_id > 0);
 
-        let outside = std::env::temp_dir().join(format!(
-            "rdlna-secret-{}-{}",
-            std::process::id(),
-            detail_id
-        ));
+        let outside_tree = TestTree::new("sidecar-outside");
+        let outside = outside_tree.path().join(format!("secret-{detail_id}"));
         std::fs::write(&outside, b"not-a-poster").unwrap();
         {
-            let mut cat = app.catalog.write().expect("catalog");
+            let mut cat = write_recover(&app.catalog);
             cat.album_art_paths.insert(art_id, outside.clone());
         }
         let escaped = app.handle(&req(&get(
@@ -3226,7 +5084,7 @@ audio_out = "to-aac"
             f.set_len(rusty_dlna_scan::MAX_SIDECAR_BYTES + 1).unwrap();
         }
         {
-            let mut cat = app.catalog.write().expect("catalog");
+            let mut cat = write_recover(&app.catalog);
             cat.album_art_paths.insert(art_id, big.clone());
         }
         let huge = app.handle(&req(&get(
@@ -3242,7 +5100,7 @@ audio_out = "to-aac"
         ));
         let _ = std::os::unix::fs::symlink(&outside, &link);
         {
-            let mut cat = app.catalog.write().expect("catalog");
+            let mut cat = write_recover(&app.catalog);
             cat.album_art_paths.insert(art_id, link.clone());
         }
         let via_link = app.handle(&req(&get(
@@ -3251,8 +5109,44 @@ audio_out = "to-aac"
         )));
         assert_eq!(via_link.status, 404, "symlink out of tree must 404");
 
-        let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_file(&big);
+        let _ = std::fs::remove_file(&link);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_uses_the_same_wide_links_policy_as_the_scanner() {
+        let mut app = testdata_app();
+        let root = app.scan_cfg.media_dirs[0].join("video");
+        let suffix = format!("{}", std::process::id());
+        let outside_tree = TestTree::new("wide-source");
+        let outside = outside_tree.path().join(format!("source-{suffix}.mkv"));
+        let link = root.join(format!("wide-link-{suffix}.mkv"));
+        std::fs::write(&outside, b"outside media bytes").unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let mut item = movie_fixture(&app);
+        item.detail_id = 9_100_001;
+        item.object_id = "wide-link-object".into();
+        item.path = link.clone();
+        item.size = std::fs::metadata(&outside).unwrap().len();
+        {
+            let mut cat = app.catalog.write().unwrap();
+            cat.by_detail.insert(item.detail_id, item.object_id.clone());
+            cat.items.insert(item.object_id.clone(), item.clone());
+        }
+        let request = req(&format!(
+            "GET /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n\r\n",
+            item.detail_id
+        ));
+        assert_eq!(app.handle(&request).status, 403);
+
+        app.cfg.wide_links = true;
+        app.scan_cfg.wide_links = true;
+        let allowed = app.handle(&request);
+        assert_eq!(allowed.status, 200);
+        assert_eq!(allowed.body, b"outside media bytes");
+
         let _ = std::fs::remove_file(&link);
     }
 
@@ -3277,8 +5171,19 @@ audio_out = "to-aac"
     }
 
     fn soap_browse(app: &App, oid: &str, flag: &str, ua: &str) -> (u16, String) {
+        soap_browse_page(app, oid, flag, ua, 0, 0)
+    }
+
+    fn soap_browse_page(
+        app: &App,
+        oid: &str,
+        flag: &str,
+        ua: &str,
+        start: usize,
+        requested: usize,
+    ) -> (u16, String) {
         let body = format!(
-            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>{oid}</ObjectID><BrowseFlag>{flag}</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"#
+            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>{oid}</ObjectID><BrowseFlag>{flag}</BrowseFlag><Filter>*</Filter><StartingIndex>{start}</StartingIndex><RequestedCount>{requested}</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"#
         );
         let raw = format!(
             "POST /whatever HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: {ua}\r\nSOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n",
@@ -3288,6 +5193,28 @@ audio_out = "to-aac"
         req.body = body.into_bytes();
         let r = app.handle(&req);
         (r.status, String::from_utf8_lossy(&r.body).into_owned())
+    }
+
+    fn add_large_catalog_page(app: &App, count: usize) {
+        let mut cat = write_recover(&app.catalog);
+        let template = cat.items.values().next().cloned().expect("fixture item");
+        let mut ids = Vec::with_capacity(count);
+        for index in 0..count {
+            let id = format!("2$8$B{index:X}");
+            let mut item = template.clone();
+            item.object_id = id.clone();
+            item.parent_id = "2$8".into();
+            item.detail_id = 1_000_000 + index as i64;
+            item.title = format!("Bounded item {index:06} {}", "<&snow雪>".repeat(96));
+            item.ref_id = None;
+            cat.items.insert(id.clone(), item);
+            ids.push(id);
+        }
+        cat.containers
+            .get_mut("2$8")
+            .expect("all-video container")
+            .children
+            .extend(ids);
     }
 
     #[test]
@@ -3322,10 +5249,7 @@ audio_out = "to-aac"
             video.contains("&lt;container ") && video.contains("storageUsed"),
             "folder DIDL (container + storageUsed) required for VLC expand: {video}"
         );
-        assert!(
-            video.contains("object.container.storageFolder"),
-            "{video}"
-        );
+        assert!(video.contains("object.container.storageFolder"), "{video}");
         // items live under 2$8
         let (st2, items) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
         assert_eq!(st2, 200);
@@ -3360,8 +5284,7 @@ audio_out = "to-aac"
             "DIDL dc:title must use NFO title: {items}"
         );
         assert!(
-            !items.contains("&lt;dc:title&gt;movie&lt;/dc:title&gt;")
-                && !items.contains(">movie<"),
+            !items.contains("&lt;dc:title&gt;movie&lt;/dc:title&gt;") && !items.contains(">movie<"),
             "filename-only title must not be the movie item title: {items}"
         );
     }
@@ -3404,7 +5327,10 @@ audio_out = "to-aac"
         );
         let (st, genres) = soap_browse(&app, "2$9", "BrowseDirectChildren", "Kodi/21.0");
         assert_eq!(st, 200);
-        assert!(genres.contains("Drama") || genres.contains("Crime"), "{genres}");
+        assert!(
+            genres.contains("Drama") || genres.contains("Crime"),
+            "{genres}"
+        );
         let drama_id = {
             let cat = app.catalog.read().unwrap();
             cat.containers
@@ -3415,7 +5341,10 @@ audio_out = "to-aac"
         };
         let (st, items) = soap_browse(&app, &drama_id, "BrowseDirectChildren", "Kodi/21.0");
         assert_eq!(st, 200);
-        assert!(items.contains("The Show") || items.contains("Pilot"), "{items}");
+        assert!(
+            items.contains("The Show") || items.contains("Pilot"),
+            "{items}"
+        );
     }
 
     #[test]
@@ -3429,7 +5358,10 @@ audio_out = "to-aac"
                 || items.contains("&lt;dc:title&gt;movie"),
             "movie item missing: {items}"
         );
-        assert!(items.contains("/AlbumArt/"), "DIDL missing /AlbumArt/: {items}");
+        assert!(
+            items.contains("/AlbumArt/"),
+            "DIDL missing /AlbumArt/: {items}"
+        );
         assert!(
             items.contains("JPEG_TN") || items.contains("albumArtURI"),
             "DIDL missing JPEG_TN or albumArtURI: {items}"
@@ -3437,7 +5369,7 @@ audio_out = "to-aac"
         let (art_id, detail_id) = parse_album_art_url(&items).expect("parse art url from DIDL");
         assert!(art_id > 0, "art id from DIDL");
         {
-            let cat = app.catalog.read().expect("catalog");
+            let cat = read_recover(&app.catalog);
             let movie = cat
                 .items
                 .values()
@@ -3457,7 +5389,10 @@ audio_out = "to-aac"
             r.body.len() >= 3 && r.body[0] == 0xff && r.body[1] == 0xd8,
             "JPEG magic"
         );
-        assert_eq!(resp_header(&r, "transferMode.dlna.org"), Some("Interactive"));
+        assert_eq!(
+            resp_header(&r, "transferMode.dlna.org"),
+            Some("Interactive")
+        );
         let feats = resp_header(&r, "contentFeatures.dlna.org").unwrap_or("");
         assert!(feats.contains("JPEG_TN"), "contentFeatures={feats}");
 
@@ -3482,8 +5417,8 @@ audio_out = "to-aac"
         assert_eq!(resp_header(&thumb, "Content-Type"), Some("image/jpeg"));
         let ffmpeg_ok = std::process::Command::new("ffmpeg")
             .arg("-version")
-            .status()
-            .map(|s| s.success())
+            .output()
+            .map(|output| output.status.success())
             .unwrap_or(false);
         if !ffmpeg_ok {
             eprintln!("skip /Resized/ GET (ffmpeg missing)");
@@ -3523,7 +5458,12 @@ audio_out = "to-aac"
     fn root_container_v_browse_zero_parent_is_root() {
         let mut app = testdata_app();
         app.cfg.root_container = Some("V".into());
-        let (st, xml) = soap_browse(&app, "0", "BrowseDirectChildren", "VLC/3.0.21 LibVLC/3.0.21");
+        let (st, xml) = soap_browse(
+            &app,
+            "0",
+            "BrowseDirectChildren",
+            "VLC/3.0.21 LibVLC/3.0.21",
+        );
         assert_eq!(st, 200);
         assert!(xml.contains("All Video"), "{xml}");
         assert!(xml.contains("Folders"), "{xml}");
@@ -3540,7 +5480,10 @@ audio_out = "to-aac"
                 && xml.contains("storageUsed&gt;-1"),
             "VLC expand marker needs container + storageFolder + storageUsed: {xml}"
         );
-        assert!(!xml.contains("&lt;item "), "root video view is folders only: {xml}");
+        assert!(
+            !xml.contains("&lt;item "),
+            "root video view is folders only: {xml}"
+        );
     }
 
     #[test]
@@ -3568,6 +5511,262 @@ audio_out = "to-aac"
     }
 
     #[test]
+    fn large_browse_and_search_are_byte_and_page_bounded() {
+        let mut app = testdata_app();
+        // This fixture extends only the in-memory generation; production
+        // requests use the SQLite query path when DB/catalog populations agree.
+        app.scan_cfg.db_path = None;
+        add_large_catalog_page(&app, 5_000);
+        let expected_browse_total = app
+            .catalog
+            .read()
+            .unwrap()
+            .containers
+            .get("2$8")
+            .unwrap()
+            .children
+            .len() as u32;
+
+        let started = std::time::Instant::now();
+        let (status, browse) =
+            soap_browse_page(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0", 0, 0);
+        assert_eq!(status, 200);
+        assert!(browse.len() <= MAX_SOAP_RESPONSE_BYTES, "{}", browse.len());
+        let returned: u32 = xml_tag_text(&browse, "NumberReturned")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let total: u32 = xml_tag_text(&browse, "TotalMatches")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(total, expected_browse_total);
+        assert!(
+            returned > 0 && returned < total,
+            "returned={returned} total={total}"
+        );
+        assert!(returned as usize <= MAX_SOAP_PAGE_OBJECTS);
+
+        let (_, page) = soap_browse_page(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0", 10, 3);
+        assert_eq!(xml_tag_text(&page, "NumberReturned").as_deref(), Some("3"));
+        assert_eq!(
+            xml_tag_text(&page, "TotalMatches")
+                .unwrap()
+                .parse::<u32>()
+                .unwrap(),
+            expected_browse_total
+        );
+        let (_, past_end) = soap_browse_page(
+            &app,
+            "2$8",
+            "BrowseDirectChildren",
+            "Kodi/21.0",
+            usize::try_from(i32::MAX).unwrap(),
+            0,
+        );
+        assert_eq!(
+            xml_tag_text(&past_end, "NumberReturned").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            xml_tag_text(&past_end, "TotalMatches")
+                .unwrap()
+                .parse::<u32>()
+                .unwrap(),
+            expected_browse_total
+        );
+
+        let (status, search) = soap_action(
+            &app,
+            "Search",
+            r#"<ContainerID>0</ContainerID><SearchCriteria>dc:title contains "Bounded item"</SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria>+dc:title</SortCriteria>"#,
+            "Kodi/21.0",
+        );
+        assert_eq!(status, 200);
+        assert!(search.len() <= MAX_SOAP_RESPONSE_BYTES, "{}", search.len());
+        assert_eq!(
+            xml_tag_text(&search, "TotalMatches").as_deref(),
+            Some("5000")
+        );
+        let search_returned: u32 = xml_tag_text(&search, "NumberReturned")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(search_returned > 0 && search_returned < 5_000);
+
+        let (_, search_past_end) = soap_action(
+            &app,
+            "Search",
+            r#"<ContainerID>0</ContainerID><SearchCriteria>dc:title contains "Bounded item"</SearchCriteria><Filter>*</Filter><StartingIndex>2147483647</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria>+dc:title</SortCriteria>"#,
+            "Kodi/21.0",
+        );
+        assert_eq!(
+            xml_tag_text(&search_past_end, "NumberReturned").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            xml_tag_text(&search_past_end, "TotalMatches").as_deref(),
+            Some("5000")
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "large-catalog regression took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn pagination_totals_and_sort_stability_hold_for_every_small_page() {
+        let app = testdata_app();
+        let cat = app.catalog.read().unwrap();
+        let parent = rusty_dlna_protocol::object_id::BROWSEDIR_ID;
+        let (all, total) =
+            sorted_child_page(&cat, parent, 0, usize::MAX, &[], DefaultOrder::FoldersFirst)
+                .expect("Browse Folders container");
+        assert_eq!(usize::try_from(total).unwrap(), all.len());
+        for start in 0..=all.len().saturating_add(2) {
+            for take in 0..=all.len().saturating_add(2) {
+                let (page, page_total) =
+                    sorted_child_page(&cat, parent, start, take, &[], DefaultOrder::FoldersFirst)
+                        .unwrap();
+                assert_eq!(page_total, total);
+                assert_eq!(page.len(), take.min(all.len().saturating_sub(start)));
+                let page_ids: Vec<_> = page
+                    .iter()
+                    .map(|child| match child {
+                        CatalogChild::Container(value) => value.object_id.as_str(),
+                        CatalogChild::Item(value) => value.object_id.as_str(),
+                    })
+                    .collect();
+                let expected_ids: Vec<_> = all
+                    .iter()
+                    .skip(start)
+                    .take(take)
+                    .map(|child| match child {
+                        CatalogChild::Container(value) => value.object_id.as_str(),
+                        CatalogChild::Item(value) => value.object_id.as_str(),
+                    })
+                    .collect();
+                assert_eq!(page_ids, expected_ids);
+            }
+        }
+
+        let template = cat.items.values().next().expect("fixture item").clone();
+        drop(cat);
+        let mut equal_keys = Vec::new();
+        for id in ["stable-c", "stable-a", "stable-b"] {
+            let mut item = template.clone();
+            item.object_id = id.into();
+            item.title = "same title".into();
+            equal_keys.push(CatalogChild::Item(Box::new(item)));
+        }
+        sort_catalog_children(
+            &mut equal_keys,
+            &[SortSpec {
+                key: SortKey::Title,
+                descending: false,
+            }],
+            DefaultOrder::FoldersFirst,
+        );
+        let ids: Vec<_> = equal_keys
+            .iter()
+            .map(|child| match child {
+                CatalogChild::Container(value) => value.object_id.as_str(),
+                CatalogChild::Item(value) => value.object_id.as_str(),
+            })
+            .collect();
+        assert_eq!(ids, ["stable-c", "stable-a", "stable-b"]);
+    }
+
+    #[test]
+    fn published_catalog_object_ids_are_globally_unique() {
+        let app = testdata_app();
+        let cat = app.catalog.read().unwrap();
+        let mut ids = std::collections::HashSet::new();
+        for id in cat.containers.keys().chain(cat.items.keys()) {
+            assert!(ids.insert(id), "duplicate published object ID: {id}");
+        }
+        for (parent_id, container) in &cat.containers {
+            let mut children = std::collections::HashSet::new();
+            for child_id in &container.children {
+                assert!(
+                    children.insert(child_id),
+                    "duplicate child {child_id} under {parent_id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn request_time_sqlite_query_matches_the_published_catalog_generation() {
+        let app = testdata_app();
+        let query = CatalogQuery {
+            groups: vec![vec![CatalogQueryClause {
+                field: CatalogQueryField::Class,
+                op: CatalogQueryOp::DerivedFrom("object.item.videoItem".into()),
+            }]],
+            sort: vec![CatalogQuerySort {
+                field: CatalogQueryField::Title,
+                descending: false,
+            }],
+            default_order: CatalogDefaultOrder::FoldersFirst,
+        };
+        let page = query_db_search(
+            app.db_pool.as_ref(),
+            app.scan_cfg.db_path.as_deref(),
+            "0",
+            &query,
+            0,
+            MAX_SOAP_PAGE_OBJECTS,
+        )
+        .expect("SQLite query path");
+        let cat = app.catalog.read().unwrap();
+        assert_eq!(page.population, catalog_population(&cat));
+        let materialized = materialize_db_page(&cat, &page).expect("same DB/catalog generation");
+        assert_eq!(materialized.len(), page.object_ids.len());
+        assert!(page.total >= 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn large_soap_client_disconnect_terminates_handler() {
+        use tokio::io::AsyncWriteExt;
+
+        let mut configured = testdata_app();
+        configured.scan_cfg.db_path = None;
+        let app = Arc::new(configured);
+        add_large_catalog_page(&app, 5_000);
+        let body = r#"<u:Browse><ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse>"#;
+        let request = format!(
+            "POST /ctl/ContentDir HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Kodi/21.0\r\nSOAPAction: \"urn:x#Browse\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_app = app.clone();
+        let server = tokio::spawn(async move {
+            let (socket, peer) = listener.accept().await.unwrap();
+            handle_conn(server_app, socket, peer).await
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        drop(client);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("disconnected SOAP handler did not terminate")
+            .expect("handler task panicked");
+        if let Err(error) = outcome {
+            let text = error.to_string();
+            assert!(
+                text.contains("Broken pipe")
+                    || text.contains("reset")
+                    || text.contains("closed")
+                    || text.contains("Connection"),
+                "unexpected disconnect error: {text}"
+            );
+        }
+    }
+
+    #[test]
     fn missing_objectid_is_402_unknown_is_401() {
         let app = testdata_app();
         let body = r#"<s:Envelope><s:Body><u:Browse></u:Browse></s:Body></s:Envelope>"#;
@@ -3592,6 +5791,148 @@ audio_out = "to-aac"
         let mut r = HttpRequest::parse_headers(headers).unwrap();
         r.body = body.to_vec();
         r
+    }
+
+    async fn raw_connection(app: Arc<App>, bytes: &[u8], close_write: bool) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, peer) = listener.accept().await.unwrap();
+            handle_conn(app, socket, peer).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        if !bytes.is_empty() {
+            client.write_all(bytes).await.unwrap();
+        }
+        if close_write {
+            client.shutdown().await.unwrap();
+        }
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(4), client.read_to_end(&mut response))
+            .await
+            .expect("server response timeout")
+            .unwrap();
+        server.await.unwrap();
+        response
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connection_parser_preserves_pipeline_and_rejects_smuggling() {
+        let app = Arc::new(testdata_app());
+        let pipeline = concat!(
+            "GET /rootDesc.xml HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n\r\n",
+            "GET /rootDesc.xml HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nConnection: close\r\n\r\n"
+        );
+        let response = raw_connection(app.clone(), pipeline.as_bytes(), true).await;
+        let text = String::from_utf8_lossy(&response);
+        assert_eq!(
+            text.matches("HTTP/1.1 200 OK").count(),
+            2,
+            "pipelined response bytes: {text}"
+        );
+
+        let body_pipeline = concat!(
+            "GET /rootDesc.xml HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n",
+            "Content-Length: 1\r\n\r\n",
+            "x",
+            "GET /rootDesc.xml HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nConnection: close\r\n\r\n"
+        );
+        let response = raw_connection(app.clone(), body_pipeline.as_bytes(), true).await;
+        let text = String::from_utf8_lossy(&response);
+        assert_eq!(
+            text.matches("HTTP/1.1 200 OK").count(),
+            2,
+            "body plus pipelined request was not preserved: {text}"
+        );
+
+        for malformed in [
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1, 1\r\n\r\n",
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 1\r\nTransfer-Encoding: identity\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost : 127.0.0.1\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nhOsT: 127.0.0.2\r\n\r\n",
+            "GET / HTTP/9.9\r\nHost: 127.0.0.1\r\n\r\n",
+        ] {
+            let response = raw_connection(app.clone(), malformed.as_bytes(), true).await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 400 Bad Request"),
+                "malformed request was not 400: {}",
+                String::from_utf8_lossy(&response)
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connection_body_caps_incomplete_bodies_and_slow_headers_are_bounded() {
+        let mut configured = testdata_app();
+        configured.cfg.max_request_body_bytes = 8;
+        configured.cfg.header_read_timeout_secs = 1;
+        configured.cfg.body_read_timeout_secs = 1;
+        let app = Arc::new(configured);
+
+        let oversized = raw_connection(
+            app.clone(),
+            b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 9\r\n\r\n",
+            true,
+        )
+        .await;
+        assert!(oversized.starts_with(b"HTTP/1.1 413 Payload Too Large"));
+
+        let incomplete = raw_connection(
+            app.clone(),
+            b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\n\r\nab",
+            true,
+        )
+        .await;
+        assert!(incomplete.starts_with(b"HTTP/1.1 400 Bad Request"));
+
+        let started = std::time::Instant::now();
+        let timeout = raw_connection(app, b"G", false).await;
+        assert!(timeout.starts_with(b"HTTP/1.1 408 Request Timeout"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_connections_holds_excess_clients_in_the_kernel_backlog() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut configured = testdata_app();
+        configured.cfg.max_connections = 1;
+        let app = Arc::new(configured);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(accept_loop(listener, app));
+
+        let mut first = tokio::net::TcpStream::connect(address).await.unwrap();
+        first.write_all(b"G").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut second = tokio::net::TcpStream::connect(address).await.unwrap();
+        second
+            .write_all(
+                b"GET /rootDesc.xml HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), second.read(&mut byte))
+                .await
+                .is_err(),
+            "second connection was serviced while the sole permit was occupied"
+        );
+
+        first.shutdown().await.unwrap();
+        drop(first);
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), second.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+        server.abort();
     }
 
     #[test]
@@ -3647,6 +5988,164 @@ audio_out = "to-aac"
         assert_eq!(past.status, 416);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn original_get_opens_non_utf8_catalog_path_without_loss() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut app = testdata_app();
+        let template = app
+            .catalog
+            .read()
+            .unwrap()
+            .items
+            .values()
+            .find(|item| item.path.ends_with("movie.mkv"))
+            .cloned()
+            .expect("movie fixture");
+        let test_tree = TestTree::new("http-nonutf8");
+        let dir = test_tree.path().to_path_buf();
+        let mut raw_name = b"movie-".to_vec();
+        raw_name.push(0x80);
+        raw_name.extend_from_slice(b".mkv");
+        let path = dir.join(std::ffi::OsString::from_vec(raw_name));
+        let expected = b"non-utf8 media body";
+        std::fs::write(&path, expected).unwrap();
+        app.scan_cfg.media_roots.clear();
+        app.scan_cfg.media_dirs = vec![dir.clone()];
+        let mut item = template;
+        item.object_id = "64$nonutf8".into();
+        item.detail_id = 9_876_543;
+        item.path = path;
+        item.size = expected.len() as u64;
+        {
+            let mut catalog = app.catalog.write().unwrap();
+            catalog
+                .by_detail
+                .insert(item.detail_id, item.object_id.clone());
+            catalog.items.insert(item.object_id.clone(), item.clone());
+        }
+
+        let response = app.handle(&req(&format!(
+            "GET /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n\r\n",
+            item.detail_id
+        )));
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, expected);
+    }
+
+    fn assert_head_has_no_payload(r: &HttpResponse) {
+        assert!(r.body.is_empty(), "HEAD retained an in-memory body");
+        assert!(r.file_range.is_none(), "HEAD retained a file stream");
+        assert!(r.remux_job.is_none(), "HEAD retained a remux stream");
+        let wire = r.bytes_wire("test", "Thu, 01 Jan 1970 00:00:00 GMT");
+        let split = wire
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP header terminator");
+        assert_eq!(&wire[split + 4..], b"", "HEAD emitted wire body bytes");
+    }
+
+    #[test]
+    fn head_suppresses_every_media_payload_without_changing_metadata() {
+        let mut app = testdata_app();
+        let movie = movie_fixture(&app);
+        let id = movie.detail_id;
+
+        let small = app.handle(&req(&format!(
+            "HEAD /MediaItems/{id}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n\r\n"
+        )));
+        assert_eq!(small.status, 200);
+        assert_eq!(
+            resp_header(&small, "Content-Length"),
+            Some(movie.size.to_string().as_str())
+        );
+        assert_head_has_no_payload(&small);
+
+        let ranged = app.handle(&req(&format!(
+            "HEAD /MediaItems/{id}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nRange: bytes=0-15\r\n\r\n"
+        )));
+        assert_eq!(ranged.status, 206);
+        assert_eq!(resp_header(&ranged, "Content-Length"), Some("16"));
+        assert_eq!(
+            resp_header(&ranged, "Content-Range"),
+            Some(format!("bytes 0-15/{}", movie.size).as_str())
+        );
+        assert_head_has_no_payload(&ranged);
+
+        // A sparse file crosses the streaming threshold without allocating a
+        // large test buffer. HEAD must not leave a deferred file stream.
+        let big_path = app.cache_dir.join("head-large.mkv");
+        std::fs::create_dir_all(&app.cache_dir).unwrap();
+        let big_size = 9 * 1024 * 1024;
+        std::fs::File::create(&big_path)
+            .unwrap()
+            .set_len(big_size)
+            .unwrap();
+        app.scan_cfg.media_dirs.push(app.cache_dir.clone());
+        let mut big = movie.clone();
+        big.detail_id = 9_000_001;
+        big.object_id = "head-large-object".into();
+        big.path = big_path.clone();
+        big.size = big_size;
+        {
+            let mut cat = app.catalog.write().unwrap();
+            cat.by_detail.insert(big.detail_id, big.object_id.clone());
+            cat.items.insert(big.object_id.clone(), big.clone());
+        }
+        let large = app.handle(&req(&format!(
+            "HEAD /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n\r\n",
+            big.detail_id
+        )));
+        assert_eq!(large.status, 200);
+        assert_eq!(
+            resp_header(&large, "Content-Length"),
+            Some(big_size.to_string().as_str())
+        );
+        assert_head_has_no_payload(&large);
+
+        let transcode = {
+            let dvp7 = app
+                .catalog
+                .read()
+                .unwrap()
+                .items
+                .values()
+                .find(|item| item.path.ends_with("dvp7.mkv"))
+                .cloned()
+                .expect("dvp7 fixture");
+            app.handle(&req(&format!(
+                "HEAD /Transcode/{}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: CrKey/1.54.384650 DLNADOC/1.50\r\n\r\n",
+                dvp7.detail_id
+            )))
+        };
+        assert_eq!(transcode.status, 200);
+        assert_head_has_no_payload(&transcode);
+
+        let art = movie.album_art;
+        assert!(art > 0);
+        let art_head = app.handle(&req(&format!(
+            "HEAD /AlbumArt/{art}-{id}.jpg HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n\r\n"
+        )));
+        assert_eq!(art_head.status, 200);
+        assert_head_has_no_payload(&art_head);
+
+        let caption = movie.captions.first().expect("caption fixture");
+        let caption_head = app.handle(&req(&format!(
+            "HEAD /Captions/{id}/{}.{} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n\r\n",
+            caption.index, caption.ext
+        )));
+        assert_eq!(caption_head.status, 200);
+        assert_head_has_no_payload(&caption_head);
+
+        let missing = app.handle(&req(
+            "HEAD /MediaItems/999999.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n\r\n",
+        ));
+        assert_eq!(missing.status, 404);
+        assert_head_has_no_payload(&missing);
+        let _ = std::fs::remove_file(big_path);
+    }
+
     #[test]
     fn transcode_get_without_remap_serves_original() {
         let app = testdata_app();
@@ -3672,20 +6171,110 @@ audio_out = "to-aac"
     #[test]
     fn crkey_dvp7_remap_first_kodi_original() {
         let app = testdata_app();
+        let dvp7 = dvp7_fixture(&app);
         let (_, kodi) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
-        assert!(kodi.contains("dvp7"));
+        assert!(kodi.contains(&format!("/MediaItems/{}.mkv", dvp7.detail_id)));
         // testdata remap is CrKey-only, so Kodi still sees the original.
-        assert!(!kodi.contains("/Transcode/"));
+        assert!(!kodi.contains(&format!("/Transcode/{}.mp4", dvp7.detail_id)));
         let (_, cr) = soap_browse(
             &app,
             "2$8",
             "BrowseDirectChildren",
             "CrKey/1.54.384650 DLNADOC/1.50",
         );
-        let t = cr.find("/Transcode/").expect("CrKey DIDL missing remap");
-        let m = cr.find("/MediaItems/").expect("CrKey DIDL missing original");
-        assert!(t < m, "remux res must be listed first: {cr}");
+        assert_transcode_before_original(&cr, dvp7.detail_id);
         assert!(cr.contains("DLNA.ORG_CI=1"));
+    }
+
+    #[test]
+    fn transcode_config_gates_jobs_and_controls_encoder_and_audio() {
+        let mut app = testdata_app();
+        let dvp7 = app
+            .catalog
+            .read()
+            .unwrap()
+            .items
+            .values()
+            .find(|item| item.path.ends_with("dvp7.mkv"))
+            .cloned()
+            .expect("dvp7 fixture");
+        let id = dvp7.detail_id;
+        let crkey = "CrKey/1.54.384650 DLNADOC/1.50";
+
+        app.cfg.transcode.enable = false;
+        let (_, disabled_didl) = soap_browse(&app, "2$8", "BrowseDirectChildren", crkey);
+        assert!(
+            !disabled_didl.contains("/Transcode/"),
+            "disabled transcode leaked into DIDL: {disabled_didl}"
+        );
+        let disabled = app.handle(&req(&format!(
+            "GET /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: {crkey}\r\n\r\n"
+        )));
+        assert_eq!(disabled.status, 200);
+        assert!(disabled.remux_job.is_none());
+        assert_eq!(disabled.body, std::fs::read(&dvp7.path).unwrap());
+
+        app.cfg.transcode.enable = true;
+        app.cfg.transcode.encoder = "libx264".into();
+        app.remaps = rusty_dlna_transcode::parse_remaps_toml(
+            r#"
+[[remap]]
+client = "CrKey"
+hdr = "dv-p7"
+action = "hdr10"
+audio_out = "copy"
+"#,
+        )
+        .unwrap();
+        let global_default = app.handle(&req(&format!(
+            "GET /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: {crkey}\r\n\r\n"
+        )));
+        let global_spec = global_default.remux_job.expect("global encoder job");
+        assert!(
+            global_spec.args.iter().any(|arg| arg == "libx264"),
+            "global encoder missing: {:?}",
+            global_spec.args
+        );
+
+        app.remaps = rusty_dlna_transcode::parse_remaps_toml(
+            r#"
+[[remap]]
+client = "CrKey"
+hdr = "dv-p7"
+action = "hdr10"
+encoder = "hevc_nvenc"
+"#,
+        )
+        .unwrap();
+        let override_resp = app.handle(&req(&format!(
+            "GET /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: {crkey}\r\n\r\n"
+        )));
+        let override_spec = override_resp.remux_job.expect("rule encoder job");
+        assert!(override_spec.args.iter().any(|arg| arg == "hevc_nvenc"));
+        assert!(!override_spec.args.iter().any(|arg| arg == "libx264"));
+
+        for (configured, expected) in [
+            ("copy", RemuxAudio::Copy),
+            ("to-ac3", RemuxAudio::Ac3),
+            ("to-aac", RemuxAudio::Aac),
+        ] {
+            app.remaps = rusty_dlna_transcode::parse_remaps_toml(&format!(
+                r#"
+[[remap]]
+client = "CrKey"
+hdr = "dv-p7"
+action = "remux-p8"
+encoder = "copy"
+audio_out = "{configured}"
+"#
+            ))
+            .unwrap();
+            let response = app.handle(&req(&format!(
+                "GET /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: {crkey}\r\n\r\n"
+            )));
+            let spec = response.remux_job.expect("Profile-8 job");
+            assert_eq!(spec.audio, expected, "audio_out={configured}");
+        }
     }
 
     #[test]
@@ -3704,9 +6293,7 @@ audio_out = "to-aac"
         )
         .unwrap();
         let (_, kodi) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
-        let t = kodi.find("/Transcode/").expect("Kodi DIDL missing remap");
-        let m = kodi.find("/MediaItems/").expect("Kodi DIDL missing original");
-        assert!(t < m, "remux res must be listed first: {kodi}");
+        assert_transcode_before_original(&kodi, dvp7_fixture(&app).detail_id);
         let (_, plat) = soap_browse(
             &app,
             "2$8",
@@ -3759,9 +6346,18 @@ audio_out = "to-aac"
         assert!(pc_fl.contains("id=&quot;1&quot;"), "{pc_fl}");
         assert!(pc_fl.contains("id=&quot;2&quot;"), "{pc_fl}");
         assert!(pc_fl.contains("id=&quot;3&quot;"), "{pc_fl}");
-        assert!(!pc_fl.contains("id=&quot;A&quot;"), "PC must not use A: {pc_fl}");
-        assert!(!pc_fl.contains("id=&quot;V&quot;"), "PC must not use V: {pc_fl}");
-        assert!(!pc_fl.contains("id=&quot;I&quot;"), "PC must not use I: {pc_fl}");
+        assert!(
+            !pc_fl.contains("id=&quot;A&quot;"),
+            "PC must not use A: {pc_fl}"
+        );
+        assert!(
+            !pc_fl.contains("id=&quot;V&quot;"),
+            "PC must not use V: {pc_fl}"
+        );
+        assert!(
+            !pc_fl.contains("id=&quot;I&quot;"),
+            "PC must not use I: {pc_fl}"
+        );
         let (_, pc_didl) = soap_browse(
             &app,
             "2$8",
@@ -3786,7 +6382,12 @@ audio_out = "to-aac"
 
         // [BD]J5500: FLAG_SKIP_DLNA_PN — media protocolInfo has no PN.
         // Album-art JPEG_TN <res> is still emitted (Phase 11).
-        let (_, j5500) = soap_browse(&app, "2$8", "BrowseDirectChildren", "DLNADOC/1.50 [BD]J5500");
+        let (_, j5500) = soap_browse(
+            &app,
+            "2$8",
+            "BrowseDirectChildren",
+            "DLNADOC/1.50 [BD]J5500",
+        );
         assert!(
             !j5500.contains("video/x-matroska:DLNA.ORG_PN=")
                 && !j5500.contains("video/x-mkv:DLNA.ORG_PN="),
@@ -3798,10 +6399,13 @@ audio_out = "to-aac"
         assert!(String::from_utf8_lossy(&xbox.body).contains("<modelNumber>1</modelNumber>"));
 
         // CrKey: transcode res first on DV P7
-        let (_, cr) = soap_browse(&app, "2$8", "BrowseDirectChildren", "CrKey/1.54 DLNADOC/1.50");
-        let t = cr.find("/Transcode/").expect("crkey remap");
-        let m = cr.find("/MediaItems/").expect("crkey original");
-        assert!(t < m, "remux res must be listed first: {cr}");
+        let (_, cr) = soap_browse(
+            &app,
+            "2$8",
+            "BrowseDirectChildren",
+            "CrKey/1.54 DLNADOC/1.50",
+        );
+        assert_transcode_before_original(&cr, dvp7_fixture(&app).detail_id);
         assert!(cr.contains("DLNA.ORG_CI=1"));
 
         // Generic DLNADOC/1.50 is not NEED_SAFE_VIDEO
@@ -3824,17 +6428,40 @@ audio_out = "to-aac"
             .unwrap_or(any)
     }
 
+    fn dvp7_fixture(app: &App) -> rusty_dlna_scan::MediaItem {
+        app.catalog
+            .read()
+            .unwrap()
+            .items
+            .values()
+            .find(|item| item.path.ends_with("dvp7.mkv"))
+            .cloned()
+            .expect("dvp7 fixture")
+    }
+
+    fn assert_transcode_before_original(xml: &str, detail_id: i64) {
+        let transcode = format!("/Transcode/{detail_id}.mp4");
+        let original = format!("/MediaItems/{detail_id}.mkv");
+        let transcode_pos = xml
+            .find(&transcode)
+            .unwrap_or_else(|| panic!("DIDL missing {transcode}: {xml}"));
+        let original_pos = xml
+            .find(&original)
+            .unwrap_or_else(|| panic!("DIDL missing {original}: {xml}"));
+        assert!(
+            transcode_pos < original_pos,
+            "transcode resource must precede the matching original: {xml}"
+        );
+    }
+
     fn set_detail_dlna_pn(app: &App, detail_id: i64, pn: &str) {
-        let mut cat = app.catalog.write().expect("catalog");
+        let mut cat = write_recover(&app.catalog);
         let oid = cat
             .by_detail
             .get(&detail_id)
             .cloned()
             .expect("by_detail oid");
-        cat.items
-            .get_mut(&oid)
-            .expect("by_detail item")
-            .dlna_pn = Some(pn.into());
+        cat.items.get_mut(&oid).expect("by_detail item").dlna_pn = Some(pn.into());
     }
 
     #[test]
@@ -3891,8 +6518,9 @@ audio_out = "to-aac"
         let (st, xml) = soap_browse(&app, &movie.object_id, "BrowseMetadata", q);
         assert_eq!(st, 200, "{xml}");
         assert!(
-            xml.contains("&lt;upnp:lastPlaybackPosition&gt;120000&lt;/upnp:lastPlaybackPosition&gt;")
-                || xml.contains("<upnp:lastPlaybackPosition>120000</upnp:lastPlaybackPosition>"),
+            xml.contains(
+                "&lt;upnp:lastPlaybackPosition&gt;120000&lt;/upnp:lastPlaybackPosition&gt;"
+            ) || xml.contains("<upnp:lastPlaybackPosition>120000</upnp:lastPlaybackPosition>"),
             "lastPlaybackPosition 120000 missing: {xml}"
         );
         assert!(
@@ -3911,6 +6539,147 @@ audio_out = "to-aac"
             !kodi.contains("120000"),
             "Kodi must keep stored seconds, not ms: {kodi}"
         );
+    }
+
+    #[test]
+    fn kodi_soap_object_id_normalization_is_strict() {
+        assert_eq!(
+            normalize_soap_object_id("64%241%245%244%241/"),
+            Some("64$1$5$4$1".into())
+        );
+        assert_eq!(normalize_soap_object_id("64%241%2f"), Some("64$1".into()));
+        assert_eq!(normalize_soap_object_id("64$1$5"), Some("64$1$5".into()));
+        for invalid in ["64%", "64%2", "64%GG", "64%00$1"] {
+            assert_eq!(normalize_soap_object_id(invalid), None, "{invalid}");
+        }
+        assert_eq!(normalize_soap_object_id(&"x".repeat(1025)), None);
+    }
+
+    #[test]
+    fn kodi_encoded_updateobject_persists_and_browses_resume_position() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let kodi_oid = format!("{}/", movie.object_id.replace('$', "%24"));
+        let new_tags =
+            "&lt;upnp:lastPlaybackPosition&gt;00:02:00&lt;/upnp:lastPlaybackPosition&gt;";
+        let kodi_ua = "UPnP/1.0 DLNADOC/1.50 Platinum/1.0.5.13";
+        let (status, xml) = soap_action(
+            &app,
+            "UpdateObject",
+            &format!(
+                "<ObjectID>{kodi_oid}</ObjectID><CurrentTagValue></CurrentTagValue><NewTagValue>{new_tags}</NewTagValue>"
+            ),
+            kodi_ua,
+        );
+        assert_eq!(status, 200, "{xml}");
+        assert!(xml.contains("UpdateObjectResponse"), "{xml}");
+
+        let (status, xml) = soap_browse(&app, &movie.object_id, "BrowseMetadata", kodi_ua);
+        assert_eq!(status, 200, "{xml}");
+        assert!(
+            xml.contains("&lt;upnp:lastPlaybackPosition&gt;120&lt;/upnp:lastPlaybackPosition&gt;")
+                || xml.contains("<upnp:lastPlaybackPosition>120</upnp:lastPlaybackPosition>"),
+            "resume position missing from Browse response: {xml}"
+        );
+        let db = LibraryDb::open(app.scan_cfg.db_path.as_ref().unwrap()).unwrap();
+        assert_eq!(db.get_bookmark(movie.detail_id).unwrap(), Some((120, 0)));
+    }
+
+    #[test]
+    fn kodi_bookmark_update_invalidates_every_cached_parent_container() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let expected_parents = app
+            .catalog
+            .read()
+            .unwrap()
+            .items
+            .values()
+            .filter(|item| item.detail_id == movie.detail_id)
+            .map(|item| item.parent_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!expected_parents.is_empty());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let subscribe = req(&format!(
+            "SUBSCRIBE /evt/ContentDir HTTP/1.1\r\n\
+             Host: 127.0.0.1:18200\r\n\
+             Callback: <http://127.0.0.1:{}/evt>\r\n\
+             NT: upnp:event\r\n\
+             Timeout: Second-300\r\n\
+             Content-Length: 0\r\n\r\n",
+            addr.port()
+        ));
+        assert_eq!(app.handle_from(&subscribe, addr).status, 200);
+        let initial = accept_notify(&listener, std::time::Duration::from_secs(3));
+        assert!(initial.contains("<ContainerUpdateIDs></ContainerUpdateIDs>"));
+
+        let before = app.update_id.load(Ordering::Relaxed);
+        let (status, xml) = soap_action(
+            &app,
+            "X_SetBookmark",
+            &format!(
+                "<ObjectID>{}</ObjectID><PosSecond>120</PosSecond>",
+                movie.object_id
+            ),
+            "UPnP/1.0 DLNADOC/1.50 Platinum/1.0.5.13",
+        );
+        assert_eq!(status, 200, "{xml}");
+        let after = app.update_id.load(Ordering::Relaxed);
+        assert_eq!(after, before.saturating_add(1));
+
+        let notify = accept_notify(&listener, std::time::Duration::from_secs(3));
+        assert!(
+            notify.contains(&format!("<SystemUpdateID>{after}</SystemUpdateID>")),
+            "{notify}"
+        );
+        for parent in expected_parents {
+            assert!(
+                notify.contains(&format!("{parent},{after}")),
+                "parent {parent:?} missing from {notify}"
+            );
+        }
+        let db = LibraryDb::open(app.scan_cfg.db_path.as_ref().unwrap()).unwrap();
+        assert_eq!(db.get_update_id().unwrap(), after);
+    }
+
+    #[test]
+    fn bookmark_database_failure_returns_action_failed_without_catalog_drift() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let db_path = app.scan_cfg.db_path.as_ref().unwrap();
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_bookmark_write BEFORE INSERT ON BOOKMARKS
+             BEGIN SELECT RAISE(FAIL, 'forced bookmark failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let (status, xml) = soap_action(
+            &app,
+            "X_SetBookmark",
+            &format!(
+                "<ObjectID>{}</ObjectID><PosSecond>120</PosSecond>",
+                movie.object_id
+            ),
+            "Kodi/21.0",
+        );
+        assert_eq!(status, 500, "{xml}");
+        assert!(xml.contains("<errorCode>501</errorCode>"), "{xml}");
+        assert_eq!(
+            app.catalog
+                .read()
+                .unwrap()
+                .get_item_by_detail(movie.detail_id)
+                .unwrap()
+                .bookmark_sec,
+            0,
+            "the in-memory catalog must not claim a write SQLite rejected"
+        );
+        let db = LibraryDb::open(db_path).unwrap();
+        assert_eq!(db.get_bookmark(movie.detail_id).unwrap(), None);
     }
 
     #[test]
@@ -3978,11 +6747,12 @@ audio_out = "to-aac"
         assert_eq!(st, 200, "{xml}");
 
         let new_tags = "&lt;upnp:lastPlaybackPosition&gt;-1&lt;/upnp:lastPlaybackPosition&gt;";
+        let current_tags = "&lt;upnp:lastPlaybackPosition&gt;120&lt;/upnp:lastPlaybackPosition&gt;";
         let (st, xml) = soap_action(
             &app,
             "UpdateObject",
             &format!(
-                "<ObjectID>{}</ObjectID><CurrentTagValue></CurrentTagValue><NewTagValue>{new_tags}</NewTagValue>",
+                "<ObjectID>{}</ObjectID><CurrentTagValue>{current_tags}</CurrentTagValue><NewTagValue>{new_tags}</NewTagValue>",
                 movie.object_id
             ),
             "Kodi/21.0",
@@ -4005,6 +6775,145 @@ audio_out = "to-aac"
             Some(0),
             "BOOKMARKS.SEC must be 0 after lastPlaybackPosition=-1"
         );
+    }
+
+    #[test]
+    fn setbookmark_missing_position_is_402_without_clearing_state() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let (status, xml) = soap_action(
+            &app,
+            "X_SetBookmark",
+            &format!(
+                "<ObjectID>{}</ObjectID><PosSecond>120</PosSecond>",
+                movie.object_id
+            ),
+            "Kodi/21.0",
+        );
+        assert_eq!(status, 200, "{xml}");
+        let update_id = app.update_id.load(Ordering::Relaxed);
+
+        let (status, xml) = soap_action(
+            &app,
+            "X_SetBookmark",
+            &format!("<ObjectID>{}</ObjectID>", movie.object_id),
+            "Kodi/21.0",
+        );
+        assert_eq!(status, 500, "{xml}");
+        assert!(xml.contains("<errorCode>402</errorCode>"), "{xml}");
+        assert_eq!(app.update_id.load(Ordering::Relaxed), update_id);
+        let db = LibraryDb::open(app.scan_cfg.db_path.as_ref().unwrap()).unwrap();
+        assert_eq!(db.get_bookmark(movie.detail_id).unwrap(), Some((120, 0)));
+    }
+
+    #[test]
+    fn updateobject_rejects_missing_malformed_and_unsupported_tag_arguments() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let oid = &movie.object_id;
+        let cases = [
+            (
+                format!(
+                    "<ObjectID>{oid}</ObjectID><NewTagValue>upnp:playCount=1</NewTagValue>"
+                ),
+                402,
+            ),
+            (
+                format!(
+                    "<ObjectID>{oid}</ObjectID><CurrentTagValue>upnp:playCount=0</CurrentTagValue>"
+                ),
+                402,
+            ),
+            (
+                format!("<ObjectID>{oid}</ObjectID><CurrentTagValue>broken</CurrentTagValue><NewTagValue>upnp:playCount=1</NewTagValue>"),
+                702,
+            ),
+            (
+                format!("<ObjectID>{oid}</ObjectID><CurrentTagValue></CurrentTagValue><NewTagValue>broken</NewTagValue>"),
+                703,
+            ),
+            (
+                format!("<ObjectID>{oid}</ObjectID><CurrentTagValue>dc:title=Old</CurrentTagValue><NewTagValue>dc:title=New</NewTagValue>"),
+                705,
+            ),
+            (
+                format!("<ObjectID>{oid}</ObjectID><CurrentTagValue>upnp:playCount=0</CurrentTagValue><NewTagValue>upnp:lastPlaybackPosition=90</NewTagValue>"),
+                706,
+            ),
+        ];
+        for (body, code) in cases {
+            let (status, xml) = soap_action(&app, "UpdateObject", &body, "Kodi/21.0");
+            assert_eq!(status, 500, "code {code}: {xml}");
+            assert!(
+                xml.contains(&format!("<errorCode>{code}</errorCode>")),
+                "{xml}"
+            );
+        }
+        let db = LibraryDb::open(app.scan_cfg.db_path.as_ref().unwrap()).unwrap();
+        assert_eq!(db.get_bookmark(movie.detail_id).unwrap(), None);
+    }
+
+    #[test]
+    fn updateobject_current_value_is_an_optimistic_concurrency_guard() {
+        let app = testdata_app();
+        let movie = movie_fixture(&app);
+        let initial_update_id = app.update_id.load(Ordering::Relaxed);
+        let (status, xml) = soap_action(
+            &app,
+            "UpdateObject",
+            &format!(
+                "<ObjectID>{}</ObjectID><CurrentTagValue>upnp:lastPlaybackPosition=1</CurrentTagValue><NewTagValue>upnp:lastPlaybackPosition=90</NewTagValue>",
+                movie.object_id
+            ),
+            "Kodi/21.0",
+        );
+        assert_eq!(status, 500, "{xml}");
+        assert!(xml.contains("<errorCode>702</errorCode>"), "{xml}");
+        assert_eq!(app.update_id.load(Ordering::Relaxed), initial_update_id);
+        let db = LibraryDb::open(app.scan_cfg.db_path.as_ref().unwrap()).unwrap();
+        assert_eq!(db.get_bookmark(movie.detail_id).unwrap(), None);
+        drop(db);
+
+        let (status, xml) = soap_action(
+            &app,
+            "X_SetBookmark",
+            &format!(
+                "<ObjectID>{}</ObjectID><PosSecond>120</PosSecond>",
+                movie.object_id
+            ),
+            "Kodi/21.0",
+        );
+        assert_eq!(status, 200, "{xml}");
+        let update_id = app.update_id.load(Ordering::Relaxed);
+
+        let (status, xml) = soap_action(
+            &app,
+            "UpdateObject",
+            &format!(
+                "<ObjectID>{}</ObjectID><CurrentTagValue>upnp:lastPlaybackPosition=60</CurrentTagValue><NewTagValue>upnp:lastPlaybackPosition=90</NewTagValue>",
+                movie.object_id
+            ),
+            "Kodi/21.0",
+        );
+        assert_eq!(status, 500, "{xml}");
+        assert!(xml.contains("<errorCode>702</errorCode>"), "{xml}");
+        assert_eq!(app.update_id.load(Ordering::Relaxed), update_id);
+        let db = LibraryDb::open(app.scan_cfg.db_path.as_ref().unwrap()).unwrap();
+        assert_eq!(db.get_bookmark(movie.detail_id).unwrap(), Some((120, 0)));
+        drop(db);
+
+        let (status, xml) = soap_action(
+            &app,
+            "UpdateObject",
+            &format!(
+                "<ObjectID>{}</ObjectID><CurrentTagValue>upnp:lastPlaybackPosition=120</CurrentTagValue><NewTagValue>upnp:lastPlaybackPosition=90</NewTagValue>",
+                movie.object_id
+            ),
+            "Kodi/21.0",
+        );
+        assert_eq!(status, 200, "{xml}");
+        let db = LibraryDb::open(app.scan_cfg.db_path.as_ref().unwrap()).unwrap();
+        assert_eq!(db.get_bookmark(movie.detail_id).unwrap(), Some((90, 0)));
     }
 
     /// True if a DIDL `<res>` body (escaped or raw) points at `/Captions/`.
@@ -4117,7 +7026,7 @@ audio_out = "to-aac"
     }
 
     #[test]
-    fn transcode_get_is_live_pipe_not_full_file() {
+    fn transcode_get_serves_growing_file_before_completion() {
         let mut app = testdata_app();
         app.remaps = rusty_dlna_transcode::parse_remaps_toml(
             r#"
@@ -4137,7 +7046,7 @@ audio_out = "to-aac"
             .unwrap()
             .items
             .values()
-            .find(|i| i.title == "dvp7")
+            .find(|i| i.path.ends_with("dvp7.mkv"))
             .cloned()
             .expect("dvp7");
         let id = dvp7.detail_id;
@@ -4157,13 +7066,24 @@ audio_out = "to-aac"
         assert_eq!(spec.args[0], "ffmpeg");
         assert!(!spec.args.iter().any(|s| s == "pipe:1"), "{:?}", spec.args);
         assert!(
-            spec.args.iter().any(|s| s.contains("frag_keyframe")),
+            spec.args
+                .iter()
+                .any(|s| s.to_string_lossy().contains("frag_keyframe")),
             "{:?}",
             spec.args
         );
-        assert!(!spec.args.iter().any(|s| s.contains("faststart")), "{:?}", spec.args);
         assert!(
-            spec.args.iter().any(|s| s.ends_with(".part")),
+            !spec
+                .args
+                .iter()
+                .any(|s| s.to_string_lossy().contains("faststart")),
+            "{:?}",
+            spec.args
+        );
+        assert!(
+            spec.args
+                .iter()
+                .any(|s| s.to_string_lossy().ends_with(".part")),
             "must write a .part file: {:?}",
             spec.args
         );
@@ -4177,12 +7097,11 @@ audio_out = "to-aac"
         assert!(!hdrs.to_ascii_lowercase().contains("content-length"));
         assert!(hdrs.contains("DLNA.ORG_OP=00"), "{hdrs}");
         assert!(hdrs.contains("DLNA.ORG_CI=1"), "{hdrs}");
-        let dest = rusty_dlna_transcode::cache_dest(
-            &app.cache_dir,
-            id,
-            rusty_dlna_transcode::RecodeAction::RemuxP8,
+        let dest = spec.dest.clone();
+        assert!(
+            !dest.is_file(),
+            "handle() must not wait for a finished cache"
         );
-        assert!(!dest.is_file(), "handle() must not wait for a finished cache");
         assert!(spec.remux_p8, "dvp7 remux-p8 must attempt dovi convert");
 
         let kodi_orig = testdata_app();
@@ -4204,32 +7123,39 @@ audio_out = "to-aac"
             .unwrap()
             .items
             .values()
-            .find(|i| i.title == "dvp7")
+            .find(|i| i.path.ends_with("dvp7.mkv"))
             .cloned()
             .expect("dvp7");
-        let live = rusty_dlna_scan::rebase_media_path(&dvp7.path, &app.scan_cfg.media_dirs);
-        let dest = rusty_dlna_transcode::cache_dest(
+        let live = rusty_dlna_scan::rebase_media_path_for_config(&dvp7.path, &app.scan_cfg);
+        let src = app.cache_dir.join("dvp7-stamp-src.mkv");
+        let _ = std::fs::copy(&live, &src);
+        let cache_key = rusty_dlna_transcode::source_identity(&src).unwrap();
+        let dest = rusty_dlna_transcode::cache_dest_for_key(
             &app.cache_dir,
             dvp7.detail_id,
             rusty_dlna_transcode::RecodeAction::RemuxP8,
+            &cache_key,
         );
         if let Some(p) = dest.parent() {
             let _ = std::fs::create_dir_all(p);
         }
-        let src = app.cache_dir.join("dvp7-stamp-src.mkv");
-        let _ = std::fs::copy(&live, &src);
         let payload = b"0123456789abcdefFINISHED_REMUX_BYTES";
         std::fs::write(&dest, payload).unwrap();
-        rusty_dlna_transcode::write_cache_stamp(&dest, &src);
-        assert!(rusty_dlna_transcode::cache_is_fresh(&dest, &src));
+        rusty_dlna_transcode::write_cache_stamp_for_key(&dest, &cache_key).unwrap();
+        assert!(rusty_dlna_transcode::cache_is_fresh_for_key(
+            &dest, &cache_key
+        ));
 
         let spec = RemuxJobSpec {
             detail_id: dvp7.detail_id,
+            job_key: format!("{}:{cache_key}:fixture", dvp7.detail_id),
+            cache_key: cache_key.clone(),
             src: src.clone(),
             dest: dest.clone(),
             args: vec!["ffmpeg".into(), "-version".into()],
             remux_p8: true,
             audio_index: 0,
+            audio: RemuxAudio::Copy,
         };
         let req = HttpRequest::parse_headers(
             "GET /Transcode/1.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nRange: bytes=0-15\r\n\r\n",
@@ -4248,7 +7174,9 @@ audio_out = "to-aac"
             let spec2 = spec.clone();
             let h = tokio::spawn(async move {
                 let (mut sock, _) = listener.accept().await.unwrap();
-                remux::serve_remux(&app2, &mut sock, &req, spec2).await.unwrap();
+                remux::serve_remux(&app2, &mut sock, &req, spec2)
+                    .await
+                    .unwrap();
             });
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             let mut c = std::net::TcpStream::connect(addr).unwrap();
@@ -4256,7 +7184,10 @@ audio_out = "to-aac"
             let _ = c.read_to_end(&mut buf);
             let _ = h.await;
             let text = String::from_utf8_lossy(&buf).into_owned();
-            let split = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(buf.len());
+            let split = buf
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .unwrap_or(buf.len());
             let body = if split + 4 <= buf.len() {
                 buf[split + 4..].to_vec()
             } else {
@@ -4274,8 +7205,10 @@ audio_out = "to-aac"
 
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&src, b"replaced-source-bytes-to-bust-stamp").unwrap();
+        let replaced_key = rusty_dlna_transcode::source_identity(&src).unwrap();
+        assert_ne!(replaced_key, cache_key, "source identity must change");
         assert!(
-            !rusty_dlna_transcode::cache_is_fresh(&dest, &src),
+            !rusty_dlna_transcode::cache_is_fresh_for_key(&dest, &replaced_key),
             "replaced source must invalidate remux dest"
         );
     }
@@ -4302,6 +7235,38 @@ audio_out = "to-aac"
 
     fn body_is_jpeg(body: &[u8]) -> bool {
         body.len() >= 3 && body[0] == 0xff && body[1] == 0xd8 && body[2] == 0xff
+    }
+
+    fn png_dimensions(body: &[u8]) -> Option<(u32, u32)> {
+        body.get(16..24).map(|dimensions| {
+            (
+                u32::from_be_bytes(dimensions[..4].try_into().unwrap()),
+                u32::from_be_bytes(dimensions[4..].try_into().unwrap()),
+            )
+        })
+    }
+
+    fn jpeg_dimensions(body: &[u8]) -> Option<(u32, u32)> {
+        let mut offset = 2usize;
+        while offset + 8 < body.len() {
+            if body[offset] != 0xff {
+                offset += 1;
+                continue;
+            }
+            let marker = body[offset + 1];
+            if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+                return Some((
+                    u16::from_be_bytes([body[offset + 7], body[offset + 8]]) as u32,
+                    u16::from_be_bytes([body[offset + 5], body[offset + 6]]) as u32,
+                ));
+            }
+            let length = u16::from_be_bytes([body[offset + 2], body[offset + 3]]) as usize;
+            if length < 2 {
+                return None;
+            }
+            offset = offset.checked_add(length + 2)?;
+        }
+        None
     }
 
     #[test]
@@ -4336,6 +7301,41 @@ audio_out = "to-aac"
             !body_is_png(&jpg.body),
             "image/jpeg response must not be PNG bytes"
         );
+
+        assert_eq!(png_dimensions(&png.body), Some((48, 48)));
+        assert_eq!(jpeg_dimensions(&jpg.body), Some((48, 48)));
+        let large_png = app.handle(&req(&get("/icons/lrg.png", "Kodi/21.0")));
+        let large_jpeg = app.handle(&req(&get("/icons/lrg.jpg", "Kodi/21.0")));
+        assert_eq!(png_dimensions(&large_png.body), Some((120, 120)));
+        assert_eq!(jpeg_dimensions(&large_jpeg.body), Some((120, 120)));
+    }
+
+    #[test]
+    fn derived_image_keys_and_cache_limits_prevent_stale_unbounded_files() {
+        let test_tree = TestTree::new("derived-cache");
+        let cache = test_tree.path().to_path_buf();
+        let key_a = derived_image_key("source-a", 160, 160, 2, 0);
+        let key_b = derived_image_key("source-b", 160, 160, 2, 0);
+        assert_ne!(key_a, key_b, "source replacement must change the cache key");
+        assert_ne!(
+            key_a,
+            derived_image_key("source-a", 640, 480, 2, 0),
+            "geometry is part of the cache key"
+        );
+
+        let old = cache.join(format!("{key_a}.jpg"));
+        let new = cache.join(format!("{key_b}.jpg"));
+        std::fs::write(&old, vec![1u8; 800]).unwrap();
+        std::fs::write(&new, vec![2u8; 800]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(10))
+            .unwrap();
+        prune_derived_image_cache(&cache, 900, 36_500, 0).unwrap();
+        assert!(!old.exists(), "oldest entry is evicted first");
+        assert!(new.exists());
     }
 
     fn soap_fault_persist(out: SoapOutcome) -> bool {
@@ -4376,9 +7376,7 @@ audio_out = "to-aac"
         assert!(xml701.contains("UPnPError"), "{xml701}");
         assert!(xml701.contains("<errorCode>701</errorCode>"), "{xml701}");
         let r701 = {
-            let body = format!(
-                r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>no-such-object</ObjectID><BrowseFlag>BrowseMetadata</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"#
-            );
+            let body = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>no-such-object</ObjectID><BrowseFlag>BrowseMetadata</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"#.to_string();
             let raw = format!(
                 "POST /ctl/ContentDir HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Kodi/21.0\r\nSOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n",
                 body.len()
@@ -4422,15 +7420,8 @@ audio_out = "to-aac"
 
     #[test]
     fn two_typed_media_dirs_keep_both_classes() {
-        let tmp = workspace().join(format!(
-            "testdata/cache/twodir-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let test_tree = TestTree::new("two-media-dirs");
+        let tmp = test_tree.path().to_path_buf();
         let vdir = tmp.join("video");
         let adir = tmp.join("audio");
         std::fs::create_dir_all(&vdir).unwrap();
@@ -4460,17 +7451,108 @@ audio_out = "to-aac"
             "A, prefix must remain (got {:?})",
             app.scan_cfg.types
         );
-        let cat = scan(&app.scan_cfg);
+        let cat = scan(&app.scan_cfg).unwrap();
         let titles: Vec<_> = cat.items.values().map(|i| i.title.as_str()).collect();
         assert!(
-            titles.iter().any(|t| *t == "clip"),
+            titles.contains(&"clip"),
             "video under V dir must be accepted: {titles:?}"
         );
         assert!(
-            titles.iter().any(|t| *t == "song"),
+            titles.contains(&"song"),
             "audio under A dir must be accepted: {titles:?}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn every_supported_format_agrees_across_scan_browse_and_get() {
+        let test_tree = TestTree::new("formats");
+        let tmp = test_tree.path().to_path_buf();
+        let media = tmp.join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let video_fixture = tmp.join("fixture.mkv");
+        rusty_dlna_scan::write_fake_mkv(&video_fixture, 64);
+        let audio_fixture = tmp.join("fixture.wav");
+        let mut wav = Vec::from(b"RIFF".as_slice());
+        wav.extend_from_slice(&36u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8_000u32.to_le_bytes());
+        wav.extend_from_slice(&16_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&audio_fixture, wav).unwrap();
+
+        let mut expected = Vec::new();
+        for (index, format) in rusty_dlna_protocol::MEDIA_FORMATS.iter().enumerate() {
+            let resolved = format.resolve(None);
+            let path = media.join(format!("format-{index}.{}", format.extension));
+            match resolved.kind {
+                rusty_dlna_protocol::MediaKind::Video => {
+                    std::fs::copy(&video_fixture, &path).unwrap();
+                }
+                rusty_dlna_protocol::MediaKind::Audio => {
+                    std::fs::copy(&audio_fixture, &path).unwrap();
+                }
+                rusty_dlna_protocol::MediaKind::Image => {
+                    std::fs::write(&path, TINY_JPEG).unwrap();
+                }
+            }
+            expected.push((path, resolved));
+            if format.is_ambiguous() {
+                let path = media.join(format!("audio-only-{index}.{}", format.extension));
+                std::fs::copy(&audio_fixture, &path).unwrap();
+                expected.push((
+                    path,
+                    format.resolve(Some(rusty_dlna_protocol::MediaKind::Audio)),
+                ));
+            }
+        }
+
+        let cfg = Config {
+            friendly_name: "format-map".into(),
+            media_dir: vec![media.display().to_string()],
+            cache_dir: Some(tmp.join("cache").display().to_string()),
+            thumbnails: false,
+            rescan_secs: 0,
+            ..Config::default()
+        };
+        let app = App::from_config(cfg, 18200, 11900, &tmp);
+        *app.catalog.write().unwrap() = scan(&app.scan_cfg).unwrap();
+        for (path, resolved) in expected {
+            let item = app
+                .catalog
+                .read()
+                .unwrap()
+                .items
+                .values()
+                .find(|item| item.path == path)
+                .cloned()
+                .unwrap_or_else(|| panic!("{} was not indexed", path.display()));
+            assert_eq!(item.mime, resolved.mime, "{}", path.display());
+            assert_eq!(item.class, resolved.upnp_class(), "{}", path.display());
+
+            let response = app.handle(&req(&get(
+                &format!("/MediaItems/{}.{}", item.detail_id, item.ext),
+                "FormatMapTest/1.0",
+            )));
+            assert_eq!(response.status, 200, "GET {}", path.display());
+            let get_mime = resp_header(&response, "Content-Type")
+                .unwrap_or_else(|| panic!("GET {} has no Content-Type", path.display()));
+
+            let (status, didl) =
+                soap_browse(&app, &item.object_id, "BrowseMetadata", "FormatMapTest/1.0");
+            assert_eq!(status, 200, "Browse {}: {didl}", path.display());
+            assert!(
+                didl.contains(get_mime),
+                "Browse {} did not advertise GET MIME {}: {didl}",
+                path.display(),
+                get_mime
+            );
+        }
     }
 
     #[test]
@@ -4486,18 +7568,86 @@ audio_out = "to-aac"
         assert!(audio_n >= 1, "Audio count {audio_n}: {body}");
         let image_n = status_row_count(&body, "Image").expect("Image row");
         assert!(image_n >= 1, "Image count {image_n}: {body}");
-        assert!(body.contains("refresh") || body.contains("Refresh") || body.contains("20"), "{body}");
+        assert!(
+            body.contains("refresh") || body.contains("Refresh") || body.contains("20"),
+            "{body}"
+        );
         assert!(
             !body.contains("<H1>200 OK</H1>"),
             "status must be the document, not the error-page wrapper: {body}"
         );
         assert!(
-            body.contains("<h1>rustyDLNA-test</h1>") || body.contains("<title>rustyDLNA-test</title>"),
+            body.contains("<h1>rustyDLNA-test</h1>")
+                || body.contains("<title>rustyDLNA-test</title>"),
             "{body}"
         );
         let root = app.handle(&req(&get("/", "Kodi/21.0")));
         assert_eq!(root.status, 200);
         assert_eq!(root.body, r.body);
+    }
+
+    #[test]
+    fn machine_status_is_structured_and_does_not_expose_absolute_paths() {
+        let app = testdata_app();
+        let response = app.handle(&req(&get("/api/status", "Operator/1.0")));
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            resp_header(&response, "Content-Type"),
+            Some("application/json")
+        );
+        let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(matches!(
+            value["status"].as_str(),
+            Some("healthy" | "degraded")
+        ));
+        assert!(value["database"]["quick_check"].is_string());
+        assert!(value["transcode"]["cache_bytes"].is_u64());
+        assert!(value["transcode"]["required_tools_ready"].is_boolean());
+        assert!(value["scanner"]["files_seen"].is_u64());
+        assert!(value["catalog"]["estimated_memory_bytes"].is_u64());
+        assert!(value["catalog"]["projected_memory_bytes"]["objects_10000"].is_u64());
+        assert!(value["catalog"]["projected_memory_bytes"]["objects_100000"].is_u64());
+        assert!(value["catalog"]["projected_memory_bytes"]["objects_1000000"].is_u64());
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(
+            !body.contains("/home/"),
+            "status leaked an absolute path: {body}"
+        );
+
+        let health = app.handle(&req(&get("/health", "Operator/1.0")));
+        assert!(matches!(health.status, 200 | 503));
+        serde_json::from_slice::<serde_json::Value>(&health.body).unwrap();
+    }
+
+    #[test]
+    fn scan_workers_are_owned_report_progress_and_join_on_shutdown() {
+        let test_tree = TestTree::new("scan-shutdown");
+        let tmp = test_tree.path();
+        let media = tmp.join("video");
+        std::fs::create_dir_all(&media).unwrap();
+        rusty_dlna_scan::write_fake_mkv(&media.join("movie.mkv"), 64);
+        let app = Arc::new(App::from_config(
+            Config {
+                friendly_name: "scan-shutdown".into(),
+                media_dir: vec![media.display().to_string()],
+                cache_dir: Some(tmp.join("cache").display().to_string()),
+                rescan_secs: 1,
+                ..Config::default()
+            },
+            18200,
+            11900,
+            tmp,
+        ));
+        spawn_library_watch(app.clone()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        stop_library_watch(&app);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(app.scan_control.stopping.load(Ordering::Acquire));
+        assert!(app.scan_control.threads.lock().unwrap().is_empty());
+        let (seen, current) = app.scan_cfg.progress.as_ref().unwrap().snapshot();
+        assert!(seen >= 1);
+        assert!(current.is_some());
     }
 
     #[test]
@@ -4560,11 +7710,57 @@ audio_out = "to-aac"
             &app,
             "Search",
             r#"<ContainerID>0</ContainerID><SearchCriteria>(upnp:class derivedfrom "object.item.audioItem") or (upnp:class derivedfrom "object.item.videoItem")</SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>"#,
-            "Kodi/21.0",
+            "FormatMapTest/1.0",
         );
         assert_eq!(st, 200, "{xml}");
         assert!(xml.contains("Fixture Movie"), "or must hit video: {xml}");
         assert!(xml.contains("Fixture Track"), "or must hit audio: {xml}");
+    }
+
+    #[test]
+    fn malformed_soap_arguments_and_search_criteria_return_standard_faults() {
+        let app = testdata_app();
+
+        for criteria in [
+            r#"unknown:field contains "Fixture""#,
+            r#"dc:title approximately "Fixture""#,
+            r#"(dc:title contains "Fixture""#,
+        ] {
+            let (status, xml) = soap_action(
+                &app,
+                "Search",
+                &format!(
+                    "<ContainerID>0</ContainerID><SearchCriteria>{criteria}</SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>"
+                ),
+                "SearchFaultTest/1.0",
+            );
+            assert_eq!(status, 500, "{xml}");
+            assert!(xml.contains("<errorCode>708</errorCode>"), "{xml}");
+        }
+
+        let (status, invalid_integer) = soap_action(
+            &app,
+            "Browse",
+            r#"<ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>not-a-number</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>"#,
+            "SoapFaultTest/1.0",
+        );
+        assert_eq!(status, 500, "{invalid_integer}");
+        assert!(
+            invalid_integer.contains("<errorCode>402</errorCode>"),
+            "{invalid_integer}"
+        );
+
+        let body = br#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>0</ObjectID></s:Body></s:Envelope>"#;
+        let raw = format!(
+            "POST /ctl/ContentDir HTTP/1.1\r\nHost: 127.0.0.1\r\nSOAPAction: \"urn:x#Browse\"\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut request = HttpRequest::parse_headers(&raw).unwrap();
+        request.body = body.to_vec();
+        let response = app.handle(&request);
+        let xml = String::from_utf8_lossy(&response.body);
+        assert_eq!(response.status, 500, "{xml}");
+        assert!(xml.contains("<errorCode>402</errorCode>"), "{xml}");
     }
 
     #[test]
@@ -4578,25 +7774,35 @@ audio_out = "to-aac"
         );
         assert_eq!(st, 200, "{xml}");
         assert!(xml.contains("Fixture Movie"), "{xml}");
-        assert!(!xml.contains(" size=&quot;") && !xml.contains(" size=\""), "Filter without res@size: {xml}");
-        assert!(!xml.contains("&lt;res ") && !xml.contains("<res "), "Filter without res: {xml}");
+        assert!(
+            !xml.contains(" size=&quot;") && !xml.contains(" size=\""),
+            "Filter without res@size: {xml}"
+        );
+        assert!(
+            !xml.contains("&lt;res ") && !xml.contains("<res "),
+            "Filter without res: {xml}"
+        );
         let (st, star) = soap_browse(&app, "2$8", "BrowseDirectChildren", "Kodi/21.0");
         assert_eq!(st, 200);
-        assert!(star.contains("size=&quot;") || star.contains("size=\""), "{star}");
+        assert!(
+            star.contains("size=&quot;") || star.contains("size=\""),
+            "{star}"
+        );
     }
 
     #[test]
     fn browse_recent_keeps_mtime_order() {
         let app = testdata_app();
         {
-            let mut cat = app.catalog.write().expect("catalog");
+            let mut cat = write_recover(&app.catalog);
             let mut videos: Vec<String> = cat
                 .items
                 .values()
                 .filter(|i| {
                     i.class.contains("video")
                         && i.ref_id.is_none()
-                        && i.object_id.starts_with(rusty_dlna_protocol::object_id::BROWSEDIR_ID)
+                        && i.object_id
+                            .starts_with(rusty_dlna_protocol::object_id::BROWSEDIR_ID)
                 })
                 .map(|i| i.object_id.clone())
                 .collect();
@@ -4635,7 +7841,9 @@ audio_out = "to-aac"
         );
         assert_eq!(st, 200, "{titled}");
         let early = titled.find("Aaa Early").expect("old title after +dc:title");
-        let fresh = titled.find("Zzz Fresh").expect("fresh title after +dc:title");
+        let fresh = titled
+            .find("Zzz Fresh")
+            .expect("fresh title after +dc:title");
         assert!(
             early < fresh,
             "explicit +dc:title must still re-sort Recent: {titled}"
@@ -4644,9 +7852,10 @@ audio_out = "to-aac"
 
     #[test]
     fn browse_force_sort_track_order() {
-        let app = testdata_app();
+        let mut app = testdata_app();
+        app.scan_cfg.db_path = None;
         {
-            let mut cat = app.catalog.write().expect("catalog");
+            let mut cat = write_recover(&app.catalog);
             let mut videos: Vec<String> = cat
                 .items
                 .values()
@@ -4735,9 +7944,7 @@ audio_out = "to-aac"
         assert_eq!(gen.status, 200);
 
         let cr_peer: SocketAddr = "192.0.2.41:1234".parse().unwrap();
-        let envelope = format!(
-            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"#
-        );
+        let envelope = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"#.to_string();
         let raw = format!(
             "POST /whatever HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: CrKey/1.54.384650 DLNADOC/1.50\r\nSOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n",
             envelope.len()
@@ -4759,13 +7966,13 @@ audio_out = "to-aac"
             })
             .expect("transcode id");
         let tget = app.handle_from(
-            &req(&get(
-                &format!("/Transcode/{tid}.mp4"),
-                "DLNADOC/1.50",
-            )),
+            &req(&get(&format!("/Transcode/{tid}.mp4"), "DLNADOC/1.50")),
             cr_peer,
         );
-        assert_ne!(tget.status, 404, "cached CrKey must still remap Transcode GET");
+        assert_ne!(
+            tget.status, 404,
+            "cached CrKey must still remap Transcode GET"
+        );
     }
 
     #[test]
@@ -4881,6 +8088,57 @@ audio_out = "to-aac"
     }
 
     #[test]
+    fn search_missing_container_id_is_402() {
+        let app = testdata_app();
+        let (status, xml) = soap_action(
+            &app,
+            "Search",
+            r#"<SearchCriteria></SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>"#,
+            "Kodi/21.0",
+        );
+        assert_eq!(status, 500, "{xml}");
+        assert!(xml.contains("<errorCode>402</errorCode>"), "{xml}");
+    }
+
+    #[test]
+    fn connection_and_registrar_required_arguments_reach_http_faults() {
+        let app = testdata_app();
+        for body in ["", "<ConnectionID>invalid</ConnectionID>"] {
+            let (status, xml) = soap_action(&app, "GetCurrentConnectionInfo", body, "Kodi/21.0");
+            assert_eq!(status, 500, "{xml}");
+            assert!(xml.contains("<errorCode>402</errorCode>"), "{xml}");
+        }
+        let (status, xml) = soap_action(
+            &app,
+            "GetCurrentConnectionInfo",
+            "<ConnectionID>1</ConnectionID>",
+            "Kodi/21.0",
+        );
+        assert_eq!(status, 500, "{xml}");
+        assert!(xml.contains("<errorCode>701</errorCode>"), "{xml}");
+        let (status, xml) = soap_action(
+            &app,
+            "GetCurrentConnectionInfo",
+            "<ConnectionID>0</ConnectionID>",
+            "Kodi/21.0",
+        );
+        assert_eq!(status, 200, "{xml}");
+
+        for method in ["IsAuthorized", "IsValidated"] {
+            let (status, xml) = soap_action(&app, method, "", "Kodi/21.0");
+            assert_eq!(status, 500, "{xml}");
+            assert!(xml.contains("<errorCode>402</errorCode>"), "{xml}");
+            let (status, xml) = soap_action(
+                &app,
+                method,
+                "<DeviceID>uuid:client</DeviceID>",
+                "Kodi/21.0",
+            );
+            assert_eq!(status, 200, "{xml}");
+        }
+    }
+
+    #[test]
     fn query_state_variable_connection_status_missing_unknown() {
         let app = testdata_app();
         let (st, xml) = soap_action(
@@ -4977,6 +8235,96 @@ audio_out = "to-aac"
     }
 
     #[test]
+    fn checked_fixtures_match_minidlna_scan_didl_and_get_contract() {
+        let app = testdata_app();
+        let expected = [
+            (
+                "music/song.flac",
+                "audio/x-flac",
+                "item.audioItem.musicTrack",
+                "Fixture Track",
+            ),
+            (
+                "music/song.mp3",
+                "audio/mpeg",
+                "item.audioItem.musicTrack",
+                "Fixture Track",
+            ),
+            ("video/tagged.mp4", "video/mp4", "item.videoItem", "tagged"),
+            (
+                "pictures/shot.jpg",
+                "image/jpeg",
+                "item.imageItem.photo",
+                "Fixture Photo",
+            ),
+        ];
+
+        for (relative, mime, class, title) in expected {
+            let item = {
+                let catalog = app.catalog.read().unwrap();
+                catalog
+                    .items
+                    .values()
+                    .find(|item| item.ref_id.is_none() && item.path.ends_with(relative))
+                    .cloned()
+                    .unwrap_or_else(|| panic!("checked fixture was not indexed: {relative}"))
+            };
+            assert_eq!(item.mime, mime, "{relative}");
+            assert_eq!(item.class, class, "{relative}");
+            assert_eq!(item.title, title, "{relative}");
+
+            let (status, didl) = soap_browse(&app, &item.object_id, "BrowseMetadata", "Kodi/21.0");
+            assert_eq!(status, 200, "{relative}: {didl}");
+            assert!(didl.contains(class), "{relative}: {didl}");
+            assert!(
+                didl.contains(&format!("http-get:*:{mime}:")),
+                "{relative}: {didl}"
+            );
+
+            let response = app.handle(&req(&get(
+                &format!("/MediaItems/{}.{}", item.detail_id, item.ext),
+                "FixtureParity/1.0",
+            )));
+            assert_eq!(response.status, 200, "GET {relative}");
+            assert_eq!(resp_header(&response, "Content-Type"), Some(mime));
+            let expected_length = item.size.to_string();
+            assert_eq!(
+                resp_header(&response, "Content-Length"),
+                Some(expected_length.as_str())
+            );
+            if response.file_range.is_none() {
+                assert_eq!(response.body, std::fs::read(&item.path).unwrap());
+            } else {
+                assert_eq!(
+                    response
+                        .file_range
+                        .as_ref()
+                        .map(|(path, _, _)| path.as_path()),
+                    Some(item.path.as_path())
+                );
+            }
+        }
+
+        let song = app
+            .catalog
+            .read()
+            .unwrap()
+            .items
+            .values()
+            .find(|item| item.ref_id.is_none() && item.path.ends_with("music/song.flac"))
+            .cloned()
+            .unwrap();
+        // Sidecar `studio` intentionally overrides embedded `artist`; the
+        // remaining embedded fields survive the NFO merge.
+        assert_eq!(song.artist.as_deref(), Some("Fixture Band"));
+        assert_eq!(song.album_artist.as_deref(), Some("Fixture Album Artist"));
+        assert_eq!(song.album.as_deref(), Some("Fixture Album"));
+        assert_eq!(song.composer.as_deref(), Some("Fixture Composer"));
+        assert_eq!(song.track, Some(2));
+        assert_eq!(song.disc, Some(1));
+    }
+
+    #[test]
     fn recent_keeps_old_mtime_and_caps_at_200() {
         let app = testdata_app();
         let movie = {
@@ -4986,13 +8334,14 @@ audio_out = "to-aac"
                 .find(|i| {
                     i.path.ends_with("movie.mkv")
                         && i.ref_id.is_none()
-                        && i.object_id.starts_with(rusty_dlna_protocol::object_id::BROWSEDIR_ID)
+                        && i.object_id
+                            .starts_with(rusty_dlna_protocol::object_id::BROWSEDIR_ID)
                 })
                 .cloned()
                 .expect("browse-folder movie.mkv")
         };
         {
-            let mut cat = app.catalog.write().expect("catalog");
+            let mut cat = write_recover(&app.catalog);
             if let Some(it) = cat.items.get_mut(&movie.object_id) {
                 it.mtime = 1;
                 it.ref_id = None;
@@ -5007,7 +8356,7 @@ audio_out = "to-aac"
             "old-mtime files stay in Recent (no 90-day window): {xml}"
         );
         {
-            let mut cat = app.catalog.write().expect("catalog");
+            let mut cat = write_recover(&app.catalog);
             for i in 0..210i64 {
                 let oid = format!("64$RECENTTEST${i:X}");
                 let mut clone = movie.clone();
@@ -5107,12 +8456,7 @@ audio_out = "to-aac"
     #[test]
     fn lg_browse_captioned_title_ends_with_dot() {
         let app = testdata_app();
-        let (st, xml) = soap_browse(
-            &app,
-            "2$8",
-            "BrowseDirectChildren",
-            "LGE_DLNA_SDK/1.6.0",
-        );
+        let (st, xml) = soap_browse(&app, "2$8", "BrowseDirectChildren", "LGE_DLNA_SDK/1.6.0");
         assert_eq!(st, 200, "{xml}");
         assert!(
             xml.contains("Fixture Movie."),
@@ -5158,9 +8502,7 @@ audio_out = "to-aac"
         assert_eq!(resp_header(&r, "Content-Type"), Some("video/divx"));
 
         let (st, xml) = {
-            let body = format!(
-                r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"#
-            );
+            let body = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"#.to_string();
             let hdr = format!(
                 "POST /whatever HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nX-AV-Client-Info: av=\"5.0\"; mv=\"2.0\"\r\nSOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"\r\nContent-Length: {}\r\nContent-Type: text/xml\r\n\r\n",
                 body.len()

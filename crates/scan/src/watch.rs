@@ -3,17 +3,19 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 
-use crate::db::LibraryDb;
 use crate::{
-    is_album_art_name, is_caption_name, is_skipped_dir, is_unfinished_name,
-    looks_like_sample_file, monitor_dirty, path_excluded, rebuild_objects, Catalog, ScanConfig,
-    ScanDelta,
+    is_album_art_name_for_config, is_caption_name, is_skipped_dir, is_unfinished_name,
+    looks_like_sample_file, monitor, monitor_dirty, open_library_db, path_excluded,
+    path_is_allowed_dir, rebuild_objects, Catalog, ScanConfig, ScanDelta, ScanResult,
 };
 
 const MASK: WatchMask = WatchMask::CREATE
@@ -123,11 +125,7 @@ fn classify_file_events(events: &[FileEvent]) -> Vec<ClassifiedEvent> {
             FileEventKind::DirMovedFrom | FileEventKind::DirMovedTo
         ) || matches!(dst.kind, FileEventKind::DirMovedTo);
         out.push(ClassifiedEvent {
-            action: if dir {
-                "dir_relocated"
-            } else {
-                "relocated"
-            },
+            action: if dir { "dir_relocated" } else { "relocated" },
             message: if dir {
                 "directory relocated"
             } else {
@@ -164,11 +162,7 @@ struct ClassifiedEvent {
 
 fn log_file_events(events: &[FileEvent]) {
     for ev in classify_file_events(events) {
-        let file = ev
-            .path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let file = ev.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         match (&ev.from, &ev.to) {
             (Some(from), Some(to)) => tracing::info!(
                 target: "rusty_dlna",
@@ -192,37 +186,62 @@ fn log_file_events(events: &[FileEvent]) {
 }
 
 /// Wait this long after the first event in a burst before applying.
-const SETTLE: Duration = Duration::from_secs(5);
-/// Burst size that used to force a tree walk. Every burst reconciles now;
-/// kept so tests still describe the old overflow threshold.
-#[allow(dead_code)]
-const RECONCILE_AFTER: usize = 64;
+const SETTLE: Duration = Duration::from_millis(250);
+const MAX_BATCH_DELAY: Duration = Duration::from_secs(2);
+const RECONCILE_AFTER: usize = 256;
 
-pub fn repair_objects_if_needed(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta) {
+#[derive(Debug, Default)]
+pub struct WatchTelemetry {
+    pub watch_count: AtomicUsize,
+    pub overflow_count: AtomicU64,
+    pub batches: AtomicU64,
+}
+
+pub fn repair_objects_if_needed(cfg: &ScanConfig) -> ScanResult<(Option<Catalog>, ScanDelta)> {
     let db = match &cfg.db_path {
-        Some(p) => LibraryDb::open(p).expect("open files.db"),
-        None => return (None, ScanDelta::default()),
+        Some(p) => open_library_db(p)?,
+        None => return Ok((None, ScanDelta::default())),
     };
-    let missing = db.details_missing_objects().unwrap_or(0);
-    let dupes = db.folders_have_duplicate_inodes();
-    if missing > 0 || dupes {
+    let missing = db.details_missing_objects()?;
+    let dupes = db.folders_have_duplicate_inodes()?;
+    if missing > 0 {
         tracing::info!(
             target: "rusty_dlna",
             missing,
             dupes,
             "repairing object tree"
         );
-        let next = rebuild_objects(cfg);
-        return (
+        let next = rebuild_objects(cfg)?;
+        return Ok((
             Some(next),
             ScanDelta {
                 added: 0,
                 removed: 0,
                 changed: 1,
             },
-        );
+        ));
     }
-    (None, ScanDelta::default())
+    if dupes {
+        tracing::info!(target: "rusty_dlna", "pruning duplicate object aliases");
+        let transaction = db.transaction()?;
+        let removed = db.prune_duplicate_folder_inodes()?;
+        db.prune_empty_folders()?;
+        transaction.commit()?;
+        tracing::info!(
+            target: "rusty_dlna",
+            removed,
+            "duplicate object aliases pruned"
+        );
+        return Ok((
+            Some(crate::load_catalog_with_policy(&db, cfg)?),
+            ScanDelta {
+                added: 0,
+                removed,
+                changed: usize::from(removed > 0),
+            },
+        ));
+    }
+    Ok((None, ScanDelta::default()))
 }
 
 /// Block on inotify. `on_change` is called after a settled burst.
@@ -230,12 +249,27 @@ pub fn run_inotify(
     cfg: ScanConfig,
     mut on_change: impl FnMut(Catalog, ScanDelta),
 ) -> std::io::Result<()> {
+    let stopping = AtomicBool::new(false);
+    run_inotify_until(cfg, &stopping, None, None, &mut on_change)
+}
+
+pub fn run_inotify_until(
+    cfg: ScanConfig,
+    stopping: &AtomicBool,
+    scan_gate: Option<&Mutex<()>>,
+    telemetry: Option<&WatchTelemetry>,
+    mut on_change: impl FnMut(Catalog, ScanDelta),
+) -> std::io::Result<()> {
     let mut ino = Inotify::init()?;
     let mut wds: HashMap<WatchDescriptor, PathBuf> = HashMap::new();
+    let mut directory_inodes = HashSet::new();
     raise_watch_limit(65_536);
     for root in &cfg.media_dirs {
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-        add_tree_watches(&mut ino, &mut wds, &cfg, &root);
+        let root = std::fs::canonicalize(root)?;
+        add_tree_watches(&mut ino, &mut wds, &mut directory_inodes, &cfg, &root)?;
+    }
+    if let Some(telemetry) = telemetry {
+        telemetry.watch_count.store(wds.len(), Ordering::Relaxed);
     }
     tracing::info!(
         target: "rusty_dlna",
@@ -245,10 +279,17 @@ pub fn run_inotify(
     );
 
     let mut buf = [0u8; 65_536];
-    loop {
+    while !stopping.load(Ordering::Acquire) {
         let mut batch = PendingBatch::default();
-        match ino.read_events_blocking(&mut buf) {
+        match poll_fd(ino.as_raw_fd(), 500) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+        match ino.read_events(&mut buf) {
             Ok(events) => collect_events(events, &wds, &cfg, &mut batch),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
@@ -256,13 +297,20 @@ pub fn run_inotify(
             continue;
         }
 
-        let deadline = Instant::now() + SETTLE;
-        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        let maximum = Instant::now() + MAX_BATCH_DELAY;
+        let mut deadline = Instant::now() + SETTLE;
+        while !stopping.load(Ordering::Acquire) {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
             let ms = left.as_millis().min(i32::MAX as u128) as i32;
             match poll_fd(ino.as_raw_fd(), ms) {
                 Ok(false) => break,
                 Ok(true) => match ino.read_events(&mut buf) {
-                    Ok(events) => collect_events(events, &wds, &cfg, &mut batch),
+                    Ok(events) => {
+                        collect_events(events, &wds, &cfg, &mut batch);
+                        deadline = (Instant::now() + SETTLE).min(maximum);
+                    }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => return Err(e),
@@ -271,9 +319,21 @@ pub fn run_inotify(
                 Err(e) => return Err(e),
             }
         }
-
-        apply_batch(&cfg, &mut ino, &mut wds, batch, &mut on_change);
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
+        let _guard = scan_gate.map(|gate| gate.lock().unwrap_or_else(|error| error.into_inner()));
+        apply_batch(
+            &cfg,
+            &mut ino,
+            &mut wds,
+            &mut directory_inodes,
+            batch,
+            telemetry,
+            &mut on_change,
+        );
     }
+    Ok(())
 }
 
 fn collect_events<'a>(
@@ -288,40 +348,45 @@ fn collect_events<'a>(
             continue;
         }
         let Some(name) = ev.name else { continue };
-        let name = name.to_string_lossy();
-        if name.starts_with('.') {
+        let display_name = name.to_string_lossy();
+        if !cfg.include_hidden && display_name.starts_with('.') {
             continue;
         }
         let Some(dir) = wds.get(&ev.wd) else { continue };
-        let path = dir.join(name.as_ref());
-        let excluded = path_excluded(&path, &name, cfg);
+        let path = dir.join(name);
+        let excluded = path_excluded(&path, &display_name, cfg);
         let kind = FileEventKind::from_mask(ev.mask);
         if ev.mask.contains(EventMask::ISDIR)
             && ev.mask.intersects(EventMask::CREATE | EventMask::MOVED_TO)
         {
-            if excluded || is_skipped_dir(&name) {
+            if excluded || is_skipped_dir(&display_name) || !path_is_allowed_dir(&path, cfg) {
                 continue;
             }
             batch.note(path.clone(), ev.cookie, kind);
             batch.add_dir(path);
             continue;
         }
-        if ev.mask.intersects(EventMask::DELETE | EventMask::MOVED_FROM) {
+        if ev
+            .mask
+            .intersects(EventMask::DELETE | EventMask::MOVED_FROM)
+        {
             if ev.mask.contains(EventMask::ISDIR) {
                 batch.note(path.clone(), ev.cookie, kind);
                 batch.remove_tree(path);
             } else {
-                if !is_sidecar_name(&name) {
+                if !is_sidecar_name(&display_name, cfg) {
                     batch.note(path.clone(), ev.cookie, kind);
                 }
                 batch.remove_file(path);
             }
             continue;
         }
-        if drop_create_event(&name, excluded) {
+        if drop_create_event(&display_name, excluded) {
             continue;
         }
-        let apply = ev.mask.intersects(EventMask::CLOSE_WRITE | EventMask::MOVED_TO)
+        let apply = ev
+            .mask
+            .intersects(EventMask::CLOSE_WRITE | EventMask::MOVED_TO)
             || (ev.mask.contains(EventMask::CREATE) && path_is_link_or_dir(&path));
         if ev.mask.contains(EventMask::CREATE) && !apply {
             // Regular-file CREATE is indexed on CLOSE_WRITE; still log it.
@@ -329,7 +394,7 @@ fn collect_events<'a>(
         }
         if apply {
             if path.is_dir() {
-                if !is_skipped_dir(&name) {
+                if !is_skipped_dir(&display_name) && path_is_allowed_dir(&path, cfg) {
                     batch.note(path.clone(), ev.cookie, kind);
                     batch.add_dir(path);
                 }
@@ -345,12 +410,19 @@ fn apply_batch(
     cfg: &ScanConfig,
     ino: &mut Inotify,
     wds: &mut HashMap<WatchDescriptor, PathBuf>,
+    directory_inodes: &mut HashSet<(u64, u64)>,
     batch: PendingBatch,
+    telemetry: Option<&WatchTelemetry>,
     on_change: &mut impl FnMut(Catalog, ScanDelta),
 ) {
-    // Incremental add/remove only sees the event path. A rename under a
-    // real folder leaves directory-symlink aliases (genres/BY_YEAR/…)
-    // stale. One tree reconcile is the source of truth.
+    let fallback =
+        batch.should_reconcile() || !batch.add_dirs.is_empty() || !batch.remove_trees.is_empty();
+    if let Some(telemetry) = telemetry {
+        telemetry.batches.fetch_add(1, Ordering::Relaxed);
+        if batch.overflow {
+            telemetry.overflow_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     log_file_events(&batch.events);
     tracing::info!(
         target: "rusty_dlna",
@@ -359,28 +431,58 @@ fn apply_batch(
         dirs = batch.add_dirs.len(),
         events = batch.events.len(),
         overflow = batch.overflow,
-        mode = "reconcile",
+        mode = if fallback { "bounded-full" } else { "targeted" },
         "inotify settled"
     );
 
-    for dir in &batch.add_dirs {
-        add_tree_watches(ino, wds, cfg, dir);
-    }
     for dir in &batch.remove_trees {
         wds.retain(|_, p| !p.starts_with(dir));
     }
-    let dirty: Vec<PathBuf> = batch.add_files.iter().cloned().collect();
-    match monitor_dirty(cfg, &dirty) {
-        (Some(cat), delta) => on_change(cat, delta),
-        _ => {}
+    if !batch.remove_trees.is_empty() {
+        directory_inodes.clear();
+        directory_inodes.extend(wds.values().filter_map(|path| {
+            std::fs::metadata(path)
+                .ok()
+                .filter(|meta| meta.is_dir())
+                .map(|meta| (meta.dev(), meta.ino()))
+        }));
+    }
+    for dir in &batch.add_dirs {
+        if let Err(error) = add_tree_watches(ino, wds, directory_inodes, cfg, dir) {
+            tracing::warn!(path = %dir.display(), %error, "could not add inotify subtree");
+        }
+    }
+    if let Some(telemetry) = telemetry {
+        telemetry.watch_count.store(wds.len(), Ordering::Relaxed);
+    }
+    // Removed sidecars are just as significant as writes: they must clear
+    // metadata/art/captions from the owning item. The path need not still
+    // exist; `monitor_dirty` uses its parent and filename as the ownership key.
+    let dirty: Vec<PathBuf> = batch
+        .add_files
+        .iter()
+        .chain(batch.remove_files.iter())
+        .cloned()
+        .collect();
+    let result = if fallback {
+        monitor(cfg)
+    } else {
+        monitor_dirty(cfg, &dirty)
+    };
+    match result {
+        Ok((Some(cat), delta)) => on_change(cat, delta),
+        Ok((None, _)) => {}
+        Err(error) => {
+            tracing::error!(%error, "inotify reconciliation failed; retaining published catalog")
+        }
     }
 }
 
-fn is_sidecar_name(name: &str) -> bool {
+fn is_sidecar_name(name: &str, cfg: &ScanConfig) -> bool {
     is_caption_name(name)
-        || name.ends_with(".nfo")
+        || name.to_ascii_lowercase().ends_with(".nfo")
         || name.ends_with(".probe.toml")
-        || is_album_art_name(name)
+        || is_album_art_name_for_config(name, cfg)
 }
 
 /// Junk / unfinished / samples are ignored. Poster and NFO writes must
@@ -410,7 +512,10 @@ impl PendingBatch {
 
     #[allow(dead_code)]
     fn unique_paths(&self) -> usize {
-        self.add_files.len() + self.remove_files.len() + self.remove_trees.len() + self.add_dirs.len()
+        self.add_files.len()
+            + self.remove_files.len()
+            + self.remove_trees.len()
+            + self.add_dirs.len()
     }
 
     #[allow(dead_code)]
@@ -458,6 +563,8 @@ fn poll_fd(fd: i32, timeout_ms: i32) -> io::Result<bool> {
         revents: 0,
     }];
     loop {
+        // SAFETY: `fds` contains one initialized `pollfd`, and the pointer is
+        // valid and writable for the declared element count during the call.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, timeout_ms) };
         if n < 0 {
             let err = io::Error::last_os_error();
@@ -479,37 +586,42 @@ fn path_is_link_or_dir(path: &Path) -> bool {
 fn add_tree_watches(
     ino: &mut Inotify,
     wds: &mut HashMap<WatchDescriptor, PathBuf>,
+    directory_inodes: &mut HashSet<(u64, u64)>,
     cfg: &ScanConfig,
     dir: &Path,
-) {
-    let name = dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    if path_excluded(dir, name, cfg) || is_skipped_dir(name) {
-        return;
+) -> io::Result<()> {
+    let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let metadata = std::fs::metadata(dir)?;
+    let inode = (metadata.dev(), metadata.ino());
+    if !metadata.is_dir() || directory_inodes.contains(&inode) {
+        return Ok(());
     }
-    if let Ok(wd) = ino.watches().add(dir, MASK) {
-        wds.insert(wd, dir.to_path_buf());
+    if !path_is_allowed_dir(dir, cfg) || path_excluded(dir, name, cfg) || is_skipped_dir(name) {
+        return Ok(());
     }
-    let rd = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    for ent in rd.filter_map(|e| e.ok()) {
+    let wd = ino.watches().add(dir, MASK)?;
+    directory_inodes.insert(inode);
+    wds.insert(wd, dir.to_path_buf());
+    let rd = std::fs::read_dir(dir)?;
+    for ent in rd {
+        let ent = ent?;
         let path = ent.path();
         let n = ent.file_name().to_string_lossy().into_owned();
-        if n.starts_with('.') {
+        if !cfg.include_hidden && n.starts_with('.') {
             continue;
         }
         if path_excluded(&path, &n, cfg) || is_skipped_dir(&n) {
             continue;
         }
-        if ent.file_type().map(|t| t.is_dir() || t.is_symlink()).unwrap_or(false) && path.is_dir()
+        if ent
+            .file_type()
+            .map(|t| t.is_dir() || t.is_symlink())
+            .unwrap_or(false)
         {
-            add_tree_watches(ino, wds, cfg, &path);
+            add_tree_watches(ino, wds, directory_inodes, cfg, &path)?;
         }
     }
+    Ok(())
 }
 
 fn raise_watch_limit(want: u32) {
@@ -522,13 +634,54 @@ fn raise_watch_limit(want: u32) {
         return;
     }
     if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
-        let _ = writeln!(f, "{want}");
+        if let Err(error) = writeln!(f, "{want}") {
+            tracing::warn!(%error, "could not raise inotify watch limit");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "rusty-dlna-{label}-{}-{sequence}",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = PathBuf;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fake_mkv(path: &Path) {
+        let mut bytes = vec![0u8; 64];
+        bytes[..4].copy_from_slice(&[0x1a, 0x45, 0xdf, 0xa3]);
+        std::fs::write(path, bytes).unwrap();
+    }
 
     #[test]
     fn rename_in_one_burst_is_remove_then_add() {
@@ -560,9 +713,10 @@ mod tests {
 
     #[test]
     fn poster_and_nfo_writes_are_not_dropped() {
-        assert!(is_sidecar_name("clip-poster.jpg"));
-        assert!(is_sidecar_name("movie.nfo"));
-        assert!(is_sidecar_name("tvshow.nfo"));
+        let cfg = ScanConfig::default();
+        assert!(is_sidecar_name("clip-poster.jpg", &cfg));
+        assert!(is_sidecar_name("movie.nfo", &cfg));
+        assert!(is_sidecar_name("tvshow.nfo", &cfg));
         assert!(!drop_create_event("clip-poster.jpg", false));
         assert!(!drop_create_event("movie.nfo", false));
         assert!(!drop_create_event("tvshow.nfo", false));
@@ -628,8 +782,10 @@ mod tests {
 
     #[test]
     fn overflow_or_large_burst_reconciles() {
-        let mut b = PendingBatch::default();
-        b.overflow = true;
+        let b = PendingBatch {
+            overflow: true,
+            ..PendingBatch::default()
+        };
         assert!(b.should_reconcile());
         let mut b = PendingBatch::default();
         for i in 0..RECONCILE_AFTER {
@@ -639,5 +795,98 @@ mod tests {
         b.remove_files.clear();
         b.remove_file(PathBuf::from("/v/one.mkv"));
         assert!(!b.should_reconcile());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inotify_reconcile_never_watches_or_indexes_an_outside_link() {
+        let tmp = TempDir::new("watch-jail");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("media");
+        let inside = root.join("inside");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        fake_mkv(&inside.join("inside.mkv"));
+        fake_mkv(&outside.join("secret.mkv"));
+        let cfg = ScanConfig {
+            media_roots: Vec::new(),
+            media_dirs: vec![root.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: crate::MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let _ = crate::scan(&cfg);
+
+        let escape = root.join("escape");
+        std::os::unix::fs::symlink(&outside, &escape).unwrap();
+        let mut ino = Inotify::init().unwrap();
+        let mut wds = HashMap::new();
+        let mut directory_inodes = HashSet::new();
+        let mut outside_published = false;
+        let mut batch = PendingBatch::default();
+        batch.add_dir(escape.clone());
+        apply_batch(
+            &cfg,
+            &mut ino,
+            &mut wds,
+            &mut directory_inodes,
+            batch,
+            None,
+            &mut |catalog, _| {
+                outside_published = catalog.items.values().any(|item| item.title == "secret");
+            },
+        );
+        assert!(!outside_published);
+        assert!(!wds.values().any(|path| path.starts_with(&escape)));
+
+        let safe_alias = root.join("safe-alias");
+        std::os::unix::fs::symlink(&inside, &safe_alias).unwrap();
+        let mut safe_published = false;
+        let mut batch = PendingBatch::default();
+        batch.add_dir(safe_alias.clone());
+        apply_batch(
+            &cfg,
+            &mut ino,
+            &mut wds,
+            &mut directory_inodes,
+            batch,
+            None,
+            &mut |catalog, _| {
+                safe_published = catalog
+                    .items
+                    .values()
+                    .any(|item| item.path.ends_with("safe-alias/inside.mkv"));
+            },
+        );
+        assert!(
+            safe_published,
+            "safe link must reconcile through inotify path"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inotify_tree_deduplicates_directory_aliases_and_cycles() {
+        let tmp = TempDir::new("watch-inode-dedupe");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("media");
+        let physical = root.join("physical");
+        std::fs::create_dir_all(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, root.join("alias")).unwrap();
+        std::os::unix::fs::symlink(&root, physical.join("cycle")).unwrap();
+        let cfg = ScanConfig {
+            media_roots: Vec::new(),
+            media_dirs: vec![root.clone()],
+            types: crate::MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let mut ino = Inotify::init().unwrap();
+        let mut wds = HashMap::new();
+        let mut directory_inodes = HashSet::new();
+        add_tree_watches(&mut ino, &mut wds, &mut directory_inodes, &cfg, &root).unwrap();
+        assert_eq!(directory_inodes.len(), 2);
+        assert_eq!(wds.len(), 2);
     }
 }

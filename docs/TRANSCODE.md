@@ -45,11 +45,18 @@ same field as a list. Unset `client` matches every player.
 
 Unset match fields are wildcards. `hdr = "dvhe.07"` is an alias for `dv-p7`.
 
-Empty `[[remap]]` list → every client, including Cast, gets the remux.
+Empty `[[remap]]` list → every client, including Cast, gets the original.
+
+`transcode.encoder` is the default only for `action = "hdr10"`; a rule-level
+`encoder` overrides it. `remux-p8` and `audio-ac3` must copy video. Run
+`rusty-dlna --config ... --check` on the deployed host to verify ffmpeg,
+ffprobe, compiled encoder support, hardware-device usability, and dovi_tool.
+Missing dovi_tool is reported as a warning because Profile-8 jobs retain the
+documented HDR10 fallback.
 
 ## HDR and Dolby Vision
 
-- **HDR10** (PQ `smpte2084` + BT.2020, 10-bit) can be preserved.
+- **HDR10-compatible output** uses PQ `smpte2084`, BT.2020, and 10-bit pixels.
   ffmpeg flags: `-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc`,
   `-tag:v hvc1`, 10-bit `p010le`.
 - **Dolby Vision Profile 7** (BL+EL+RPU, `compatibility_id=6`) cannot.
@@ -58,8 +65,9 @@ Empty `[[remap]]` list → every client, including Cast, gets the remux.
 - CUDA decode of DV P7 failed on the box that proved the offline path
   (`Impossible to convert… Function not implemented`). Encode jobs
   default to **software decode + NVENC** (or libx264), same as that encode.
-- Copy mastering display / MaxCLL when present (`-mastering_display`,
-  `-max_cll`) so tone-map matches the disc.
+- Mastering-display, MaxCLL, and MaxFALL metadata are not currently copied.
+  The server does not claim mastering-metadata preservation; deployments that
+  require exact HDR mastering metadata should serve the original resource.
 
 ## Serve path: background growing fMP4 (file cache)
 
@@ -93,13 +101,27 @@ If `decide` says original, the handler serves the source file.
 
 ## HTTP
 
-Transcoded GETs (live pipe):
+Transcoded GETs while the `.part` file is growing:
 
 - `Connection: close`
 - `transferMode.dlna.org: Streaming`
 - `contentFeatures.dlna.org: … DLNA.ORG_CI=1; DLNA.ORG_OP=00…`
 - No `Content-Length`, no `Accept-Ranges`
 - TimeSeek without Range is still 406
+
+After ffprobe validates and atomically publishes the finished cache, GET/HEAD
+uses `DLNA.ORG_OP=01`, `Content-Length`, `Accept-Ranges: bytes`, and normal
+single-range 206/416 behavior. This distinction is derived from job state, not
+from the DIDL resource advertisement.
+
+The supervisor bounds stderr by streaming a fixed tail, uses UTF-8-safe lossy
+decoding only after capture, applies the configured wall-clock deadline, and
+terminates/reaps the process group on cancellation or shutdown. Persisted
+per-stream descriptors retain both the source stream index and the audio
+ordinal used in `0:a:N`; repeated codecs therefore do not collapse selection.
+Successful output must pass a bounded ffprobe check before `.part` is renamed.
+Failed verification deletes the incomplete output and leaves no reusable
+cache entry.
 
 Do not reuse `stream_buffer_mb` for encoded bytes. That window is source
 file data.
@@ -108,8 +130,10 @@ file data.
 
 Not “transcode everything.” Proper means:
 
-1. Know the source (container, codec, HDR, audio) — rustyDLNA DB does not.
+1. Know the source (container, codec, HDR, audio stream descriptors) from the
+   persisted scanner probe.
 2. Know the client (table + `NEED_SAFE_VIDEO`).
 3. Hide or demote the unplayable `<res>` for that client.
-4. Preserve HDR10; drop DV.
-5. Bound encoder jobs; cancel cleanly.
+4. Produce HDR10-compatible color signaling and drop DV, without claiming
+   mastering-display/MaxCLL preservation.
+5. Bound encoder jobs and cache space; cancel and reap cleanly.

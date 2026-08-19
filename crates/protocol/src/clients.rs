@@ -538,13 +538,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.kind, ClientKind::SonyBdp);
-        let kodi = identify_request(
-            Some("Kodi/21.0 DLNADOC/1.50"),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let kodi = identify_request(Some("Kodi/21.0 DLNADOC/1.50"), None, None, None).unwrap();
         assert_eq!(kodi.kind, ClientKind::Kodi);
         let generic = identify_request(Some("DLNADOC/1.50"), None, None, None).unwrap();
         assert_eq!(generic.kind, ClientKind::StandardDlna150);
@@ -640,10 +634,7 @@ mod tests {
             remap_mime_full(bdp, "video/x-matroska", None, None),
             "video/divx"
         );
-        assert_eq!(
-            remap_mime_full(bdp, "video/mpeg", None, None),
-            "video/divx"
-        );
+        assert_eq!(remap_mime_full(bdp, "video/mpeg", None, None), "video/divx");
 
         let generic = identify_user_agent("UPnP/1.0").unwrap();
         assert!(!generic.flags.contains(ClientFlags::DLNA));

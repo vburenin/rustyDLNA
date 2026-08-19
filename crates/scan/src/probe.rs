@@ -2,46 +2,158 @@
 //! No ffmpeg CLI. Bounded `probesize` / `analyzeduration`.
 
 use std::ffi::CStr;
+use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 use std::ptr;
 use std::sync::Once;
+use std::time::{Duration, Instant};
+
+fn path_cstring(path: &Path) -> Option<std::ffi::CString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(path.as_os_str().as_bytes()).ok()
+    }
+    #[cfg(not(unix))]
+    {
+        std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()
+    }
+}
 
 use ffmpeg_sys_next as sys;
 
-use crate::{duration_str, AvMeta, SourceProbe};
+use crate::{duration_str, AvMeta, EmbeddedTags, SourceProbe};
 
 #[derive(Clone, Debug, Default)]
 pub struct MediaProbe {
     pub probe: SourceProbe,
     pub av: AvMeta,
+    pub tags: EmbeddedTags,
 }
 
 static INIT: Once = Once::new();
 
 fn init_libav() {
-    INIT.call_once(|| {
-        unsafe {
-            sys::av_log_set_level(sys::AV_LOG_ERROR);
-        }
+    // SAFETY: this process-wide libav logging setter accepts an enum value and
+    // `Once` guarantees the global mutation is performed only once.
+    INIT.call_once(|| unsafe {
+        #[cfg(test)]
+        let level = sys::AV_LOG_QUIET;
+        #[cfg(not(test))]
+        // libav labels recoverable bitstream defects (for example truncated
+        // H.264 user-data SEI or an invalid VUI time base) as AV_LOG_ERROR
+        // even when avformat can still identify the file successfully.  The
+        // scanner reports an actual failed probe itself, so keep only fatal
+        // process/library diagnostics on stderr here.
+        let level = sys::AV_LOG_FATAL;
+        sys::av_log_set_level(level);
     });
+}
+
+unsafe fn dictionary_value(dictionary: *mut sys::AVDictionary, keys: &[&str]) -> Option<String> {
+    if dictionary.is_null() {
+        return None;
+    }
+    for key in keys {
+        let Ok(key) = std::ffi::CString::new(*key) else {
+            continue;
+        };
+        let entry = sys::av_dict_get(dictionary, key.as_ptr(), ptr::null(), 0);
+        if entry.is_null() || (*entry).value.is_null() {
+            continue;
+        }
+        let value = CStr::from_ptr((*entry).value).to_string_lossy();
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn tag_number(value: Option<String>) -> Option<i64> {
+    value?.split('/').next()?.trim().parse().ok()
+}
+
+unsafe fn fill_tags_from_dictionary(tags: &mut EmbeddedTags, dictionary: *mut sys::AVDictionary) {
+    macro_rules! fill {
+        ($field:ident, $keys:expr) => {
+            if tags.$field.is_none() {
+                tags.$field = dictionary_value(dictionary, $keys);
+            }
+        };
+    }
+    fill!(title, &["title"]);
+    fill!(artist, &["artist"]);
+    fill!(
+        album_artist,
+        &["album_artist", "albumartist", "album artist"]
+    );
+    fill!(album, &["album"]);
+    fill!(genre, &["genre"]);
+    fill!(composer, &["composer"]);
+    fill!(contributor, &["performer", "contributor"]);
+    fill!(date, &["date", "year", "creation_time"]);
+    fill!(comment, &["comment", "description"]);
+    fill!(camera_make, &["make", "camera_make"]);
+    fill!(camera_model, &["model", "camera_model"]);
+    if tags.disc.is_none() {
+        tags.disc = tag_number(dictionary_value(dictionary, &["disc", "discnumber"]));
+    }
+    if tags.track.is_none() {
+        tags.track = tag_number(dictionary_value(dictionary, &["track", "tracknumber"]));
+    }
+    if tags.rating.is_none() {
+        tags.rating = tag_number(dictionary_value(dictionary, &["rating", "rate"]));
+    }
+    if tags.rotation.is_none() {
+        tags.rotation = tag_number(dictionary_value(dictionary, &["rotate", "rotation"]));
+    }
+}
+
+fn fill_missing_tags(tags: &mut EmbeddedTags, fallback: EmbeddedTags) {
+    macro_rules! fill {
+        ($field:ident) => {
+            if tags.$field.is_none() {
+                tags.$field = fallback.$field;
+            }
+        };
+    }
+    fill!(title);
+    fill!(artist);
+    fill!(album_artist);
+    fill!(album);
+    fill!(genre);
+    fill!(composer);
+    fill!(contributor);
+    fill!(date);
+    fill!(comment);
+    fill!(disc);
+    fill!(track);
+    fill!(rating);
+    fill!(camera_make);
+    fill!(camera_model);
+    fill!(rotation);
 }
 
 /// Open the file with libavformat and fill DETAILS. Never shells out.
 pub fn probe_media(path: &Path) -> Option<MediaProbe> {
+    probe_media_with_timeout(path, Duration::from_secs(30))
+}
+
+pub fn probe_media_with_timeout(path: &Path, timeout: Duration) -> Option<MediaProbe> {
     init_libav();
-    let file = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let file = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let path_s = path.display().to_string();
-    tracing::info!(
+    tracing::debug!(
         target: "rusty_dlna",
         file,
         path = %path_s,
         "libav exploring"
     );
-    let Ok(path_c) = std::ffi::CString::new(path.to_string_lossy().as_ref()) else {
-        tracing::info!(
+    let Some(path_c) = path_cstring(path) else {
+        tracing::warn!(
             target: "rusty_dlna",
             file,
             path = %path_s,
@@ -49,9 +161,11 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
         );
         return None;
     };
-    let got = unsafe { probe_avformat(path_c.as_ptr()) };
+    // SAFETY: `path_c` is NUL-terminated for the entire call. The helper owns
+    // and closes every libav allocation it creates before returning.
+    let got = unsafe { probe_avformat(path_c.as_ptr(), timeout) };
     match &got {
-        Some(m) => tracing::info!(
+        Some(m) => tracing::debug!(
             target: "rusty_dlna",
             file,
             path = %path_s,
@@ -69,7 +183,7 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
             subs = %m.av.subs.as_deref().unwrap_or(""),
             "libav probe"
         ),
-        None => tracing::info!(
+        None => tracing::warn!(
             target: "rusty_dlna",
             file,
             path = %path_s,
@@ -79,7 +193,115 @@ pub fn probe_media(path: &Path) -> Option<MediaProbe> {
     got
 }
 
-unsafe fn probe_avformat(url: *const libc::c_char) -> Option<MediaProbe> {
+/// Probe a still image without exposing libav's image decoder as a video
+/// stream identity. Only dimensions are useful to ContentDirectory.
+pub fn probe_image(path: &Path) -> Option<MediaProbe> {
+    probe_image_with_timeout(path, Duration::from_secs(30))
+}
+
+pub fn probe_image_with_timeout(path: &Path, timeout: Duration) -> Option<MediaProbe> {
+    let mut image = probe_media_with_timeout(path, timeout)?;
+    image.probe.container = "jpeg".into();
+    image.probe.video.clear();
+    image.probe.audio.clear();
+    image.probe.hdr.clear();
+    image.av.duration = None;
+    image.av.bitrate = None;
+    image.av.channels = None;
+    image.av.samplerate = None;
+    apply_exif(path, &mut image);
+    Some(image)
+}
+
+fn exif_ascii(exif: &exif::Exif, tag: exif::Tag) -> Option<String> {
+    let field = exif.get_field(tag, exif::In::PRIMARY)?;
+    let exif::Value::Ascii(values) = &field.value else {
+        return None;
+    };
+    values.iter().find_map(|value| {
+        let value = value.strip_suffix(&[0]).unwrap_or(value);
+        let value = String::from_utf8_lossy(value).trim().to_string();
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+fn exif_date(value: String) -> String {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 19 && bytes[4] == b':' && bytes[7] == b':' && bytes[10] == b' ' {
+        format!(
+            "{}-{}-{}T{}Z",
+            &value[0..4],
+            &value[5..7],
+            &value[8..10],
+            &value[11..19]
+        )
+    } else {
+        rusty_dlna_protocol::w3c_normalize_date(&value)
+    }
+}
+
+fn apply_exif(path: &Path, image: &mut MediaProbe) {
+    let Ok(file) = File::open(path) else {
+        return;
+    };
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut BufReader::new(file)) else {
+        return;
+    };
+    image.tags.camera_make = exif_ascii(&exif, exif::Tag::Make);
+    image.tags.camera_model = exif_ascii(&exif, exif::Tag::Model);
+    image.tags.album = exif_ascii(&exif, exif::Tag(exif::Context::Tiff, 0x010d));
+    image.tags.rating = exif
+        .get_field(exif::Tag(exif::Context::Tiff, 0x4746), exif::In::PRIMARY)
+        .and_then(|field| field.value.get_uint(0))
+        .map(i64::from);
+    image.tags.comment = exif_ascii(&exif, exif::Tag::ImageDescription)
+        .or_else(|| exif_ascii(&exif, exif::Tag::UserComment));
+    image.tags.title = image.tags.comment.clone();
+    image.tags.date = exif_ascii(&exif, exif::Tag::DateTimeOriginal)
+        .or_else(|| exif_ascii(&exif, exif::Tag::DateTime))
+        .map(exif_date);
+    let orientation = exif
+        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+        .and_then(|field| field.value.get_uint(0));
+    image.tags.rotation = match orientation {
+        Some(3) => Some(180),
+        Some(6) => Some(90),
+        Some(8) => Some(270),
+        _ => Some(0),
+    };
+    let width = exif
+        .get_field(exif::Tag::PixelXDimension, exif::In::PRIMARY)
+        .or_else(|| exif.get_field(exif::Tag::ImageWidth, exif::In::PRIMARY))
+        .and_then(|field| field.value.get_uint(0))
+        .unwrap_or(image.probe.width);
+    let height = exif
+        .get_field(exif::Tag::PixelYDimension, exif::In::PRIMARY)
+        .or_else(|| exif.get_field(exif::Tag::ImageLength, exif::In::PRIMARY))
+        .and_then(|field| field.value.get_uint(0))
+        .unwrap_or(image.probe.height);
+    let (display_width, display_height) = if matches!(image.tags.rotation, Some(90 | 270)) {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    if display_width > 0 && display_height > 0 {
+        image.probe.width = display_width;
+        image.probe.height = display_height;
+        image.av.resolution = Some(format!("{display_width}x{display_height}"));
+    }
+}
+
+struct ProbeDeadline(Instant);
+
+unsafe extern "C" fn interrupt_expired(opaque: *mut libc::c_void) -> libc::c_int {
+    if opaque.is_null() {
+        return 0;
+    }
+    let deadline = &*(opaque.cast::<ProbeDeadline>());
+    i32::from(Instant::now() >= deadline.0)
+}
+
+unsafe fn probe_avformat(url: *const libc::c_char, timeout: Duration) -> Option<MediaProbe> {
     let mut opts: *mut sys::AVDictionary = ptr::null_mut();
     let k1 = c"probesize";
     let v1 = c"50000000";
@@ -88,10 +310,24 @@ unsafe fn probe_avformat(url: *const libc::c_char) -> Option<MediaProbe> {
     sys::av_dict_set(&mut opts, k1.as_ptr(), v1.as_ptr(), 0);
     sys::av_dict_set(&mut opts, k2.as_ptr(), v2.as_ptr(), 0);
 
-    let mut ctx: *mut sys::AVFormatContext = ptr::null_mut();
+    let mut deadline = Box::new(ProbeDeadline(
+        Instant::now() + timeout.max(Duration::from_secs(1)),
+    ));
+    let mut ctx = sys::avformat_alloc_context();
+    if ctx.is_null() {
+        sys::av_dict_free(&mut opts);
+        return None;
+    }
+    (*ctx).interrupt_callback = sys::AVIOInterruptCB {
+        callback: Some(interrupt_expired),
+        opaque: (&mut *deadline as *mut ProbeDeadline).cast(),
+    };
     let err = sys::avformat_open_input(&mut ctx, url, ptr::null_mut(), &mut opts);
     sys::av_dict_free(&mut opts);
     if err < 0 || ctx.is_null() {
+        if !ctx.is_null() {
+            sys::avformat_close_input(&mut ctx);
+        }
         return None;
     }
     let _ = sys::avformat_find_stream_info(ctx, ptr::null_mut());
@@ -102,15 +338,18 @@ unsafe fn probe_avformat(url: *const libc::c_char) -> Option<MediaProbe> {
             video: String::new(),
             hdr: String::new(),
             audio: String::new(),
+            audio_streams: String::new(),
             width: 0,
             height: 0,
         },
         av: AvMeta::default(),
+        tags: EmbeddedTags::default(),
     };
     let fmt = (*ctx).iformat;
     if !fmt.is_null() {
         out.probe.container = map_format(c_str((*fmt).name));
     }
+    fill_tags_from_dictionary(&mut out.tags, (*ctx).metadata);
 
     let dur = (*ctx).duration;
     if dur > 0 && dur != sys::AV_NOPTS_VALUE {
@@ -125,6 +364,8 @@ unsafe fn probe_avformat(url: *const libc::c_char) -> Option<MediaProbe> {
 
     let mut videos: Vec<String> = Vec::new();
     let mut audios: Vec<String> = Vec::new();
+    let mut audio_streams: Vec<String> = Vec::new();
+    let mut audio_stream_tags = EmbeddedTags::default();
     let mut subs: Vec<String> = Vec::new();
     let nb = (*ctx).nb_streams as isize;
     for i in 0..nb {
@@ -137,7 +378,7 @@ unsafe fn probe_avformat(url: *const libc::c_char) -> Option<MediaProbe> {
             continue;
         }
         match (*par).codec_type {
-            t if t == sys::AVMediaType::AVMEDIA_TYPE_VIDEO => {
+            sys::AVMediaType::AVMEDIA_TYPE_VIDEO => {
                 let name = map_video((*par).codec_id);
                 if out.av.creator.is_none() && is_divx_tag((*par).codec_tag) {
                     out.av.creator = Some("DiVX".into());
@@ -167,9 +408,18 @@ unsafe fn probe_avformat(url: *const libc::c_char) -> Option<MediaProbe> {
                     }
                 }
             }
-            t if t == sys::AVMediaType::AVMEDIA_TYPE_AUDIO => {
+            sys::AVMediaType::AVMEDIA_TYPE_AUDIO => {
+                // Track titles such as "MVO", "English", or "Commentary"
+                // describe this audio stream, not a containing movie. Keep
+                // them as item tags only for an audio-only media file.
+                fill_tags_from_dictionary(&mut audio_stream_tags, (*st).metadata);
                 let name = map_audio((*par).codec_id);
-                let first = audios.is_empty();
+                let first = audio_streams.is_empty();
+                let audio_ordinal = audio_streams.len();
+                audio_streams.push(format!(
+                    "{i}:{audio_ordinal}:{name}:{}",
+                    (*par).ch_layout.nb_channels.max(0)
+                ));
                 push_unique(&mut audios, name);
                 if first {
                     if (*par).ch_layout.nb_channels > 0 {
@@ -180,7 +430,7 @@ unsafe fn probe_avformat(url: *const libc::c_char) -> Option<MediaProbe> {
                     }
                 }
             }
-            t if t == sys::AVMediaType::AVMEDIA_TYPE_SUBTITLE => {
+            sys::AVMediaType::AVMEDIA_TYPE_SUBTITLE => {
                 push_unique(&mut subs, map_subtitle((*par).codec_id));
             }
             _ => {}
@@ -188,16 +438,17 @@ unsafe fn probe_avformat(url: *const libc::c_char) -> Option<MediaProbe> {
     }
     out.probe.video = videos.join(",");
     out.probe.audio = audios.join(",");
+    out.probe.audio_streams = audio_streams.join(",");
+    if videos.is_empty() {
+        fill_missing_tags(&mut out.tags, audio_stream_tags);
+    }
     if !subs.is_empty() {
         out.av.subs = Some(subs.join(","));
     }
 
     sys::avformat_close_input(&mut ctx);
 
-    if out.probe.container.is_empty()
-        && out.probe.video.is_empty()
-        && out.av.duration.is_none()
-    {
+    if out.probe.container.is_empty() && out.probe.video.is_empty() && out.av.duration.is_none() {
         return None;
     }
     if out.probe.hdr.is_empty() {
@@ -206,10 +457,7 @@ unsafe fn probe_avformat(url: *const libc::c_char) -> Option<MediaProbe> {
     Some(out)
 }
 
-unsafe fn dovi_profile(
-    st: *mut sys::AVStream,
-    par: *mut sys::AVCodecParameters,
-) -> Option<u8> {
+unsafe fn dovi_profile(st: *mut sys::AVStream, par: *mut sys::AVCodecParameters) -> Option<u8> {
     let kind = sys::AVPacketSideDataType::AV_PKT_DATA_DOVI_CONF;
     let mut sz = 0usize;
     let from_st = sys::av_stream_get_side_data(st, kind, &mut sz);
@@ -228,10 +476,7 @@ unsafe fn dovi_profile(
 fn dv_profile_in_bytes(buf: &[u8]) -> Option<u8> {
     for tag in [b"dvcC".as_slice(), b"dvvC".as_slice()] {
         let mut start = 0;
-        while let Some(rel) = buf[start..]
-            .windows(4)
-            .position(|w| w == tag)
-        {
+        while let Some(rel) = buf[start..].windows(4).position(|w| w == tag) {
             let after = start + rel + 4;
             let end = buf.len().min(after + 24);
             let slice = &buf[after..end];
@@ -252,7 +497,10 @@ fn dv_profile_in_bytes(buf: &[u8]) -> Option<u8> {
 fn is_divx_tag(tag: u32) -> bool {
     // little-endian fourcc
     let b = tag.to_le_bytes();
-    matches!(&b, b"DIVX" | b"DX50" | b"XVID" | b"divx" | b"dx50" | b"xvid")
+    matches!(
+        &b,
+        b"DIVX" | b"DX50" | b"XVID" | b"divx" | b"dx50" | b"xvid"
+    )
 }
 
 fn map_format(name: &str) -> String {
@@ -306,6 +554,8 @@ fn map_video(id: sys::AVCodecID) -> String {
 }
 
 fn map_subtitle(id: sys::AVCodecID) -> String {
+    // SAFETY: libav returns a process-lifetime codec-name string for any codec
+    // identifier; `c_str` also handles a null pointer by returning "".
     let name = unsafe { c_str(sys::avcodec_get_name(id)) };
     if name.is_empty() {
         "other".into()
@@ -330,13 +580,33 @@ fn map_audio(id: sys::AVCodecID) -> String {
 
 /// Stream index of the first `AV_DISPOSITION_ATTACHED_PIC`, if any.
 pub fn attached_pic_stream(path: &Path) -> Option<i32> {
+    attached_pic_stream_with_timeout(path, Duration::from_secs(30))
+}
+
+pub fn attached_pic_stream_with_timeout(path: &Path, timeout: Duration) -> Option<i32> {
     init_libav();
-    let path_c = std::ffi::CString::new(path.to_string_lossy().as_ref()).ok()?;
+    let path_c = path_cstring(path)?;
+    // SAFETY: the CString and boxed deadline remain live while libav uses
+    // their pointers. Each successful context allocation is closed on every
+    // return path, and stream indices are bounded by `nb_streams`.
     unsafe {
-        let mut ctx: *mut sys::AVFormatContext = ptr::null_mut();
+        let mut deadline = Box::new(ProbeDeadline(
+            Instant::now() + timeout.max(Duration::from_secs(1)),
+        ));
+        let mut ctx = sys::avformat_alloc_context();
+        if ctx.is_null() {
+            return None;
+        }
+        (*ctx).interrupt_callback = sys::AVIOInterruptCB {
+            callback: Some(interrupt_expired),
+            opaque: (&mut *deadline as *mut ProbeDeadline).cast(),
+        };
         if sys::avformat_open_input(&mut ctx, path_c.as_ptr(), ptr::null_mut(), ptr::null_mut()) < 0
             || ctx.is_null()
         {
+            if !ctx.is_null() {
+                sys::avformat_close_input(&mut ctx);
+            }
             return None;
         }
         let _ = sys::avformat_find_stream_info(ctx, ptr::null_mut());
@@ -359,74 +629,333 @@ pub fn attached_pic_stream(path: &Path) -> Option<i32> {
 
 /// Decode attached cover art to JPEG. `dest` must end in `.jpg`.
 pub fn extract_attached_pic(src: &Path, dest: &Path) -> bool {
-    let Some(idx) = attached_pic_stream(src) else {
-        return false;
+    extract_attached_pic_result(src, dest).unwrap_or(false)
+}
+
+pub fn extract_attached_pic_result(src: &Path, dest: &Path) -> std::io::Result<bool> {
+    extract_attached_pic_with_timeout_result(src, dest, Duration::from_secs(30))
+}
+
+pub fn extract_attached_pic_with_timeout_result(
+    src: &Path,
+    dest: &Path,
+    timeout: Duration,
+) -> std::io::Result<bool> {
+    extract_attached_pic_with_limits_result(src, dest, timeout, 256 * 1024 * 1024)
+}
+
+pub fn extract_attached_pic_with_limits_result(
+    src: &Path,
+    dest: &Path,
+    timeout: Duration,
+    max_alloc_bytes: u64,
+) -> std::io::Result<bool> {
+    let Some(idx) = attached_pic_stream_with_timeout(src, timeout) else {
+        return Ok(false);
     };
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-        ])
-        .arg(src)
-        .args(["-map", &format!("0:{idx}"), "-frames:v", "1", "-an"])
-        .arg(dest)
-        .status()
-        .map(|s| s.success() && dest.is_file())
-        .unwrap_or(false)
+    with_atomic_image_destination(dest, |temporary| {
+        let mut command = std::process::Command::new("ffmpeg");
+        command
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-max_alloc"])
+            .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
+            .arg("-i")
+            .arg(src)
+            .args(["-map", &format!("0:{idx}"), "-frames:v", "1", "-an"])
+            .arg(temporary);
+        command_status_with_timeout(&mut command, timeout).map(|status| status.success())
+    })
 }
 
 /// One-shot poster when there is no sidecar and no attached pic.
 /// Scale `src` to at most `w`×`h` JPEG at `dest` (`/Resized/`).
 pub fn scale_jpeg(src: &Path, dest: &Path, w: u32, h: u32) -> bool {
+    scale_jpeg_result(src, dest, w, h).unwrap_or(false)
+}
+
+pub fn scale_jpeg_result(src: &Path, dest: &Path, w: u32, h: u32) -> std::io::Result<bool> {
+    scale_jpeg_with_options_result(
+        src,
+        dest,
+        w,
+        h,
+        2,
+        Duration::from_secs(30),
+        256 * 1024 * 1024,
+    )
+}
+
+pub fn scale_jpeg_with_options_result(
+    src: &Path,
+    dest: &Path,
+    w: u32,
+    h: u32,
+    quality: u8,
+    timeout: Duration,
+    max_alloc_bytes: u64,
+) -> std::io::Result<bool> {
     if w == 0 || h == 0 {
-        return false;
-    }
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        return Ok(false);
     }
     let vf = format!("scale={w}:{h}:force_original_aspect_ratio=decrease");
-    std::process::Command::new("ffmpeg")
-        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-        .arg(src)
-        .args(["-frames:v", "1", "-vf", &vf, "-an"])
-        .arg(dest)
-        .status()
-        .map(|s| s.success() && dest.is_file())
-        .unwrap_or(false)
+    with_atomic_image_destination(dest, |temporary| {
+        let mut command = std::process::Command::new("ffmpeg");
+        command
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-max_alloc"])
+            .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
+            .arg("-threads")
+            .arg("1")
+            .arg("-i")
+            .arg(src)
+            .args([
+                "-frames:v",
+                "1",
+                "-vf",
+                &vf,
+                "-q:v",
+                &quality.clamp(2, 31).to_string(),
+                "-an",
+            ])
+            .arg(temporary);
+        command_status_with_timeout(&mut command, timeout).map(|status| status.success())
+    })
 }
 
 pub fn generate_video_thumb(src: &Path, dest: &Path) -> bool {
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    generate_video_thumb_result(src, dest).unwrap_or(false)
+}
+
+pub fn generate_video_thumb_result(src: &Path, dest: &Path) -> std::io::Result<bool> {
+    generate_video_thumb_with_options_result(src, dest, 320, 2, false, Duration::from_secs(30))
+}
+
+pub fn generate_video_thumb_with_options_result(
+    src: &Path,
+    dest: &Path,
+    width: u32,
+    quality: u8,
+    filmstrip: bool,
+    timeout: Duration,
+) -> std::io::Result<bool> {
+    generate_video_thumb_with_limits_result(
+        src,
+        dest,
+        width,
+        quality,
+        filmstrip,
+        timeout,
+        256 * 1024 * 1024,
+    )
+}
+
+pub fn generate_video_thumb_with_limits_result(
+    src: &Path,
+    dest: &Path,
+    width: u32,
+    quality: u8,
+    filmstrip: bool,
+    timeout: Duration,
+    max_alloc_bytes: u64,
+) -> std::io::Result<bool> {
+    if width == 0 {
+        return Ok(false);
     }
-    std::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-ss",
-            "1",
-            "-i",
-        ])
-        .arg(src)
-        .args([
-            "-frames:v",
-            "1",
-            "-vf",
-            "scale=320:-2",
-            "-an",
-        ])
-        .arg(dest)
-        .status()
-        .map(|s| s.success() && dest.is_file())
-        .unwrap_or(false)
+    let filter = if filmstrip {
+        let cell = (width / 4).max(1);
+        format!("fps=1/600,scale={cell}:-2,tile=4x1")
+    } else {
+        format!("scale={width}:-2")
+    };
+    let frames = if filmstrip { "4" } else { "1" };
+    with_atomic_image_destination(dest, |temporary| {
+        let mut command = std::process::Command::new("ffmpeg");
+        command
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-max_alloc"])
+            .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
+            .args(["-threads", "1", "-ss", "1", "-i"])
+            .arg(src)
+            .args([
+                "-frames:v",
+                frames,
+                "-vf",
+                &filter,
+                "-q:v",
+                &quality.clamp(2, 31).to_string(),
+                "-an",
+            ])
+            .arg(temporary);
+        command_status_with_timeout(&mut command, timeout).map(|status| status.success())
+    })
+}
+
+static IMAGE_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn with_atomic_image_destination<F>(dest: &Path, generate: F) -> std::io::Result<bool>
+where
+    F: FnOnce(&Path) -> std::io::Result<bool>,
+{
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let sequence = IMAGE_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image.jpg");
+    let temporary =
+        dest.with_file_name(format!(".{name}.{}-{sequence}.tmp.jpg", std::process::id()));
+    let generated = generate(&temporary)?;
+    if !generated || !temporary.is_file() {
+        let _ = std::fs::remove_file(&temporary);
+        return Ok(false);
+    }
+    match std::fs::rename(&temporary, dest) {
+        Ok(()) => Ok(true),
+        // Another preparation worker may have won the same physical-source
+        // cache key. Its complete atomic output is equally valid.
+        Err(_) if dest.is_file() => {
+            let _ = std::fs::remove_file(&temporary);
+            Ok(true)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+pub fn command_status_with_timeout(
+    command: &mut std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    command_output_with_timeout(command, timeout).map(|output| output.status)
+}
+
+/// Run a metadata helper with a deadline while continuously draining bounded
+/// stdout/stderr. Draining avoids child-process pipe deadlocks; retaining only
+/// the first 256 KiB prevents corrupt inputs from growing scanner memory.
+pub fn command_output_with_timeout(
+    command: &mut std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Put helpers in their own process group so a deadline also terminates
+    // descendants that inherited the capture pipes (for example `sh -c`).
+    // Otherwise joining the drain threads could wait indefinitely for an
+    // orphaned grandchild even after the direct child was killed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    fn drain_limited<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            const LIMIT: usize = 256 * 1024;
+            let mut kept = Vec::new();
+            let mut buffer = [0u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        let room = LIMIT.saturating_sub(kept.len());
+                        kept.extend_from_slice(&buffer[..read.min(room)]);
+                    }
+                }
+            }
+            kept
+        })
+    }
+    let stdout_thread = stdout.map(drain_limited);
+    let stderr_thread = stderr.map(drain_limited);
+    let deadline = Instant::now() + timeout.max(Duration::from_secs(1));
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            #[cfg(unix)]
+            {
+                // SAFETY: the child was started as leader of a fresh process
+                // group whose numeric ID is its PID. A negative target sends
+                // SIGKILL only to that group, never to the parent process.
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(thread) = stdout_thread {
+                let _ = thread.join();
+            }
+            if let Some(thread) = stderr_thread {
+                let _ = thread.join();
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("external command exceeded {} seconds", timeout.as_secs()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = stdout_thread
+        .and_then(|thread| thread.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_thread
+        .and_then(|thread| thread.join().ok())
+        .unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Extract the JPEG stored in EXIF IFD1, when present. Offsets in these tags
+/// are relative to the TIFF buffer returned by `kamadak-exif`.
+pub fn extract_exif_thumbnail_result(src: &Path, dest: &Path) -> std::io::Result<bool> {
+    extract_exif_thumbnail_with_limit_result(src, dest, 64 * 1024 * 1024)
+}
+
+pub fn extract_exif_thumbnail_with_limit_result(
+    src: &Path,
+    dest: &Path,
+    max_bytes: usize,
+) -> std::io::Result<bool> {
+    let file = File::open(src)?;
+    let exif = match exif::Reader::new().read_from_container(&mut BufReader::new(file)) {
+        Ok(exif) => exif,
+        Err(exif::Error::NotFound(_)) => return Ok(false),
+        Err(error) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+    };
+    let offset = exif
+        .get_field(exif::Tag::JPEGInterchangeFormat, exif::In(1))
+        .and_then(|field| field.value.get_uint(0));
+    let length = exif
+        .get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In(1))
+        .and_then(|field| field.value.get_uint(0));
+    let (Some(offset), Some(length)) = (offset, length) else {
+        return Ok(false);
+    };
+    let start = offset as usize;
+    let Some(end) = start.checked_add(length as usize) else {
+        return Ok(false);
+    };
+    let Some(jpeg) = exif.buf().get(start..end) else {
+        return Ok(false);
+    };
+    if jpeg.len() < 3 || jpeg.len() > max_bytes || jpeg[..3] != [0xff, 0xd8, 0xff] {
+        return Ok(false);
+    }
+    with_atomic_image_destination(dest, |temporary| {
+        std::fs::write(temporary, jpeg)?;
+        Ok(true)
+    })
 }
 
 unsafe fn c_str(p: *const libc::c_char) -> &'static str {
@@ -439,21 +968,90 @@ unsafe fn c_str(p: *const libc::c_char) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "rusty-dlna-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create probe test directory");
+            Self(path)
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = PathBuf;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn external_command_deadline_kills_a_stuck_helper() {
+        let started = Instant::now();
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "sleep 2"]);
+        let error = command_status_with_timeout(&mut command, Duration::from_millis(50))
+            .expect_err("sleep must exceed the one-second minimum deadline");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(1800));
+    }
+
+    #[test]
+    fn concurrent_image_outputs_are_atomic_and_leave_no_temporary_files() {
+        let dir = TempDir::new("atomic-image");
+        let dest = dir.join("result.jpg");
+        let mut workers = Vec::new();
+        for byte in 1u8..=8 {
+            let dest = dest.clone();
+            workers.push(std::thread::spawn(move || {
+                with_atomic_image_destination(&dest, |temporary| {
+                    std::fs::write(temporary, vec![byte; 4096])?;
+                    Ok(true)
+                })
+                .unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let bytes = std::fs::read(&dest).unwrap();
+        assert_eq!(bytes.len(), 4096);
+        assert!(bytes.iter().all(|byte| *byte == bytes[0]));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
     use crate::write_fake_mkv;
 
     #[test]
     fn libav_reads_real_container() {
-        let dir = std::env::temp_dir().join(format!("libav-probe-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = TempDir::new("libav-probe");
         let p = dir.join("clip.mkv");
         write_fake_mkv(&p, 64);
         let got = probe_media(&p).expect("libav probe");
+        assert!(!got.probe.video.is_empty(), "{got:?}");
         assert!(
-            !got.probe.video.is_empty(),
+            got.av.duration.is_some() || got.av.resolution.is_some(),
             "{got:?}"
         );
-        assert!(got.av.duration.is_some() || got.av.resolution.is_some(), "{got:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -62,10 +62,7 @@ pub fn parse_sort_criteria(raw: Option<&str>) -> Result<Vec<SortSpec>, SortError
 }
 
 /// Unparseable + FLAG_DLNA → SOAP 709.
-pub fn sort_or_709(
-    raw: Option<&str>,
-    client: &ClientProfile,
-) -> Result<Vec<SortSpec>, u16> {
+pub fn sort_or_709(raw: Option<&str>, client: &ClientProfile) -> Result<Vec<SortSpec>, u16> {
     match parse_sort_criteria(raw) {
         Ok(v) => Ok(v),
         Err(SortError::Unparseable) if client.flags.contains(ClientFlags::DLNA) => Err(709),

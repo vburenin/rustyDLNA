@@ -8,6 +8,7 @@ pub mod client_cache;
 pub mod clients;
 pub mod date;
 pub mod isolation;
+pub mod media_format;
 pub mod object_id;
 pub mod paths;
 pub mod persist;
@@ -20,13 +21,17 @@ mod oracle;
 pub use client_cache::{ClientCache, ClientCacheEntry, CLIENT_CACHE_SLOTS, CLIENT_CACHE_TTL_SECS};
 pub use clients::{
     identify_friendly_name, identify_friendly_name_ssdp, identify_model_name, identify_request,
-    identify_user_agent, identify_x_av_client_info, remap_mime, remap_mime_full,
-    ClientFlags, ClientKind, ClientProfile, MatchKind, CLIENTS,
+    identify_user_agent, identify_x_av_client_info, remap_mime, remap_mime_full, ClientFlags,
+    ClientKind, ClientProfile, MatchKind, CLIENTS,
 };
-pub use date::{w3c_date_from_unix, w3c_normalize_date};
+pub use date::{utc_date_time, w3c_date_from_unix, w3c_normalize_date, UtcDateTime};
 pub use isolation::{
     collides_with_live_ports, test_listen_ports, LIVE_HTTP_PORT, LIVE_SSDP_PORT, TEST_HTTP_PORT,
     TEST_SSDP_PORT,
+};
+pub use media_format::{
+    media_format_for_extension, media_format_for_name, wildcard_protocol_info_entries, MediaFormat,
+    MediaKind, ResolvedMediaFormat, MEDIA_FORMATS,
 };
 pub use paths::{
     album_art_id_from_path, caption_from_path, media_item_id_from_path, strtoll_prefix,

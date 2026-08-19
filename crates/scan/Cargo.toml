@@ -15,3 +15,5 @@ libc = "0.2"
 ffmpeg-next = "8.1"
 ffmpeg-sys-next = "8.1"
 sha1 = "0.10"
+kamadak-exif = "0.6.1"
+quick-xml.workspace = true

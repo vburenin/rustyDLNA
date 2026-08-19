@@ -1,0 +1,5 @@
+#EXTM3U
+#EXTINF:1,Fixture FLAC
+song.flac
+#EXTINF:1,Fixture MP3
+song.mp3

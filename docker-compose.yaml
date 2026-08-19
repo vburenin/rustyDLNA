@@ -13,18 +13,38 @@ services:
       context: .
     image: rusty-dlna:local
     restart: unless-stopped
+    init: true
     network_mode: host
     environment:
       TZ: ${TZ:-UTC}
       LANG: C.UTF-8
       LC_ALL: C.UTF-8
       RUST_LOG: ${RUST_LOG:-info}
+      RUSTY_DLNA_HTTP_PORT: ${RUSTY_DLNA_HTTP_PORT:-8200}
+      RUSTY_DLNA_SSDP_PORT: ${RUSTY_DLNA_SSDP_PORT:-1900}
     volumes:
       # media_dir inside the container is V,/storage/video.
       - ${RUSTY_DLNA_MEDIA:-./media}:/storage/video:ro
-      # Optional same-path bind when files.db stored a host realpath
-      # different from media_dir. Set RUSTY_DLNA_MEDIA_AT in .env.
-      - ${RUSTY_DLNA_MEDIA_AT:-/storage/video}:${RUSTY_DLNA_MEDIA_AT:-/storage/video}:ro
-      - ${RUSTY_DLNA_CACHE:-./data/cache}:/var/cache/rusty-dlna
+      # A Docker-managed volume avoids host bind-mount ownership mismatches.
+      # restart.sh verifies that the image's uid/gid 10001 can write it.
+      - rusty-dlna-cache:/var/cache/rusty-dlna
       - ${RUSTY_DLNA_CONF:-./rusty-dlna.toml}:/etc/rusty-dlna.toml:ro
       - /etc/localtime:/etc/localtime:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent --show-error http://127.0.0.1:$${RUSTY_DLNA_HTTP_PORT}/health
+          | grep -Eq '"status"[[:space:]]*:[[:space:]]*"(healthy|degraded)"'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  rusty-dlna-cache:
+    name: ${RUSTY_DLNA_CACHE_VOLUME:-rusty-dlna-cache}

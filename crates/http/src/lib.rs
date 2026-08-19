@@ -7,10 +7,11 @@ pub mod request;
 
 use rusty_dlna_protocol::http_should_persist;
 use rusty_dlna_protocol::paths::{
-    caption_default_url, ALBUM_ART_PREFIX, CAPTIONS_PREFIX, CONNECTIONMGR_CONTROLURL,
-    CONNECTIONMGR_PATH, CONTENTDIRECTORY_CONTROLURL, CONTENTDIRECTORY_PATH, ICONS_PREFIX,
-    MEDIA_ITEMS_PREFIX, RESIZED_PREFIX, ROOTDESC_PATH, STATUS_PATH, THUMBNAILS_PREFIX,
-    TRANSCODE_PREFIX, X_MS_MEDIARECEIVERREGISTRAR_CONTROLURL, X_MS_MEDIARECEIVERREGISTRAR_PATH,
+    caption_default_url, ALBUM_ART_PREFIX, API_STATUS_PATH, CAPTIONS_PREFIX,
+    CONNECTIONMGR_CONTROLURL, CONNECTIONMGR_PATH, CONTENTDIRECTORY_CONTROLURL,
+    CONTENTDIRECTORY_PATH, HEALTH_PATH, ICONS_PREFIX, MEDIA_ITEMS_PREFIX, RESIZED_PREFIX,
+    ROOTDESC_PATH, STATUS_PATH, THUMBNAILS_PREFIX, TRANSCODE_PREFIX,
+    X_MS_MEDIARECEIVERREGISTRAR_CONTROLURL, X_MS_MEDIARECEIVERREGISTRAR_PATH,
 };
 
 pub use desc::{
@@ -40,6 +41,8 @@ pub enum HttpRoute {
     Icon,
     Caption,
     Status,
+    Health,
+    ApiStatus,
     Presentation,
     NotFound,
 }
@@ -68,6 +71,8 @@ pub fn route(method: &str, path: &str) -> HttpRoute {
         | CONNECTIONMGR_CONTROLURL
         | X_MS_MEDIARECEIVERREGISTRAR_CONTROLURL => HttpRoute::Soap,
         STATUS_PATH => HttpRoute::Status,
+        HEALTH_PATH => HttpRoute::Health,
+        API_STATUS_PATH => HttpRoute::ApiStatus,
         "/" => HttpRoute::Presentation,
         p if p.starts_with(MEDIA_ITEMS_PREFIX) => HttpRoute::MediaItem,
         p if p.starts_with(TRANSCODE_PREFIX) => HttpRoute::Transcode,
@@ -87,17 +92,15 @@ pub fn persist_for_route(
     conn_close: bool,
     conn_keep: bool,
 ) -> bool {
-    if route == HttpRoute::MediaItem
-        || route == HttpRoute::Transcode
-        || route == HttpRoute::Soap
-    {
+    if route == HttpRoute::MediaItem || route == HttpRoute::Transcode || route == HttpRoute::Soap {
         return false;
     }
     http_should_persist(httpver, conn_close, conn_keep)
 }
 
 /// Incoming request body cap (SOAP / GENA). Media GET has no body.
-pub const MAX_HTTP_BODY: usize = 256 * 1024 * 1024;
+/// Absolute safety ceiling. The server's configurable default is lower.
+pub const MAX_HTTP_BODY: usize = 16 * 1024 * 1024;
 
 pub fn http_body_too_large(len: usize) -> bool {
     len > MAX_HTTP_BODY
@@ -113,7 +116,7 @@ pub fn valid_host_header(host: &str) -> bool {
         if p.is_empty() || !p.bytes().all(|c| c.is_ascii_digit()) {
             return false;
         }
-        if p.parse::<u32>().ok().is_none_or(|n| n > 65535) {
+        if !matches!(p.parse::<u32>(), Ok(0..=65535)) {
             return false;
         }
     }
@@ -131,7 +134,10 @@ pub fn timeseek_without_range(req: &HttpRequest) -> bool {
 
 /// `getcontentFeatures.dlna.org` / `getAvailableSeekRange.dlna.org` must be `1`.
 pub fn dlna_get_header_invalid(req: &HttpRequest) -> bool {
-    for name in ["getcontentFeatures.dlna.org", "getAvailableSeekRange.dlna.org"] {
+    for name in [
+        "getcontentFeatures.dlna.org",
+        "getAvailableSeekRange.dlna.org",
+    ] {
         if let Some(v) = req.header(name) {
             if v.trim() != "1" {
                 return true;
@@ -146,8 +152,11 @@ pub fn wants_content_language(req: &HttpRequest) -> bool {
 }
 
 pub fn is_chunked(req: &HttpRequest) -> bool {
-    req.header("Transfer-Encoding")
-        .is_some_and(|v| v.to_ascii_lowercase().split(',').any(|t| t.trim() == "chunked"))
+    req.header("Transfer-Encoding").is_some_and(|v| {
+        v.to_ascii_lowercase()
+            .split(',')
+            .any(|t| t.trim() == "chunked")
+    })
 }
 
 pub fn dlna_strict(req: &HttpRequest) -> bool {
@@ -195,21 +204,20 @@ pub fn interactive_on_non_image(
 
 /// IMF-fixdate GMT (`Date:` header).
 pub fn imf_fixdate_gmt(unix: i64) -> String {
-    let t = time::OffsetDateTime::from_unix_timestamp(unix)
-        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let t = rusty_dlna_protocol::utc_date_time(unix);
     const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     format!(
         "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
-        DAYS[t.weekday().number_days_from_sunday() as usize],
-        t.day(),
-        MONTHS[u8::from(t.month()) as usize - 1],
-        t.year(),
-        t.hour(),
-        t.minute(),
-        t.second()
+        DAYS[t.weekday_from_sunday as usize],
+        t.day,
+        MONTHS[t.month as usize - 1],
+        t.year,
+        t.hour,
+        t.minute,
+        t.second
     )
 }
 
@@ -243,12 +251,21 @@ pub fn dlna_org_features(pn: Option<&str>, op: &str, ci: u8, mime: &str) -> Stri
     }
 }
 
-pub fn protocol_info(mime: &str, pn: Option<&str>, dlna_client: bool, skip_pn: bool, ci: u8) -> String {
+pub fn protocol_info(
+    mime: &str,
+    pn: Option<&str>,
+    dlna_client: bool,
+    skip_pn: bool,
+    ci: u8,
+) -> String {
     if !dlna_client {
         return format!("http-get:*:{mime}:*");
     }
     let pn = if skip_pn { None } else { pn };
-    format!("http-get:*:{mime}:{}", dlna_org_features(pn, "01", ci, mime))
+    format!(
+        "http-get:*:{mime}:{}",
+        dlna_org_features(pn, "01", ci, mime)
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -271,12 +288,24 @@ pub struct HttpResponse {
 #[derive(Clone, Debug)]
 pub struct RemuxJobSpec {
     pub detail_id: i64,
+    /// Complete immutable identity used for in-process job sharing.
+    pub job_key: String,
+    /// Source/plan/tool digest stored beside the finished cache file.
+    pub cache_key: String,
     pub src: std::path::PathBuf,
     pub dest: std::path::PathBuf,
-    pub args: Vec<String>,
+    pub args: Vec<std::ffi::OsString>,
     /// Try `dovi_tool` P8.1 convert first; `args` is the hdr10 fallback.
     pub remux_p8: bool,
     pub audio_index: usize,
+    pub audio: RemuxAudio,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemuxAudio {
+    Copy,
+    Ac3,
+    Aac,
 }
 
 impl HttpResponse {
@@ -306,7 +335,14 @@ impl HttpResponse {
     }
 
     pub fn xml(status: u16, body: String, persist: bool) -> Self {
-        let mut r = Self::new(status, if status == 200 { "OK" } else { "Internal Server Error" });
+        let mut r = Self::new(
+            status,
+            if status == 200 {
+                "OK"
+            } else {
+                "Internal Server Error"
+            },
+        );
         r.set("Content-Type", r#"text/xml; charset="utf-8""#);
         r.body = body.into_bytes();
         r.set("Content-Length", r.body.len());
@@ -374,16 +410,28 @@ pub fn set_caption_info_sec(r: &mut HttpResponse, url: &str) {
 
 /// Original `/MediaItems/` headers: `Accept-Ranges: bytes`, `OP=01`, `CI=0`,
 /// `Connection: close`. Empty `DLNA_PN` on HEVC MKV remux.
-pub fn media_response(
-    server: &str,
-    date: &str,
-    mime: &str,
-    size: u64,
-    range: Option<ByteRange>,
-    body: Vec<u8>,
-    pn: Option<&str>,
-    ci: u8,
-) -> HttpResponse {
+pub struct MediaResponseOptions<'a> {
+    pub server: &'a str,
+    pub date: &'a str,
+    pub mime: &'a str,
+    pub size: u64,
+    pub range: Option<ByteRange>,
+    pub body: Vec<u8>,
+    pub pn: Option<&'a str>,
+    pub ci: u8,
+}
+
+pub fn media_response(options: MediaResponseOptions<'_>) -> HttpResponse {
+    let MediaResponseOptions {
+        server,
+        date,
+        mime,
+        size,
+        range,
+        body,
+        pn,
+        ci,
+    } = options;
     let (status, reason, clen, crange) = match range {
         None => (200u16, "OK", size, None),
         Some(r) => (
@@ -446,6 +494,8 @@ mod tests {
         assert_eq!(route("GET", "/ctl/ContentDir"), HttpRoute::Soap);
         assert_eq!(route("GET", "/Captions/9/0.srt"), HttpRoute::Caption);
         assert_eq!(route("GET", "/Transcode/3.mp4"), HttpRoute::Transcode);
+        assert_eq!(route("GET", "/health"), HttpRoute::Health);
+        assert_eq!(route("GET", "/api/status"), HttpRoute::ApiStatus);
     }
 
     #[test]
@@ -474,8 +524,8 @@ mod tests {
     }
 
     #[test]
-    fn request_body_cap_is_256_mib() {
-        assert_eq!(MAX_HTTP_BODY, 256 * 1024 * 1024);
+    fn request_body_has_a_hard_16_mib_ceiling() {
+        assert_eq!(MAX_HTTP_BODY, 16 * 1024 * 1024);
         assert!(!http_body_too_large(0));
         assert!(!http_body_too_large(MAX_HTTP_BODY));
         assert!(http_body_too_large(MAX_HTTP_BODY + 1));
@@ -526,16 +576,34 @@ mod tests {
             "GET /MediaItems/1.mkv HTTP/1.1\r\nHost: 127.0.0.1\r\ntransferMode.dlna.org: Interactive\r\n\r\n",
         )
         .unwrap();
-        assert!(interactive_on_non_image(&req, "video/x-matroska", false, false));
-        assert!(!interactive_on_non_image(&req, "video/x-matroska", true, false));
-        assert!(interactive_on_non_image(&req, "video/x-matroska", true, true));
+        assert!(interactive_on_non_image(
+            &req,
+            "video/x-matroska",
+            false,
+            false
+        ));
+        assert!(!interactive_on_non_image(
+            &req,
+            "video/x-matroska",
+            true,
+            false
+        ));
+        assert!(interactive_on_non_image(
+            &req,
+            "video/x-matroska",
+            true,
+            true
+        ));
         assert!(!interactive_on_non_image(&req, "image/jpeg", false, false));
     }
 
     #[test]
     fn skip_dlna_pn_omits_pn_from_content_features() {
         let with_pn = dlna_org_features(Some("AVC_MP4_MP_SD_AC3"), "01", 0, "video/mp4");
-        assert!(with_pn.contains("DLNA.ORG_PN=AVC_MP4_MP_SD_AC3"), "{with_pn}");
+        assert!(
+            with_pn.contains("DLNA.ORG_PN=AVC_MP4_MP_SD_AC3"),
+            "{with_pn}"
+        );
         let skip = protocol_info("video/mp4", Some("AVC_MP4_MP_SD_AC3"), true, true, 0);
         assert!(!skip.contains("DLNA.ORG_PN="), "{skip}");
         assert!(skip.contains("DLNA.ORG_OP=01"), "{skip}");

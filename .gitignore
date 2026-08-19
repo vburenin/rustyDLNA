@@ -6,6 +6,10 @@
 .env
 .env.local
 *.log
+*.cdx.json
+soak-report.tsv
+perf.data
+perf.data.old
 /cache
 testdata/cache/
 /data

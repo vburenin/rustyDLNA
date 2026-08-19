@@ -50,7 +50,12 @@ impl ClientCache {
     }
 
     /// Search by IPv4. Age > 3600s expires unless the same MAC extends another hour.
-    pub fn search(&mut self, addr: Ipv4Addr, now: u64, mac: Option<[u8; 6]>) -> Option<&'static ClientProfile> {
+    pub fn search(
+        &mut self,
+        addr: Ipv4Addr,
+        now: u64,
+        mac: Option<[u8; 6]>,
+    ) -> Option<&'static ClientProfile> {
         for slot in &mut self.slots {
             let Some(ent) = slot else {
                 continue;
@@ -171,7 +176,11 @@ mod tests {
         let first = cache.remember(ip, kodi, None, 1_000);
         assert_eq!(first.kind, ClientKind::Kodi);
         let second = cache.remember(ip, generic, None, 1_010);
-        assert_eq!(second.kind, ClientKind::Kodi, "generic UA must not clobber Kodi");
+        assert_eq!(
+            second.kind,
+            ClientKind::Kodi,
+            "generic UA must not clobber Kodi"
+        );
         assert_eq!(cache.len(), 1);
     }
 
@@ -184,7 +193,9 @@ mod tests {
         let mut cache = ClientCache::new();
         cache.remember(ip, kodi, mac, 0);
         assert_eq!(
-            cache.search(ip, CLIENT_CACHE_TTL_SECS + 1, mac).map(|p| p.kind),
+            cache
+                .search(ip, CLIENT_CACHE_TTL_SECS + 1, mac)
+                .map(|p| p.kind),
             Some(ClientKind::Kodi),
             "same MAC extends another hour"
         );
@@ -212,6 +223,9 @@ mod tests {
         let mut cache = ClientCache::new();
         cache.remember(ip, b, None, 1);
         let _ = cache.add(ip, a, None, 2);
-        assert_eq!(cache.search(ip, 3, None).unwrap().kind, ClientKind::SamsungSeriesB);
+        assert_eq!(
+            cache.search(ip, 3, None).unwrap().kind,
+            ClientKind::SamsungSeriesB
+        );
     }
 }

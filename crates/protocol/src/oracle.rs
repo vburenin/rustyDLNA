@@ -5,7 +5,13 @@
 use std::path::PathBuf;
 
 use crate::clients::{identify_user_agent, remap_mime, ClientFlags, CLIENTS};
-use crate::object_id::{BROWSEDIR_ID, IMAGE_ID, MUSIC_ID, ROOT_ID, VIDEO_ID};
+use crate::object_id::{
+    BROWSEDIR_ID, IMAGE_ALBUM_ID, IMAGE_ALL_ID, IMAGE_CAMERA_ID, IMAGE_DATE_ID, IMAGE_DIR_ID,
+    IMAGE_ID, IMAGE_PLIST_ID, IMAGE_RATING_ID, MUSIC_ALBUM_ARTIST_ID, MUSIC_ALBUM_ID, MUSIC_ALL_ID,
+    MUSIC_ARTIST_ID, MUSIC_COMPOSER_ID, MUSIC_CONTRIB_ARTIST_ID, MUSIC_DIR_ID, MUSIC_GENRE_ID,
+    MUSIC_ID, MUSIC_PLIST_ID, MUSIC_RATING_ID, ROOT_ID, VIDEO_ACTOR_ID, VIDEO_ALL_ID, VIDEO_DIR_ID,
+    VIDEO_GENRE_ID, VIDEO_ID, VIDEO_PLIST_ID, VIDEO_RATING_ID, VIDEO_SERIES_ID,
+};
 use crate::paths::{
     CONNECTIONMGR_CONTROLURL, CONNECTIONMGR_EVENTURL, CONNECTIONMGR_PATH,
     CONTENTDIRECTORY_CONTROLURL, CONTENTDIRECTORY_EVENTURL, CONTENTDIRECTORY_PATH, ROOTDESC_PATH,
@@ -61,16 +67,68 @@ fn path_literals_appear_in_oracle_paths() {
 #[test]
 fn object_ids_appear_in_scanner_h() {
     let h = oracle("scanner.h");
-    for lit in [ROOT_ID, BROWSEDIR_ID, MUSIC_ID, VIDEO_ID, IMAGE_ID] {
-        if lit == ROOT_ID {
-            // scanner.h does not #define "0"; replica.md documents it.
-            assert!(
-                replica().contains("`0`") && replica().contains("True root"),
-                "replica.md must document root id 0"
-            );
-            continue;
-        }
-        assert!(h.contains(&quoted(lit)), "scanner.h missing object id {lit}");
+    for (name, lit) in [
+        ("BROWSEDIR_ID", BROWSEDIR_ID),
+        ("MUSIC_ID", MUSIC_ID),
+        ("MUSIC_ALL_ID", MUSIC_ALL_ID),
+        ("MUSIC_GENRE_ID", MUSIC_GENRE_ID),
+        ("MUSIC_ARTIST_ID", MUSIC_ARTIST_ID),
+        ("MUSIC_ALBUM_ID", MUSIC_ALBUM_ID),
+        ("MUSIC_PLIST_ID", MUSIC_PLIST_ID),
+        ("MUSIC_DIR_ID", MUSIC_DIR_ID),
+        ("MUSIC_CONTRIB_ARTIST_ID", MUSIC_CONTRIB_ARTIST_ID),
+        ("MUSIC_ALBUM_ARTIST_ID", MUSIC_ALBUM_ARTIST_ID),
+        ("MUSIC_COMPOSER_ID", MUSIC_COMPOSER_ID),
+        ("MUSIC_RATING_ID", MUSIC_RATING_ID),
+        ("VIDEO_ID", VIDEO_ID),
+        ("VIDEO_ALL_ID", VIDEO_ALL_ID),
+        ("VIDEO_GENRE_ID", VIDEO_GENRE_ID),
+        ("VIDEO_ACTOR_ID", VIDEO_ACTOR_ID),
+        ("VIDEO_SERIES_ID", VIDEO_SERIES_ID),
+        ("VIDEO_PLIST_ID", VIDEO_PLIST_ID),
+        ("VIDEO_DIR_ID", VIDEO_DIR_ID),
+        ("VIDEO_RATING_ID", VIDEO_RATING_ID),
+        ("IMAGE_ID", IMAGE_ID),
+        ("IMAGE_ALL_ID", IMAGE_ALL_ID),
+        ("IMAGE_DATE_ID", IMAGE_DATE_ID),
+        ("IMAGE_ALBUM_ID", IMAGE_ALBUM_ID),
+        ("IMAGE_CAMERA_ID", IMAGE_CAMERA_ID),
+        ("IMAGE_PLIST_ID", IMAGE_PLIST_ID),
+        ("IMAGE_DIR_ID", IMAGE_DIR_ID),
+        ("IMAGE_RATING_ID", IMAGE_RATING_ID),
+    ] {
+        assert!(
+            h.lines().any(|line| {
+                line.starts_with(&format!("#define {name}")) && line.contains(&quoted(lit))
+            }),
+            "scanner.h missing exact {name}={lit}"
+        );
+    }
+    // The root is implicit in scanner.h and explicit in the reference's
+    // containers table and our wire contract.
+    assert_eq!(ROOT_ID, "0");
+    assert!(oracle("containers.c").contains("Alternate root") || replica().contains("True root"));
+}
+
+#[test]
+fn virtual_view_aliases_appear_in_containers_c() {
+    let c = oracle("containers.c");
+    for lit in ["1$FF0", "2$FF0", "3$FF0", "Recently Added"] {
+        assert!(c.contains(lit), "containers.c missing {lit}");
+    }
+    for alias in [
+        "4", "5", "6", "7", "8", "B", "C", "F", "14", "15", "16", "D2",
+    ] {
+        assert!(
+            c.contains(&format!("NULL, \"{alias}\"")),
+            "containers.c missing PlaysForSure alias {alias}"
+        );
+    }
+    for alias in ["A", "V", "I"] {
+        assert!(
+            c.contains(&format!("NULL, \"{alias}\"")),
+            "containers.c missing Samsung alias {alias}"
+        );
     }
 }
 
@@ -128,7 +186,10 @@ fn client_table_order_matches_oracle_and_rusty_additions() {
     let generic = c
         .rfind("\"SEC_HHP_\"")
         .expect("clients.c must contain generic SEC_HHP_");
-    assert!(pc < generic, "SEC_HHP_[PC] must sit above SEC_HHP_ in oracle");
+    assert!(
+        pc < generic,
+        "SEC_HHP_[PC] must sit above SEC_HHP_ in oracle"
+    );
 
     let rust: Vec<&str> = CLIENTS.iter().filter_map(|p| p.match_str).collect();
     let rpc = rust
@@ -139,7 +200,10 @@ fn client_table_order_matches_oracle_and_rusty_additions() {
         .iter()
         .position(|s| *s == "SEC_HHP_")
         .expect("Rust table missing SEC_HHP_");
-    assert!(rpc < rsec, "Rust table must keep SEC_HHP_[PC] before SEC_HHP_");
+    assert!(
+        rpc < rsec,
+        "Rust table must keep SEC_HHP_[PC] before SEC_HHP_"
+    );
 
     let cr = rust
         .iter()

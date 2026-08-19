@@ -9,7 +9,8 @@
 //! `one_run` +0, byebye +1, series/remux +2, body-cap +3, dialect +4,
 //! remaining +5, kodi-platinum +6. Never bind live 8200/1900 (`isolation`).
 //!
-//! Unset env → skip (so host `cargo test` without sockets stays green).
+//! Unset env → skip for ordinary unit runs. `RUSTY_DLNA_REQUIRE_E2E=1`
+//! converts a missing/invalid environment into a hard failure for CI.
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
@@ -18,7 +19,17 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 fn env_ports() -> Option<(u16, u16)> {
-    let http = std::env::var("RUSTY_DLNA_HTTP_PORT").ok()?.parse().ok()?;
+    let required = std::env::var("RUSTY_DLNA_REQUIRE_E2E").as_deref() == Ok("1");
+    let http = match std::env::var("RUSTY_DLNA_HTTP_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        Some(port) => port,
+        None if required => {
+            panic!("RUSTY_DLNA_REQUIRE_E2E=1 requires a valid RUSTY_DLNA_HTTP_PORT")
+        }
+        None => return None,
+    };
     let ssdp = std::env::var("RUSTY_DLNA_SSDP_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -30,16 +41,22 @@ fn workspace() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-struct Server(Child);
+struct Server {
+    child: Child,
+    temp_dir: PathBuf,
+}
 
 impl Drop for Server {
     fn drop(&mut self) {
         // SIGTERM so `serve` can send SSDP byebye. SIGKILL skips that path.
         #[cfg(unix)]
         unsafe {
-            libc::kill(self.0.id() as i32, libc::SIGTERM);
+            // SAFETY: `Child::id` is the live process we spawned, and SIGTERM
+            // does not dereference memory or outlive this cleanup operation.
+            libc::kill(self.child.id() as i32, libc::SIGTERM);
         }
-        let _ = self.0.wait();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
     }
 }
 
@@ -56,7 +73,10 @@ fn raw_http(port: u16, req: &str) -> (u16, String, Vec<u8>) {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let split = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(buf.len());
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(buf.len());
     let headers = String::from_utf8_lossy(&buf[..split]).into_owned();
     let body = if split + 4 <= buf.len() {
         buf[split + 4..].to_vec()
@@ -122,11 +142,12 @@ fn movie_media_id(items: &str) -> i64 {
     let after = &items[movie_at..];
     let url_start = after.find("/MediaItems/").expect("movie res");
     let rest = &after[url_start..];
-    let end = rest.find("&lt;").or_else(|| rest.find('<')).unwrap_or(rest.len());
+    let end = rest
+        .find("&lt;")
+        .or_else(|| rest.find('<'))
+        .unwrap_or(rest.len());
     let path = rest[..end].split(".mkv").next().unwrap();
-    path.trim_start_matches("/MediaItems/")
-        .parse()
-        .expect("id")
+    path.trim_start_matches("/MediaItems/").parse().expect("id")
 }
 
 fn feature_has_id(xml: &str, id: &str) -> bool {
@@ -180,8 +201,8 @@ fn ensure_fixtures() {
         let _ = std::fs::write(
             &shot,
             [
-                0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01,
-                0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
+                0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
+                0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
             ],
         );
     }
@@ -224,20 +245,61 @@ fn spawn_bin(http: u16, ssdp: u16) -> Server {
 fn spawn_bin_with_sink(http: u16, ssdp: u16, sink: Option<String>) -> Server {
     ensure_fixtures();
     let root = workspace();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!(
+        "rusty-dlna-e2e-{}-{http}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&temp_dir).expect("create E2E temporary directory");
+    let config_path = temp_dir.join("rusty-dlna.toml");
+    let media_dir = root.join("testdata/library");
+    let config = format!(
+        r#"friendly_name = "rustyDLNA-test"
+media_dir = ["{}"]
+exclude_dir = ["exclude_me"]
+cache_dir = "cache"
+db_dir = "database"
+advertise_ip = "127.0.0.1"
+uuid = "uuid:00000000-0000-4000-8000-000000000001"
+notify_interval = 895
+
+[transcode]
+enable = true
+encoder = "libx264"
+max_jobs = 1
+
+[[remap]]
+name = "crkey-dvp7"
+client = "CrKey"
+hdr = "dv-p7"
+action = "remux-p8"
+encoder = "copy"
+audio_out = "to-aac"
+"#,
+        media_dir.display()
+    );
+    std::fs::write(&config_path, config).expect("write E2E configuration");
     let bin = env!("CARGO_BIN_EXE_rusty-dlna");
     let mut cmd = Command::new(bin);
     cmd.current_dir(&root)
         .arg("--config")
-        .arg(root.join("testdata/rusty-dlna.test.toml"))
+        .arg(config_path)
         .env("RUSTY_DLNA_HTTP_PORT", http.to_string())
         .env("RUSTY_DLNA_SSDP_PORT", ssdp.to_string())
-        .env("RUST_LOG", "info");
+        .env(
+            "RUST_LOG",
+            std::env::var("RUSTY_DLNA_E2E_LOG").unwrap_or_else(|_| "off".into()),
+        );
     if let Some(s) = sink {
         cmd.env("RUSTY_DLNA_SSDP_SINK", s);
     }
     let child = cmd.spawn().expect("spawn rusty-dlna");
+    let server = Server { child, temp_dir };
     wait_http(http);
-    Server(child)
+    server
 }
 
 fn one_run(http: u16, ssdp: u16) {
@@ -316,12 +378,12 @@ fn one_run(http: u16, ssdp: u16) {
     let after = &items[movie_at..];
     let url_start = after.find("/MediaItems/").expect("movie res");
     let rest = &after[url_start..];
-    let end = rest.find("&lt;").or_else(|| rest.find('<')).unwrap_or(rest.len());
+    let end = rest
+        .find("&lt;")
+        .or_else(|| rest.find('<'))
+        .unwrap_or(rest.len());
     let path = rest[..end].split(".mkv").next().unwrap();
-    let id: i64 = path
-        .trim_start_matches("/MediaItems/")
-        .parse()
-        .expect("id");
+    let id: i64 = path.trim_start_matches("/MediaItems/").parse().expect("id");
     let movie = workspace().join("testdata/library/video/movie.mkv");
     let expect = std::fs::read(&movie).unwrap();
     let (st, hdr, body) = raw_http(
@@ -444,7 +506,9 @@ fn request_body_cap_and_soap_host() {
     };
     let http = http.saturating_add(3);
     let ssdp = ssdp.saturating_add(3);
-    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(http, ssdp));
+    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(
+        http, ssdp
+    ));
     let _srv = spawn_bin(http, ssdp);
 
     let over = 256 * 1024 * 1024 + 1;
@@ -458,9 +522,7 @@ fn request_body_cap_and_soap_host() {
 
     let (st, hdr, _) = raw_http(
         http,
-        &format!(
-            "POST /ctl/ContentDir HTTP/1.1\r\nHost: attacker.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        ),
+        "POST /ctl/ContentDir HTTP/1.1\r\nHost: attacker.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
     assert_eq!(st, 400, "SOAP hostname Host must 400: {hdr}");
 }
@@ -484,7 +546,9 @@ fn ssdp_byebye_on_drop() {
     // Distinct ports so this can run beside `container_listen_twice`.
     let http = http.saturating_add(1);
     let ssdp = ssdp.saturating_add(1);
-    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(http, ssdp));
+    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(
+        http, ssdp
+    ));
     let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
     sink.set_read_timeout(Some(Duration::from_secs(2))).ok();
     let sink_addr = sink.local_addr().unwrap();
@@ -525,7 +589,9 @@ fn series_genre_and_remux_e2e() {
     };
     let http = http.saturating_add(2);
     let ssdp = ssdp.saturating_add(2);
-    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(http, ssdp));
+    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(
+        http, ssdp
+    ));
     let _srv = spawn_bin(http, ssdp);
 
     let inner_v = r#"<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse>"#;
@@ -616,7 +682,9 @@ fn replica_dialect_e2e() {
     // +4: beside twice (base), byebye (+1), series/remux (+2), body-cap (+3).
     let http = http.saturating_add(4);
     let ssdp = ssdp.saturating_add(4);
-    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(http, ssdp));
+    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(
+        http, ssdp
+    ));
     let _srv = spawn_bin(http, ssdp);
 
     // 1. Kodi rootDesc: MediaServer + rustyDLNA Server token
@@ -908,7 +976,9 @@ fn replica_dialect_e2e() {
     // 17. Icons: 200 + matching magic
     let (st, _hdr, png) = raw_http(
         http,
-        &format!("GET /icons/sm.png HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"),
+        &format!(
+            "GET /icons/sm.png HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"
+        ),
     );
     assert_eq!(st, 200);
     assert!(
@@ -918,7 +988,9 @@ fn replica_dialect_e2e() {
     );
     let (st, _hdr, jpg) = raw_http(
         http,
-        &format!("GET /icons/sm.jpg HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"),
+        &format!(
+            "GET /icons/sm.jpg HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: close\r\n\r\n"
+        ),
     );
     assert_eq!(st, 200);
     assert!(
@@ -963,7 +1035,10 @@ fn replica_dialect_e2e() {
         &browse_inner("1", "BrowseDirectChildren"),
     );
     assert_eq!(st, 200, "Browse 1: {music}");
-    assert!(music.contains("All Music"), "Browse 1 missing All Music: {music}");
+    assert!(
+        music.contains("All Music"),
+        "Browse 1 missing All Music: {music}"
+    );
     let (st, tracks) = soap(
         http,
         "Kodi/21.0",
@@ -1032,7 +1107,9 @@ fn remaining_dialect_e2e() {
     };
     let http = http.saturating_add(5);
     let ssdp = ssdp.saturating_add(5);
-    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(http, ssdp));
+    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(
+        http, ssdp
+    ));
     let _srv = spawn_bin(http, ssdp);
     let items = wait_media_items(http, "Kodi/21.0", "2$8");
     assert!(items.contains("Fixture Movie"), "{items}");
@@ -1068,8 +1145,14 @@ fn remaining_dialect_e2e() {
     );
     assert_eq!(st, 200, "{filt}");
     assert!(filt.contains("Fixture Movie"), "{filt}");
-    assert!(!filt.contains(" size=&quot;") && !filt.contains(" size=\""), "{filt}");
-    assert!(!filt.contains("&lt;res ") && !filt.contains("<res "), "{filt}");
+    assert!(
+        !filt.contains(" size=&quot;") && !filt.contains(" size=\""),
+        "{filt}"
+    );
+    assert!(
+        !filt.contains("&lt;res ") && !filt.contains("<res "),
+        "{filt}"
+    );
 
     // SSDP ST leftover :10 must not reply
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -1124,8 +1207,5 @@ fn kodi_platinum_client_e2e() {
         "Kodi/Platinum client failed status={:?}\n{stdout}{stderr}",
         out.status
     );
-    assert!(
-        stdout.contains("Kodi/Platinum walk OK"),
-        "{stdout}{stderr}"
-    );
+    assert!(stdout.contains("Kodi/Platinum walk OK"), "{stdout}{stderr}");
 }

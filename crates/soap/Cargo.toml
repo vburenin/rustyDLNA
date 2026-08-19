@@ -8,3 +8,5 @@ description = "SOAP ContentDirectory / ConnectionManager / MS registrar"
 [dependencies]
 rusty-dlna-protocol.workspace = true
 thiserror.workspace = true
+quick-xml.workspace = true
+roxmltree.workspace = true

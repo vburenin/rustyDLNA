@@ -4,10 +4,11 @@
 //! related stream traits** (container, HEVC, DV profile, audio, client
 //! kind) — not titles or paths. First matching row wins.
 
-use rusty_dlna_protocol::{
-    identify_user_agent, ClientFlags, ClientKind, ClientProfile,
-};
+use rusty_dlna_protocol::{identify_user_agent, ClientFlags, ClientKind, ClientProfile};
 use serde::Deserialize;
+use sha1::{Digest, Sha1};
+use std::ffi::OsString;
+use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceMedia {
@@ -80,10 +81,11 @@ pub enum Decision {
     Recode,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RecodeAction {
     /// Leave the file alone (useful to carve out an exception).
+    #[default]
     Original,
     /// HEVC BL + rewrite RPU to Profile 8.1. Keeps DV; no NVENC.
     RemuxP8,
@@ -136,7 +138,7 @@ impl<'de> Deserialize<'de> for ClientSelector {
 /// `client` / `clients` name the **software** (UA token or profile),
 /// not a title.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RemapRule {
     /// Optional label for logs (`name = "streamer-p7"`).
     pub name: Option<String>,
@@ -149,12 +151,6 @@ pub struct RemapRule {
     pub action: RecodeAction,
     pub encoder: Option<String>,
     pub audio_out: Option<AudioAction>,
-}
-
-impl Default for RecodeAction {
-    fn default() -> Self {
-        RecodeAction::Original
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -197,6 +193,31 @@ pub fn pick_audio_index(audio_csv: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Select from persisted per-stream descriptors rather than the de-duplicated
+/// codec summary. Records are `global-stream:audio-ordinal:codec:channels`.
+pub fn pick_audio_index_from_streams(descriptors: &str, fallback_audio_csv: &str) -> usize {
+    let streams = descriptors
+        .split(',')
+        .filter_map(|record| {
+            let mut fields = record.split(':');
+            let _global_index = fields.next()?.parse::<usize>().ok()?;
+            let audio_index = fields.next()?.parse::<usize>().ok()?;
+            let codec = fields.next()?.trim();
+            Some((audio_index, codec))
+        })
+        .collect::<Vec<_>>();
+    streams
+        .iter()
+        .find(|(_, codec)| matches!(*codec, "aac" | "ac3" | "eac3" | "mp3"))
+        .map(|(audio_index, _)| *audio_index)
+        .unwrap_or_else(|| {
+            streams
+                .first()
+                .map(|(audio_index, _)| *audio_index)
+                .unwrap_or_else(|| pick_audio_index(fallback_audio_csv))
+        })
+}
+
 fn audio_map_arg(plan: &TranscodePlan) -> String {
     format!("0:a:{}?", plan.audio_index)
 }
@@ -213,7 +234,11 @@ fn hdr10_encode_args(plan: &TranscodePlan) -> Vec<String> {
         "-c:v".into(),
         plan.video_encoder.clone(),
         "-profile:v".into(),
-        if x264 { "high10".into() } else { "main10".into() },
+        if x264 {
+            "high10".into()
+        } else {
+            "main10".into()
+        },
         "-pix_fmt".into(),
         if x264 {
             "yuv420p10le".into()
@@ -242,7 +267,10 @@ pub fn software_matches(want: &str, profile: &ClientProfile, raw_ua: Option<&str
         return true;
     }
     let wl = w.to_ascii_lowercase();
-    if matches!(wl.as_str(), "google-cast" | "cast" | "crkey" | "streamer" | "chromecast") {
+    if matches!(
+        wl.as_str(),
+        "google-cast" | "cast" | "crkey" | "streamer" | "chromecast"
+    ) {
         return profile.kind == ClientKind::GoogleCast
             || raw_ua.is_some_and(|u| u.to_ascii_lowercase().contains("crkey"));
     }
@@ -272,7 +300,12 @@ impl RemapRule {
         self.matches_ua(client, None, src)
     }
 
-    pub fn matches_ua(&self, client: &ClientProfile, raw_ua: Option<&str>, src: &SourceMedia) -> bool {
+    pub fn matches_ua(
+        &self,
+        client: &ClientProfile,
+        raw_ua: Option<&str>,
+        src: &SourceMedia,
+    ) -> bool {
         if !self.client.is_empty() {
             let ok = self
                 .client
@@ -307,8 +340,8 @@ pub fn decide(client: &ClientProfile, src: &SourceMedia, remaps: &[RemapRule]) -
 /// Same, with the live User-Agent so `client = "CrKey"` can match the
 /// particular software, not just the coarse profile.
 pub fn decide_ua(ua: &str, src: &SourceMedia, remaps: &[RemapRule]) -> TranscodePlan {
-    let profile = identify_user_agent(ua)
-        .or_else(|| rusty_dlna_protocol::identify_x_av_client_info(ua));
+    let profile =
+        identify_user_agent(ua).or_else(|| rusty_dlna_protocol::identify_x_av_client_info(ua));
     let Some(profile) = profile else {
         return TranscodePlan::default();
     };
@@ -321,16 +354,34 @@ pub fn decide_for(
     src: &SourceMedia,
     remaps: &[RemapRule],
 ) -> TranscodePlan {
+    decide_for_with_default_encoder(client, raw_ua, src, remaps, None)
+}
+
+/// Decide using the process-wide encoder as the default for rules that
+/// actually encode video (`action = "hdr10"`). Remux-P8 and audio-only
+/// conversion always copy video, so applying a global encoder to them would
+/// silently change the action's documented meaning.
+pub fn decide_for_with_default_encoder(
+    client: &ClientProfile,
+    raw_ua: Option<&str>,
+    src: &SourceMedia,
+    remaps: &[RemapRule],
+    default_encoder: Option<&str>,
+) -> TranscodePlan {
     if src.hdr == HdrKind::Unknown {
         return TranscodePlan::default();
     }
     let Some(rule) = remaps.iter().find(|r| r.matches_ua(client, raw_ua, src)) else {
         return TranscodePlan::default();
     };
-    plan_from_rule(rule, src)
+    plan_from_rule(rule, src, default_encoder)
 }
 
-fn plan_from_rule(rule: &RemapRule, src: &SourceMedia) -> TranscodePlan {
+fn plan_from_rule(
+    rule: &RemapRule,
+    src: &SourceMedia,
+    default_encoder: Option<&str>,
+) -> TranscodePlan {
     match rule.action {
         RecodeAction::Original => TranscodePlan {
             rule: rule.name.clone(),
@@ -356,15 +407,18 @@ fn plan_from_rule(rule: &RemapRule, src: &SourceMedia) -> TranscodePlan {
             video_encoder: rule
                 .encoder
                 .clone()
+                .or_else(|| default_encoder.map(str::to_owned))
                 .unwrap_or_else(|| "hevc_nvenc".into()),
-            audio: rule.audio_out.unwrap_or(if matches!(
-                src.audio,
-                AudioCodec::Ac3 | AudioCodec::Eac3 | AudioCodec::Aac
-            ) {
-                AudioAction::Copy
-            } else {
-                AudioAction::ToAc3
-            }),
+            audio: rule.audio_out.unwrap_or(
+                if matches!(
+                    src.audio,
+                    AudioCodec::Ac3 | AudioCodec::Eac3 | AudioCodec::Aac
+                ) {
+                    AudioAction::Copy
+                } else {
+                    AudioAction::ToAc3
+                },
+            ),
             container: "mp4",
             audio_index: 0,
         },
@@ -391,35 +445,80 @@ pub fn parse_remaps_toml(text: &str) -> Result<Vec<RemapRule>, toml::de::Error> 
     Ok(toml::from_str::<File>(text)?.remap)
 }
 
-/// ffmpeg argv for a live pipe. Remux-P8 copies video; HDR10 encodes.
-pub fn ffmpeg_live_args(src_path: &str, plan: &TranscodePlan) -> Vec<String> {
-    let mut a = vec![
-        "ffmpeg".into(),
-        "-hide_banner".into(),
-        "-nostats".into(),
-        "-i".into(),
-        src_path.into(),
-        "-map".into(),
-        "0:v:0".into(),
-        "-map".into(),
-        audio_map_arg(plan),
-    ];
-    match plan.action {
-        RecodeAction::Original => {}
-        RecodeAction::RemuxP8 | RecodeAction::AudioAc3 => {
-            a.extend(["-c:v".into(), plan.video_encoder.clone()]);
+fn valid_codec_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+/// Reject rule combinations that otherwise produce misleading ffmpeg plans.
+/// Binary/encoder availability is intentionally checked separately by the
+/// server's `--check`, where actionable host diagnostics can be reported.
+pub fn validate_remap_rules(remaps: &[RemapRule], default_encoder: &str) -> Result<(), String> {
+    if !valid_codec_name(default_encoder) || default_encoder == "copy" {
+        return Err(format!(
+            "transcode.encoder must name a video encoder (for example libx264), got {default_encoder:?}"
+        ));
+    }
+    for (index, rule) in remaps.iter().enumerate() {
+        let label = rule
+            .name
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("remap #{}", index + 1));
+        if let Some(encoder) = rule.encoder.as_deref() {
+            if !valid_codec_name(encoder) {
+                return Err(format!("{label}: invalid encoder name {encoder:?}"));
+            }
         }
-        RecodeAction::Hdr10 => {
-            a.extend(hdr10_encode_args(plan));
+        match rule.action {
+            RecodeAction::Original => {
+                if rule.encoder.is_some() || rule.audio_out.is_some() {
+                    return Err(format!(
+                        "{label}: action=original cannot set encoder or audio_out"
+                    ));
+                }
+            }
+            RecodeAction::RemuxP8 => {
+                if rule.encoder.as_deref().is_some_and(|value| value != "copy") {
+                    return Err(format!(
+                        "{label}: action=remux-p8 must use encoder=copy; use action=hdr10 to encode video"
+                    ));
+                }
+                if rule.video.is_some_and(|video| video != VideoCodec::Hevc) {
+                    return Err(format!("{label}: action=remux-p8 only supports HEVC video"));
+                }
+                if rule.hdr.is_some_and(|hdr| {
+                    !matches!(
+                        hdr,
+                        HdrKind::DolbyVisionProfile7 | HdrKind::DolbyVisionOther
+                    )
+                }) {
+                    return Err(format!(
+                        "{label}: action=remux-p8 requires Dolby Vision Profile 7 input"
+                    ));
+                }
+            }
+            RecodeAction::Hdr10 => {
+                let encoder = rule.encoder.as_deref().unwrap_or(default_encoder);
+                if encoder == "copy" {
+                    return Err(format!(
+                        "{label}: action=hdr10 must encode video and cannot use encoder=copy"
+                    ));
+                }
+            }
+            RecodeAction::AudioAc3 => {
+                if rule.encoder.as_deref().is_some_and(|value| value != "copy") {
+                    return Err(format!(
+                        "{label}: action=audio-ac3 only converts audio and must use encoder=copy"
+                    ));
+                }
+            }
         }
     }
-    match plan.audio {
-        AudioAction::Copy => a.extend(["-c:a".into(), "copy".into()]),
-        AudioAction::ToAc3 => a.extend(["-c:a".into(), "ac3".into(), "-b:a".into(), "640k".into()]),
-        AudioAction::ToAac => a.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "256k".into()]),
-    }
-    a.extend(live_frag_tail("pipe:1"));
-    a
+    Ok(())
 }
 
 /// ffmpeg argv that writes a **growing** fragmented MP4. First fragment is
@@ -455,6 +554,26 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
     a
 }
 
+/// Path-preserving variant used by the server. Command arguments remain
+/// native OS strings so Unix filenames with arbitrary bytes reach ffmpeg
+/// unchanged.
+pub fn ffmpeg_grow_os_args(
+    src_path: &Path,
+    dst_path: &Path,
+    plan: &TranscodePlan,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = ffmpeg_grow_args("", "", plan)
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    // The string builder always places input at argv[5] and output last.
+    args[5] = src_path.as_os_str().to_os_string();
+    if let Some(output) = args.last_mut() {
+        *output = dst_path.as_os_str().to_os_string();
+    }
+    args
+}
+
 fn live_frag_tail(out: &str) -> Vec<String> {
     vec![
         "-flush_packets".into(),
@@ -469,65 +588,10 @@ fn live_frag_tail(out: &str) -> Vec<String> {
     ]
 }
 
-/// ffmpeg argv that writes a **finished file** (remux/hdr10 cache).
-/// No `pipe:1`, no `-ss` seek restart — Range is served from the file.
-pub fn ffmpeg_file_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) -> Vec<String> {
-    let mut a = vec![
-        "ffmpeg".into(),
-        "-hide_banner".into(),
-        "-nostats".into(),
-        "-y".into(),
-        "-i".into(),
-        src_path.into(),
-        "-map".into(),
-        "0:v:0".into(),
-        "-map".into(),
-        audio_map_arg(plan),
-    ];
-    match plan.action {
-        RecodeAction::Original => {}
-        RecodeAction::RemuxP8 | RecodeAction::AudioAc3 => {
-            a.extend(["-c:v".into(), plan.video_encoder.clone()]);
-        }
-        RecodeAction::Hdr10 => {
-            a.extend(hdr10_encode_args(plan));
-        }
-    }
-    match plan.audio {
-        AudioAction::Copy => a.extend(["-c:a".into(), "copy".into()]),
-        AudioAction::ToAc3 => a.extend(["-c:a".into(), "ac3".into(), "-b:a".into(), "640k".into()]),
-        AudioAction::ToAac => a.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "256k".into()]),
-    }
-    a.extend([
-        "-f".into(),
-        "mp4".into(),
-        "-movflags".into(),
-        "+faststart".into(),
-        dst_path.into(),
-    ]);
-    a
-}
-
-/// Child that is killed on `Drop` (client disconnect / job cancel).
-pub struct FfmpegJob {
-    pub child: std::process::Child,
-}
-
-impl Drop for FfmpegJob {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 #[derive(Debug)]
 pub struct JobGate {
     max: usize,
     cur: std::sync::atomic::AtomicUsize,
-}
-
-pub struct JobPermit<'a> {
-    gate: &'a JobGate,
 }
 
 impl JobGate {
@@ -535,23 +599,6 @@ impl JobGate {
         Self {
             max: max.max(1),
             cur: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    pub fn try_acquire(&self) -> Option<JobPermit<'_>> {
-        use std::sync::atomic::Ordering;
-        loop {
-            let c = self.cur.load(Ordering::SeqCst);
-            if c >= self.max {
-                return None;
-            }
-            if self
-                .cur
-                .compare_exchange(c, c + 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return Some(JobPermit { gate: self });
-            }
         }
     }
 
@@ -578,27 +625,26 @@ impl JobGate {
     }
 
     pub fn release(&self) {
-        self.cur
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.cur.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-impl Drop for JobPermit<'_> {
-    fn drop(&mut self) {
-        self.gate
-            .cur
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-pub fn cache_dest(cache_dir: &std::path::Path, detail_id: i64, action: RecodeAction) -> std::path::PathBuf {
+/// Cache path for a specific source/plan/tool identity. Keeping the digest in
+/// the filename prevents two incompatible plans for one DETAILS row from
+/// overwriting or attaching to the same output.
+pub fn cache_dest_for_key(
+    cache_dir: &std::path::Path,
+    detail_id: i64,
+    action: RecodeAction,
+    cache_key: &str,
+) -> std::path::PathBuf {
     let tag = match action {
         RecodeAction::Hdr10 => "hdr10",
         RecodeAction::RemuxP8 => "remux",
         RecodeAction::AudioAc3 => "ac3",
         RecodeAction::Original => "orig",
     };
-    cache_dir.join(format!("{detail_id}-{tag}.mp4"))
+    cache_dir.join(format!("{detail_id}-{tag}-{cache_key}.mp4"))
 }
 
 /// In-progress remux. Only rename to `cache_dest` when ffmpeg exits 0.
@@ -614,36 +660,111 @@ pub fn cache_stamp_path(dest: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(p)
 }
 
-fn src_stamp(src: &std::path::Path) -> Option<String> {
-    let m = std::fs::metadata(src).ok()?;
-    let mtime = m
+/// Stable-enough source fingerprint without hashing an entire multi-gigabyte
+/// movie. It covers the canonical path, nanosecond mtime, Unix device/inode,
+/// length, and samples from the beginning, middle, and end of the file.
+pub fn source_identity(src: &std::path::Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let canonical = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    let modified = metadata
         .modified()
         .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    Some(format!("{}:{}", mtime, m.len()))
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+    let mut hasher = Sha1::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    if let Some(modified) = modified {
+        hasher.update(modified.as_secs().to_le_bytes());
+        hasher.update(modified.subsec_nanos().to_le_bytes());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        hasher.update(metadata.dev().to_le_bytes());
+        hasher.update(metadata.ino().to_le_bytes());
+    }
+
+    let mut file = std::fs::File::open(&canonical).ok()?;
+    const SAMPLE: u64 = 64 * 1024;
+    let end = metadata.len().saturating_sub(SAMPLE);
+    let middle = metadata.len().saturating_div(2).saturating_sub(SAMPLE / 2);
+    let mut positions = vec![0, middle, end];
+    positions.sort_unstable();
+    positions.dedup();
+    let mut buffer = vec![0u8; SAMPLE as usize];
+    for position in positions {
+        file.seek(SeekFrom::Start(position)).ok()?;
+        let read = file.read(&mut buffer).ok()?;
+        hasher.update(position.to_le_bytes());
+        hasher.update((read as u64).to_le_bytes());
+        hasher.update(&buffer[..read]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
 }
 
-pub fn write_cache_stamp(dest: &std::path::Path, src: &std::path::Path) {
-    if let Some(s) = src_stamp(src) {
-        let _ = std::fs::write(cache_stamp_path(dest), s);
+fn tool_version(executable: &std::path::Path) -> String {
+    let output = std::process::Command::new(executable)
+        .arg("-version")
+        .stdin(std::process::Stdio::null())
+        .output();
+    match output {
+        Ok(output) => {
+            let text = if output.stdout.is_empty() {
+                String::from_utf8_lossy(&output.stderr)
+            } else {
+                String::from_utf8_lossy(&output.stdout)
+            };
+            text.lines().next().unwrap_or("unknown").trim().to_owned()
+        }
+        Err(error) => format!("unavailable:{error}"),
     }
 }
 
-pub fn cache_is_fresh(dest: &std::path::Path, src: &std::path::Path) -> bool {
-    let Ok(meta) = dest.metadata() else {
+/// Digest of everything that can materially change cached output.
+pub fn transcode_cache_key(
+    src: &std::path::Path,
+    plan: &TranscodePlan,
+    remux_p8: bool,
+) -> Option<String> {
+    let source = source_identity(src)?;
+    let ffmpeg = tool_version(std::path::Path::new("ffmpeg"));
+    let dovi = if remux_p8 {
+        dovi_tool_path()
+            .map(|path| tool_version(&path))
+            .unwrap_or_else(|| "unavailable".into())
+    } else {
+        "unused".into()
+    };
+    let signature = format!(
+        "source={source}\naction={:?}\nencoder={}\naudio={:?}\naudio_index={}\ncontainer={}\nremux_p8={remux_p8}\nffmpeg={ffmpeg}\ndovi={dovi}\nbuild={}",
+        plan.action,
+        plan.video_encoder,
+        plan.audio,
+        plan.audio_index,
+        plan.container,
+        env!("CARGO_PKG_VERSION"),
+    );
+    let mut hasher = Sha1::new();
+    hasher.update(signature.as_bytes());
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+pub fn write_cache_stamp_for_key(dest: &std::path::Path, cache_key: &str) -> std::io::Result<()> {
+    std::fs::write(cache_stamp_path(dest), cache_key)
+}
+
+pub fn cache_is_fresh_for_key(dest: &std::path::Path, cache_key: &str) -> bool {
+    let Ok(metadata) = dest.metadata() else {
         return false;
     };
-    if meta.len() == 0 {
+    if metadata.len() == 0 {
         return false;
     }
-    let Some(want) = src_stamp(src) else {
-        return true;
-    };
     std::fs::read_to_string(cache_stamp_path(dest))
         .ok()
-        .is_some_and(|have| have.trim() == want)
+        .is_some_and(|have| have.trim() == cache_key)
 }
 
 pub fn dovi_tool_path() -> Option<std::path::PathBuf> {
@@ -676,43 +797,91 @@ pub fn hdr10_fallback_plan(from: &TranscodePlan) -> TranscodePlan {
         } else {
             from.video_encoder.clone()
         },
-        audio: match from.audio {
-            AudioAction::Copy => AudioAction::ToAac,
-            other => other,
-        },
+        // A fallback changes only the video treatment.  In particular, a
+        // caller that selected audio copy must not get a surprise AAC encode
+        // merely because dovi_tool is unavailable.
+        audio: from.audio,
         container: "mp4",
         audio_index: from.audio_index,
     }
 }
 
-fn run_cmd(args: &[String]) -> Result<(), String> {
+fn run_cmd_controlled(
+    args: &[String],
+    deadline: std::time::Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<(), String> {
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+
     if args.is_empty() {
         return Err("empty command".into());
     }
-    let out = std::process::Command::new(&args[0])
+    let mut child = std::process::Command::new(&args[0])
         .args(&args[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|e| format!("spawn {}: {e}", args[0]))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let tail = if err.len() > 800 {
-            &err[err.len() - 800..]
-        } else {
-            &err
+    let stderr = child.stderr.take();
+    let stderr_reader = std::thread::spawn(move || {
+        const MAX_STDERR: usize = 64 * 1024;
+        let Some(mut stderr) = stderr else {
+            return Vec::new();
         };
-        return Err(format!("{}: {tail}", args[0]));
+        let mut tail = std::collections::VecDeque::with_capacity(MAX_STDERR);
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            tail.extend(&chunk[..read]);
+            while tail.len() > MAX_STDERR {
+                tail.pop_front();
+            }
+        }
+        tail.into_iter().collect::<Vec<_>>()
+    });
+    let (status, stopped) = loop {
+        if cancelled.load(Ordering::Acquire) {
+            let _ = child.kill();
+            break (child.wait().ok(), Some("cancelled"));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            break (child.wait().ok(), Some("timed out"));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break (Some(status), None),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("wait {}: {error}", args[0]));
+            }
+        }
+    };
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if let Some(stopped) = stopped {
+        return Err(format!("{} {stopped}", args[0]));
+    }
+    if !status.is_some_and(|status| status.success()) {
+        let tail = String::from_utf8_lossy(&stderr);
+        return Err(format!("{}: {}", args[0], tail.trim()));
     }
     Ok(())
 }
 
-/// BL + P8.1 RPU via `dovi_tool -m 2 convert --discard`. Writes `dest_part`.
-pub fn run_remux_p8(
+/// BL + P8.1 RPU via `dovi_tool -m 2 convert --discard`. Writes `dest_part`
+/// under the caller's deadline and cancellation token.
+pub fn run_remux_p8_controlled(
     src: &std::path::Path,
     dest_part: &std::path::Path,
     plan: &TranscodePlan,
+    deadline: std::time::Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<(), String> {
     let dovi = dovi_tool_path().ok_or_else(|| "dovi_tool not on PATH".to_string())?;
     if let Some(parent) = dest_part.parent() {
@@ -772,59 +941,37 @@ pub fn run_remux_p8(
     ];
     match plan.audio {
         AudioAction::Copy => mux.extend(["-c:a".into(), "copy".into()]),
-        AudioAction::ToAc3 => mux.extend(["-c:a".into(), "ac3".into(), "-b:a".into(), "640k".into()]),
-        AudioAction::ToAac => mux.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "256k".into()]),
+        AudioAction::ToAc3 => {
+            mux.extend(["-c:a".into(), "ac3".into(), "-b:a".into(), "640k".into()])
+        }
+        AudioAction::ToAac => {
+            mux.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "256k".into()])
+        }
     }
     mux.extend(live_frag_tail(&dest_part.to_string_lossy()));
-    let result = run_cmd(&extract)
-        .and_then(|_| run_cmd(&convert))
-        .and_then(|_| run_cmd(&mux));
+    let result = run_cmd_controlled(&extract, deadline, cancelled)
+        .and_then(|_| run_cmd_controlled(&convert, deadline, cancelled))
+        .and_then(|_| run_cmd_controlled(&mux, deadline, cancelled));
     let _ = std::fs::remove_file(&hevc);
     let _ = std::fs::remove_file(&p8);
     result
 }
 
-/// Run ffmpeg CLI to a cache file. Returns the dest path. Existing non-empty
-/// dest is reused so Range scrub does not restart a pipe.
-pub fn ensure_cached_file(
-    src: &std::path::Path,
-    dest: &std::path::Path,
-    plan: &TranscodePlan,
-) -> std::io::Result<std::path::PathBuf> {
-    if dest.is_file() && dest.metadata()?.len() > 0 {
-        return Ok(dest.to_path_buf());
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let args = ffmpeg_file_args(
-        &src.to_string_lossy(),
-        &dest.to_string_lossy(),
-        plan,
-    );
-    let mut cmd = std::process::Command::new(&args[0]);
-    cmd.args(&args[1..]);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::piped());
-    let out = cmd.output()?;
-    if !out.status.success() {
-        return Err(std::io::Error::other(format!(
-            "ffmpeg failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
-    }
-    if !dest.is_file() || dest.metadata()?.len() == 0 {
-        return Err(std::io::Error::other("ffmpeg produced no cache file"));
-    }
-    Ok(dest.to_path_buf())
-}
-
 fn first_codec(s: &str) -> &str {
-    s.split(',').map(str::trim).find(|p| !p.is_empty()).unwrap_or("")
+    s.split(',')
+        .map(str::trim)
+        .find(|p| !p.is_empty())
+        .unwrap_or("")
 }
 
-pub fn probe_to_source(container: &str, video: &str, hdr: &str, audio: &str, w: u32, h: u32) -> SourceMedia {
+pub fn probe_to_source(
+    container: &str,
+    video: &str,
+    hdr: &str,
+    audio: &str,
+    w: u32,
+    h: u32,
+) -> SourceMedia {
     let video = first_codec(video);
     let audio = first_codec(audio);
     let hdr = first_codec(hdr);
@@ -921,6 +1068,61 @@ action = "audio-ac3"
     }
 
     #[test]
+    fn remap_validation_rejects_contradictory_actions_and_bad_encoder_names() {
+        let original = parse_remaps_toml(
+            r#"
+[[remap]]
+action = "original"
+audio_out = "to-aac"
+"#,
+        )
+        .unwrap();
+        assert!(validate_remap_rules(&original, "libx264")
+            .unwrap_err()
+            .contains("action=original"));
+
+        let p8_encode = parse_remaps_toml(
+            r#"
+[[remap]]
+hdr = "dv-p7"
+action = "remux-p8"
+encoder = "hevc_nvenc"
+"#,
+        )
+        .unwrap();
+        assert!(validate_remap_rules(&p8_encode, "libx264")
+            .unwrap_err()
+            .contains("encoder=copy"));
+
+        let hdr_copy = parse_remaps_toml(
+            r#"
+[[remap]]
+hdr = "dv-p7"
+action = "hdr10"
+encoder = "copy"
+"#,
+        )
+        .unwrap();
+        assert!(validate_remap_rules(&hdr_copy, "libx264")
+            .unwrap_err()
+            .contains("cannot use encoder=copy"));
+
+        let bad_name = parse_remaps_toml(
+            r#"
+[[remap]]
+hdr = "dv-p7"
+action = "hdr10"
+encoder = "-y bad"
+"#,
+        )
+        .unwrap();
+        assert!(validate_remap_rules(&bad_name, "libx264")
+            .unwrap_err()
+            .contains("invalid encoder name"));
+        assert!(validate_remap_rules(&sample_remaps(), "libx264").is_ok());
+    }
+
+    #[test]
     fn kodi_ignores_cast_only_rule() {
         let kodi = identify_user_agent("Kodi/21.0").unwrap();
         let p = decide(kodi, &p7_truehd(), &sample_remaps());
@@ -936,7 +1138,7 @@ action = "audio-ac3"
         assert_eq!(p.action, RecodeAction::Hdr10);
         assert_eq!(p.rule.as_deref(), Some("cast-p7"));
         assert!(p.drop_dolby_vision);
-        let args = ffmpeg_live_args("/media/movie.mkv", &p);
+        let args = ffmpeg_grow_args("/media/movie.mkv", "/cache/movie.mp4.part", &p);
         assert!(args.contains(&"hevc_nvenc".into()));
         assert!(args.contains(&"smpte2084".into()));
         assert!(!args.iter().any(|s| s.contains("faststart")));
@@ -1084,91 +1286,27 @@ action = "audio-ac3"
     }
 
     #[test]
-    fn file_cache_argv_is_not_a_live_pipe() {
+    fn growing_cache_argv_uses_fragmented_file_not_stdout() {
         let cast = identify_user_agent("CrKey/1.54").unwrap();
         let p = decide(cast, &p7_truehd(), &sample_remaps());
-        let args = ffmpeg_file_args("/media/movie.mkv", "/cache/1-hdr10.mp4", &p);
-        assert_eq!(args[0], "ffmpeg");
-        assert!(args.contains(&"+faststart".into()));
-        assert!(!args.iter().any(|s| s == "pipe:1"));
-        assert!(!args.iter().any(|s| s == "-ss"));
-        assert!(args.last().unwrap().ends_with("1-hdr10.mp4"));
-        let live = ffmpeg_live_args("/media/movie.mkv", &p);
-        assert!(live.contains(&"pipe:1".into()));
-        assert!(live.contains(&"-flush_packets".into()));
-        assert!(live.contains(&"-frag_duration".into()));
-        assert!(live
-            .iter()
-            .any(|s| s.contains("frag_keyframe+empty_moov+default_base_moof")));
-        assert!(!live.iter().any(|s| s.contains("faststart")));
         let grow = ffmpeg_grow_args("/media/movie.mkv", "/cache/1-hdr10.mp4.part", &p);
+        assert_eq!(grow[0], "ffmpeg");
         assert!(grow.contains(&"/cache/1-hdr10.mp4.part".into()));
         assert!(!grow.iter().any(|s| s == "pipe:1"));
         assert!(!grow.iter().any(|s| s.contains("faststart")));
         assert!(grow.iter().any(|s| s.contains("frag_keyframe")));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn live_pipe_emits_ftyp_before_process_exits() {
-        use std::io::Read;
-        use std::process::{Command, Stdio};
-        if Command::new("ffmpeg").arg("-version").output().is_err() {
-            eprintln!("skip live pipe (no ffmpeg)");
-            return;
-        }
-        let src = std::env::temp_dir().join(format!("rdlna-live-{}.mkv", std::process::id()));
-        let mk = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=duration=6:size=160x90:rate=10",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=6",
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "aac",
-                src.to_str().unwrap(),
-            ])
-            .status();
-        if !mk.map(|s| s.success()).unwrap_or(false) {
-            let _ = std::fs::remove_file(&src);
-            eprintln!("skip live pipe (could not make fixture)");
-            return;
-        }
-        let plan = TranscodePlan {
-            decision: Decision::Recode,
-            action: RecodeAction::RemuxP8,
-            video_encoder: "copy".into(),
-            audio: AudioAction::ToAac,
-            container: "mp4",
-            ..TranscodePlan::default()
-        };
-        let args = ffmpeg_live_args(&src.to_string_lossy(), &plan);
-        let mut child = Command::new(&args[0])
-            .args(&args[1..])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn live ffmpeg");
-        let mut stdout = child.stdout.take().expect("stdout");
-        let mut buf = [0u8; 32];
-        let n = stdout.read(&mut buf).expect("first fragment");
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_file(&src);
-        assert!(n >= 8, "expected fMP4 bytes, got {n}");
-        assert_eq!(&buf[4..8], b"ftyp", "first box must be ftyp, got {buf:x?}");
+    fn growing_argv_preserves_non_utf8_path_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let src = std::path::PathBuf::from(OsString::from_vec(b"/media/movie-\x80.mkv".to_vec()));
+        let dst = std::path::PathBuf::from(OsString::from_vec(b"/cache/movie-\x81.part".to_vec()));
+        let args = ffmpeg_grow_os_args(&src, &dst, &TranscodePlan::default());
+        assert_eq!(args[5].as_bytes(), src.as_os_str().as_bytes());
+        assert_eq!(args.last().unwrap().as_bytes(), dst.as_os_str().as_bytes());
     }
 
     #[test]
@@ -1179,7 +1317,8 @@ action = "audio-ac3"
             return;
         }
         let src = std::env::temp_dir().join(format!("rdlna-grow-src-{}.mkv", std::process::id()));
-        let dest = std::env::temp_dir().join(format!("rdlna-grow-dst-{}.mp4.part", std::process::id()));
+        let dest =
+            std::env::temp_dir().join(format!("rdlna-grow-dst-{}.mp4.part", std::process::id()));
         let mk = Command::new("ffmpeg")
             .args([
                 "-y",
@@ -1244,35 +1383,13 @@ action = "audio-ac3"
     }
 
     #[test]
-    fn drop_kills_ffmpeg_job_and_max_jobs_caps() {
+    fn job_gate_caps_background_jobs() {
         let gate = JobGate::new(1);
-        let p1 = gate.try_acquire().expect("first slot");
-        assert!(gate.try_acquire().is_none());
-        drop(p1);
-        assert!(gate.try_acquire().is_some());
-
-        let child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("spawn sleep");
-        let pid = child.id();
-        {
-            let _job = FfmpegJob { child };
-        }
-        // SIGKILL has been sent; wait briefly for the zombie to clear.
-        for _ in 0..20 {
-            if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            } else {
-                break;
-            }
-        }
-        let still = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
-        if let Some(st) = still {
-            // zombie 'Z' is acceptable; running 'R'/'S' is not
-            let state = st.split_whitespace().nth(2).unwrap_or("");
-            assert_eq!(state, "Z", "child should be dead after Drop, stat={st}");
-        }
+        assert!(gate.try_add());
+        assert!(!gate.try_add());
+        gate.release();
+        assert!(gate.try_add());
+        gate.release();
     }
 
     #[test]
@@ -1280,6 +1397,11 @@ action = "audio-ac3"
         assert_eq!(pick_audio_index("truehd,ac3,aac"), 1);
         assert_eq!(pick_audio_index("aac"), 0);
         assert_eq!(pick_audio_index("truehd,dts"), 0);
+        assert_eq!(
+            pick_audio_index_from_streams("1:0:truehd:8,2:1:ac3:6,3:2:ac3:2", "truehd,ac3"),
+            1,
+            "duplicate codec summary must not erase the real lossy ordinal"
+        );
         let mut plan = TranscodePlan {
             decision: Decision::Recode,
             action: RecodeAction::RemuxP8,
@@ -1294,7 +1416,12 @@ action = "audio-ac3"
         let fb = hdr10_fallback_plan(&plan);
         assert_eq!(fb.action, RecodeAction::Hdr10);
         assert_ne!(fb.video_encoder, "copy");
+        assert_eq!(fb.audio, AudioAction::ToAac);
         assert_eq!(fb.audio_index, 1);
+        plan.audio = AudioAction::Copy;
+        assert_eq!(hdr10_fallback_plan(&plan).audio, AudioAction::Copy);
+        plan.audio = AudioAction::ToAc3;
+        assert_eq!(hdr10_fallback_plan(&plan).audio, AudioAction::ToAc3);
         plan.audio_index = pick_audio_index("truehd,eac3");
         assert_eq!(plan.audio_index, 1);
         let x264 = hdr10_fallback_plan(&plan);
@@ -1310,32 +1437,68 @@ action = "audio-ac3"
             return;
         }
         let src = std::env::temp_dir().join(format!("rdlna-nodovi-{}.mkv", std::process::id()));
-        let dest = std::env::temp_dir().join(format!("rdlna-nodovi-{}.mp4.part", std::process::id()));
+        let dest =
+            std::env::temp_dir().join(format!("rdlna-nodovi-{}.mp4.part", std::process::id()));
         let _ = std::fs::write(&src, b"not-hevc");
         let plan = TranscodePlan {
             action: RecodeAction::RemuxP8,
             video_encoder: "copy".into(),
             ..TranscodePlan::default()
         };
-        let err = run_remux_p8(&src, &dest, &plan).unwrap_err();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let err = run_remux_p8_controlled(
+            &src,
+            &dest,
+            &plan,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            &cancelled,
+        )
+        .unwrap_err();
         assert!(err.contains("dovi_tool"), "{err}");
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&dest);
     }
 
     #[test]
-    fn cache_stamp_invalidates_on_source_change() {
-        let tmp = std::env::temp_dir().join(format!("rdlna-stamp-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&tmp);
+    fn keyed_cache_changes_for_same_size_source_and_effective_plan() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rdlna-keyed-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
         let src = tmp.join("src.mkv");
-        let dest = tmp.join("1-remux.mp4");
-        std::fs::write(&src, b"aaaa").unwrap();
-        std::fs::write(&dest, b"cached").unwrap();
-        write_cache_stamp(&dest, &src);
-        assert!(cache_is_fresh(&dest, &src));
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&src, b"bbbbbbbb").unwrap();
-        assert!(!cache_is_fresh(&dest, &src), "size/mtime change must bust cache");
+        std::fs::write(&src, b"same-size-content-a").unwrap();
+        let mut plan = TranscodePlan {
+            decision: Decision::Recode,
+            action: RecodeAction::Hdr10,
+            video_encoder: "libx264".into(),
+            audio: AudioAction::Copy,
+            container: "mp4",
+            ..TranscodePlan::default()
+        };
+        let first = transcode_cache_key(&src, &plan, false).unwrap();
+        let first_dest = cache_dest_for_key(&tmp, 7, plan.action, &first);
+
+        // Size and (on coarse filesystems) timestamp can remain unchanged;
+        // sampled content must still invalidate the identity.
+        std::fs::write(&src, b"same-size-content-b").unwrap();
+        let replaced = transcode_cache_key(&src, &plan, false).unwrap();
+        assert_ne!(replaced, first);
+        assert_ne!(
+            cache_dest_for_key(&tmp, 7, plan.action, &replaced),
+            first_dest
+        );
+
+        plan.video_encoder = "hevc_nvenc".into();
+        let encoder_changed = transcode_cache_key(&src, &plan, false).unwrap();
+        assert_ne!(encoder_changed, replaced);
+        plan.audio = AudioAction::ToAc3;
+        let audio_changed = transcode_cache_key(&src, &plan, false).unwrap();
+        assert_ne!(audio_changed, encoder_changed);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

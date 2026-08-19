@@ -15,10 +15,12 @@ use rusty_dlna_protocol::soap::{
 };
 use rusty_dlna_protocol::w3c_normalize_date;
 use rusty_dlna_protocol::{ClientFlags, ClientKind, ClientProfile};
+use std::collections::HashMap;
 
 pub use filter::{didl_xmlns, parse_filter, FilterBits};
 pub use search::{
-    parse_search_criteria, row_matches, SearchClause, SearchQuery, SearchRow,
+    parse_search_criteria, row_matches, try_parse_search_criteria, SearchClause, SearchParseError,
+    SearchProp, SearchQuery, SearchRow,
 };
 pub use sort::{default_order, parse_sort_criteria, sort_or_709, DefaultOrder, SortKey, SortSpec};
 
@@ -29,7 +31,10 @@ pub fn xml_escape(s: &str) -> String {
 }
 
 fn xml_escape_into(s: &str, out: &mut String) {
-    if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'')) {
+    if !s
+        .bytes()
+        .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\''))
+    {
         out.push_str(s);
         return;
     }
@@ -69,57 +74,101 @@ fn xml_escape_didl_into(s: &str, out: &mut String) {
     }
 }
 
-/// Text of `<tag>`, `<u:tag>`, or `<ns:tag>` (first match, case-insensitive).
-pub fn xml_tag_text(hay: &str, tag: &str) -> Option<String> {
-    let mut search = 0;
-    while let Some(rel) = hay[search..].find('<') {
-        let abs = search + rel;
-        let after = &hay[abs + 1..];
-        if after.starts_with('/') || after.starts_with('!') || after.starts_with('?') {
-            search = abs + 1;
-            continue;
+#[derive(Debug, thiserror::Error)]
+#[error("malformed SOAP XML: {0}")]
+pub struct SoapXmlError(String);
+
+fn xml_fields(hay: &str) -> Result<HashMap<String, Vec<String>>, SoapXmlError> {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(hay);
+    // Keep segment-boundary whitespace: quick-xml 0.41 emits entity
+    // references separately, so trimming each text event would turn
+    // `Foo &amp; Bar` into `Foo&Bar`. Trim only the completed element below.
+    reader.config_mut().trim_text(false);
+    reader.config_mut().expand_empty_elements = true;
+    let mut stack: Vec<(String, String)> = Vec::new();
+    let mut fields: HashMap<String, Vec<String>> = HashMap::new();
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) => {
+                let name =
+                    String::from_utf8_lossy(start.local_name().as_ref()).to_ascii_lowercase();
+                stack.push((name, String::new()));
+            }
+            Ok(Event::Text(text)) => {
+                if let Some((_, value)) = stack.last_mut() {
+                    let decoded = text
+                        .decode()
+                        .map_err(|error| SoapXmlError(error.to_string()))?;
+                    let unescaped = quick_xml::escape::unescape(&decoded)
+                        .map_err(|error| SoapXmlError(error.to_string()))?;
+                    value.push_str(&unescaped);
+                }
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                if let Some((_, value)) = stack.last_mut() {
+                    if let Some(character) = reference
+                        .resolve_char_ref()
+                        .map_err(|error| SoapXmlError(error.to_string()))?
+                    {
+                        value.push(character);
+                    } else {
+                        let name = reference
+                            .decode()
+                            .map_err(|error| SoapXmlError(error.to_string()))?;
+                        let entity =
+                            quick_xml::escape::resolve_xml_entity(&name).ok_or_else(|| {
+                                SoapXmlError(format!("unrecognized XML entity '&{name};'"))
+                            })?;
+                        value.push_str(entity);
+                    }
+                }
+            }
+            Ok(Event::CData(text)) => {
+                if let Some((_, value)) = stack.last_mut() {
+                    value.push_str(
+                        &text
+                            .decode()
+                            .map_err(|error| SoapXmlError(error.to_string()))?,
+                    );
+                }
+            }
+            Ok(Event::End(end)) => {
+                let end_name =
+                    String::from_utf8_lossy(end.local_name().as_ref()).to_ascii_lowercase();
+                let Some((name, value)) = stack.pop() else {
+                    return Err(SoapXmlError("unexpected closing element".into()));
+                };
+                if name != end_name {
+                    return Err(SoapXmlError(format!(
+                        "closing element {end_name} does not match {name}"
+                    )));
+                }
+                fields
+                    .entry(name)
+                    .or_default()
+                    .push(value.trim().to_string());
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(SoapXmlError(error.to_string())),
         }
-        let name_end = after
-            .find(|c: char| c == '>' || c == ' ' || c == '/' || c == '\t')
-            .unwrap_or(0);
-        if name_end == 0 {
-            search = abs + 1;
-            continue;
-        }
-        let raw_name = &after[..name_end];
-        let local = raw_name.rsplit(':').next().unwrap_or(raw_name);
-        if !local.eq_ignore_ascii_case(tag) {
-            search = abs + 1;
-            continue;
-        }
-        let gt = after.find('>')?;
-        if after.as_bytes().get(gt.saturating_sub(1)) == Some(&b'/') {
-            return Some(String::new());
-        }
-        let content_start = abs + 1 + gt + 1;
-        let rest = &hay[content_start..];
-        let rel_end = find_close_tag(rest, raw_name)
-            .or_else(|| find_close_tag(rest, tag))
-            .or_else(|| find_close_tag(rest, local))?;
-        return Some(hay[content_start..content_start + rel_end].to_string());
     }
-    None
+    if !stack.is_empty() {
+        return Err(SoapXmlError("unclosed element".into()));
+    }
+    Ok(fields)
 }
 
-fn find_close_tag(hay: &str, name: &str) -> Option<usize> {
-    let mut i = 0;
-    while let Some(rel) = hay[i..].find("</") {
-        let abs = i + rel;
-        let after = &hay[abs + 2..];
-        if after.len() >= name.len()
-            && after[..name.len()].eq_ignore_ascii_case(name)
-            && after.as_bytes().get(name.len()) == Some(&b'>')
-        {
-            return Some(abs);
-        }
-        i = abs + 2;
-    }
-    None
+/// Text of `<tag>`, `<u:tag>`, or `<ns:tag>` (first match,
+/// case-insensitive), decoded through the bounded request body's XML parser.
+pub fn xml_tag_text(hay: &str, tag: &str) -> Option<String> {
+    xml_fields(hay)
+        .ok()?
+        .remove(&tag.to_ascii_lowercase())?
+        .into_iter()
+        .next()
 }
 
 pub fn wrap_soap_success(body: &str) -> String {
@@ -132,6 +181,7 @@ pub fn wrap_soap_success(body: &str) -> String {
 }
 
 pub fn soap_fault(code: u16, desc: &str) -> String {
+    let desc = xml_escape(desc);
     format!(
         "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
          s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
@@ -293,9 +343,7 @@ pub fn emit_didl_object(o: &DidlObject, bits: &FilterBits) -> String {
             s.push_str("</upnp:searchClass>");
         }
         if let Some(c) = o.av_media_class {
-            s.push_str(
-                "<av:mediaClass xmlns:av=\"urn:schemas-sony-com:av\">",
-            );
+            s.push_str("<av:mediaClass xmlns:av=\"urn:schemas-sony-com:av\">");
             s.push(c);
             s.push_str("</av:mediaClass>");
         }
@@ -326,32 +374,48 @@ pub fn emit_didl_object(o: &DidlObject, bits: &FilterBits) -> String {
                 }
             }
         }
-        emit_opt_tag(&mut s, "dc:creator", o.creator.as_deref());
-        if let Some(desc) = o.description.as_deref().filter(|v| !v.is_empty()) {
-            let cut = truncate_chars(desc, 384);
-            emit_opt_tag(&mut s, "dc:description", Some(cut));
+        if bits.dc_creator {
+            emit_opt_tag(&mut s, "dc:creator", o.creator.as_deref());
         }
-        emit_opt_tag(&mut s, "upnp:artist", o.artist.as_deref());
-        emit_opt_tag(&mut s, "upnp:actor", o.actor.as_deref());
-        emit_opt_tag(&mut s, "upnp:album", o.album.as_deref());
-        emit_opt_tag(&mut s, "upnp:genre", o.genre.as_deref());
-        if o.class.contains("audio") {
+        if bits.dc_description {
+            if let Some(desc) = o.description.as_deref().filter(|v| !v.is_empty()) {
+                let cut = truncate_chars(desc, 384);
+                emit_opt_tag(&mut s, "dc:description", Some(cut));
+            }
+        }
+        if bits.upnp_artist {
+            emit_opt_tag(&mut s, "upnp:artist", o.artist.as_deref());
+        }
+        if bits.upnp_actor {
+            emit_opt_tag(&mut s, "upnp:actor", o.actor.as_deref());
+        }
+        if bits.upnp_album {
+            emit_opt_tag(&mut s, "upnp:album", o.album.as_deref());
+        }
+        if bits.upnp_genre {
+            emit_opt_tag(&mut s, "upnp:genre", o.genre.as_deref());
+        }
+        if bits.upnp_track && o.class.contains("audio") {
             if let Some(n) = o.track {
                 s.push_str(&format!(
                     "<upnp:originalTrackNumber>{n}</upnp:originalTrackNumber>"
                 ));
             }
         }
-        if let Some(n) = o.season {
-            s.push_str(&format!("<upnp:episodeSeason>{n}</upnp:episodeSeason>"));
+        if bits.upnp_episode {
+            if let Some(n) = o.season {
+                s.push_str(&format!("<upnp:episodeSeason>{n}</upnp:episodeSeason>"));
+            }
+            if let Some(n) = o.episode {
+                s.push_str(&format!("<upnp:episodeNumber>{n}</upnp:episodeNumber>"));
+            }
         }
-        if let Some(n) = o.episode {
-            s.push_str(&format!("<upnp:episodeNumber>{n}</upnp:episodeNumber>"));
-        }
-        if let Some(pos) = o.last_playback_position {
-            s.push_str(&format!(
-                "<upnp:lastPlaybackPosition>{pos}</upnp:lastPlaybackPosition>"
-            ));
+        if bits.upnp_last_playback {
+            if let Some(pos) = o.last_playback_position {
+                s.push_str(&format!(
+                    "<upnp:lastPlaybackPosition>{pos}</upnp:lastPlaybackPosition>"
+                ));
+            }
         }
         if bits.sec {
             if let Some(dcm) = o.dcm_info.as_deref().filter(|v| !v.is_empty()) {
@@ -360,8 +424,10 @@ pub fn emit_didl_object(o: &DidlObject, bits: &FilterBits) -> String {
                 s.push_str("</sec:dcmInfo>");
             }
         }
-        if let Some(n) = o.playback_count.filter(|n| *n > 0) {
-            s.push_str(&format!("<upnp:playbackCount>{n}</upnp:playbackCount>"));
+        if bits.upnp_playback_count {
+            if let Some(n) = o.playback_count.filter(|n| *n > 0) {
+                s.push_str(&format!("<upnp:playbackCount>{n}</upnp:playbackCount>"));
+            }
         }
         for r in &o.resources {
             if !bits.res && !bits.pv {
@@ -425,7 +491,9 @@ pub fn emit_didl_object(o: &DidlObject, bits: &FilterBits) -> String {
                 s.push_str("</sec:CaptionInfoEx>");
             }
         }
-        emit_album_art_uri(&mut s, o);
+        if bits.upnp_album_art {
+            emit_album_art_uri(&mut s, o);
+        }
         s.push_str("</item>");
         s
     }
@@ -482,6 +550,7 @@ pub struct SoapCall {
     pub search_criteria: Option<String>,
     pub pos_second: Option<i64>,
     pub connection_id: Option<String>,
+    pub device_id: Option<String>,
     pub filter: Option<String>,
     pub current_tag_value: Option<String>,
     pub new_tag_value: Option<String>,
@@ -489,29 +558,69 @@ pub struct SoapCall {
     pub var_name: Option<String>,
 }
 
-pub fn parse_soap_call(action: &str, body: &str) -> SoapCall {
-    let object_id = xml_tag_text(body, "ObjectID").or_else(|| xml_tag_text(body, "ContainerID"));
-    let starting_index = xml_tag_text(body, "StartingIndex")
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    let requested_count = xml_tag_text(body, "RequestedCount")
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    SoapCall {
+pub fn try_parse_soap_call(action: &str, body: &str) -> Result<SoapCall, SoapXmlError> {
+    let mut fields = xml_fields(body)?;
+    let mut take = |name: &str| {
+        fields
+            .remove(&name.to_ascii_lowercase())
+            .and_then(|values| values.into_iter().next())
+    };
+    let object_id = take("ObjectID").or_else(|| take("ContainerID"));
+    let parse_i32 = |name: &str, value: Option<String>| -> Result<i32, SoapXmlError> {
+        match value {
+            None => Ok(0),
+            Some(value) => value
+                .trim()
+                .parse()
+                .map_err(|_| SoapXmlError(format!("{name} is not a valid integer"))),
+        }
+    };
+    let starting_index = parse_i32("StartingIndex", take("StartingIndex"))?;
+    let requested_count = parse_i32("RequestedCount", take("RequestedCount"))?;
+    let pos_second = match take("PosSecond") {
+        None => None,
+        Some(value) => Some(
+            value
+                .trim()
+                .parse()
+                .map_err(|_| SoapXmlError("PosSecond is not a valid integer".into()))?,
+        ),
+    };
+    Ok(SoapCall {
         method: method_from_header(action),
         object_id,
-        browse_flag: xml_tag_text(body, "BrowseFlag"),
+        browse_flag: take("BrowseFlag"),
         starting_index,
         requested_count,
-        search_criteria: xml_tag_text(body, "SearchCriteria"),
-        pos_second: xml_tag_text(body, "PosSecond").and_then(|s| s.trim().parse().ok()),
-        connection_id: xml_tag_text(body, "ConnectionID"),
-        filter: xml_tag_text(body, "Filter"),
-        current_tag_value: xml_tag_text(body, "CurrentTagValue"),
-        new_tag_value: xml_tag_text(body, "NewTagValue"),
-        sort_criteria: xml_tag_text(body, "SortCriteria"),
-        var_name: xml_tag_text(body, "varName"),
-    }
+        search_criteria: take("SearchCriteria"),
+        pos_second,
+        connection_id: take("ConnectionID"),
+        device_id: take("DeviceID"),
+        filter: take("Filter"),
+        current_tag_value: take("CurrentTagValue"),
+        new_tag_value: take("NewTagValue"),
+        sort_criteria: take("SortCriteria"),
+        var_name: take("varName"),
+    })
+}
+
+pub fn parse_soap_call(action: &str, body: &str) -> SoapCall {
+    try_parse_soap_call(action, body).unwrap_or_else(|_| SoapCall {
+        method: method_from_header(action),
+        object_id: None,
+        browse_flag: None,
+        starting_index: 0,
+        requested_count: 0,
+        search_criteria: None,
+        pos_second: None,
+        connection_id: None,
+        device_id: None,
+        filter: None,
+        current_tag_value: None,
+        new_tag_value: None,
+        sort_criteria: None,
+        var_name: None,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -550,11 +659,51 @@ impl SoapOutcome {
             persist: false,
         }
     }
+    pub fn fault702() -> Self {
+        Self::Fault {
+            http: 500,
+            code: 702,
+            desc: "Invalid CurrentTagValue",
+            persist: false,
+        }
+    }
+    pub fn fault703() -> Self {
+        Self::Fault {
+            http: 500,
+            code: 703,
+            desc: "Invalid NewTagValue",
+            persist: false,
+        }
+    }
+    pub fn fault705() -> Self {
+        Self::Fault {
+            http: 500,
+            code: 705,
+            desc: "Read Only Tag",
+            persist: false,
+        }
+    }
+    pub fn fault706() -> Self {
+        Self::Fault {
+            http: 500,
+            code: 706,
+            desc: "Parameter Mismatch",
+            persist: false,
+        }
+    }
     pub fn fault709() -> Self {
         Self::Fault {
             http: 500,
             code: 709,
             desc: "Unsupported or invalid sort criteria",
+            persist: false,
+        }
+    }
+    pub fn fault708() -> Self {
+        Self::Fault {
+            http: 500,
+            code: 708,
+            desc: "Unsupported or invalid search criteria",
             persist: false,
         }
     }
@@ -566,15 +715,26 @@ impl SoapOutcome {
             persist: false,
         }
     }
+    pub fn fault501() -> Self {
+        Self::Fault {
+            http: 500,
+            code: 501,
+            desc: "Action Failed",
+            persist: false,
+        }
+    }
 }
 
 /// Title hacks from `callback()` in `upnpsoap.c`.
-pub fn apply_title_hack(title: &str, ext: &str, client: &ClientProfile, has_captions: bool) -> String {
+pub fn apply_title_hack(
+    title: &str,
+    ext: &str,
+    client: &ClientProfile,
+    has_captions: bool,
+) -> String {
     match client.kind {
         ClientKind::Lg | ClientKind::LgNetCast if has_captions => format!("{title}."),
-        ClientKind::AsusOPlay if has_captions => {
-            title.chars().take(23).collect()
-        }
+        ClientKind::AsusOPlay if has_captions => title.chars().take(23).collect(),
         ClientKind::HyundaiTv => format!("{title}.{ext}"),
         _ => title.to_string(),
     }
@@ -667,28 +827,78 @@ pub fn bookmark_seconds(pos: i64, convert_ms: bool) -> i64 {
     }
 }
 
-/// Tags parsed from UpdateObject `CurrentTagValue` / `NewTagValue`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct UpdateObjectTags {
-    pub last_playback_position: Option<i64>,
-    pub playback_count: Option<i64>,
+/// One optimistic-concurrency update from the advertised value to a new value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpdateObjectValue {
+    pub current: i64,
+    pub new: i64,
 }
 
-/// MiniDLNA-style tag list: `<upnp:lastPlaybackPosition>N</…>` or `name=N`.
-/// NewTagValue wins over CurrentTagValue. Unknown tags ignored.
-pub fn parse_update_object_tags(current: Option<&str>, new: Option<&str>) -> UpdateObjectTags {
-    let new = new.unwrap_or("");
-    let current = current.unwrap_or("");
-    let pick = |names: &[&str]| update_tag_i64(new, names).or_else(|| update_tag_i64(current, names));
-    UpdateObjectTags {
-        last_playback_position: pick(&["upnp:lastPlaybackPosition", "lastPlaybackPosition"]),
-        playback_count: pick(&[
-            "upnp:playbackCount",
-            "upnp:playCount",
-            "playbackCount",
-            "playCount",
-        ]),
+/// Writable tags parsed from paired UpdateObject arguments.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UpdateObjectTags {
+    pub last_playback_position: Option<UpdateObjectValue>,
+    pub playback_count: Option<UpdateObjectValue>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UpdateObjectParseError {
+    InvalidCurrent,
+    InvalidNew,
+    ReadOnlyTag,
+    ParameterMismatch,
+}
+
+#[derive(Default)]
+struct ParsedUpdateTags {
+    last_playback_position: Option<i64>,
+    playback_count: Option<i64>,
+}
+
+#[derive(Clone, Copy)]
+enum UpdateTag {
+    LastPlaybackPosition,
+    PlaybackCount,
+}
+
+/// Parse the two tag lists used by ContentDirectory `UpdateObject`.
+///
+/// The service supports Kodi/MiniDLNA's escaped XML fragments and the legacy
+/// `name=value` spelling. Every requested tag must be writable and must have a
+/// valid integer/duration value. An empty current list represents the absence
+/// of the advertised bookmark fields, whose database value is zero.
+pub fn parse_update_object_tags(
+    current: &str,
+    new: &str,
+) -> Result<UpdateObjectTags, UpdateObjectParseError> {
+    let current = parse_update_tag_list(current, true).map_err(|error| match error {
+        TagListError::Malformed => UpdateObjectParseError::InvalidCurrent,
+        TagListError::ReadOnly => UpdateObjectParseError::ReadOnlyTag,
+    })?;
+    let new = parse_update_tag_list(new, false).map_err(|error| match error {
+        TagListError::Malformed => UpdateObjectParseError::InvalidNew,
+        TagListError::ReadOnly => UpdateObjectParseError::ReadOnlyTag,
+    })?;
+
+    if new.last_playback_position.is_none() && new.playback_count.is_none() {
+        return Err(UpdateObjectParseError::InvalidNew);
     }
+    if current.last_playback_position.is_some() && new.last_playback_position.is_none()
+        || current.playback_count.is_some() && new.playback_count.is_none()
+    {
+        return Err(UpdateObjectParseError::ParameterMismatch);
+    }
+
+    Ok(UpdateObjectTags {
+        last_playback_position: new.last_playback_position.map(|new| UpdateObjectValue {
+            current: current.last_playback_position.unwrap_or(0),
+            new,
+        }),
+        playback_count: new.playback_count.map(|new| UpdateObjectValue {
+            current: current.playback_count.unwrap_or(0),
+            new,
+        }),
+    })
 }
 
 fn unescape_xml_light(s: &str) -> String {
@@ -710,39 +920,104 @@ fn parse_pos_or_count(v: &str) -> Option<i64> {
             let h: i64 = parts[0].parse().ok()?;
             let m: i64 = parts[1].parse().ok()?;
             let s: i64 = parts[2].split('.').next()?.parse().ok()?;
+            if h < 0 || !(0..60).contains(&m) || !(0..60).contains(&s) {
+                return None;
+            }
             return Some(h.saturating_mul(3600) + m.saturating_mul(60) + s);
         }
     }
     v.parse().ok()
 }
 
-fn update_tag_i64(hay: &str, names: &[&str]) -> Option<i64> {
-    if hay.is_empty() {
-        return None;
+#[derive(Clone, Copy)]
+enum TagListError {
+    Malformed,
+    ReadOnly,
+}
+
+fn update_tag(name: &str) -> Result<UpdateTag, TagListError> {
+    match name.trim().rsplit(':').next().unwrap_or("") {
+        "lastPlaybackPosition" => Ok(UpdateTag::LastPlaybackPosition),
+        "playbackCount" | "playCount" => Ok(UpdateTag::PlaybackCount),
+        _ => Err(TagListError::ReadOnly),
     }
-    let decoded = unescape_xml_light(hay);
-    for tag in names {
-        let local = tag.rsplit(':').next().unwrap_or(tag);
-        if let Some(v) = xml_tag_text(&decoded, local) {
-            if let Some(n) = parse_pos_or_count(&v) {
-                return Some(n);
+}
+
+fn set_update_tag(
+    parsed: &mut ParsedUpdateTags,
+    tag: UpdateTag,
+    value: &str,
+    allow_empty: bool,
+) -> Result<(), TagListError> {
+    let value = if allow_empty && value.trim().is_empty() {
+        0
+    } else {
+        parse_pos_or_count(value).ok_or(TagListError::Malformed)?
+    };
+    let field = match tag {
+        UpdateTag::LastPlaybackPosition => &mut parsed.last_playback_position,
+        UpdateTag::PlaybackCount => {
+            if value < 0 {
+                return Err(TagListError::Malformed);
             }
+            &mut parsed.playback_count
         }
-        for key in [*tag, local] {
-            let pat = format!("{key}=");
-            if let Some(i) = decoded.find(&pat) {
-                let rest = decoded[i + pat.len()..].trim_start();
-                let num: String = rest
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit() || *c == '-')
-                    .collect();
-                if let Some(n) = parse_pos_or_count(&num) {
-                    return Some(n);
-                }
+    };
+    if field.replace(value).is_some() {
+        return Err(TagListError::Malformed);
+    }
+    Ok(())
+}
+
+fn parse_update_tag_list(input: &str, allow_empty: bool) -> Result<ParsedUpdateTags, TagListError> {
+    let decoded = unescape_xml_light(input);
+    if decoded.trim().is_empty() {
+        return Ok(ParsedUpdateTags::default());
+    }
+    if !decoded.contains('<') {
+        let mut parsed = ParsedUpdateTags::default();
+        for item in decoded.split(',') {
+            let (name, value) = item.split_once('=').ok_or(TagListError::Malformed)?;
+            set_update_tag(&mut parsed, update_tag(name)?, value, allow_empty)?;
+        }
+        return Ok(parsed);
+    }
+
+    let wrapped = format!(
+        "<root xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" \
+         xmlns:dc=\"http://purl.org/dc/elements/1.1/\">{decoded}</root>"
+    );
+    let document = roxmltree::Document::parse(&wrapped).map_err(|_| TagListError::Malformed)?;
+    let root = document.root_element();
+    let mut parsed = ParsedUpdateTags::default();
+    let mut elements = 0usize;
+    for child in root.children() {
+        if child.is_element() {
+            if child.children().any(|node| node.is_element()) {
+                return Err(TagListError::Malformed);
             }
+            elements += 1;
+            let text = child.text().unwrap_or("");
+            set_update_tag(
+                &mut parsed,
+                update_tag(child.tag_name().name())?,
+                text,
+                allow_empty,
+            )?;
+        } else if child.is_text()
+            && child
+                .text()
+                .unwrap_or("")
+                .chars()
+                .any(|character| !character.is_whitespace() && character != ',')
+        {
+            return Err(TagListError::Malformed);
         }
     }
-    None
+    if elements == 0 {
+        return Err(TagListError::Malformed);
+    }
+    Ok(parsed)
 }
 
 pub fn empty_cd_response(method: &str) -> String {
@@ -883,11 +1158,27 @@ pub const PROTOCOL_INFO_SOURCE: &str = concat!(
     "http-get:*:audio/x-wav:*,",
     "http-get:*:audio/x-flac:*,",
     "http-get:*:audio/x-dsd:*,",
-    "http-get:*:application/ogg:*",
-    "http-get:*:application/vnd.rn-realmedia:*",
-    "http-get:*:application/vnd.rn-realmedia-vbr:*",
+    "http-get:*:application/ogg:*,",
+    "http-get:*:application/vnd.rn-realmedia:*,",
+    "http-get:*:application/vnd.rn-realmedia-vbr:*,",
     "http-get:*:video/webm:*"
 );
+
+/// MiniDLNA's profiled list plus wildcard entries generated from the canonical
+/// extension/MIME map. This prevents the scanner from serving a format that
+/// ConnectionManager does not advertise.
+pub fn protocol_info_source() -> String {
+    let mut entries = PROTOCOL_INFO_SOURCE
+        .split(',')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for entry in rusty_dlna_protocol::wildcard_protocol_info_entries() {
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    entries.join(",")
+}
 
 fn ok_tag(method: &str, xmlns: &str, inner: &str) -> String {
     wrap_soap_success(&format!(
@@ -924,7 +1215,7 @@ pub fn dispatch_simple(
         "GetProtocolInfo" => Some(SoapOutcome::Ok(ok_tag(
             method,
             CONNECTIONMANAGER_TYPE,
-            &format!("<Source>{PROTOCOL_INFO_SOURCE}</Source><Sink></Sink>"),
+            &format!("<Source>{}</Source><Sink></Sink>", protocol_info_source()),
         ))),
         "GetCurrentConnectionIDs" => Some(SoapOutcome::Ok(ok_tag(
             method,
@@ -932,8 +1223,17 @@ pub fn dispatch_simple(
             "<ConnectionIDs>0</ConnectionIDs>",
         ))),
         "GetCurrentConnectionInfo" => {
-            let id = call.connection_id.as_deref().unwrap_or("");
-            if id != "0" && !id.is_empty() {
+            let id = match call
+                .connection_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .and_then(|id| id.parse::<i32>().ok())
+            {
+                Some(id) => id,
+                None => return Some(SoapOutcome::fault402()),
+            };
+            if id != 0 {
                 return Some(SoapOutcome::fault701());
             }
             Some(SoapOutcome::Ok(ok_tag(
@@ -945,15 +1245,23 @@ pub fn dispatch_simple(
                  <Status>Unknown</Status>",
             )))
         }
-        "IsAuthorized" | "IsValidated" => Some(SoapOutcome::Ok(ok_tag(
-            method,
-            MS_REGISTRAR_TYPE,
-            "<Result>1</Result>",
-        ))),
+        "IsAuthorized" | "IsValidated" => {
+            if call.device_id.is_none() {
+                return Some(SoapOutcome::fault402());
+            }
+            Some(SoapOutcome::Ok(ok_tag(
+                method,
+                MS_REGISTRAR_TYPE,
+                "<Result>1</Result>",
+            )))
+        }
         "RegisterDevice" => Some(SoapOutcome::Ok(ok_tag(
             method,
             MS_REGISTRAR_TYPE,
-            &format!("<RegistrationRespMsg>{}</RegistrationRespMsg>", xml_escape(uuid)),
+            &format!(
+                "<RegistrationRespMsg>{}</RegistrationRespMsg>",
+                xml_escape(uuid)
+            ),
         ))),
         "X_GetFeatureList" => {
             let ids = feature_list_ids(client, root_container);
@@ -993,6 +1301,63 @@ pub fn build_browse(
     } else {
         browse_response(&inner, returned, total, update_id, bits)
     }
+}
+
+/// Build a Browse/Search response directly into its final escaped SOAP form,
+/// stopping before `max_bytes`.  `TotalMatches` always describes the complete
+/// query; `NumberReturned` describes only objects that fit.  This makes the
+/// truncation a normal pagination boundary instead of emitting invalid XML or
+/// lying about the returned page.
+pub fn build_browse_bounded(
+    is_search: bool,
+    objects: &[DidlObject],
+    total: u32,
+    update_id: u32,
+    bits: &FilterBits,
+    max_bytes: usize,
+) -> (String, u32) {
+    let method = if is_search { "Search" } else { "Browse" };
+    let mut out = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n\
+         <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+         s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+         <s:Body><u:{method}Response xmlns:u=\"{CONTENTDIRECTORY_TYPE}\">\
+         <Result>"
+    );
+    let didl_open = format!("<DIDL-Lite{}>\n", didl_xmlns(bits));
+    xml_escape_didl_into(&didl_open, &mut out);
+
+    let suffix = |returned: u32| {
+        let mut value = String::new();
+        xml_escape_didl_into("</DIDL-Lite>", &mut value);
+        value.push_str(&format!(
+            "</Result>\n\
+             <NumberReturned>{returned}</NumberReturned>\n\
+             <TotalMatches>{total}</TotalMatches>\n\
+             <UpdateID>{update_id}</UpdateID>\
+             </u:{method}Response></s:Body></s:Envelope>\r\n"
+        ));
+        value
+    };
+
+    let mut returned = 0u32;
+    for object in objects {
+        let raw = emit_didl_object(object, bits);
+        let escaped = xml_escape_didl_result(&raw);
+        let next = returned.saturating_add(1);
+        if out
+            .len()
+            .saturating_add(escaped.len())
+            .saturating_add(suffix(next).len())
+            > max_bytes
+        {
+            break;
+        }
+        out.push_str(&escaped);
+        returned = next;
+    }
+    out.push_str(&suffix(returned));
+    (out, returned)
 }
 
 pub fn magic_object_id(id: &str, client: &ClientProfile) -> String {
@@ -1046,16 +1411,20 @@ pub fn rewrite_pfs_child(id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn oracle(name: &str) -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("docs/oracle")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    }
 
     #[test]
     fn browse_is_escaped_didl() {
-        let xml = browse_response(
-            "<container id=\"0\"/>",
-            1,
-            1,
-            28,
-            &FilterBits::standard(),
-        );
+        let xml = browse_response("<container id=\"0\"/>", 1, 1, 28, &FilterBits::standard());
         assert!(xml.contains("&lt;DIDL-Lite"));
         assert!(
             xml.contains("&lt;container id=\"0\"/&gt;"),
@@ -1073,6 +1442,64 @@ mod tests {
             method_from_header(r#""urn:schemas-upnp-org:service:ContentDirectory:1#Search""#),
             Some("Search")
         );
+    }
+
+    #[test]
+    fn soap_faults_match_reference_shape_and_codes() {
+        let reference = oracle("upnpsoap-faults.c");
+        for (code, description) in [
+            (401, "Invalid Action"),
+            (402, "Invalid Args"),
+            (701, "No such object error"),
+            (708, "Unsupported or invalid search criteria"),
+            (709, "Unsupported or invalid sort criteria"),
+        ] {
+            assert!(
+                reference.contains(&format!("SoapError(h, {code}, \"{description}\")")),
+                "reference call site missing {code} {description}"
+            );
+            let xml = soap_fault(code, description);
+            let document = roxmltree::Document::parse(&xml).expect("generated SOAP fault parses");
+            assert_eq!(
+                document
+                    .descendants()
+                    .find(|node| node.tag_name().name() == "errorCode")
+                    .and_then(|node| node.text()),
+                Some(code.to_string().as_str())
+            );
+            assert!(xml.contains(&format!(
+                "<errorDescription>{description}</errorDescription>"
+            )));
+            for shape in [
+                "<faultcode>s:Client</faultcode>",
+                "<faultstring>UPnPError</faultstring>",
+                "urn:schemas-upnp-org:control-1-0",
+            ] {
+                assert!(reference.contains(shape), "reference missing {shape}");
+                assert!(xml.contains(shape), "generated fault missing {shape}");
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_info_source_is_a_well_formed_entry_list() {
+        let source = protocol_info_source();
+        let entries = source.split(',').collect::<Vec<_>>();
+        // Keep this in lockstep with RESOURCE_PROTOCOL_INFO_VALUES in the
+        // reference upnpglobalvars.h: 94 adjacent string literals.
+        assert!(entries.len() >= 94, "unexpected protocol-info entry count");
+        assert!(entries.iter().all(|entry| !entry.is_empty()));
+        for entry in &entries {
+            let fields = entry.split(':').collect::<Vec<_>>();
+            assert_eq!(fields.len(), 4, "invalid protocol-info entry: {entry}");
+            assert_eq!(fields[0], "http-get", "invalid protocol: {entry}");
+            assert_eq!(fields[1], "*", "invalid network field: {entry}");
+            assert!(!fields[2].is_empty(), "missing MIME type: {entry}");
+            assert!(!fields[3].is_empty(), "missing additional info: {entry}");
+        }
+        for generated in rusty_dlna_protocol::wildcard_protocol_info_entries() {
+            assert!(entries.contains(&generated.as_str()), "missing {generated}");
+        }
     }
 
     #[test]
@@ -1173,7 +1600,10 @@ mod tests {
     fn didl_namespaces_follow_filter_bits() {
         let samsung = parse_filter(Some("*"), true);
         let xml = browse_response("<item/>", 1, 1, 1, &samsung);
-        assert!(xml.contains("xmlns:sec=\"http://www.sec.co.kr/dlna\""), "{xml}");
+        assert!(
+            xml.contains("xmlns:sec=\"http://www.sec.co.kr/dlna\""),
+            "{xml}"
+        );
         assert!(
             xml.contains("xmlns:dlna=\"urn:schemas-dlna-org:metadata-1-0/\""),
             "{xml}"
@@ -1188,35 +1618,83 @@ mod tests {
 
         let pv = parse_filter(Some("pv:subtitleFileUri"), false);
         let xml = browse_response("<item/>", 1, 1, 1, &pv);
-        assert!(xml.contains("xmlns:pv=\"http://www.pv.com/pvns/\""), "{xml}");
+        assert!(
+            xml.contains("xmlns:pv=\"http://www.pv.com/pvns/\""),
+            "{xml}"
+        );
     }
 
     #[test]
     fn parse_soap_call_reads_update_tags() {
-        let body = r#"<u:UpdateObject><ObjectID>64$1</ObjectID><CurrentTagValue>old</CurrentTagValue><NewTagValue>&lt;upnp:playCount&gt;3&lt;/upnp:playCount&gt;</NewTagValue></u:UpdateObject>"#;
+        let body = r#"<u:UpdateObject><ObjectID>64$1</ObjectID><CurrentTagValue>&lt;upnp:playCount&gt;2&lt;/upnp:playCount&gt;</CurrentTagValue><NewTagValue>&lt;upnp:playCount&gt;3&lt;/upnp:playCount&gt;</NewTagValue></u:UpdateObject>"#;
         let call = parse_soap_call("urn:x#UpdateObject", body);
         assert_eq!(call.object_id.as_deref(), Some("64$1"));
-        assert_eq!(call.current_tag_value.as_deref(), Some("old"));
-        assert!(
-            call.new_tag_value
-                .as_deref()
-                .unwrap_or("")
-                .contains("playCount")
+        assert!(call
+            .current_tag_value
+            .as_deref()
+            .unwrap_or("")
+            .contains("playCount"));
+        assert!(call
+            .new_tag_value
+            .as_deref()
+            .unwrap_or("")
+            .contains("playCount"));
+        let tags = parse_update_object_tags(
+            call.current_tag_value.as_deref().unwrap(),
+            call.new_tag_value.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            tags.playback_count,
+            Some(UpdateObjectValue { current: 2, new: 3 })
         );
-        let tags = parse_update_object_tags(call.current_tag_value.as_deref(), call.new_tag_value.as_deref());
-        assert_eq!(tags.playback_count, Some(3));
         assert_eq!(
             parse_update_object_tags(
-                None,
-                Some("<upnp:lastPlaybackPosition>90</upnp:lastPlaybackPosition>")
+                "",
+                "<upnp:lastPlaybackPosition>90</upnp:lastPlaybackPosition>"
             )
+            .unwrap()
             .last_playback_position,
-            Some(90)
+            Some(UpdateObjectValue {
+                current: 0,
+                new: 90
+            })
         );
         assert_eq!(
-            parse_update_object_tags(None, Some("upnp:lastPlaybackPosition=90,upnp:playCount=3"))
+            parse_update_object_tags("", "upnp:lastPlaybackPosition=90,upnp:playCount=3")
+                .unwrap()
                 .last_playback_position,
-            Some(90)
+            Some(UpdateObjectValue {
+                current: 0,
+                new: 90
+            })
+        );
+    }
+
+    #[test]
+    fn update_object_tag_lists_reject_malformed_read_only_and_mismatched_values() {
+        assert_eq!(
+            parse_update_object_tags("broken", "upnp:playCount=2"),
+            Err(UpdateObjectParseError::InvalidCurrent)
+        );
+        assert_eq!(
+            parse_update_object_tags("upnp:playCount=1", "upnp:playCount=nope"),
+            Err(UpdateObjectParseError::InvalidNew)
+        );
+        assert_eq!(
+            parse_update_object_tags("dc:title=Old", "dc:title=New"),
+            Err(UpdateObjectParseError::ReadOnlyTag)
+        );
+        assert_eq!(
+            parse_update_object_tags(
+                "upnp:playCount=1,upnp:lastPlaybackPosition=60",
+                "upnp:playCount=2"
+            ),
+            Err(UpdateObjectParseError::ParameterMismatch)
+        );
+        assert_eq!(
+            parse_update_object_tags("", ""),
+            Err(UpdateObjectParseError::InvalidNew)
         );
     }
 
@@ -1230,10 +1708,7 @@ mod tests {
         assert_eq!(call.filter.as_deref(), Some("*"));
         let listed = r#"<Browse><Filter>dc:title,sec:CaptionInfoEx</Filter></Browse>"#;
         let call = parse_soap_call("urn:x#Browse", listed);
-        assert_eq!(
-            call.filter.as_deref(),
-            Some("dc:title,sec:CaptionInfoEx")
-        );
+        assert_eq!(call.filter.as_deref(), Some("dc:title,sec:CaptionInfoEx"));
     }
 
     #[test]
@@ -1303,6 +1778,36 @@ mod tests {
         assert!(pv.contains("pv:subtitleFileUri=\"http://127.0.0.1:18200/Captions/9.srt\""));
         assert!(!pv.contains("sec:CaptionInfoEx"));
         assert!(!pv.contains("<dc:date>"));
+
+        let mut rich = obj.clone();
+        rich.creator = Some("Creator".into());
+        rich.description = Some("Description".into());
+        rich.artist = Some("Artist".into());
+        rich.actor = Some("Actor".into());
+        rich.album = Some("Album".into());
+        rich.genre = Some("Genre".into());
+        rich.track = Some(7);
+        rich.season = Some(2);
+        rich.episode = Some(4);
+        rich.album_art_uri = Some("http://127.0.0.1/art.jpg".into());
+        let listed = emit_didl_object(&rich, &parse_filter(Some("dc:creator,res@size"), false));
+        assert!(listed.contains("<dc:creator>Creator</dc:creator>"));
+        assert!(listed.contains("<res protocolInfo=") && listed.contains(" size=\"1\""));
+        for omitted in [
+            "dc:date",
+            "dc:description",
+            "upnp:artist",
+            "upnp:actor",
+            "upnp:album",
+            "upnp:genre",
+            "upnp:originalTrackNumber",
+            "upnp:episodeSeason",
+            "upnp:albumArtURI",
+            "upnp:lastPlaybackPosition",
+            "upnp:playbackCount",
+        ] {
+            assert!(!listed.contains(omitted), "unexpected {omitted}: {listed}");
+        }
     }
 
     fn dummy_item(ref_id: Option<&str>, search: Vec<String>) -> DidlObject {
@@ -1336,6 +1841,130 @@ mod tests {
             ref_id: ref_id.map(str::to_string),
             search_classes: search,
             av_media_class: None,
+        }
+    }
+
+    #[test]
+    fn bounded_browse_stops_on_complete_object_and_reports_exact_counts() {
+        let mut first = dummy_item(None, vec![]);
+        first.title = "A & <one> \"quoted\" 雪".repeat(32);
+        let mut second = first.clone();
+        second.id = "2$9$2".into();
+        second.title = "second".repeat(64);
+        let bits = FilterBits::standard();
+        let (one, one_count) =
+            build_browse_bounded(false, &[first.clone()], 77, 9, &bits, usize::MAX);
+        assert_eq!(one_count, 1);
+
+        let (at_boundary, returned) =
+            build_browse_bounded(false, &[first.clone(), second], 77, 9, &bits, one.len());
+        assert_eq!(returned, 1);
+        assert_eq!(at_boundary.len(), one.len());
+        assert!(at_boundary.contains("<NumberReturned>1</NumberReturned>"));
+        assert!(at_boundary.contains("<TotalMatches>77</TotalMatches>"));
+        assert!(at_boundary.ends_with("</s:Envelope>\r\n"));
+
+        let (below_boundary, returned) =
+            build_browse_bounded(true, &[first], 77, 9, &bits, one.len() - 1);
+        assert_eq!(returned, 0);
+        assert!(below_boundary.len() < one.len());
+        assert!(below_boundary.contains("<NumberReturned>0</NumberReturned>"));
+        assert!(below_boundary.contains("<TotalMatches>77</TotalMatches>"));
+        assert!(below_boundary.contains("SearchResponse"));
+    }
+
+    fn assert_xml(name: &str, xml: &str) {
+        roxmltree::Document::parse(xml).unwrap_or_else(|error| panic!("{name}: {error}\n{xml}"));
+    }
+
+    #[test]
+    fn every_generated_soap_and_didl_shape_is_well_formed_xml() {
+        let mut object = dummy_item(Some("64$<&\"'雪"), vec!["object.item.videoItem".into()]);
+        object.title = "Björk & <Friends> \"Live\" '25 雪".into();
+        object.creator = Some("Creator & Co".into());
+        object.description = Some("plot <one> & two".into());
+        object.artist = Some("artist > actor".into());
+        object.actor = Some("A&B".into());
+        object.album = Some("\"album\"".into());
+        object.genre = Some("rock 'n' roll".into());
+        object.album_art_uri = Some("http://192.0.2.1/art?a=1&b=<2>".into());
+        object.album_art_profile = true;
+        object.resources.push(DidlRes {
+            url: "http://192.0.2.1/media?a=1&b=<2>".into(),
+            protocol_info: "http-get:*:video/mp4:DLNA.ORG_PN=X&Y".into(),
+            size: Some(42),
+            duration: Some("0:00:01.000".into()),
+            bitrate: Some(1),
+            resolution: Some("1x1".into()),
+            sample_frequency: Some(48_000),
+            nr_audio_channels: Some(2),
+            pv_subtitle_type: Some("SRT".into()),
+            pv_subtitle_uri: Some("http://192.0.2.1/cap?a=1&b=2".into()),
+        });
+        object.captions.push(DidlCaption {
+            ext: "srt".into(),
+            url: "http://192.0.2.1/cap?a=1&b=2".into(),
+        });
+        object.dcm_info = Some("CREATIONDATE=0,FOLDER=A&B".into());
+        let bits = parse_filter(Some("*"), true);
+        let raw_didl = format!(
+            "<DIDL-Lite{}>{}</DIDL-Lite>",
+            didl_xmlns(&bits),
+            emit_didl(&[object.clone()], &bits)
+        );
+        assert_xml("raw DIDL", &raw_didl);
+
+        for (name, xml) in [
+            (
+                "Browse SOAP",
+                build_browse(false, &[object.clone()], 1, 1, 7, &bits),
+            ),
+            (
+                "Search SOAP",
+                build_browse(true, &[object.clone()], 1, 1, 7, &bits),
+            ),
+            (
+                "bounded Browse SOAP",
+                build_browse_bounded(false, &[object], 1, 7, &bits, 2 * 1024 * 1024).0,
+            ),
+            ("SOAP fault", soap_fault(402, "Invalid Args & <bad>")),
+            (
+                "empty ContentDirectory response",
+                empty_cd_response("UpdateObject"),
+            ),
+        ] {
+            let document = roxmltree::Document::parse(&xml)
+                .unwrap_or_else(|error| panic!("{name}: {error}\n{xml}"));
+            if let Some(result) = document
+                .descendants()
+                .find(|node| node.tag_name().name() == "Result")
+                .and_then(|node| node.text())
+                .filter(|text| text.contains("DIDL-Lite"))
+            {
+                assert_xml(&format!("{name} Result DIDL"), result);
+            }
+        }
+
+        let client = rusty_dlna_protocol::identify_user_agent("Kodi/21.0").unwrap();
+        for (method, body) in [
+            ("GetSearchCapabilities", ""),
+            ("GetSortCapabilities", ""),
+            ("GetSystemUpdateID", ""),
+            ("GetProtocolInfo", ""),
+            ("GetCurrentConnectionIDs", ""),
+            ("GetCurrentConnectionInfo", "<ConnectionID>0</ConnectionID>"),
+            ("IsAuthorized", "<DeviceID>uuid:client</DeviceID>"),
+            ("IsValidated", "<DeviceID></DeviceID>"),
+            ("RegisterDevice", ""),
+            ("X_GetFeatureList", ""),
+            ("QueryStateVariable", "<varName>ConnectionStatus</varName>"),
+        ] {
+            let call = parse_soap_call(&format!("urn:x#{method}"), body);
+            let Some(SoapOutcome::Ok(xml)) = dispatch_simple(&call, client, "uuid:a&<b>", 9, None)
+            else {
+                panic!("{method} did not produce success XML");
+            };
+            assert_xml(method, &xml);
         }
     }
 
@@ -1376,40 +2005,33 @@ mod tests {
 
     #[test]
     fn extra_ci1_protocol_infos_toshiba_sony_bdp_bravia() {
-        let toshiba = extra_ci1_protocol_infos(
-            ClientKind::ToshibaTv,
-            "video/mpeg",
-            Some("MPEG_TS_HD_NA"),
-        );
+        let toshiba =
+            extra_ci1_protocol_infos(ClientKind::ToshibaTv, "video/mpeg", Some("MPEG_TS_HD_NA"));
         assert!(
             toshiba.iter().any(|(_, info)| {
                 info.contains("DLNA.ORG_PN=MPEG_PS_NTSC") && info.contains("DLNA.ORG_CI=1")
             }),
             "{toshiba:?}"
         );
-        let none = extra_ci1_protocol_infos(ClientKind::ToshibaTv, "video/mpeg", Some("MPEG_PS_NTSC"));
+        let none =
+            extra_ci1_protocol_infos(ClientKind::ToshibaTv, "video/mpeg", Some("MPEG_PS_NTSC"));
         assert!(none.is_empty(), "{none:?}");
 
-        let bdp_ts = extra_ci1_protocol_infos(
-            ClientKind::SonyBdp,
-            "video/mpeg",
-            Some("AVC_TS_MP_HD_AC3"),
-        );
+        let bdp_ts =
+            extra_ci1_protocol_infos(ClientKind::SonyBdp, "video/mpeg", Some("AVC_TS_MP_HD_AC3"));
         assert!(
-            bdp_ts.iter().any(|(_, info)| info.contains("MPEG_TS_SD_NA")
-                && info.contains("DLNA.ORG_CI=1")),
+            bdp_ts
+                .iter()
+                .any(|(_, info)| info.contains("MPEG_TS_SD_NA") && info.contains("DLNA.ORG_CI=1")),
             "{bdp_ts:?}"
         );
         assert!(
-            bdp_ts.iter().any(|(_, info)| info.contains("MPEG_TS_SD_EU")
-                && info.contains("DLNA.ORG_CI=1")),
+            bdp_ts
+                .iter()
+                .any(|(_, info)| info.contains("MPEG_TS_SD_EU") && info.contains("DLNA.ORG_CI=1")),
             "{bdp_ts:?}"
         );
-        let bdp_mkv = extra_ci1_protocol_infos(
-            ClientKind::SonyBdp,
-            "video/x-matroska",
-            None,
-        );
+        let bdp_mkv = extra_ci1_protocol_infos(ClientKind::SonyBdp, "video/x-matroska", None);
         assert!(
             bdp_mkv.iter().any(|(m, info)| {
                 m == "video/avi" && info.contains("MPEG_PS_NTSC") && info.contains("CI=1")
@@ -1486,6 +2108,55 @@ mod tests {
     }
 
     #[test]
+    fn connection_info_requires_a_well_formed_connection_id() {
+        let client = rusty_dlna_protocol::identify_user_agent("Kodi/21.0").unwrap();
+        for body in [
+            "",
+            "<ConnectionID></ConnectionID>",
+            "<ConnectionID>abc</ConnectionID>",
+        ] {
+            let call = parse_soap_call("urn:x#GetCurrentConnectionInfo", body);
+            assert!(matches!(
+                dispatch_simple(&call, client, "uuid:x", 1, None),
+                Some(SoapOutcome::Fault { code: 402, .. })
+            ));
+        }
+        let nonzero = parse_soap_call(
+            "urn:x#GetCurrentConnectionInfo",
+            "<ConnectionID>7</ConnectionID>",
+        );
+        assert!(matches!(
+            dispatch_simple(&nonzero, client, "uuid:x", 1, None),
+            Some(SoapOutcome::Fault { code: 701, .. })
+        ));
+        let zero = parse_soap_call(
+            "urn:x#GetCurrentConnectionInfo",
+            "<ConnectionID>00</ConnectionID>",
+        );
+        assert!(matches!(
+            dispatch_simple(&zero, client, "uuid:x", 1, None),
+            Some(SoapOutcome::Ok(_))
+        ));
+    }
+
+    #[test]
+    fn registrar_authorization_requires_device_id_element() {
+        let client = rusty_dlna_protocol::identify_user_agent("Kodi/21.0").unwrap();
+        for method in ["IsAuthorized", "IsValidated"] {
+            let missing = parse_soap_call(&format!("urn:x#{method}"), "");
+            assert!(matches!(
+                dispatch_simple(&missing, client, "uuid:x", 1, None),
+                Some(SoapOutcome::Fault { code: 402, .. })
+            ));
+            let present = parse_soap_call(&format!("urn:x#{method}"), "<DeviceID></DeviceID>");
+            assert!(matches!(
+                dispatch_simple(&present, client, "uuid:x", 1, None),
+                Some(SoapOutcome::Ok(_))
+            ));
+        }
+    }
+
+    #[test]
     fn didl_emits_search_class_and_refid() {
         let root = DidlObject {
             id: "0".into(),
@@ -1524,7 +2195,9 @@ mod tests {
         };
         let xml = emit_didl_object(&root, &FilterBits::standard());
         assert!(
-            xml.contains("<upnp:searchClass includeDerived=\"1\">object.item.audioItem</upnp:searchClass>"),
+            xml.contains(
+                "<upnp:searchClass includeDerived=\"1\">object.item.audioItem</upnp:searchClass>"
+            ),
             "{xml}"
         );
         assert!(xml.contains("object.item.imageItem"), "{xml}");

@@ -18,7 +18,7 @@ pub fn notify_max_age(notify_interval_secs: u32) -> u32 {
     notify_interval_secs.saturating_mul(2).saturating_add(10)
 }
 
-pub fn known_service_types<'a>(uuid: &'a str) -> [&'a str; 6] {
+pub fn known_service_types(uuid: &str) -> [&str; 6] {
     [
         uuid,
         NT_ROOTDEVICE,

@@ -1,32 +1,130 @@
 //! Library scan: skip rules, NFO dates, captions, inode reuse, SQLite store.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 pub mod db;
 pub mod nfo;
+mod playlist;
 pub mod probe;
 pub mod watch;
-pub use db::{mime_to_ext, LibraryDb};
+pub use db::{
+    mime_to_ext, CatalogDefaultOrder, CatalogQuery, CatalogQueryClause, CatalogQueryField,
+    CatalogQueryOp, CatalogQueryPage, CatalogQuerySort, DetailStat, DetailStreamUpdate,
+    ExistingDetail, InodeSource, LibraryDb, NewDetail,
+};
 pub use nfo::{
-    episode_display_title, nfo_date_from_text, nfo_for_file, nfo_too_large, parse_nfo_text,
-    split_genres, NfoMeta,
+    episode_display_title, nfo_date_from_text, nfo_for_file, nfo_for_file_with_policy,
+    nfo_for_file_with_policy_result, nfo_too_large, parse_nfo_text, split_genres, NfoError,
+    NfoMeta,
 };
 pub use probe::{
-    attached_pic_stream, extract_attached_pic, generate_video_thumb, probe_media, scale_jpeg,
-    MediaProbe,
+    attached_pic_stream, extract_attached_pic, extract_attached_pic_result,
+    extract_attached_pic_with_limits_result, extract_attached_pic_with_timeout_result,
+    extract_exif_thumbnail_result, extract_exif_thumbnail_with_limit_result, generate_video_thumb,
+    generate_video_thumb_result, generate_video_thumb_with_limits_result, probe_image,
+    probe_image_with_timeout, probe_media, probe_media_with_timeout, scale_jpeg, scale_jpeg_result,
+    scale_jpeg_with_options_result, MediaProbe,
 };
-pub use watch::{repair_objects_if_needed, run_inotify};
+pub use watch::{repair_objects_if_needed, run_inotify, run_inotify_until, WatchTelemetry};
 
 use rusty_dlna_protocol::object_id::{
     BROWSEDIR_ID, IMAGE_ALBUM_ID, IMAGE_ALL_ID, IMAGE_CAMERA_ID, IMAGE_DATE_ID, IMAGE_DIR_ID,
     IMAGE_ID, IMAGE_PLIST_ID, IMAGE_RATING_ID, IMAGE_RECENT_ID, MUSIC_ALBUM_ARTIST_ID,
     MUSIC_ALBUM_ID, MUSIC_ALL_ID, MUSIC_ARTIST_ID, MUSIC_COMPOSER_ID, MUSIC_CONTRIB_ARTIST_ID,
     MUSIC_DIR_ID, MUSIC_GENRE_ID, MUSIC_ID, MUSIC_PLIST_ID, MUSIC_RATING_ID, MUSIC_RECENT_ID,
-    RECENT_MAX, ROOT_ID, VIDEO_ACTOR_ID, VIDEO_ALL_ID, VIDEO_DIR_ID,
-    VIDEO_GENRE_ID, VIDEO_ID, VIDEO_PLIST_ID, VIDEO_RATING_ID, VIDEO_RECENT_ID, VIDEO_SERIES_ID,
+    RECENT_MAX, ROOT_ID, VIDEO_ACTOR_ID, VIDEO_ALL_ID, VIDEO_DIR_ID, VIDEO_GENRE_ID, VIDEO_ID,
+    VIDEO_PLIST_ID, VIDEO_RATING_ID, VIDEO_RECENT_ID, VIDEO_SERIES_ID,
 };
 use rusty_dlna_protocol::w3c_date_from_unix;
+use rusty_dlna_protocol::{media_format_for_name, MediaKind, ResolvedMediaFormat};
+
+const PATH_HEX_PREFIX: &str = "RDLNA_PATH_HEX_V1:";
+const PATH_UTF8_ESCAPE_PREFIX: &str = "RDLNA_PATH_UTF8_V1:";
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn unhex_bytes(encoded: &str) -> Option<Vec<u8>> {
+    fn digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    if encoded.len() & 1 != 0 {
+        return None;
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Some(digit(pair[0])? << 4 | digit(pair[1])?))
+        .collect()
+}
+
+/// Reversible SQLite TEXT representation. Ordinary UTF-8 stays readable;
+/// invalid Unix bytes and reserved-prefix UTF-8 names are hex escaped.
+pub fn path_to_db(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        match std::str::from_utf8(bytes) {
+            Ok(text)
+                if !text.starts_with(PATH_HEX_PREFIX)
+                    && !text.starts_with(PATH_UTF8_ESCAPE_PREFIX) =>
+            {
+                text.to_string()
+            }
+            Ok(_) => format!("{PATH_UTF8_ESCAPE_PREFIX}{}", hex_bytes(bytes)),
+            Err(_) => format!("{PATH_HEX_PREFIX}{}", hex_bytes(bytes)),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+pub fn path_from_db(stored: &str) -> PathBuf {
+    let encoded = stored
+        .strip_prefix(PATH_HEX_PREFIX)
+        .or_else(|| stored.strip_prefix(PATH_UTF8_ESCAPE_PREFIX));
+    #[cfg(unix)]
+    if let Some(bytes) = encoded.and_then(unhex_bytes) {
+        use std::os::unix::ffi::OsStringExt;
+        return PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    }
+    PathBuf::from(stored)
+}
+
+/// Stable UI text for a filesystem name. Invalid UTF-8 is lossy for display
+/// only, with a raw-byte digest so distinct names cannot collapse together.
+fn display_os_name(name: &OsStr) -> String {
+    if let Some(text) = name.to_str() {
+        return text.to_string();
+    }
+    use sha1::{Digest, Sha1};
+    let digest = Sha1::digest(name.as_encoded_bytes());
+    format!(
+        "{} [{:02x}{:02x}{:02x}{:02x}]",
+        name.to_string_lossy(),
+        digest[0],
+        digest[1],
+        digest[2],
+        digest[3]
+    )
+}
 
 pub fn is_junk_dir(name: &str) -> bool {
     matches!(
@@ -63,15 +161,20 @@ pub fn is_skipped_dir(name: &str) -> bool {
 pub fn path_is_unwanted(path: &Path, cfg: &ScanConfig) -> bool {
     let name = path
         .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    path_excluded(path, name, cfg)
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default();
+    let live = rebase_media_path_for_config(path, cfg);
+    !path_is_allowed_file(&live, cfg)
+        || !cfg
+            .root_types_for_path(&live)
+            .is_some_and(|types| types.allows(&name))
+        || path_excluded(path, &name, cfg)
         || path
             .components()
             .any(|c| c.as_os_str().to_str().is_some_and(is_skipped_dir))
-        || is_unfinished_name(name)
-        || looks_like_sample_file(name)
-        || is_album_art_name(name)
+        || is_unfinished_name(&name)
+        || looks_like_sample_file(&name)
+        || is_album_art_name(&name)
 }
 
 pub fn is_unfinished_name(name: &str) -> bool {
@@ -143,28 +246,17 @@ fn ends_with_ci(name: &str, suffix: &str) -> bool {
 
 /// dialect `is_video` (`scanner skip rules`).
 pub fn is_video(name: &str) -> bool {
-    [
-        ".mpg", ".mpeg", ".avi", ".divx", ".asf", ".wmv", ".mp4", ".m4v", ".mts",
-        ".m2ts", ".m2t", ".mkv", ".vob", ".ts", ".flv", ".xvid", ".mov", ".3gp",
-        ".rm", ".rmvb", ".webm",
-    ]
-    .iter()
-    .any(|s| ends_with_ci(name, s))
+    media_format_for_name(name).is_some_and(|format| format.video_mime.is_some())
 }
 
 /// dialect `is_audio`.
 pub fn is_audio(name: &str) -> bool {
-    [
-        ".mp3", ".flac", ".wma", ".asf", ".fla", ".flc", ".m4a", ".aac", ".mp4",
-        ".m4p", ".wav", ".ogg", ".pcm", ".3gp", ".dsf", ".dff",
-    ]
-    .iter()
-    .any(|s| ends_with_ci(name, s))
+    media_format_for_name(name).is_some_and(|format| format.audio_mime.is_some())
 }
 
 /// dialect `is_image` — JPEG only (not PNG).
 pub fn is_image(name: &str) -> bool {
-    ends_with_ci(name, ".jpg") || ends_with_ci(name, ".jpeg")
+    media_format_for_name(name).is_some_and(|format| format.image_mime.is_some())
 }
 
 pub fn is_album_art_name(name: &str) -> bool {
@@ -211,42 +303,125 @@ pub fn is_jpeg_bytes(bytes: &[u8]) -> bool {
 
 /// First matching sidecar next to `video_path`. Stem poster, then fanart,
 /// then folder poster/folder/cover (MiniDLNA case variants).
+const FOLDER_ART_NAMES: &[&str] = &[
+    "poster.jpg",
+    "Poster.jpg",
+    "poster.png",
+    "poster.jpeg",
+    "Poster.jpeg",
+    "Poster.png",
+    "folder.jpg",
+    "Folder.jpg",
+    "folder.png",
+    "folder.jpeg",
+    "Folder.jpeg",
+    "Folder.png",
+    "cover.jpg",
+    "Cover.jpg",
+    "cover.png",
+    "cover.jpeg",
+    "Cover.jpeg",
+    "Cover.png",
+];
+
 pub fn find_album_art(video_path: &Path) -> Option<PathBuf> {
     let parent = video_path.parent()?;
-    let stem = video_path.file_stem()?.to_str()?;
+    let stem = video_path.file_stem()?;
     for suffix in ["-poster.jpg", "-poster.png", "-fanart.jpg", "-fanart.png"] {
-        let p = parent.join(format!("{stem}{suffix}"));
+        let mut name = stem.to_os_string();
+        name.push(suffix);
+        let p = parent.join(name);
         if p.is_file() {
             return Some(p);
         }
     }
-    const FOLDER: &[&str] = &[
-        "poster.jpg",
-        "Poster.jpg",
-        "poster.png",
-        "poster.jpeg",
-        "Poster.jpeg",
-        "Poster.png",
-        "folder.jpg",
-        "Folder.jpg",
-        "folder.png",
-        "folder.jpeg",
-        "Folder.jpeg",
-        "Folder.png",
-        "cover.jpg",
-        "Cover.jpg",
-        "cover.png",
-        "cover.jpeg",
-        "Cover.jpeg",
-        "Cover.png",
-    ];
-    for name in FOLDER {
+    for name in FOLDER_ART_NAMES {
         let p = parent.join(name);
         if p.is_file() {
             return Some(p);
         }
     }
     None
+}
+
+fn find_album_art_for_config(video_path: &Path, cfg: &ScanConfig) -> Option<PathBuf> {
+    let parent = video_path.parent()?;
+    if let Some(stem) = video_path.file_stem()?.to_str() {
+        for configured in &cfg.album_art_names {
+            // Names are basenames by contract. Validation rejects separators, but
+            // retain this guard for embedders that construct ScanConfig directly.
+            if Path::new(configured)
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some(configured)
+            {
+                continue;
+            }
+            let name = configured.replace("{stem}", stem).replace("%s", stem);
+            let candidate = parent.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    find_album_art(video_path)
+}
+
+fn find_album_art_in_inventory(
+    media_path: &Path,
+    cfg: &ScanConfig,
+    files: &HashMap<OsString, PathBuf>,
+) -> Option<PathBuf> {
+    let stem = media_path.file_stem()?;
+    if let Some(stem_text) = stem.to_str() {
+        for configured in &cfg.album_art_names {
+            if Path::new(configured)
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some(configured.as_str())
+            {
+                continue;
+            }
+            let name = configured
+                .replace("{stem}", stem_text)
+                .replace("%s", stem_text);
+            if let Some(path) = files.get(OsStr::new(&name)) {
+                return Some(path.clone());
+            }
+        }
+    }
+    for suffix in ["-poster.jpg", "-poster.png", "-fanart.jpg", "-fanart.png"] {
+        let mut name = stem.to_os_string();
+        name.push(suffix);
+        if let Some(path) = files.get(&name) {
+            return Some(path.clone());
+        }
+    }
+    for name in FOLDER_ART_NAMES {
+        if let Some(path) = files.get(OsStr::new(name)) {
+            return Some(path.clone());
+        }
+    }
+    None
+}
+
+pub fn is_album_art_name_for_config(name: &str, cfg: &ScanConfig) -> bool {
+    is_album_art_name(name)
+        || cfg.album_art_names.iter().any(|pattern| {
+            if pattern.contains("{stem}") || pattern.contains("%s") {
+                let suffix = pattern
+                    .split_once("{stem}")
+                    .or_else(|| pattern.split_once("%s"))
+                    .map(|(_, suffix)| suffix)
+                    .unwrap_or("");
+                !suffix.is_empty()
+                    && name
+                        .to_ascii_lowercase()
+                        .ends_with(&suffix.to_ascii_lowercase())
+            } else {
+                name.eq_ignore_ascii_case(pattern)
+            }
+        })
 }
 
 fn sha1_hex(data: &[u8]) -> String {
@@ -261,55 +436,126 @@ fn sha1_hex(data: &[u8]) -> String {
     s
 }
 
-fn convert_image_to_jpeg(src: &Path, dest: &Path) -> bool {
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
+fn source_image_identity(path: &Path) -> ScanResult<String> {
+    use sha1::{Digest, Sha1};
+    use std::io::{Read, Seek, SeekFrom};
+
+    let metadata = std::fs::metadata(path).map_err(|error| scan_io(path, error))?;
+    let mut hasher = Sha1::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        hasher.update(metadata.dev().to_le_bytes());
+        hasher.update(metadata.ino().to_le_bytes());
     }
-    std::process::Command::new("ffmpeg")
-        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-        .arg(src)
-        .arg(dest)
-        .status()
-        .map(|s| s.success() && dest.is_file())
-        .unwrap_or(false)
+    #[cfg(not(unix))]
+    hasher.update(
+        std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .as_bytes(),
+    );
+    hasher.update(metadata.len().to_le_bytes());
+    if let Ok(modified) = metadata.modified() {
+        if let Ok(modified) = modified.duration_since(std::time::UNIX_EPOCH) {
+            hasher.update(modified.as_secs().to_le_bytes());
+            hasher.update(modified.subsec_nanos().to_le_bytes());
+        }
+    }
+    let mut file = std::fs::File::open(path).map_err(|error| scan_io(path, error))?;
+    const SAMPLE: u64 = 32 * 1024;
+    let mut offsets = [
+        0,
+        metadata.len().saturating_div(2).saturating_sub(SAMPLE / 2),
+        metadata.len().saturating_sub(SAMPLE),
+    ];
+    offsets.sort_unstable();
+    let mut last = None;
+    let mut sample = vec![0; SAMPLE as usize];
+    for offset in offsets {
+        if last == Some(offset) {
+            continue;
+        }
+        last = Some(offset);
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| scan_io(path, error))?;
+        let read = file
+            .read(&mut sample)
+            .map_err(|error| scan_io(path, error))?;
+        hasher.update(offset.to_le_bytes());
+        hasher.update(&sample[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn image_within_limits(cfg: &ScanConfig, src: &Path) -> bool {
+    let Some(image) = probe_image_with_timeout(src, cfg.external_command_timeout) else {
+        return false;
+    };
+    u64::from(image.probe.width)
+        .checked_mul(u64::from(image.probe.height))
+        .is_some_and(|pixels| pixels > 0 && pixels <= cfg.image_max_pixels)
+}
+
+fn convert_image_to_jpeg(cfg: &ScanConfig, src: &Path, dest: &Path) -> ScanResult<bool> {
+    crate::probe::with_atomic_image_destination(dest, |temporary| {
+        let mut command = std::process::Command::new("ffmpeg");
+        command
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-max_alloc"])
+            .arg(cfg.image_memory_limit_bytes.to_string())
+            .args(["-threads", "1", "-i"])
+            .arg(src)
+            .arg(temporary);
+        crate::probe::command_status_with_timeout(&mut command, cfg.external_command_timeout)
+            .map(|status| status.success())
+    })
+    .map_err(|error| scan_io(src, error))
 }
 
 /// JPEG sidecars stay in place. Anything else is converted once under
 /// `{db_path.parent()}/art/{sha1}.jpg`. Memory DBs skip conversion.
-pub fn persist_album_art_file(cfg: &ScanConfig, src: &Path) -> Option<PathBuf> {
-    let bytes = std::fs::read(src).ok()?;
-    if bytes.is_empty() {
-        return None;
+pub fn persist_album_art_file(cfg: &ScanConfig, src: &Path) -> ScanResult<Option<PathBuf>> {
+    let metadata = std::fs::metadata(src).map_err(|error| scan_io(src, error))?;
+    if metadata.len() == 0 || metadata.len() > cfg.image_memory_limit_bytes {
+        return Ok(None);
     }
-    if is_jpeg_bytes(&bytes) {
-        return Some(src.to_path_buf());
+    if !image_within_limits(cfg, src) {
+        return Ok(None);
     }
-    let cache = cfg.db_path.as_ref()?.parent()?;
-    let dest = cache.join("art").join(format!("{}.jpg", sha1_hex(&bytes)));
+    let mut magic = [0u8; 3];
+    let jpeg = std::fs::File::open(src)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic))
+        .is_ok()
+        && is_jpeg_bytes(&magic);
+    if jpeg {
+        return Ok(Some(src.to_path_buf()));
+    }
+    let Some(cache) = cfg.db_path.as_ref().and_then(|path| path.parent()) else {
+        return Ok(None);
+    };
+    let dest = cache
+        .join("art")
+        .join(format!("{}.jpg", source_image_identity(src)?));
     if dest.is_file() {
-        return Some(dest);
+        return Ok(Some(dest));
     }
-    if convert_image_to_jpeg(src, &dest) {
-        Some(dest)
+    if convert_image_to_jpeg(cfg, src, &dest)? {
+        Ok(Some(dest))
     } else {
-        None
+        Ok(None)
     }
 }
 
-fn store_album_art_path(db: &LibraryDb, stored: &Path, detail_id: i64) -> bool {
-    let stored_s = stored.to_string_lossy();
-    let Ok(art_id) = db.upsert_album_art(&stored_s) else {
-        return false;
-    };
-    let prev = db.detail_album_art(detail_id);
+fn store_album_art_path(db: &LibraryDb, stored: &Path, detail_id: i64) -> ScanResult<bool> {
+    let stored_s = path_to_db(stored);
+    let art_id = db.upsert_album_art(&stored_s)?;
+    let prev = db.detail_album_art(detail_id)?;
     if prev == art_id {
-        return false;
+        return Ok(false);
     }
-    if db.set_detail_album_art(detail_id, art_id).is_err() {
-        return false;
-    }
-    let _ = db.copy_album_art_to_inode_aliases(detail_id);
-    true
+    db.set_detail_album_art(detail_id, art_id)?;
+    db.copy_album_art_to_inode_aliases(detail_id)?;
+    Ok(true)
 }
 
 fn cache_art_jpeg(cfg: &ScanConfig, key: &str) -> Option<PathBuf> {
@@ -317,50 +563,174 @@ fn cache_art_jpeg(cfg: &ScanConfig, key: &str) -> Option<PathBuf> {
     Some(cache.join("art").join(format!("{key}.jpg")))
 }
 
-fn attach_album_art(db: &LibraryDb, cfg: &ScanConfig, path: &Path, detail_id: i64) -> bool {
-    if let Some(src) = find_album_art(path) {
-        if let Some(stored) = persist_album_art_file(cfg, &src) {
-            return store_album_art_path(db, &stored, detail_id);
+/// Resolve or generate artwork without touching SQLite. The cache identity is
+/// physical-file based, so hard links and paths below symlinked directories
+/// converge on one derivative instead of running ffmpeg once per DETAILS row.
+fn prepare_album_art(cfg: &ScanConfig, path: &Path) -> ScanResult<Option<PathBuf>> {
+    if !path_is_allowed_file(path, cfg) {
+        return Ok(None);
+    }
+    if let Some(src) = find_album_art_for_config(path, cfg).filter(|p| path_is_allowed_file(p, cfg))
+    {
+        if let Some(stored) = persist_album_art_file(cfg, &src)? {
+            return Ok(Some(stored));
         }
     }
-    if let Some(dest) = cache_art_jpeg(cfg, &format!("embed-{detail_id}")) {
-        if dest.is_file() || extract_attached_pic(path, &dest) {
-            if dest.is_file() {
-                return store_album_art_path(db, &dest, detail_id);
-            }
+    let stamp = if cfg.thumbnails {
+        source_image_identity(path).ok()
+    } else {
+        None
+    };
+    let embedded_dest = stamp
+        .as_deref()
+        .and_then(|stamp| cache_art_jpeg(cfg, &format!("embed-{stamp}")));
+    if let Some(dest) = embedded_dest.as_ref().filter(|dest| dest.is_file()) {
+        return Ok(Some(dest.clone()));
+    }
+    let is_video_item = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_video);
+    let thumbnail_dest = (is_video_item && cfg.thumbnails)
+        .then(|| {
+            stamp
+                .as_deref()
+                .and_then(|stamp| cache_art_jpeg(cfg, &format!("thumb-{stamp}")))
+        })
+        .flatten();
+    // A generated thumbnail means the first preparation already found no
+    // usable sidecar/embedded cover. Reuse that physical cache result instead
+    // of retrying attached-picture extraction for every symlink alias and
+    // every periodic reconciliation.
+    if let Some(dest) = thumbnail_dest.as_ref().filter(|dest| dest.is_file()) {
+        return Ok(Some(dest.clone()));
+    }
+    if let Some(dest) = embedded_dest {
+        let image_thumb = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_image)
+            && extract_exif_thumbnail_with_limit_result(
+                path,
+                &dest,
+                cfg.image_memory_limit_bytes.min(usize::MAX as u64) as usize,
+            )
+            .map_err(|error| scan_io(&dest, error))?;
+        let generated = dest.is_file()
+            || image_thumb
+            || extract_attached_pic_with_limits_result(
+                path,
+                &dest,
+                cfg.external_command_timeout,
+                cfg.image_memory_limit_bytes,
+            )
+            .map_err(|error| scan_io(&dest, error))?;
+        if generated && dest.is_file() {
+            return Ok(Some(dest));
         }
     }
-    if db.detail_album_art(detail_id) > 0 {
-        return false;
-    }
-    if let Some(dest) = cache_art_jpeg(cfg, &format!("thumb-{detail_id}")) {
-        if dest.is_file() || generate_video_thumb(path, &dest) {
-            if dest.is_file() {
-                return store_album_art_path(db, &dest, detail_id);
-            }
+    if let Some(dest) = thumbnail_dest {
+        let generated = crate::probe::generate_video_thumb_with_limits_result(
+            path,
+            &dest,
+            cfg.thumbnail_width,
+            cfg.thumbnail_quality,
+            cfg.thumbnail_filmstrip,
+            cfg.external_command_timeout,
+            cfg.image_memory_limit_bytes,
+        )
+        .map_err(|error| scan_io(&dest, error))?;
+        if generated && dest.is_file() {
+            return Ok(Some(dest));
         }
     }
-    false
+    Ok(None)
 }
 
-fn apply_nfo_to_detail(db: &LibraryDb, id: i64, nfo: &NfoMeta) {
-    if nfo.is_empty() {
+fn apply_prepared_album_art(
+    db: &LibraryDb,
+    detail_id: i64,
+    stored: Option<&Path>,
+) -> ScanResult<bool> {
+    match stored {
+        Some(stored) => store_album_art_path(db, stored, detail_id),
+        None => db.clear_detail_album_art(detail_id).map_err(Into::into),
+    }
+}
+
+fn attach_album_art(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    path: &Path,
+    detail_id: i64,
+) -> ScanResult<bool> {
+    let stored = prepare_album_art(cfg, path)?;
+    apply_prepared_album_art(db, detail_id, stored.as_deref())
+}
+
+fn attach_album_art_for_index(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    path: &Path,
+    detail_id: i64,
+    prepared: Option<&PreparedPhysicalFile>,
+) -> ScanResult<bool> {
+    match prepared {
+        Some(prepared) => apply_prepared_album_art(db, detail_id, prepared.album_art.as_deref()),
+        None => attach_album_art(db, cfg, path, detail_id),
+    }
+}
+
+fn remove_stale_cached_art(cfg: &ScanConfig, paths: &[String]) {
+    let Some(owned_dir) = cfg
+        .db_path
+        .as_ref()
+        .and_then(|db_path| db_path.parent())
+        .map(|parent| parent.join("art"))
+    else {
         return;
-    }
-    let _ = db.update_detail_nfo(id, nfo);
-    let _ = db.copy_nfo_to_inode_aliases(id);
-}
-
-fn find_or_create_container(db: &LibraryDb, parent: &str, name: &str, class: &str) -> String {
-    if let Some(oid) = db.find_child_object(parent, name) {
-        if db.object_detail_id(&oid).is_none() {
-            let _ = db.upsert_object(&oid, parent, class, None, name, None);
-            return oid;
+    };
+    for path in paths {
+        let path = path_from_db(path);
+        if !path.starts_with(&owned_dir)
+            || path.extension().and_then(|ext| ext.to_str()) != Some("jpg")
+        {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::debug!(path = %path.display(), "removed unreferenced artwork cache"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not remove unreferenced artwork cache")
+            }
         }
     }
-    let id = allocate_child_id(db, parent);
-    let _ = db.upsert_object(&id, parent, class, None, name, None);
-    id
+}
+
+fn apply_nfo_to_detail(db: &LibraryDb, id: i64, nfo: &NfoMeta) -> ScanResult<()> {
+    if nfo.is_empty() {
+        return Ok(());
+    }
+    db.update_detail_nfo(id, nfo)?;
+    db.copy_nfo_to_inode_aliases(id)?;
+    Ok(())
+}
+
+fn find_or_create_container(
+    db: &LibraryDb,
+    parent: &str,
+    name: &str,
+    class: &str,
+) -> ScanResult<String> {
+    if let Some(oid) = db.find_child_object(parent, name)? {
+        if db.object_detail_id(&oid)?.is_none() {
+            db.upsert_object(&oid, parent, class, None, name, None)?;
+            return Ok(oid);
+        }
+    }
+    let id = allocate_child_id(db, parent)?;
+    db.upsert_object(&id, parent, class, None, name, None)?;
+    Ok(id)
 }
 
 fn recent_root(id: &str) -> Option<&'static str> {
@@ -380,165 +750,257 @@ fn season_folder_title(disc: Option<i64>) -> Option<String> {
     }
 }
 
-fn attach_video_virtuals(db: &LibraryDb, detail: i64, class: &str, browse_oid: &str) {
+fn attach_video_virtuals(
+    db: &LibraryDb,
+    detail: i64,
+    class: &str,
+    browse_oid: &str,
+) -> ScanResult<()> {
     if !class.contains("video") {
-        return;
+        return Ok(());
     }
-    let Ok((album, genre, disc, _track, title)) = db.detail_group_fields(detail) else {
-        return;
-    };
-    let title = title.unwrap_or_default();
-    let _ = db.delete_detail_under_root(detail, VIDEO_SERIES_ID);
-    let _ = db.delete_detail_under_root(detail, VIDEO_GENRE_ID);
-    let _ = db.delete_detail_under_root(detail, VIDEO_ACTOR_ID);
-    if let Some(show) = album.as_deref().filter(|s| !s.is_empty()) {
-        let show_id = find_or_create_container(
-            db,
-            VIDEO_SERIES_ID,
-            show,
-            "container.album.videoAlbum",
-        );
-        let parent = match season_folder_title(disc) {
-            Some(season) => find_or_create_container(
-                db,
-                &show_id,
-                &season,
-                "container.storageFolder",
-            ),
+    let fields = db.detail_group_fields(detail)?;
+    let title = fields.title.unwrap_or_default();
+    let device = fields.device;
+    let inode = fields.inode;
+    db.delete_detail_under_root(detail, VIDEO_SERIES_ID)?;
+    db.delete_detail_under_root(detail, VIDEO_GENRE_ID)?;
+    db.delete_detail_under_root(detail, VIDEO_ACTOR_ID)?;
+    if let Some(show) = fields.album.as_deref().filter(|s| !s.is_empty()) {
+        let show_id =
+            find_or_create_container(db, VIDEO_SERIES_ID, show, "container.album.videoAlbum")?;
+        let parent = match season_folder_title(fields.disc) {
+            Some(season) => {
+                find_or_create_container(db, &show_id, &season, "container.storageFolder")?
+            }
             None => show_id,
         };
         let ep_name = episode_display_title(&title, Some(show));
-        let ep_id = format!("{parent}${detail:X}");
-        let _ = db.upsert_object(
-            &ep_id,
-            &parent,
-            class,
-            Some(detail),
-            &ep_name,
-            Some(browse_oid),
-        );
+        if !db.folder_has_inode(&parent, device, inode)? {
+            let ep_id = format!("{parent}${detail:X}");
+            db.upsert_object(
+                &ep_id,
+                &parent,
+                class,
+                Some(detail),
+                &ep_name,
+                Some(browse_oid),
+            )?;
+        }
     }
-    if let Some(g) = genre.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(g) = fields.genre.as_deref().filter(|s| !s.is_empty()) {
         for name in split_genres(g) {
-            let gid = find_or_create_container(db, VIDEO_GENRE_ID, &name, "container.genre.videoGenre");
+            let gid =
+                find_or_create_container(db, VIDEO_GENRE_ID, &name, "container.genre.videoGenre")?;
+            if !db.folder_has_inode(&gid, device, inode)? {
+                let iid = format!("{gid}${detail:X}");
+                db.upsert_object(&iid, &gid, class, Some(detail), &title, Some(browse_oid))?;
+            }
+        }
+    }
+    let tags = db.detail_tag_fields(detail)?;
+    if let Some(actor) = tags
+        .artist
+        .or(tags.creator)
+        .filter(|value| !value.is_empty())
+    {
+        let aid =
+            find_or_create_container(db, VIDEO_ACTOR_ID, &actor, "container.person.movieActor")?;
+        if !db.folder_has_inode(&aid, device, inode)? {
+            let iid = format!("{aid}${detail:X}");
+            db.upsert_object(&iid, &aid, class, Some(detail), &title, Some(browse_oid))?;
+        }
+    }
+    Ok(())
+}
+
+fn attach_audio_virtuals(
+    db: &LibraryDb,
+    detail: i64,
+    class: &str,
+    browse_oid: &str,
+) -> ScanResult<()> {
+    let tags = db.detail_tag_fields(detail)?;
+    for root in [
+        MUSIC_GENRE_ID,
+        MUSIC_ARTIST_ID,
+        MUSIC_ALBUM_ID,
+        MUSIC_CONTRIB_ARTIST_ID,
+        MUSIC_ALBUM_ARTIST_ID,
+        MUSIC_COMPOSER_ID,
+        MUSIC_RATING_ID,
+    ] {
+        db.delete_detail_under_root(detail, root)?;
+    }
+    let title = tags
+        .title
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(browse_oid)
+        .to_string();
+    if let Some(album) = tags.album.as_deref().filter(|s| !s.is_empty()) {
+        let aid =
+            find_or_create_container(db, MUSIC_ALBUM_ID, album, "container.album.musicAlbum")?;
+        let iid = format!("{aid}${detail:X}");
+        db.upsert_object(&iid, &aid, class, Some(detail), &title, Some(browse_oid))?;
+    }
+    if let Some(artist) = tags.artist.as_deref().filter(|s| !s.is_empty()) {
+        let aid =
+            find_or_create_container(db, MUSIC_ARTIST_ID, artist, "container.person.musicArtist")?;
+        let parent = match tags.album.as_deref().filter(|s| !s.is_empty()) {
+            Some(al) => find_or_create_container(db, &aid, al, "container.album.musicAlbum")?,
+            None => aid,
+        };
+        let iid = format!("{parent}${detail:X}");
+        db.upsert_object(&iid, &parent, class, Some(detail), &title, Some(browse_oid))?;
+    }
+    if let Some(g) = tags.genre.as_deref().filter(|s| !s.is_empty()) {
+        for name in split_genres(g) {
+            let gid =
+                find_or_create_container(db, MUSIC_GENRE_ID, &name, "container.genre.musicGenre")?;
             let iid = format!("{gid}${detail:X}");
-            let _ = db.upsert_object(
-                &iid,
-                &gid,
+            db.upsert_object(&iid, &gid, class, Some(detail), &title, Some(browse_oid))?;
+        }
+    }
+    for (root, value, class) in [
+        (
+            MUSIC_CONTRIB_ARTIST_ID,
+            tags.contributor.as_deref(),
+            "container.person.musicArtist",
+        ),
+        (
+            MUSIC_ALBUM_ARTIST_ID,
+            tags.album_artist.as_deref(),
+            "container.person.musicArtist",
+        ),
+        (
+            MUSIC_COMPOSER_ID,
+            tags.composer.as_deref(),
+            "container.person.musicArtist",
+        ),
+    ] {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            let container = find_or_create_container(db, root, value, class)?;
+            let item = format!("{container}${detail:X}");
+            db.upsert_object(
+                &item,
+                &container,
                 class,
                 Some(detail),
                 &title,
                 Some(browse_oid),
-            );
+            )?;
         }
     }
-    if let Some(actor) = db
-        .detail_tag_fields(detail)
-        .ok()
-        .and_then(|(artist, _, _, creator, _)| artist.or(creator))
-        .filter(|s| !s.is_empty())
-    {
-        let aid = find_or_create_container(db, VIDEO_ACTOR_ID, &actor, "container.person.movieActor");
-        let iid = format!("{aid}${detail:X}");
-        let _ = db.upsert_object(&iid, &aid, class, Some(detail), &title, Some(browse_oid));
+    if let Some(rating) = tags.rating {
+        let label = rating.to_string();
+        let container =
+            find_or_create_container(db, MUSIC_RATING_ID, &label, "container.storageFolder")?;
+        let item = format!("{container}${detail:X}");
+        db.upsert_object(
+            &item,
+            &container,
+            class,
+            Some(detail),
+            &title,
+            Some(browse_oid),
+        )?;
     }
+    Ok(())
 }
 
-fn attach_audio_virtuals(db: &LibraryDb, detail: i64, class: &str, browse_oid: &str) {
-    let Ok((artist, album, genre, _, _)) = db.detail_tag_fields(detail) else {
-        return;
-    };
-    let _ = db.delete_detail_under_root(detail, MUSIC_GENRE_ID);
-    let _ = db.delete_detail_under_root(detail, MUSIC_ARTIST_ID);
-    let _ = db.delete_detail_under_root(detail, MUSIC_ALBUM_ID);
+fn attach_image_virtuals(
+    db: &LibraryDb,
+    detail: i64,
+    class: &str,
+    browse_oid: &str,
+) -> ScanResult<()> {
+    let tags = db.detail_tag_fields(detail)?;
+    db.delete_detail_under_root(detail, IMAGE_DATE_ID)?;
+    db.delete_detail_under_root(detail, IMAGE_CAMERA_ID)?;
+    db.delete_detail_under_root(detail, IMAGE_ALBUM_ID)?;
+    db.delete_detail_under_root(detail, IMAGE_RATING_ID)?;
     let title = db
-        .detail_group_fields(detail)
-        .ok()
-        .and_then(|(_, _, _, _, t)| t)
+        .detail_group_fields(detail)?
+        .title
         .unwrap_or_else(|| browse_oid.to_string());
-    if let Some(album) = album.as_deref().filter(|s| !s.is_empty()) {
-        let aid = find_or_create_container(db, MUSIC_ALBUM_ID, album, "container.album.musicAlbum");
-        let iid = format!("{aid}${detail:X}");
-        let _ = db.upsert_object(&iid, &aid, class, Some(detail), &title, Some(browse_oid));
-    }
-    if let Some(artist) = artist.as_deref().filter(|s| !s.is_empty()) {
-        let aid = find_or_create_container(db, MUSIC_ARTIST_ID, artist, "container.person.musicArtist");
-        let parent = match album.as_deref().filter(|s| !s.is_empty()) {
-            Some(al) => find_or_create_container(db, &aid, al, "container.album.musicAlbum"),
-            None => aid,
-        };
-        let iid = format!("{parent}${detail:X}");
-        let _ = db.upsert_object(&iid, &parent, class, Some(detail), &title, Some(browse_oid));
-    }
-    if let Some(g) = genre.as_deref().filter(|s| !s.is_empty()) {
-        for name in split_genres(g) {
-            let gid = find_or_create_container(db, MUSIC_GENRE_ID, &name, "container.genre.musicGenre");
-            let iid = format!("{gid}${detail:X}");
-            let _ = db.upsert_object(&iid, &gid, class, Some(detail), &title, Some(browse_oid));
-        }
-    }
-}
-
-fn attach_image_virtuals(db: &LibraryDb, detail: i64, class: &str, browse_oid: &str) {
-    let Ok((_, album, _, creator, date)) = db.detail_tag_fields(detail) else {
-        return;
-    };
-    let _ = db.delete_detail_under_root(detail, IMAGE_DATE_ID);
-    let _ = db.delete_detail_under_root(detail, IMAGE_CAMERA_ID);
-    let _ = db.delete_detail_under_root(detail, IMAGE_ALBUM_ID);
-    let title = db
-        .detail_group_fields(detail)
-        .ok()
-        .and_then(|(_, _, _, _, t)| t)
-        .unwrap_or_else(|| browse_oid.to_string());
-    let day = date
+    let day = tags
+        .date
         .as_deref()
         .filter(|s| s.len() >= 10)
         .map(|s| s[..10].to_string())
         .unwrap_or_else(|| "Unknown Date".into());
-    let date_id = find_or_create_container(db, IMAGE_DATE_ID, &day, "container.album.photoAlbum");
+    let date_id = find_or_create_container(db, IMAGE_DATE_ID, &day, "container.album.photoAlbum")?;
     let did = format!("{date_id}${detail:X}");
-    let _ = db.upsert_object(&did, &date_id, class, Some(detail), &title, Some(browse_oid));
-    let camera = creator
+    db.upsert_object(
+        &did,
+        &date_id,
+        class,
+        Some(detail),
+        &title,
+        Some(browse_oid),
+    )?;
+    let camera = tags
+        .creator
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or("Unknown Camera");
-    let cam_id = find_or_create_container(db, IMAGE_CAMERA_ID, camera, "container.storageFolder");
-    let cam_date = find_or_create_container(db, &cam_id, &day, "container.album.photoAlbum");
+    let cam_id = find_or_create_container(db, IMAGE_CAMERA_ID, camera, "container.storageFolder")?;
+    let cam_date = find_or_create_container(db, &cam_id, &day, "container.album.photoAlbum")?;
     let cid = format!("{cam_date}${detail:X}");
-    let _ = db.upsert_object(&cid, &cam_date, class, Some(detail), &title, Some(browse_oid));
-    if let Some(al) = album.as_deref().filter(|s| !s.is_empty()) {
-        let aid = find_or_create_container(db, IMAGE_ALBUM_ID, al, "container.album.photoAlbum");
+    db.upsert_object(
+        &cid,
+        &cam_date,
+        class,
+        Some(detail),
+        &title,
+        Some(browse_oid),
+    )?;
+    if let Some(al) = tags.album.as_deref().filter(|s| !s.is_empty()) {
+        let aid = find_or_create_container(db, IMAGE_ALBUM_ID, al, "container.album.photoAlbum")?;
         let iid = format!("{aid}${detail:X}");
-        let _ = db.upsert_object(&iid, &aid, class, Some(detail), &title, Some(browse_oid));
+        db.upsert_object(&iid, &aid, class, Some(detail), &title, Some(browse_oid))?;
     }
+    if let Some(rating) = tags.rating {
+        let label = rating.to_string();
+        let rid = find_or_create_container(db, IMAGE_RATING_ID, &label, "container.storageFolder")?;
+        let iid = format!("{rid}${detail:X}");
+        db.upsert_object(&iid, &rid, class, Some(detail), &title, Some(browse_oid))?;
+    }
+    Ok(())
 }
 
-fn apply_nfo(db: &LibraryDb, cfg: &ScanConfig, path: &Path, detail_id: i64) -> bool {
-    let nfo = nfo_for_file(path, &cfg.media_dirs);
+fn apply_nfo(db: &LibraryDb, cfg: &ScanConfig, path: &Path, detail_id: i64) -> ScanResult<bool> {
+    let nfo = nfo_for_file_with_policy_result(path, &cfg.media_dirs, cfg.wide_links)?;
     if nfo.is_empty() {
-        return false;
+        return Ok(false);
     }
-    apply_nfo_to_detail(db, detail_id, &nfo);
-    if is_video(
-        path.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(""),
-    ) {
-        if let Some(browse) = db.browse_object_for_detail(detail_id) {
-            attach_video_virtuals(db, detail_id, "item.videoItem", &browse);
+    apply_nfo_to_detail(db, detail_id, &nfo)?;
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default();
+    if is_video(&name) {
+        if let Some(browse) = db.browse_object_for_detail(detail_id)? {
+            attach_video_virtuals(db, detail_id, "item.videoItem", &browse)?;
         }
     }
-    true
+    Ok(true)
 }
 
-fn apply_nfo_in_dir(db: &LibraryDb, cfg: &ScanConfig, dir: &Path, recursive: bool) -> bool {
-    let rd = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
+fn apply_nfo_in_dir(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    dir: &Path,
+    recursive: bool,
+) -> ScanResult<bool> {
+    if !path_is_allowed_dir(dir, cfg) {
+        return Ok(false);
+    }
+    let rd = std::fs::read_dir(dir).map_err(|error| scan_io(dir, error))?;
     let mut any = false;
-    for ent in rd.filter_map(|e| e.ok()) {
+    for ent in rd {
+        let ent = ent.map_err(|error| scan_io(dir, error))?;
         let path = ent.path();
         let name = ent.file_name().to_string_lossy().into_owned();
         let is_dir = match ent.file_type() {
@@ -547,7 +1009,11 @@ fn apply_nfo_in_dir(db: &LibraryDb, cfg: &ScanConfig, dir: &Path, recursive: boo
             _ => false,
         };
         if is_dir {
-            if recursive && !is_skipped_dir(&name) && apply_nfo_in_dir(db, cfg, &path, true) {
+            if recursive
+                && !is_skipped_dir(&name)
+                && path_is_allowed_dir(&path, cfg)
+                && apply_nfo_in_dir(db, cfg, &path, true)?
+            {
                 any = true;
             }
             continue;
@@ -555,36 +1021,340 @@ fn apply_nfo_in_dir(db: &LibraryDb, cfg: &ScanConfig, dir: &Path, recursive: boo
         if !is_video(&name) && !is_audio(&name) {
             continue;
         }
-        let path_s = path.to_string_lossy();
-        if let Some((id, ..)) = db.find_detail_by_path(&path_s).ok().flatten() {
-            if apply_nfo(db, cfg, &path, id) {
+        if !path_is_allowed_file(&path, cfg) {
+            continue;
+        }
+        let path_s = path_to_db(&path);
+        if let Some(existing) = db.find_detail_by_path(&path_s)? {
+            let id = existing.id;
+            let before = db.detail_presentation(id)?;
+            let title = path
+                .file_stem()
+                .map(display_os_name)
+                .unwrap_or_else(|| "item".to_string());
+            db.reset_detail_tags_to_file_defaults(id, &title, &file_mtime_date(&path))?;
+            // Reconstruct the complete precedence chain. This is essential
+            // for deletion: merely applying the now-empty NFO would retain
+            // values written by the old sidecar forever.
+            db.copy_embedded_tags_to_inode_aliases(id)?;
+            persist_probe(db, cfg, &path, id)?;
+            apply_nfo(db, cfg, &path, id)?;
+            if let Some(browse) = db.browse_object_for_detail(id)? {
+                let (_, class, _) = mime_and_class(&name);
+                if is_video(&name) {
+                    attach_video_virtuals(db, id, class, &browse)?;
+                } else {
+                    attach_audio_virtuals(db, id, class, &browse)?;
+                }
+            }
+            if db.detail_presentation(id)? != before {
                 any = true;
             }
         }
     }
-    any
+    Ok(any)
 }
 
-fn attach_album_art_in_dir(db: &LibraryDb, cfg: &ScanConfig, dir: &Path) -> bool {
-    let rd = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-    let mut any = false;
-    for ent in rd.filter_map(|e| e.ok()) {
-        let path = ent.path();
-        let name = ent.file_name().to_string_lossy().into_owned();
-        if !is_video(&name) && !is_audio(&name) {
+/// Re-apply changed effective NFO metadata once per physical inode. Inotify
+/// handles live sidecar deletion; the periodic pass must not reopen media when
+/// its selected NFO already matches the persisted presentation.
+fn presentation_matches_nfo(presentation: &db::DetailPresentation, nfo: &NfoMeta) -> bool {
+    fn matches<T: PartialEq>(actual: &Option<T>, expected: &Option<T>) -> bool {
+        expected
+            .as_ref()
+            .is_none_or(|expected| actual.as_ref() == Some(expected))
+    }
+    matches(&presentation.title, &nfo.title)
+        && matches(&presentation.comment, &nfo.comment)
+        && matches(&presentation.genre, &nfo.genre)
+        && matches(&presentation.creator, &nfo.creator)
+        && matches(&presentation.artist, &nfo.artist)
+        && matches(&presentation.disc, &nfo.disc)
+        && matches(&presentation.track, &nfo.track)
+        && matches(&presentation.date, &nfo.date)
+        && matches(&presentation.album, &nfo.showtitle)
+}
+
+fn refresh_nfo_periodic(db: &LibraryDb, cfg: &ScanConfig, rows: &[DetailStat]) -> ScanResult<bool> {
+    let mut groups: HashMap<(i64, i64, i64), Vec<(i64, PathBuf)>> = HashMap::new();
+    for row in rows {
+        let unique = if row.inode == 0 { row.id } else { 0 };
+        groups
+            .entry((row.device, row.inode, unique))
+            .or_default()
+            .push((row.id, path_from_db(&row.path)));
+    }
+    let mut changed = false;
+    for mut aliases in groups.into_values() {
+        aliases.sort_by(|left, right| left.1.cmp(&right.1));
+        let mut parsed = Vec::with_capacity(aliases.len());
+        for (id, path) in &aliases {
+            let live = rebase_media_path_for_config(path, cfg);
+            let nfo = nfo_for_file_with_policy_result(&live, &cfg.media_dirs, cfg.wide_links)?;
+            parsed.push((*id, live, nfo));
+        }
+        let selected = parsed
+            .iter()
+            .find(|(_, _, nfo)| !nfo.is_empty())
+            .or_else(|| parsed.first());
+        let Some((selected_id, _selected_path, selected_nfo)) = selected else {
+            continue;
+        };
+        let before = aliases
+            .iter()
+            .map(|(id, _)| db.detail_presentation(*id))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if selected_nfo.is_empty() {
+            // Inotify normally observes NFO deletion. If it happened while
+            // the service was stopped, video title policy still gives us an
+            // unambiguous cheap repair: no NFO means the filename is the
+            // title. Do not reopen media merely to recover embedded tags.
+            for ((id, path), presentation) in aliases.iter().zip(&before) {
+                if !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_video)
+                {
+                    continue;
+                }
+                let wanted = path
+                    .file_stem()
+                    .map(display_os_name)
+                    .unwrap_or_else(|| "item".to_string());
+                if presentation.title.as_deref() == Some(wanted.as_str()) {
+                    continue;
+                }
+                db.update_detail_title(*id, &wanted)?;
+                let fields = db.detail_group_fields(*id)?;
+                let series_title = episode_display_title(&wanted, fields.album.as_deref());
+                db.update_detail_names_under_root(*id, VIDEO_SERIES_ID, &series_title)?;
+                db.update_detail_names_under_root(*id, VIDEO_GENRE_ID, &wanted)?;
+                db.update_detail_names_under_root(*id, VIDEO_ACTOR_ID, &wanted)?;
+                changed = true;
+            }
             continue;
         }
-        let path_s = path.to_string_lossy();
-        if let Some((id, ..)) = db.find_detail_by_path(&path_s).ok().flatten() {
-            if attach_album_art(db, cfg, &path, id) {
+        // Inotify handles live NFO writes/deletes. The periodic pass only
+        // needs libav when an effective NFO value differs from persisted
+        // presentation metadata; unchanged media must never be re-probed.
+        if before
+            .iter()
+            .all(|presentation| presentation_matches_nfo(presentation, selected_nfo))
+        {
+            continue;
+        }
+        // A periodic walk may discover NFO state written while the service was
+        // offline. Apply its explicit overrides directly; reconstructing the
+        // embedded base requires libav and is reserved for a real sidecar
+        // inotify event, never routine reconciliation.
+        apply_nfo_to_detail(db, *selected_id, selected_nfo)?;
+        for (id, path) in &aliases {
+            let name = path
+                .file_name()
+                .map(|value| value.to_string_lossy())
+                .unwrap_or_default();
+            let (_, class, _) = mime_and_class(&name);
+            if let Some(browse) = db.browse_object_for_detail(*id)? {
+                if is_video(&name) {
+                    attach_video_virtuals(db, *id, class, &browse)?;
+                } else if is_audio(&name) {
+                    attach_audio_virtuals(db, *id, class, &browse)?;
+                } else if is_image(&name) {
+                    attach_image_virtuals(db, *id, class, &browse)?;
+                }
+            }
+        }
+        let after = aliases
+            .iter()
+            .map(|(id, _)| db.detail_presentation(*id))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        changed |= before != after;
+    }
+    Ok(changed)
+}
+
+/// A regular child of a directory already accepted by the root policy cannot
+/// escape through its final component. Only symlink children need another
+/// canonical jail check.
+fn directory_entry_is_allowed_file(
+    entry: &std::fs::DirEntry,
+    path: &Path,
+    cfg: &ScanConfig,
+) -> bool {
+    entry.file_type().ok().is_some_and(|file_type| {
+        file_type.is_file() || (file_type.is_symlink() && path_is_allowed_file(path, cfg))
+    })
+}
+
+fn refresh_captions_in_dir(db: &LibraryDb, cfg: &ScanConfig, dir: &Path) -> ScanResult<bool> {
+    if !path_is_allowed_dir(dir, cfg) {
+        return Ok(false);
+    }
+    let mut media = Vec::new();
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|error| scan_io(dir, error))? {
+        let entry = entry.map_err(|error| scan_io(dir, error))?;
+        let path = entry.path();
+        if !directory_entry_is_allowed_file(&entry, &path, cfg) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_video(&name) {
+            media.push(path);
+        } else if cfg.subtitles && is_caption_name(&name) {
+            candidates.push(path);
+        }
+    }
+    candidates.sort();
+    let mut changed = false;
+    for path in media {
+        if let Some(existing) = db.find_detail_by_path(&path_to_db(&path))? {
+            let captions = captions_from_candidates(&path, &candidates);
+            changed |= db.replace_captions(existing.id, &captions)?;
+        }
+    }
+    Ok(changed)
+}
+
+/// Refresh only media whose stem can own this caption. `touched` is true even
+/// when the path list is unchanged, because CLOSE_WRITE changed subtitle
+/// bytes served at the same URL and clients need one new update generation.
+fn refresh_caption_event(db: &LibraryDb, cfg: &ScanConfig, sidecar: &Path) -> ScanResult<bool> {
+    let Some(dir) = sidecar.parent() else {
+        return Ok(false);
+    };
+    if !path_is_allowed_dir(dir, cfg) {
+        return Ok(false);
+    }
+    let mut touched = false;
+    for entry in std::fs::read_dir(dir).map_err(|error| scan_io(dir, error))? {
+        let entry = entry.map_err(|error| scan_io(dir, error))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !is_video(&name) || !directory_entry_is_allowed_file(&entry, &path, cfg) {
+            continue;
+        }
+        if !caption_path_matches_media(sidecar, &path) {
+            continue;
+        }
+        if let Some(existing) = db.find_detail_by_path(&path_to_db(&path))? {
+            db.replace_captions(existing.id, &captions_for(&path, cfg)?)?;
+            touched = true;
+        }
+    }
+    Ok(touched)
+}
+
+pub fn artwork_path_matches_media(sidecar: &Path, media: &Path) -> bool {
+    let Some(sidecar_name) = sidecar.file_name() else {
+        return false;
+    };
+    if let Some(text) = sidecar_name.to_str() {
+        let lower = text.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "poster.jpg"
+                | "poster.jpeg"
+                | "poster.png"
+                | "folder.jpg"
+                | "folder.jpeg"
+                | "folder.png"
+                | "cover.jpg"
+                | "cover.jpeg"
+                | "cover.png"
+        ) {
+            return true;
+        }
+    }
+    let Some(stem) = media.file_stem().map(OsStr::as_encoded_bytes) else {
+        return false;
+    };
+    let candidate = sidecar_name.as_encoded_bytes();
+    [
+        b"-poster.jpg".as_slice(),
+        b"-poster.png",
+        b"-fanart.jpg",
+        b"-fanart.png",
+    ]
+    .iter()
+    .any(|suffix| {
+        candidate.len() == stem.len() + suffix.len()
+            && candidate[..stem.len()] == *stem
+            && candidate[stem.len()..].eq_ignore_ascii_case(suffix)
+    })
+}
+
+fn refresh_artwork_event(db: &LibraryDb, cfg: &ScanConfig, sidecar: &Path) -> ScanResult<bool> {
+    let Some(dir) = sidecar.parent() else {
+        return Ok(false);
+    };
+    if !path_is_allowed_dir(dir, cfg) {
+        return Ok(false);
+    }
+    let mut touched = false;
+    for entry in std::fs::read_dir(dir).map_err(|error| scan_io(dir, error))? {
+        let entry = entry.map_err(|error| scan_io(dir, error))?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if (!is_video(&name) && !is_audio(&name) && !is_image(&name))
+            || !directory_entry_is_allowed_file(&entry, &path, cfg)
+            || !artwork_path_matches_media(sidecar, &path)
+        {
+            continue;
+        }
+        if let Some(existing) = db.find_detail_by_path(&path_to_db(&path))? {
+            attach_album_art(db, cfg, &path, existing.id)?;
+            touched = true;
+        }
+    }
+    Ok(touched)
+}
+
+fn attach_album_art_in_dir(db: &LibraryDb, cfg: &ScanConfig, dir: &Path) -> ScanResult<bool> {
+    if !path_is_allowed_dir(dir, cfg) {
+        return Ok(false);
+    }
+    let mut files = HashMap::new();
+    let mut media = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|error| scan_io(dir, error))? {
+        let entry = entry.map_err(|error| scan_io(dir, error))?;
+        let path = entry.path();
+        if !directory_entry_is_allowed_file(&entry, &path, cfg) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_text = name.to_string_lossy();
+        if is_video(&name_text) || is_audio(&name_text) {
+            media.push(path.clone());
+        }
+        files.insert(name, path);
+    }
+    let mut any = false;
+    for path in media {
+        let path_s = path_to_db(&path);
+        if let Some(existing) = db.find_detail_by_path(&path_s)? {
+            let sidecar = find_album_art_in_inventory(&path, cfg, &files);
+            let art_id = db.detail_album_art(existing.id)?;
+            let current = (art_id > 0)
+                .then(|| db.album_art_path(art_id))
+                .transpose()?
+                .flatten()
+                .map(|stored| path_from_db(&stored));
+            if let Some(current) = current.as_ref().filter(|stored| stored.is_file()) {
+                let generated = current
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("thumb-") || name.starts_with("embed-"));
+                if (generated && sidecar.is_none()) || (!generated && sidecar.is_some()) {
+                    continue;
+                }
+            }
+            if attach_album_art(db, cfg, &path, existing.id)? {
                 any = true;
             }
         }
     }
-    any
+    Ok(any)
 }
 
 /// Which media classes a `media_dir=` root accepts (dialect `V,` / `A,` / `P,`).
@@ -632,7 +1402,9 @@ impl MediaTypes {
         }
     }
     pub fn allows(&self, name: &str) -> bool {
-        (self.video && is_video(name)) || (self.audio && is_audio(name)) || (self.image && is_image(name))
+        (self.video && is_video(name))
+            || (self.audio && is_audio(name))
+            || (self.image && is_image(name))
     }
 }
 
@@ -646,7 +1418,10 @@ impl Default for MediaTypes {
 pub fn parse_media_dir(spec: &str) -> (MediaTypes, PathBuf) {
     if let Some((prefix, rest)) = spec.split_once(',') {
         let p = prefix.trim();
-        if p.chars().all(|c| matches!(c, 'A' | 'a' | 'V' | 'v' | 'P' | 'p')) && !rest.is_empty() {
+        if p.chars()
+            .all(|c| matches!(c, 'A' | 'a' | 'V' | 'v' | 'P' | 'p'))
+            && !rest.is_empty()
+        {
             let mut t = MediaTypes {
                 video: false,
                 audio: false,
@@ -689,14 +1464,126 @@ where
     (dirs, types)
 }
 
+/// One configured media root. Unlike the legacy `media_dirs`/`types` pair,
+/// this keeps identity and the A/V/P mask attached to the directory that owns
+/// them. `aliases` contains paths persisted by an earlier run (for example a
+/// host path before the database was moved into a container).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaRoot {
+    pub configured_path: PathBuf,
+    pub canonical_path: PathBuf,
+    pub key: String,
+    pub display_title: String,
+    pub types: MediaTypes,
+    pub aliases: Vec<PathBuf>,
+}
+
+impl MediaRoot {
+    fn path_candidates(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.configured_path.as_path())
+            .chain(std::iter::once(self.canonical_path.as_path()))
+            .chain(self.aliases.iter().map(PathBuf::as_path))
+    }
+}
+
+fn stable_media_root_key(title: &str) -> String {
+    format!("root-{}", &sha1_hex(title.to_lowercase().as_bytes())[..16])
+}
+
+/// Parse and validate all configured media roots before the scanner or HTTP
+/// server can use them. Empty input is valid (an empty library), but every
+/// configured root must exist and be a directory. Canonically duplicate,
+/// nested, and case-insensitively same-basename roots are rejected because
+/// they make ownership and relocation ambiguous.
+pub fn build_media_roots<I, S>(specs: I, config_dir: &Path) -> Result<Vec<MediaRoot>, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut roots = Vec::new();
+    for spec in specs {
+        let (types, raw) = parse_media_dir(spec.as_ref());
+        let configured_path = if raw.is_absolute() {
+            raw
+        } else {
+            config_dir.join(raw)
+        };
+        let canonical_path = configured_path.canonicalize().map_err(|error| {
+            format!(
+                "media root does not exist or cannot be resolved: {} ({error})",
+                configured_path.display()
+            )
+        })?;
+        if !canonical_path.is_dir() {
+            return Err(format!(
+                "media root is not a directory: {}",
+                configured_path.display()
+            ));
+        }
+        let display_title = configured_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "media root must have a UTF-8 directory name: {}",
+                    configured_path.display()
+                )
+            })?
+            .to_string();
+        roots.push(MediaRoot {
+            configured_path,
+            canonical_path,
+            key: stable_media_root_key(&display_title),
+            display_title,
+            types,
+            aliases: Vec::new(),
+        });
+    }
+
+    for left in 0..roots.len() {
+        for right in left + 1..roots.len() {
+            let a = &roots[left];
+            let b = &roots[right];
+            if a.canonical_path == b.canonical_path {
+                return Err(format!(
+                    "duplicate media roots resolve to {}",
+                    a.canonical_path.display()
+                ));
+            }
+            if a.canonical_path.starts_with(&b.canonical_path)
+                || b.canonical_path.starts_with(&a.canonical_path)
+            {
+                return Err(format!(
+                    "nested media roots are ambiguous: {} and {}",
+                    a.configured_path.display(),
+                    b.configured_path.display()
+                ));
+            }
+            if a.display_title.eq_ignore_ascii_case(&b.display_title) {
+                return Err(format!(
+                    "media roots must have distinct directory names: {} and {}",
+                    a.configured_path.display(),
+                    b.configured_path.display()
+                ));
+            }
+        }
+    }
+    Ok(roots)
+}
+
 /// dialect `GetVideoMetadata`: reject non-media. Strong container magic
 /// (EBML/ftyp/RIFF/…) is proof the file is a real bitstream, not text.
 /// Ambiguous headers (TS/MPEG/MP3) get a short `ffprobe`.
 pub fn file_is_viable(path: &Path) -> bool {
+    file_is_viable_with_timeout(path, std::time::Duration::from_secs(30))
+}
+
+fn file_is_viable_with_timeout(path: &Path, timeout: std::time::Duration) -> bool {
     match sniff_container(path) {
         Sniff::Reject => false,
         Sniff::Strong => true,
-        Sniff::Weak => ffprobe_has_av_stream(path).unwrap_or(false),
+        Sniff::Weak => ffprobe_has_av_stream(path, timeout).unwrap_or(false),
     }
 }
 
@@ -739,8 +1626,9 @@ fn sniff_container(path: &Path) -> Sniff {
     Sniff::Reject
 }
 
-fn ffprobe_has_av_stream(path: &Path) -> Option<bool> {
-    let out = std::process::Command::new("ffprobe")
+fn ffprobe_has_av_stream(path: &Path, timeout: std::time::Duration) -> Option<bool> {
+    let mut command = std::process::Command::new("ffprobe");
+    command
         .args([
             "-v",
             "error",
@@ -753,14 +1641,16 @@ fn ffprobe_has_av_stream(path: &Path) -> Option<bool> {
             "-of",
             "csv=p=0",
         ])
-        .arg(path)
-        .output()
-        .ok()?;
+        .arg(path);
+    let out = crate::probe::command_output_with_timeout(&mut command, timeout).ok()?;
     if !out.status.success() {
         return Some(false);
     }
     let s = String::from_utf8_lossy(&out.stdout);
-    Some(s.lines().any(|l| l.contains("video") || l.contains("audio")))
+    Some(
+        s.lines()
+            .any(|l| l.contains("video") || l.contains("audio")),
+    )
 }
 
 /// First-bytes sniff so a `.mkv` that is actually text/NFO is not indexed.
@@ -889,52 +1779,52 @@ pub fn write_incomplete_mp4(path: &Path, size: usize) {
     std::fs::write(path, data).expect("write incomplete mp4");
 }
 
-fn mime_and_class(name: &str) -> (&'static str, &'static str, &'static str) {
-    let l = name.to_ascii_lowercase();
-    if l.ends_with(".mkv") {
-        ("video/x-matroska", "item.videoItem", "mkv")
-    } else if l.ends_with(".mp4") || l.ends_with(".m4v") {
-        ("video/mp4", "item.videoItem", "mp4")
-    } else if l.ends_with(".avi") {
-        ("video/x-msvideo", "item.videoItem", "avi")
-    } else if l.ends_with(".mov") {
-        ("video/quicktime", "item.videoItem", "mov")
-    } else if l.ends_with(".ts") || l.ends_with(".m2ts") {
-        ("video/mpeg", "item.videoItem", "ts")
-    } else if l.ends_with(".mp3") {
-        ("audio/mpeg", "item.audioItem.musicTrack", "mp3")
-    } else if l.ends_with(".flac") {
-        ("audio/x-flac", "item.audioItem.musicTrack", "flac")
-    } else if l.ends_with(".jpg") || l.ends_with(".jpeg") {
-        ("image/jpeg", "item.imageItem.photo", "jpg")
-    } else if l.ends_with(".png") {
-        ("image/png", "item.imageItem.photo", "png")
-    } else {
-        ("application/octet-stream", "item.videoItem", "bin")
-    }
+fn resolved_media_format(name: &str, probe: Option<&MediaProbe>) -> Option<ResolvedMediaFormat> {
+    resolved_media_format_with_hint(name, probe, None)
 }
 
-#[derive(Clone, Debug)]
+fn resolved_media_format_with_hint(
+    name: &str,
+    probe: Option<&MediaProbe>,
+    mime_hint: Option<&str>,
+) -> Option<ResolvedMediaFormat> {
+    let format = media_format_for_name(name)?;
+    let detected = probe
+        .and_then(|got| {
+            if !got.probe.video.is_empty() {
+                Some(MediaKind::Video)
+            } else if !got.probe.audio.is_empty() {
+                Some(MediaKind::Audio)
+            } else {
+                None
+            }
+        })
+        .or_else(|| match mime_hint.unwrap_or_default() {
+            mime if mime.starts_with("video/") => Some(MediaKind::Video),
+            mime if mime.starts_with("audio/") => Some(MediaKind::Audio),
+            mime if mime.starts_with("image/") => Some(MediaKind::Image),
+            _ => None,
+        });
+    Some(format.resolve(detected))
+}
+
+fn mime_and_class(name: &str) -> (&'static str, &'static str, &'static str) {
+    resolved_media_format(name, None)
+        .map(|format| (format.mime, format.upnp_class(), format.extension))
+        .unwrap_or(("application/octet-stream", "item.videoItem", "bin"))
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct SourceProbe {
     pub container: String,
     pub video: String,
     pub hdr: String,
     pub audio: String,
+    /// Comma-separated `global-stream:audio-ordinal:codec:channels` records.
+    /// Unlike `audio`, this preserves duplicate codecs and real stream order.
+    pub audio_streams: String,
     pub width: u32,
     pub height: u32,
-}
-
-impl Default for SourceProbe {
-    fn default() -> Self {
-        Self {
-            container: String::new(),
-            video: String::new(),
-            hdr: String::new(),
-            audio: String::new(),
-            width: 0,
-            height: 0,
-        }
-    }
 }
 
 pub fn parse_probe_toml(text: &str) -> SourceProbe {
@@ -954,6 +1844,7 @@ pub fn parse_probe_toml(text: &str) -> SourceProbe {
             "video" => p.video = v.to_string(),
             "hdr" => p.hdr = v.to_string(),
             "audio" => p.audio = v.to_string(),
+            "audio_streams" => p.audio_streams = v.to_string(),
             "width" => p.width = v.parse().unwrap_or(0),
             "height" => p.height = v.parse().unwrap_or(0),
             _ => {}
@@ -998,10 +1889,15 @@ pub struct MediaItem {
     pub creator: Option<String>,
     pub comment: Option<String>,
     pub artist: Option<String>,
+    pub album_artist: Option<String>,
+    pub composer: Option<String>,
+    pub contributor: Option<String>,
     pub album: Option<String>,
     pub genre: Option<String>,
     pub disc: Option<i64>,
     pub track: Option<i64>,
+    pub rating: Option<i64>,
+    pub rotation: Option<i64>,
     /// `BOOKMARKS.SEC` (raw seconds). Default 0 when no row.
     pub bookmark_sec: i64,
     /// `BOOKMARKS.WATCH_COUNT`. Default 0 when no row.
@@ -1033,9 +1929,29 @@ pub struct AvMeta {
     pub creator: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EmbeddedTags {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album_artist: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub composer: Option<String>,
+    pub contributor: Option<String>,
+    pub date: Option<String>,
+    pub comment: Option<String>,
+    pub disc: Option<i64>,
+    pub track: Option<i64>,
+    pub rating: Option<i64>,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub rotation: Option<i64>,
+}
+
 /// dialect `GetVideoMetadata` / lav: duration, bitrate/8, WxH, audio.
 pub fn probe_av_meta(path: &Path) -> Option<AvMeta> {
-    let out = std::process::Command::new("ffprobe")
+    let mut command = std::process::Command::new("ffprobe");
+    command
         .args([
             "-v",
             "error",
@@ -1048,9 +1964,10 @@ pub fn probe_av_meta(path: &Path) -> Option<AvMeta> {
             "-of",
             "default=noprint_wrappers=1",
         ])
-        .arg(path)
-        .output()
-        .ok()?;
+        .arg(path);
+    let out =
+        crate::probe::command_output_with_timeout(&mut command, std::time::Duration::from_secs(30))
+            .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1087,10 +2004,7 @@ pub fn probe_av_meta(path: &Path) -> Option<AvMeta> {
     if w > 0 && h > 0 {
         meta.resolution = Some(format!("{w}x{h}"));
     }
-    if meta.duration.is_none()
-        && meta.bitrate.is_none()
-        && meta.resolution.is_none()
-    {
+    if meta.duration.is_none() && meta.bitrate.is_none() && meta.resolution.is_none() {
         return None;
     }
     Some(meta)
@@ -1118,6 +2032,8 @@ pub struct Catalog {
     pub recent_ids: Vec<String>,
     /// `ALBUM_ART.ID` → stored JPEG path.
     pub album_art_paths: HashMap<i64, PathBuf>,
+    recent_limit: usize,
+    recent_cutoff_unix: Option<i64>,
 }
 
 impl Catalog {
@@ -1130,6 +2046,8 @@ impl Catalog {
             recent_count: 0,
             recent_ids: Vec::new(),
             album_art_paths: HashMap::new(),
+            recent_limit: RECENT_MAX,
+            recent_cutoff_unix: None,
         };
         c.add_container(ROOT_ID, "-1", "root", "container.storageFolder", true);
         c.add_container(
@@ -1141,7 +2059,13 @@ impl Catalog {
         );
         c.add_container(MUSIC_ID, ROOT_ID, "Music", "container.storageFolder", true);
         c.add_container(VIDEO_ID, ROOT_ID, "Video", "container.storageFolder", true);
-        c.add_container(IMAGE_ID, ROOT_ID, "Pictures", "container.storageFolder", true);
+        c.add_container(
+            IMAGE_ID,
+            ROOT_ID,
+            "Pictures",
+            "container.storageFolder",
+            true,
+        );
         c.add_container(
             VIDEO_ALL_ID,
             VIDEO_ID,
@@ -1365,7 +2289,14 @@ impl Catalog {
         c
     }
 
-    fn add_container(&mut self, id: &str, parent: &str, title: &str, class: &str, searchable: bool) {
+    fn add_container(
+        &mut self,
+        id: &str,
+        parent: &str,
+        title: &str,
+        class: &str,
+        searchable: bool,
+    ) {
         self.containers.insert(
             id.to_string(),
             Container {
@@ -1387,18 +2318,86 @@ impl Catalog {
         }
     }
 
-    fn next_child_id(&self, parent: &str) -> String {
-        let n = self
-            .containers
-            .get(parent)
-            .map(|c| c.children.len() + 1)
-            .unwrap_or(1);
-        format!("{parent}${n:X}")
-    }
-
     pub fn get_item_by_detail(&self, id: i64) -> Option<&MediaItem> {
         let oid = self.by_detail.get(&id)?;
         self.items.get(oid)
+    }
+
+    /// Approximate owned bytes for capacity planning. This includes value
+    /// structs and the heap buffers directly owned by catalog strings,
+    /// vectors, captions, paths, and index entries; allocator/hash-table
+    /// bucket overhead is intentionally reported as an estimate.
+    pub fn estimated_memory_bytes(&self) -> u64 {
+        fn string_bytes(value: &String) -> usize {
+            value.capacity()
+        }
+        fn optional_string_bytes(value: &Option<String>) -> usize {
+            value.as_ref().map(string_bytes).unwrap_or(0)
+        }
+        let mut bytes = self
+            .items
+            .len()
+            .saturating_mul(std::mem::size_of::<MediaItem>())
+            .saturating_add(
+                self.containers
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Container>()),
+            );
+        for (key, item) in &self.items {
+            bytes = bytes
+                .saturating_add(key.capacity())
+                .saturating_add(item.object_id.capacity())
+                .saturating_add(item.parent_id.capacity())
+                .saturating_add(item.title.capacity())
+                .saturating_add(item.class.capacity())
+                .saturating_add(item.date.capacity())
+                .saturating_add(item.path.as_os_str().as_encoded_bytes().len())
+                .saturating_add(item.mime.capacity())
+                .saturating_add(item.ext.capacity())
+                .saturating_add(item.probe.container.capacity())
+                .saturating_add(item.probe.video.capacity())
+                .saturating_add(item.probe.hdr.capacity())
+                .saturating_add(item.probe.audio.capacity())
+                .saturating_add(item.probe.audio_streams.capacity())
+                .saturating_add(optional_string_bytes(&item.dlna_pn))
+                .saturating_add(optional_string_bytes(&item.ref_id))
+                .saturating_add(optional_string_bytes(&item.duration))
+                .saturating_add(optional_string_bytes(&item.resolution))
+                .saturating_add(optional_string_bytes(&item.creator))
+                .saturating_add(optional_string_bytes(&item.comment))
+                .saturating_add(optional_string_bytes(&item.artist))
+                .saturating_add(optional_string_bytes(&item.album_artist))
+                .saturating_add(optional_string_bytes(&item.composer))
+                .saturating_add(optional_string_bytes(&item.contributor))
+                .saturating_add(optional_string_bytes(&item.album))
+                .saturating_add(optional_string_bytes(&item.genre))
+                .saturating_add(
+                    item.captions
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Caption>()),
+                );
+            for caption in &item.captions {
+                bytes = bytes
+                    .saturating_add(caption.path.as_os_str().as_encoded_bytes().len())
+                    .saturating_add(caption.ext.capacity());
+            }
+        }
+        for (key, container) in &self.containers {
+            bytes = bytes
+                .saturating_add(key.capacity())
+                .saturating_add(container.object_id.capacity())
+                .saturating_add(container.parent_id.capacity())
+                .saturating_add(container.title.capacity())
+                .saturating_add(container.class.capacity())
+                .saturating_add(
+                    container
+                        .children
+                        .iter()
+                        .map(|child| child.capacity())
+                        .sum::<usize>(),
+                );
+        }
+        u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 
     pub fn children_of(&self, id: &str) -> Option<Vec<CatalogChild>> {
@@ -1447,7 +2446,11 @@ impl Catalog {
                 if let Some(cont) = self.containers.get(oid) {
                     Some(CatalogChild::Container(cont.clone()))
                 } else {
-                    self.items.get(oid).cloned().map(CatalogChild::Item)
+                    self.items
+                        .get(oid)
+                        .cloned()
+                        .map(Box::new)
+                        .map(CatalogChild::Item)
                 }
             })
             .collect();
@@ -1487,14 +2490,15 @@ impl Catalog {
 
     pub fn recent_items(&self, root: &str) -> Vec<CatalogChild> {
         if root == VIDEO_RECENT_ID && !self.recent_ids.is_empty() {
-            return self.recent_ids
+            return self
+                .recent_ids
                 .iter()
                 .filter_map(|id| {
                     let it = self.items.get(id)?;
                     let mut clone = it.clone();
                     clone.object_id = format!("{root}${id}");
                     clone.parent_id = root.to_string();
-                    Some(CatalogChild::Item(clone))
+                    Some(CatalogChild::Item(Box::new(clone)))
                 })
                 .collect();
         }
@@ -1510,15 +2514,17 @@ impl Catalog {
                 i.class.contains(class_pat)
                     && i.ref_id.is_none()
                     && i.object_id.starts_with(BROWSEDIR_ID)
+                    && self
+                        .recent_cutoff_unix
+                        .map(|cutoff| normalized_mtime_seconds(i.mtime) >= cutoff)
+                        .unwrap_or(true)
             })
             .collect();
         items.sort_by(|a, b| {
-            b.mtime
-                .cmp(&a.mtime)
-                .then_with(|| {
-                    path_is_symlink(&a.path)
-                        .cmp(&path_is_symlink(&b.path))
-                })
+            normalized_mtime_seconds(b.mtime)
+                .cmp(&normalized_mtime_seconds(a.mtime))
+                .then_with(|| b.mtime.cmp(&a.mtime))
+                .then_with(|| path_is_symlink(&a.path).cmp(&path_is_symlink(&b.path)))
                 .then_with(|| a.title.cmp(&b.title))
                 .then_with(|| a.object_id.cmp(&b.object_id))
         });
@@ -1535,7 +2541,7 @@ impl Catalog {
             }
             seen.insert(key, ());
             ids.push(it.object_id.clone());
-            if ids.len() == RECENT_MAX {
+            if ids.len() == self.recent_limit {
                 break;
             }
         }
@@ -1545,7 +2551,7 @@ impl Catalog {
                 let mut clone = it.clone();
                 clone.object_id = format!("{root}${id}");
                 clone.parent_id = root.to_string();
-                Some(CatalogChild::Item(clone))
+                Some(CatalogChild::Item(Box::new(clone)))
             })
             .collect()
     }
@@ -1563,6 +2569,23 @@ impl Catalog {
             })
             .collect();
         self.recent_count = self.recent_ids.len() as u32;
+    }
+
+    pub fn configure_recent_policy(&mut self, limit: usize, days: Option<u32>) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        self.configure_recent_policy_at(limit, days, now);
+    }
+
+    pub fn configure_recent_policy_at(&mut self, limit: usize, days: Option<u32>, now: i64) {
+        self.recent_limit = limit.max(1);
+        self.recent_cutoff_unix =
+            days.map(|days| now.saturating_sub(i64::from(days).saturating_mul(24 * 60 * 60)));
+        self.recent_ids.clear();
+        self.recent_count = 0;
+        self.rebuild_recent_index();
     }
 
     pub fn metadata(&self, id: &str) -> Option<CatalogChild> {
@@ -1583,7 +2606,7 @@ impl Catalog {
             return Some(CatalogChild::Container(c.clone()));
         }
         if let Some(it) = self.items.get(id) {
-            return Some(CatalogChild::Item(it.clone()));
+            return Some(CatalogChild::Item(Box::new(it.clone())));
         }
         // Infuse / libupnp caches ObjectID. After a rebuild the Browse
         // Folders id may have changed; All Video is `2$8$` + detail hex
@@ -1614,7 +2637,7 @@ impl Catalog {
             it.object_id = id.to_string();
             it.parent_id = VIDEO_ALL_ID.to_string();
         }
-        Some(CatalogChild::Item(it))
+        Some(CatalogChild::Item(Box::new(it)))
     }
 
     /// Mirror Browse Folders video files into `2$15` so Video/Folders works
@@ -1701,13 +2724,7 @@ impl Catalog {
             let vid = browse_to_typed_dir(&bid, VIDEO_DIR_ID);
             let vparent = browse_to_typed_dir(&cont.parent_id, VIDEO_DIR_ID);
             if !self.containers.contains_key(&vid) {
-                self.add_container(
-                    &vid,
-                    &vparent,
-                    &cont.title,
-                    "container.storageFolder",
-                    true,
-                );
+                self.add_container(&vid, &vparent, &cont.title, "container.storageFolder", true);
             }
             self.link_child(&vparent, &vid);
         }
@@ -1723,18 +2740,236 @@ impl Default for Catalog {
 #[derive(Clone, Debug)]
 pub enum CatalogChild {
     Container(Container),
-    Item(MediaItem),
+    Item(Box<MediaItem>),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ScanConfig {
+    /// Authoritative production root model. When populated, all ownership,
+    /// filtering, reconciliation, and relocation decisions use these records.
+    pub media_roots: Vec<MediaRoot>,
+    /// Compatibility mirror for older embedders and tests. New callers should
+    /// populate `media_roots`; production keeps this equal to configured paths.
     pub media_dirs: Vec<PathBuf>,
     pub exclude_dirs: Vec<String>,
     pub exclude_files: Vec<String>,
+    /// Include dot-prefixed files and directories. Default false matches the
+    /// reference's privacy-oriented scan policy.
+    pub include_hidden: bool,
+    /// Extra folder-art basenames. `{stem}` and `%s` expand to the media stem.
+    pub album_art_names: Vec<String>,
+    pub subtitles: bool,
+    pub thumbnails: bool,
+    pub thumbnail_width: u32,
+    pub thumbnail_quality: u8,
+    pub thumbnail_filmstrip: bool,
+    /// Maximum decoded still-image pixels and a per-allocation/source byte cap.
+    pub image_max_pixels: u64,
+    pub image_memory_limit_bytes: u64,
+    /// Hard deadline for libav exploration and ffmpeg/ffprobe helpers.
+    pub external_command_timeout: std::time::Duration,
+    /// Maximum physical media files prepared concurrently. SQLite publication
+    /// remains deterministic and single-threaded; only libav/filesystem/
+    /// thumbnail work runs in this bounded pool.
+    pub scan_workers: usize,
+    /// Maximum unique physical items per Recently Added media class.
+    pub recent_limit: usize,
+    /// Optional mtime window in days. Future mtimes remain eligible.
+    pub recent_days: Option<u32>,
+    /// Keep Kodi resume positions and play counts for this many 24-hour days
+    /// since their last update. Zero means indefinite retention.
+    pub bookmark_retention_days: u32,
     /// dialect `media_dir=V,…` filter. Default = all (AVP).
     pub types: MediaTypes,
     /// dialect `files.db`. None = in-memory SQLite (tests).
     pub db_path: Option<PathBuf>,
+    /// Follow directory/file symlinks whose canonical target is outside every
+    /// configured media root. This is intentionally false by default because
+    /// enabling it exposes content reachable through links below a media root.
+    pub wide_links: bool,
+    /// Optional lock-free-ish progress telemetry shared with the server.
+    pub progress: Option<std::sync::Arc<ScanProgress>>,
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            media_roots: Vec::new(),
+            media_dirs: Vec::new(),
+            exclude_dirs: Vec::new(),
+            exclude_files: Vec::new(),
+            include_hidden: false,
+            album_art_names: Vec::new(),
+            subtitles: true,
+            thumbnails: true,
+            thumbnail_width: 320,
+            thumbnail_quality: 2,
+            thumbnail_filmstrip: false,
+            image_max_pixels: 40_000_000,
+            image_memory_limit_bytes: 256 * 1024 * 1024,
+            external_command_timeout: std::time::Duration::from_secs(30),
+            scan_workers: default_scan_workers(),
+            recent_limit: RECENT_MAX,
+            recent_days: None,
+            bookmark_retention_days: 0,
+            types: MediaTypes::default(),
+            db_path: None,
+            wide_links: false,
+            progress: None,
+        }
+    }
+}
+
+/// A bounded, hardware-aware default. Sixteen keeps large initial scans busy
+/// on modern hosts without allowing an unbounded number of libav/ffmpeg jobs.
+pub fn default_scan_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().min(16))
+        .unwrap_or(4)
+        .max(1)
+}
+
+#[derive(Debug, Default)]
+pub struct ScanProgress {
+    files_seen: std::sync::atomic::AtomicU64,
+    current_path: std::sync::Mutex<Option<PathBuf>>,
+}
+
+impl ScanProgress {
+    fn reset(&self) {
+        self.files_seen
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut path) = self.current_path.lock() {
+            *path = None;
+        }
+    }
+
+    fn record(&self, path: &Path) {
+        self.files_seen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut current) = self.current_path.lock() {
+            *current = Some(path.to_path_buf());
+        }
+    }
+
+    pub fn snapshot(&self) -> (u64, Option<PathBuf>) {
+        (
+            self.files_seen.load(std::sync::atomic::Ordering::Relaxed),
+            self.current_path
+                .lock()
+                .map(|path| path.clone())
+                .unwrap_or_default(),
+        )
+    }
+}
+
+fn normalized_mtime_seconds(value: i64) -> i64 {
+    // Schema generations before nanosecond replacement tracking stored Unix
+    // seconds. Treat large values as nanoseconds so upgrades are seamless.
+    if value.unsigned_abs() > 10_000_000_000 {
+        value / 1_000_000_000
+    } else {
+        value
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SelectedRoot<'a> {
+    key: &'a str,
+    title: &'a str,
+    types: MediaTypes,
+    relative_to: &'a Path,
+    configured_path: &'a Path,
+}
+
+impl ScanConfig {
+    fn selected_root<'a>(&'a self, path: &Path) -> Option<SelectedRoot<'a>> {
+        if !self.media_roots.is_empty() {
+            return self.media_roots.iter().find_map(|root| {
+                root.path_candidates().find_map(|candidate| {
+                    path.strip_prefix(candidate).ok().map(|_| SelectedRoot {
+                        key: &root.key,
+                        title: &root.display_title,
+                        types: root.types,
+                        relative_to: candidate,
+                        configured_path: &root.configured_path,
+                    })
+                })
+            });
+        }
+        self.media_dirs.iter().find_map(|root| {
+            path.strip_prefix(root).ok().map(|_| SelectedRoot {
+                key: root.file_name().and_then(|s| s.to_str()).unwrap_or("media"),
+                title: root.file_name().and_then(|s| s.to_str()).unwrap_or("media"),
+                types: self.types,
+                relative_to: root,
+                configured_path: root,
+            })
+        })
+    }
+
+    fn root_types_for_path(&self, path: &Path) -> Option<MediaTypes> {
+        self.selected_root(path).map(|root| root.types)
+    }
+
+    fn root_title_for_path(&self, path: &Path) -> Option<&str> {
+        self.selected_root(path).map(|root| root.title)
+    }
+}
+
+/// Load the prior configured/canonical path for each stable root key, then
+/// persist this run's paths. A moved database can therefore translate catalog
+/// paths explicitly without guessing from directory component names.
+pub fn load_and_persist_media_root_mappings(
+    roots: &mut [MediaRoot],
+    db_path: &Path,
+) -> Result<(), String> {
+    let db = open_library_db(db_path)
+        .map_err(|error| format!("open media-root mapping database: {error}"))?;
+    for root in roots.iter_mut() {
+        for field in ["configured", "canonical"] {
+            let setting_key = format!("media_root:{}:{field}", root.key);
+            if let Some(value) = db
+                .setting(&setting_key)
+                .map_err(|error| format!("read media-root mapping {setting_key}: {error}"))?
+            {
+                let old = path_from_db(&value);
+                if old != root.configured_path
+                    && old != root.canonical_path
+                    && !root.aliases.contains(&old)
+                {
+                    root.aliases.push(old);
+                }
+            }
+        }
+        db.set_setting(
+            &format!("media_root:{}:configured", root.key),
+            &path_to_db(&root.configured_path),
+        )
+        .map_err(|error| format!("persist configured media-root path: {error}"))?;
+        db.set_setting(
+            &format!("media_root:{}:canonical", root.key),
+            &path_to_db(&root.canonical_path),
+        )
+        .map_err(|error| format!("persist canonical media-root path: {error}"))?;
+    }
+
+    for left in 0..roots.len() {
+        for right in left + 1..roots.len() {
+            for a in roots[left].path_candidates() {
+                for b in roots[right].path_candidates() {
+                    if a == b || a.starts_with(b) || b.starts_with(a) {
+                        return Err(format!(
+                            "persisted media-root mappings are ambiguous: {} and {}",
+                            a.display(),
+                            b.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1744,16 +2979,121 @@ pub struct ScanDelta {
     pub changed: usize,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ScanError {
+    #[error("library database error: {0}")]
+    Database(#[from] rusqlite::Error),
+    #[error("I/O error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("scanner invariant failed: {0}")]
+    Invariant(String),
+    #[error(transparent)]
+    Nfo(#[from] NfoError),
+}
+
+pub type ScanResult<T> = Result<T, ScanError>;
+
+fn scan_io(path: &Path, source: std::io::Error) -> ScanError {
+    ScanError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn is_corrupt_database_error(error: &rusqlite::Error) -> bool {
+    let rusqlite::Error::SqliteFailure(error, _) = error else {
+        return false;
+    };
+    let primary = error.extended_code & 0xff;
+    primary == rusqlite::ffi::SQLITE_CORRUPT || primary == rusqlite::ffi::SQLITE_NOTADB
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+/// Open the catalog, preserving a corrupt database and its WAL sidecars before
+/// creating a fresh database. Busy, permission, migration, and other errors
+/// are propagated unchanged: those states are retryable and must never be
+/// mistaken for corruption.
+pub(crate) fn open_library_db(path: &Path) -> ScanResult<LibraryDb> {
+    match LibraryDb::open(path) {
+        Ok(db) => Ok(db),
+        Err(error) if is_corrupt_database_error(&error) => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let marker = format!(".corrupt-{stamp}-{}", std::process::id());
+            let backup = path_with_suffix(path, &marker);
+            std::fs::rename(path, &backup).map_err(|source| scan_io(path, source))?;
+            for sidecar in ["-wal", "-shm"] {
+                let source_path = path_with_suffix(path, sidecar);
+                if source_path.exists() {
+                    let backup_path = path_with_suffix(&backup, sidecar);
+                    std::fs::rename(&source_path, &backup_path)
+                        .map_err(|source| scan_io(&source_path, source))?;
+                }
+            }
+            tracing::error!(
+                target: "rusty_dlna",
+                path = %path.display(),
+                backup = %backup.display(),
+                %error,
+                "corrupt library database preserved; rebuilding a fresh catalog"
+            );
+            Ok(LibraryDb::open(path)?)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Persist the UPnP SystemUpdateID using the same checked/recovering database
+/// open policy as scanner writes.
+pub fn persist_system_update_id(path: &Path, id: u32) -> ScanResult<()> {
+    open_library_db(path)?.set_update_id(id)?;
+    Ok(())
+}
+
 pub fn path_is_live_file(path: &Path) -> bool {
-    std::fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|m| m.is_file())
+        .unwrap_or(false)
 }
 
 /// Album art / caption files served into RAM. Larger → 413.
 pub const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
 
-/// True if `path` is a regular file whose canonical location is under one
-/// of `roots`. Follows symlinks, so a link that escapes the tree is false.
-pub fn path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
+fn canonical_path_is_under_roots(real: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| {
+        root.canonicalize()
+            .ok()
+            .is_some_and(|canonical_root| real.starts_with(canonical_root))
+    })
+}
+
+fn lexical_path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| {
+        path.starts_with(root)
+            || root
+                .canonicalize()
+                .ok()
+                .is_some_and(|canonical_root| path.starts_with(canonical_root))
+    })
+}
+
+fn path_is_allowed_kind(
+    path: &Path,
+    roots: &[PathBuf],
+    wide_links: bool,
+    wanted: impl FnOnce(&std::fs::Metadata) -> bool,
+) -> bool {
     if roots.is_empty() {
         return false;
     }
@@ -1763,125 +3103,126 @@ pub fn path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
     let Ok(meta) = std::fs::metadata(&real) else {
         return false;
     };
-    if !meta.is_file() {
+    if !wanted(&meta) {
         return false;
     }
-    roots.iter().any(|root| {
-        root.canonicalize()
-            .ok()
-            .is_some_and(|r| real.starts_with(&r))
-    })
+    canonical_path_is_under_roots(&real, roots)
+        || (wide_links && lexical_path_is_under_roots(path, roots))
 }
 
-/// If `stored` is missing, rebase it onto a configured media root.
-///
-/// Host scans often persist a realpath while the container only mounts
-/// that tree at a media root. Match the media-root directory name in
-/// `stored` and try the remainder under each configured root.
-pub fn rebase_media_path(stored: &Path, roots: &[PathBuf]) -> PathBuf {
+/// Apply the scanner's root policy to a regular file. With `wide_links=false`
+/// both the walked name and its final canonical target stay jailed. With the
+/// explicit opt-in enabled, a link lexically below a configured root may point
+/// outside it and the same rule is used by HTTP serving.
+pub fn path_is_allowed_file(path: &Path, cfg: &ScanConfig) -> bool {
+    path_is_allowed_kind(path, &cfg.media_dirs, cfg.wide_links, |meta| meta.is_file())
+}
+
+/// Directory counterpart to [`path_is_allowed_file`], used by both walkers and
+/// the inotify watch builder before opening or descending a directory.
+pub fn path_is_allowed_dir(path: &Path, cfg: &ScanConfig) -> bool {
+    path_is_allowed_kind(path, &cfg.media_dirs, cfg.wide_links, |meta| meta.is_dir())
+}
+
+/// True if `path` is a regular file whose canonical location is under one
+/// of `roots`. Follows symlinks, so a link that escapes the tree is false.
+pub fn path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    path_is_allowed_kind(path, roots, false, |meta| meta.is_file())
+}
+
+/// Rebase a persisted media path using the root record that owns it. This does
+/// not search for a coincidentally matching directory-name component.
+pub fn rebase_media_path_for_config(stored: &Path, cfg: &ScanConfig) -> PathBuf {
     if stored.as_os_str().is_empty() {
         return stored.to_path_buf();
     }
-    if path_is_live_file(stored) {
+    let Some(root) = cfg.selected_root(stored) else {
         return stored.to_path_buf();
+    };
+    let Ok(relative) = stored.strip_prefix(root.relative_to) else {
+        return stored.to_path_buf();
+    };
+    let candidate = root.configured_path.join(relative);
+    if path_is_live_file(&candidate) {
+        candidate
+    } else {
+        stored.to_path_buf()
     }
-    for root in roots {
-        let Some(key) = root.file_name() else {
-            continue;
-        };
-        if let Some(rel) = rel_after_component(stored, key) {
-            let cand = root.join(&rel);
-            if path_is_live_file(&cand) {
-                return cand;
-            }
-        }
-    }
-    stored.to_path_buf()
 }
 
-/// Relative path after the media-root directory name (`video` in
-/// `/storage/video` and `/mnt/pool/video`).
-pub fn media_rel_key(path: &Path, roots: &[PathBuf]) -> String {
-    for root in roots {
-        if let Some(key) = root.file_name() {
-            if let Some(rel) = rel_after_component(path, key) {
-                return rel.to_string_lossy().into_owned();
-            }
-        }
-        if let Ok(rel) = path.strip_prefix(root) {
-            return rel.to_string_lossy().into_owned();
-        }
-    }
-    path.to_string_lossy().into_owned()
+/// Stable reconciliation key qualified by its selected media-root identity.
+pub fn media_rel_key_for_config(path: &Path, cfg: &ScanConfig) -> String {
+    let Some(root) = cfg.selected_root(path) else {
+        return path_to_db(path);
+    };
+    let Ok(relative) = path.strip_prefix(root.relative_to) else {
+        return path_to_db(path);
+    };
+    format!("{}:{}", root.key, path_to_db(relative))
 }
 
-fn rel_after_component(path: &Path, key: &std::ffi::OsStr) -> Option<PathBuf> {
-    let comps: Vec<_> = path.components().collect();
-    let i = comps.iter().position(|c| c.as_os_str() == key)?;
-    let mut rel = PathBuf::new();
-    for c in &comps[i + 1..] {
-        rel.push(c.as_os_str());
-    }
-    Some(rel)
-}
-
-fn paths_are_same_media(stored: &str, event: &Path, roots: &[PathBuf]) -> bool {
-    if Path::new(stored) == event {
+fn paths_are_same_media(stored: &str, event: &Path, cfg: &ScanConfig) -> bool {
+    let stored_path = path_from_db(stored);
+    if stored_path == event {
         return true;
     }
-    let key = media_rel_key(event, roots);
-    !key.is_empty() && media_rel_key(Path::new(stored), roots) == key
+    let key = media_rel_key_for_config(event, cfg);
+    !key.is_empty() && media_rel_key_for_config(&stored_path, cfg) == key
 }
 
-fn path_is_under_watched(stored: &str, dir: &Path, roots: &[PathBuf]) -> bool {
-    let stored_p = Path::new(stored);
+fn path_is_under_watched(stored: &str, dir: &Path, cfg: &ScanConfig) -> bool {
+    let stored_path = path_from_db(stored);
+    let stored_p = stored_path.as_path();
     if stored_p == dir || stored_p.starts_with(dir) {
         return true;
     }
-    let drel = media_rel_key(dir, roots);
+    let drel = media_rel_key_for_config(dir, cfg);
     if drel.is_empty() {
         return false;
     }
-    let frel = media_rel_key(stored_p, roots);
+    let frel = media_rel_key_for_config(stored_p, cfg);
     frel == drel || frel.starts_with(&format!("{drel}/"))
 }
 
-fn open_library(cfg: &ScanConfig) -> Option<LibraryDb> {
+fn open_library(cfg: &ScanConfig) -> ScanResult<Option<LibraryDb>> {
     match &cfg.db_path {
-        Some(p) => LibraryDb::open(p).ok(),
-        None => None,
+        Some(p) => Ok(Some(open_library_db(p)?)),
+        None => Ok(None),
     }
 }
 
 /// Drop DETAILS/OBJECTS for `path`, matching host-realpath vs container-mount
 /// prefixes (e.g. `/mnt/pool/video/…` vs `/storage/video/…`).
-pub fn forget_path(cfg: &ScanConfig, path: &Path) -> usize {
+pub fn forget_path(cfg: &ScanConfig, path: &Path) -> ScanResult<usize> {
     forget_matching(cfg, path, false)
 }
 
 /// Drop every DETAILS row under `dir`, using the same prefix-alias rules.
-pub fn forget_tree(cfg: &ScanConfig, dir: &Path) -> usize {
+pub fn forget_tree(cfg: &ScanConfig, dir: &Path) -> ScanResult<usize> {
     forget_matching(cfg, dir, true)
 }
 
-fn forget_matching(cfg: &ScanConfig, path: &Path, tree: bool) -> usize {
+fn forget_matching(cfg: &ScanConfig, path: &Path, tree: bool) -> ScanResult<usize> {
     let _write = library_write_guard();
-    let Some(db) = open_library(cfg) else {
-        return 0;
+    let Some(db) = open_library(cfg)? else {
+        return Ok(0);
     };
-    let rows = db.all_detail_stats().unwrap_or_default();
+    let transaction = db.transaction()?;
+    let rows = db.all_detail_stats()?;
     let mut n = 0usize;
-    for (p, _, _, _, _, _) in rows {
+    for row in rows {
+        let p = row.path;
         let hit = if tree {
-            path_is_under_watched(&p, path, &cfg.media_dirs)
+            path_is_under_watched(&p, path, cfg)
         } else {
-            paths_are_same_media(&p, path, &cfg.media_dirs)
+            paths_are_same_media(&p, path, cfg)
         };
         if hit {
-            n += db.remove_path_and_symlink_aliases(&p).unwrap_or(0);
+            n += db.remove_path_and_symlink_aliases(&p)?;
         }
     }
-    n
+    transaction.commit()?;
+    Ok(n)
 }
 
 pub fn path_is_symlink(path: &Path) -> bool {
@@ -1901,7 +3242,7 @@ fn file_mtime_unix(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
+        .map(|duration| i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -1912,11 +3253,37 @@ pub(crate) fn path_excluded(path: &Path, name: &str, cfg: &ScanConfig) -> bool {
         }
     }
     for e in &cfg.exclude_files {
-        if name == e {
+        if basename_glob_matches(e, name) {
             return true;
         }
     }
     false
+}
+
+/// MiniDLNA `exclude_file` matching: basename only, ASCII case-insensitive,
+/// with `*` (zero or more bytes) and `?` (one byte).
+pub fn basename_glob_matches(pattern: &str, name: &str) -> bool {
+    fn matches(pattern: &[u8], name: &[u8]) -> bool {
+        match pattern.first().copied() {
+            None => name.is_empty(),
+            Some(b'*') => {
+                let rest = pattern
+                    .iter()
+                    .position(|byte| *byte != b'*')
+                    .unwrap_or(pattern.len());
+                let pattern = &pattern[rest..];
+                pattern.is_empty()
+                    || (0..=name.len()).any(|offset| matches(pattern, &name[offset..]))
+            }
+            Some(b'?') => !name.is_empty() && matches(&pattern[1..], &name[1..]),
+            Some(expected) => {
+                name.first()
+                    .is_some_and(|actual| expected.eq_ignore_ascii_case(actual))
+                    && matches(&pattern[1..], &name[1..])
+            }
+        }
+    }
+    matches(pattern.as_bytes(), name.as_bytes())
 }
 
 /// dialect `exclude_dir`: a path component (`incomplete`) or a suffix
@@ -1947,39 +3314,65 @@ fn file_mtime_date(path: &Path) -> String {
     w3c_date_from_unix(unix).unwrap_or_else(|| "1970-01-01T00:00:00Z".into())
 }
 
-fn captions_for(file: &Path) -> Vec<Caption> {
+pub fn caption_path_matches_media(sidecar: &Path, media: &Path) -> bool {
+    let Some(ext) = sidecar.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    if !matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "srt" | "ass" | "ssa" | "vtt" | "smi" | "sub"
+    ) {
+        return false;
+    }
+    let Some(base) = sidecar.file_stem().map(OsStr::as_encoded_bytes) else {
+        return false;
+    };
+    let Some(stem) = media.file_stem().map(OsStr::as_encoded_bytes) else {
+        return false;
+    };
+    base == stem
+        || base
+            .strip_prefix(stem)
+            .is_some_and(|variant| variant.starts_with(b".") && variant.len() > 1)
+}
+
+fn captions_from_candidates(file: &Path, candidates: &[PathBuf]) -> Vec<Caption> {
+    candidates
+        .iter()
+        .filter(|path| caption_path_matches_media(path, file))
+        .enumerate()
+        .map(|(index, path)| Caption {
+            index: index as u32,
+            path: path.clone(),
+            ext: path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| caption_ext(&format!("x.{value}")))
+                .unwrap_or("sub")
+                .into(),
+        })
+        .collect()
+}
+
+fn captions_for(file: &Path, cfg: &ScanConfig) -> ScanResult<Vec<Caption>> {
+    if !cfg.subtitles {
+        return Ok(Vec::new());
+    }
     let parent = match file.parent() {
         Some(p) => p,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
-    let stem = match file.file_stem().and_then(|s| s.to_str()) {
-        Some(s) => s,
-        None => return Vec::new(),
-    };
-    let mut caps = Vec::new();
-    let rd = match std::fs::read_dir(parent) {
-        Ok(r) => r,
-        Err(_) => return caps,
-    };
-    let mut names: Vec<PathBuf> = rd
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(stem) && is_caption_name(n))
-        })
-        .collect();
-    names.sort();
-    for (i, p) in names.into_iter().enumerate() {
-        let ext = caption_ext(p.file_name().and_then(|n| n.to_str()).unwrap_or(""));
-        caps.push(Caption {
-            index: i as u32,
-            path: p,
-            ext: ext.into(),
-        });
+    let rd = std::fs::read_dir(parent).map_err(|error| scan_io(parent, error))?;
+    let mut names = Vec::new();
+    for entry in rd {
+        let entry = entry.map_err(|error| scan_io(parent, error))?;
+        let path = entry.path();
+        if path_is_allowed_file(&path, cfg) && caption_path_matches_media(&path, file) {
+            names.push(path);
+        }
     }
-    caps
+    names.sort();
+    Ok(captions_from_candidates(file, &names))
 }
 
 /// Cheap HDR guess from a title or path. Browse uses this so a folder
@@ -2045,7 +3438,10 @@ pub fn probe_toml_exists(file: &Path) -> bool {
 
 /// First codec when VIDEO/AUDIO store extra tracks as `aac,ac3`.
 pub fn primary_codec(s: &str) -> &str {
-    s.split(',').map(str::trim).find(|p| !p.is_empty()).unwrap_or("")
+    s.split(',')
+        .map(str::trim)
+        .find(|p| !p.is_empty())
+        .unwrap_or("")
 }
 
 /// `1920x800` / `1920X800` from DETAILS.RESOLUTION.
@@ -2150,6 +3546,7 @@ pub fn probe_from_stored(
     container: Option<&str>,
     video: Option<&str>,
     audio: Option<&str>,
+    audio_streams: Option<&str>,
     hdr: Option<&str>,
     resolution: Option<&str>,
 ) -> SourceProbe {
@@ -2171,29 +3568,36 @@ pub fn probe_from_stored(
         container,
         video,
         audio: audio.filter(|s| !s.is_empty()).unwrap_or("").to_string(),
+        audio_streams: audio_streams
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string(),
         hdr: hdr.filter(|s| !s.is_empty()).unwrap_or("").to_string(),
         width,
         height,
     }
 }
 
-pub fn apply_probe_to_detail(db: &LibraryDb, id: i64, got: &MediaProbe) {
+pub fn apply_probe_to_detail(db: &LibraryDb, id: i64, got: &MediaProbe) -> ScanResult<()> {
     let mut got = got.clone();
     if got.probe.hdr.is_empty() {
         got.probe.hdr = "sdr".into();
     }
-    let _ = db.update_detail_stream(
+    db.update_detail_stream(
         id,
-        got.av.duration.as_deref(),
-        got.av.bitrate,
-        got.av.resolution.as_deref(),
-        got.av.channels,
-        got.av.samplerate,
-        Some(got.probe.container.as_str()).filter(|s| !s.is_empty()),
-        Some(got.probe.video.as_str()).filter(|s| !s.is_empty()),
-        Some(got.probe.audio.as_str()).filter(|s| !s.is_empty()),
-        Some(got.probe.hdr.as_str()),
-    );
+        DetailStreamUpdate {
+            duration: got.av.duration.as_deref(),
+            bitrate: got.av.bitrate,
+            resolution: got.av.resolution.as_deref(),
+            channels: got.av.channels,
+            samplerate: got.av.samplerate,
+            container: Some(got.probe.container.as_str()).filter(|s| !s.is_empty()),
+            video: Some(got.probe.video.as_str()).filter(|s| !s.is_empty()),
+            audio: Some(got.probe.audio.as_str()).filter(|s| !s.is_empty()),
+            hdr: Some(got.probe.hdr.as_str()),
+        },
+    )?;
+    db.update_detail_audio_streams(id, Some(&got.probe.audio_streams))?;
     let pn = dlna_pn_from_probe(
         &got.probe.container,
         &got.probe.video,
@@ -2202,27 +3606,91 @@ pub fn apply_probe_to_detail(db: &LibraryDb, id: i64, got: &MediaProbe) {
         got.probe.width,
         got.probe.height,
     );
-    let _ = db.update_detail_dlna_pn(id, pn.as_deref());
+    db.update_detail_dlna_pn(id, pn.as_deref())?;
     if let Some(c) = got.av.creator.as_deref().filter(|s| !s.is_empty()) {
-        let _ = db.update_detail_creator_if_empty(id, c);
+        db.update_detail_creator_if_empty(id, c)?;
     }
-    let _ = db.copy_stream_to_inode_aliases(id);
+    db.update_detail_embedded_tags(id, &got.tags)?;
+    db.mark_detail_stream_probed(id)?;
+    db.copy_stream_to_inode_aliases(id)?;
+    db.copy_embedded_tags_to_inode_aliases(id)?;
+    Ok(())
 }
 
 /// Probe `path` and persist. Libav `None` still applies a `.probe.toml`
 /// sidecar. With neither, stream columns stay unset so a later size change
 /// can retry (growing MP4 with no moov yet).
-fn persist_probe(db: &LibraryDb, path: &Path, id: i64) -> bool {
-    if let Some(mut got) = probe_media(path) {
-        merge_sidecar(path, &mut got.probe);
-        apply_probe_to_detail(db, id, &got);
-        return true;
+fn persist_probe(db: &LibraryDb, cfg: &ScanConfig, path: &Path, id: i64) -> ScanResult<bool> {
+    persist_probe_with(db, cfg, path, id, None)
+}
+
+fn persist_probe_with(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    path: &Path,
+    id: i64,
+    known: Option<MediaProbe>,
+) -> ScanResult<bool> {
+    if !path_is_allowed_file(path, cfg) {
+        return Ok(false);
+    }
+    let got = if is_image(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(""),
+    ) {
+        known.or_else(|| probe_image_with_timeout(path, cfg.external_command_timeout))
+    } else {
+        known.or_else(|| probe_media_with_timeout(path, cfg.external_command_timeout))
+    };
+    persist_prepared_probe(db, cfg, path, id, got)
+}
+
+/// Persist an already-attempted probe. `None` is a cached failure and must not
+/// reopen the same physical file on the serial SQLite publication pass.
+fn persist_prepared_probe(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    path: &Path,
+    id: i64,
+    got: Option<MediaProbe>,
+) -> ScanResult<bool> {
+    if !path_is_allowed_file(path, cfg) {
+        return Ok(false);
+    }
+    if is_image(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(""),
+    ) {
+        let Some(got) = got else {
+            db.clear_detail_stream(id)?;
+            return Ok(false);
+        };
+        db.update_detail_stream(
+            id,
+            DetailStreamUpdate {
+                resolution: got.av.resolution.as_deref(),
+                container: Some("jpeg"),
+                ..DetailStreamUpdate::default()
+            },
+        )?;
+        db.update_detail_embedded_tags(id, &got.tags)?;
+        db.mark_detail_stream_probed(id)?;
+        db.copy_stream_to_inode_aliases(id)?;
+        db.copy_embedded_tags_to_inode_aliases(id)?;
+        return Ok(true);
+    }
+    if let Some(mut got) = got {
+        merge_sidecar(cfg, path, &mut got.probe)?;
+        apply_probe_to_detail(db, id, &got)?;
+        return Ok(true);
     }
     let mut probe = SourceProbe::default();
-    merge_sidecar(path, &mut probe);
+    merge_sidecar(cfg, path, &mut probe)?;
     if probe.hdr.is_empty() && probe.video.is_empty() && probe.audio.is_empty() {
-        let _ = db.clear_detail_stream(id);
-        return false;
+        db.clear_detail_stream(id)?;
+        return Ok(false);
     }
     apply_probe_to_detail(
         db,
@@ -2230,43 +3698,48 @@ fn persist_probe(db: &LibraryDb, path: &Path, id: i64) -> bool {
         &MediaProbe {
             probe,
             av: AvMeta::default(),
+            tags: EmbeddedTags::default(),
         },
-    );
-    true
+    )?;
+    Ok(true)
 }
 
-fn merge_sidecar(path: &Path, probe: &mut SourceProbe) {
+fn merge_sidecar(cfg: &ScanConfig, path: &Path, probe: &mut SourceProbe) -> ScanResult<()> {
     let named = PathBuf::from(format!("{}.probe.toml", path.display()));
     let stem = path.with_extension("probe.toml");
     for c in [named, stem] {
-        if let Ok(text) = std::fs::read_to_string(&c) {
-            let s = parse_probe_toml(&text);
-            if !s.container.is_empty() {
-                probe.container = s.container;
-            }
-            if !s.video.is_empty() {
-                probe.video = s.video;
-            }
-            if !s.audio.is_empty() {
-                probe.audio = s.audio;
-            }
-            if !s.hdr.is_empty() {
-                probe.hdr = s.hdr;
-            }
-            if s.width > 0 {
-                probe.width = s.width;
-            }
-            if s.height > 0 {
-                probe.height = s.height;
-            }
-            return;
+        if !path_is_allowed_file(&c, cfg) {
+            continue;
         }
+        let text = std::fs::read_to_string(&c).map_err(|error| scan_io(&c, error))?;
+        let s = parse_probe_toml(&text);
+        if !s.container.is_empty() {
+            probe.container = s.container;
+        }
+        if !s.video.is_empty() {
+            probe.video = s.video;
+        }
+        if !s.audio.is_empty() {
+            probe.audio = s.audio;
+        }
+        if !s.hdr.is_empty() {
+            probe.hdr = s.hdr;
+        }
+        if s.width > 0 {
+            probe.width = s.width;
+        }
+        if s.height > 0 {
+            probe.height = s.height;
+        }
+        return Ok(());
     }
+    Ok(())
 }
 
 /// ffprobe codec / Dolby Vision profile. Used when no sidecar exists.
 pub fn probe_stream_identity(path: &Path) -> Option<SourceProbe> {
-    let out = std::process::Command::new("ffprobe")
+    let mut command = std::process::Command::new("ffprobe");
+    command
         .args([
             "-v",
             "error",
@@ -2279,9 +3752,10 @@ pub fn probe_stream_identity(path: &Path) -> Option<SourceProbe> {
             "-of",
             "default=noprint_wrappers=1",
         ])
-        .arg(path)
-        .output()
-        .ok()?;
+        .arg(path);
+    let out =
+        crate::probe::command_output_with_timeout(&mut command, std::time::Duration::from_secs(30))
+            .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -2310,21 +3784,14 @@ pub fn probe_stream_identity(path: &Path) -> Option<SourceProbe> {
                     color_transfer = v.trim().to_string();
                 }
             }
-            "dv_profile" => {
-                if dv_profile.is_none() {
-                    dv_profile = v.trim().parse().ok();
-                }
-            }
+            "dv_profile" if dv_profile.is_none() => dv_profile = v.trim().parse().ok(),
             _ => {}
         }
     }
     if video.is_empty() && audio.is_empty() && dv_profile.is_none() {
         return None;
     }
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("mkv");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("mkv");
     let mut p = SourceProbe::default();
     p.container = match ext {
         "mp4" | "m4v" => "mp4".into(),
@@ -2377,9 +3844,9 @@ pub fn load_existing(cfg: &ScanConfig) -> Catalog {
     if !path.exists() {
         return Catalog::new();
     }
-    match LibraryDb::open(path).and_then(|db| {
-        let n = db.detail_count().unwrap_or(0);
-        let cat = db.load_catalog()?;
+    match open_library_db(path).and_then(|db| {
+        let n = db.detail_count()?;
+        let cat = load_catalog_with_policy(&db, cfg)?;
         Ok((n, cat))
     }) {
         Ok((n, cat)) if !cat.items.is_empty() || !cat.containers.is_empty() => {
@@ -2404,59 +3871,157 @@ pub fn load_existing(cfg: &ScanConfig) -> Catalog {
     }
 }
 
-pub fn scan(cfg: &ScanConfig) -> Catalog {
+pub fn load_catalog_with_policy(db: &LibraryDb, cfg: &ScanConfig) -> ScanResult<Catalog> {
+    let mut catalog = db.load_catalog()?;
+    catalog.configure_recent_policy(cfg.recent_limit, cfg.recent_days);
+    Ok(catalog)
+}
+
+pub fn scan(cfg: &ScanConfig) -> ScanResult<Catalog> {
     scan_inner(cfg, true)
 }
 
 /// Background refresh: do not wipe OBJECTS; skip files whose SIZE+TIMESTAMP
 /// are unchanged; never descend into `exclude_dir` (e.g. `incomplete`).
-pub fn scan_refresh(cfg: &ScanConfig) -> Catalog {
+pub fn scan_refresh(cfg: &ScanConfig) -> ScanResult<Catalog> {
     scan_inner(cfg, false)
 }
 
-fn scan_inner(cfg: &ScanConfig, rebuild: bool) -> Catalog {
+/// One-time repair for catalogs created while embedded stream/container titles
+/// could overwrite a video's filename. Video release tags are frequently an
+/// encoder, uploader, or audio-track label rather than a human-facing movie
+/// name, so normalize every video to filename/NFO. The persisted policy
+/// revision makes later starts O(1).
+pub fn repair_video_titles_if_needed(cfg: &ScanConfig) -> ScanResult<(Option<Catalog>, ScanDelta)> {
+    const POLICY_KEY: &str = "video_title_policy_rev";
+    const POLICY_REV: &str = "3";
+
+    let _write = library_write_guard();
     let db = match &cfg.db_path {
-        Some(p) => LibraryDb::open(p).expect("open files.db"),
-        None => LibraryDb::open_memory().expect("open memory db"),
+        Some(path) => open_library_db(path)?,
+        None => return Ok((None, ScanDelta::default())),
     };
-    if rebuild {
-        let _ = db.clear_objects();
+    if db.setting(POLICY_KEY)?.as_deref() == Some(POLICY_REV) {
+        return Ok((None, ScanDelta::default()));
     }
-    let _ = db.seed_virtual_containers();
-    let _ = db.begin();
-    let media_dirs = cfg.media_dirs.clone();
-    let mut walk_stack: HashMap<(u64, u64), ()> = HashMap::new();
-    let mut indexed = 0usize;
-    for root in &media_dirs {
-        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-        let title = root
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("media")
-            .to_string();
-        walk_into_db(
-            &db,
+    let transaction = db.transaction()?;
+    let mut changed = 0usize;
+    let mut desired_by_physical: HashMap<(i64, i64, String), String> = HashMap::new();
+    for row in db.video_detail_titles()? {
+        let db::VideoDetailTitle {
+            id,
+            path: stored,
+            title: current,
+            device,
+            inode,
+        } = row;
+        let stored_path = path_from_db(&stored);
+        let filename_title = stored_path
+            .file_stem()
+            .map(display_os_name)
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| current.clone());
+        let key = (device, inode, filename_title.clone());
+        let wanted = if let Some(wanted) = desired_by_physical.get(&key) {
+            wanted.clone()
+        } else {
+            let live = rebase_media_path_for_config(&stored_path, cfg);
+            let nfo_title = if path_is_allowed_file(&live, cfg) {
+                nfo_for_file_with_policy_result(&live, &cfg.media_dirs, cfg.wide_links)?.title
+            } else {
+                None
+            };
+            let wanted = nfo_title.unwrap_or(filename_title);
+            desired_by_physical.insert(key, wanted.clone());
+            wanted
+        };
+        let mut item_changed = false;
+        if current != wanted {
+            db.update_detail_title(id, &wanted)?;
+            item_changed = true;
+        }
+        let fields = db.detail_group_fields(id)?;
+        let series_title = episode_display_title(&wanted, fields.album.as_deref());
+        item_changed |= db.update_detail_names_under_root(id, VIDEO_SERIES_ID, &series_title)? > 0;
+        item_changed |= db.update_detail_names_under_root(id, VIDEO_GENRE_ID, &wanted)? > 0;
+        item_changed |= db.update_detail_names_under_root(id, VIDEO_ACTOR_ID, &wanted)? > 0;
+        changed += usize::from(item_changed);
+    }
+    db.set_setting(POLICY_KEY, POLICY_REV)?;
+    transaction.commit()?;
+    let delta = ScanDelta {
+        changed,
+        ..ScanDelta::default()
+    };
+    if changed == 0 {
+        return Ok((None, delta));
+    }
+    tracing::info!(
+        target: "rusty_dlna",
+        changed,
+        "repaired video titles from filenames/NFO"
+    );
+    Ok((Some(load_catalog_with_policy(&db, cfg)?), delta))
+}
+
+fn scan_inner(cfg: &ScanConfig, rebuild: bool) -> ScanResult<Catalog> {
+    if let Some(progress) = &cfg.progress {
+        progress.reset();
+    }
+    let db = match &cfg.db_path {
+        Some(p) => open_library_db(p)?,
+        None => LibraryDb::open_memory()?,
+    };
+    let transaction = db.transaction()?;
+    if rebuild {
+        db.clear_objects()?;
+    }
+    db.seed_virtual_containers()?;
+    {
+        let mut walker = DbWalker {
+            db: &db,
             cfg,
-            &mut walk_stack,
-            &root,
-            BROWSEDIR_ID,
-            &title,
+            walk_stack: HashMap::new(),
             rebuild,
-            &mut indexed,
+            indexed: 0,
+            pending: Vec::new(),
+        };
+        for root in &cfg.media_dirs {
+            let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            let title = cfg
+                .root_title_for_path(&root)
+                .unwrap_or("media")
+                .to_string();
+            walker.walk(&root, BROWSEDIR_ID, &title)?;
+        }
+        walker.index_pending()?;
+    }
+    db.prune_missing_files()?;
+    db.prune_excluded_paths(cfg)?;
+    playlist::sync_playlists(&db, cfg)?;
+    db.prune_empty_folders()?;
+    let expired_bookmarks =
+        db.prune_expired_bookmarks(cfg.bookmark_retention_days, unix_now_seconds())?;
+    if expired_bookmarks > 0 {
+        tracing::info!(
+            target: "rusty_dlna",
+            removed = expired_bookmarks,
+            retention_days = cfg.bookmark_retention_days,
+            "expired playback state pruned"
         );
     }
-    let _ = db.commit();
-    let _ = db.prune_missing_files();
-    let _ = db.prune_excluded_paths(cfg);
-    let _ = db.prune_empty_folders();
-    let n = db.detail_count().unwrap_or(0);
+    if rebuild {
+        db.set_setting("video_title_policy_rev", "3")?;
+    }
+    transaction.commit()?;
+    let n = db.detail_count()?;
     tracing::info!(
         target: "rusty_dlna",
         details = n,
         path = %db.path.display(),
         "scan complete"
     );
-    db.load_catalog().unwrap_or_else(|_| Catalog::new())
+    load_catalog_with_policy(&db, cfg)
 }
 
 pub(crate) fn library_write_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -2464,18 +4029,22 @@ pub(crate) fn library_write_guard() -> std::sync::MutexGuard<'static, ()> {
     M.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn unix_now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 /// List files on disk (skip `exclude_dir` / junk), compare to DETAILS, apply
 /// only adds/changes/deletes. Does not wipe OBJECTS or rewrite unchanged rows.
-pub fn monitor(cfg: &ScanConfig) -> (Option<Catalog>, ScanDelta) {
+pub fn monitor(cfg: &ScanConfig) -> ScanResult<(Option<Catalog>, ScanDelta)> {
     monitor_dirty(cfg, &[])
 }
 
 fn log_library_file(path: impl AsRef<Path>, action: &'static str, message: &'static str) {
     let path = path.as_ref();
-    let file = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let file = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     tracing::info!(
         target: "rusty_dlna",
         file,
@@ -2487,51 +4056,73 @@ fn log_library_file(path: impl AsRef<Path>, action: &'static str, message: &'sta
 
 /// Like [`monitor`], but restat `dirty` paths (inotify CLOSE_WRITE / move
 /// targets) so SIZE/TIMESTAMP stay current without stating the whole tree.
-pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, ScanDelta) {
+pub fn monitor_dirty(
+    cfg: &ScanConfig,
+    dirty: &[PathBuf],
+) -> ScanResult<(Option<Catalog>, ScanDelta)> {
+    let started = std::time::Instant::now();
+    let restat_all = dirty.is_empty();
+    if let Some(progress) = &cfg.progress {
+        progress.reset();
+    }
+    if restat_all {
+        tracing::info!(target: "rusty_dlna", "library reconciliation started");
+    }
     let _write = library_write_guard();
     let db = match &cfg.db_path {
-        Some(p) => LibraryDb::open(p).expect("open files.db"),
-        None => LibraryDb::open_memory().expect("open memory db"),
+        Some(p) => open_library_db(p)?,
+        None => LibraryDb::open_memory()?,
     };
-    let listed = list_media_files(cfg);
-    let db_rows = db.all_detail_stats().unwrap_or_default();
+    let listed = list_media_files(cfg)?;
+    let db_rows = db.all_detail_stats()?;
+    if restat_all {
+        tracing::info!(
+            target: "rusty_dlna",
+            files = listed.len(),
+            details = db_rows.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "library walk complete"
+        );
+    }
     let mut listed_by_rel: HashMap<String, &ListedFile> = HashMap::new();
-    for (p, st) in &listed {
-        listed_by_rel.insert(media_rel_key(Path::new(p), &cfg.media_dirs), st);
+    for st in listed.values() {
+        listed_by_rel.insert(media_rel_key_for_config(&st.path, cfg), st);
     }
     let dirty_rels: HashSet<String> = dirty
         .iter()
-        .map(|p| media_rel_key(p, &cfg.media_dirs))
+        .map(|p| media_rel_key_for_config(p, cfg))
         .collect();
-    let mut in_db_by_rel: HashMap<String, Vec<(String, i64, i64, i64, i64, i64)>> = HashMap::new();
-    for (p, id, sz, ts, dev, ino) in &db_rows {
-        in_db_by_rel
-            .entry(media_rel_key(Path::new(p), &cfg.media_dirs))
-            .or_default()
-            .push((p.clone(), *id, *sz, *ts, *dev, *ino));
-    }
-    let _ = db.seed_virtual_containers();
-    let need_probe: HashSet<(i64, i64)> = db
-        .inodes_needing_stream_probe()
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    let transaction = db.transaction()?;
+    db.seed_virtual_containers()?;
     // Periodic `monitor()` (empty dirty) restats every listed row so a
     // replaced file (new inode / new size) cannot stay frozen. Inotify
-    // passes only restat dirty + incomplete paths.
-    let restat_all = dirty.is_empty();
-    let _ = db.begin();
+    // passes only restat dirty paths. Missing optional stream fields are not
+    // evidence that an unchanged file needs another libav pass: some damaged
+    // or unusual streams legitimately leave fields empty. A failed probe is
+    // retried when the file's size, timestamp, device, or inode changes.
     let mut added = 0usize;
     let mut removed = 0usize;
     let mut changed = 0usize;
-    for (path, ..) in &db_rows {
-        let key = media_rel_key(Path::new(path), &cfg.media_dirs);
-        if path_is_unwanted(Path::new(path), cfg) || !listed_by_rel.contains_key(&key) {
-            if db.remove_path_and_symlink_aliases(path).unwrap_or(0) > 0 {
-                log_library_file(path, "removed", "library file removed");
-                removed += 1;
-            }
+    for row in &db_rows {
+        let decoded = path_from_db(&row.path);
+        let key = media_rel_key_for_config(&decoded, cfg);
+        if (path_is_unwanted(&decoded, cfg) || !listed_by_rel.contains_key(&key))
+            && db.remove_path_and_symlink_aliases(&row.path)? > 0
+        {
+            log_library_file(&decoded, "removed", "library file removed");
+            removed += 1;
         }
+    }
+    // Removal can delete several inode aliases at once. Rebuild the lookup
+    // from live rows before matching additions; stale IDs would otherwise be
+    // updated or queried later in the same transaction.
+    let live_db_rows = db.all_detail_stats()?;
+    let mut in_db_by_rel: HashMap<String, Vec<DetailStat>> = HashMap::new();
+    for row in &live_db_rows {
+        in_db_by_rel
+            .entry(media_rel_key_for_config(&path_from_db(&row.path), cfg))
+            .or_default()
+            .push(row.clone());
     }
     // Same on-disk file stored under the host realpath and the container
     // mount is one library item. Keep the live listed path, drop extras.
@@ -2539,54 +4130,67 @@ pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, S
         if rows.len() < 2 || !listed_by_rel.contains_key(key) {
             continue;
         }
-        let listed_path = listed_by_rel[key].path.to_string_lossy();
+        let listed_path = path_to_db(&listed_by_rel[key].path);
         let keep = rows
             .iter()
-            .find(|(p, ..)| p.as_str() == listed_path)
+            .find(|row| row.path == listed_path)
             .or_else(|| {
                 rows.iter()
-                    .find(|(p, ..)| path_is_live_file(Path::new(p)))
+                    .find(|row| path_is_live_file(&path_from_db(&row.path)))
             })
-            .map(|(p, ..)| p.clone());
+            .map(|row| row.path.clone());
         let Some(keep) = keep else {
             continue;
         };
-        for (p, id, ..) in rows {
-            if p == &keep {
+        for row in rows {
+            if row.path == keep {
                 continue;
             }
-            if db.remove_detail_id(*id).is_ok() {
-                log_library_file(p, "removed", "library duplicate path dropped");
-                removed += 1;
-            }
+            db.remove_detail_id(row.id)?;
+            log_library_file(
+                path_from_db(&row.path),
+                "removed",
+                "library duplicate path dropped",
+            );
+            removed += 1;
         }
     }
     for (path_s, st) in &listed {
-        let key = media_rel_key(Path::new(path_s), &cfg.media_dirs);
-        let existing = in_db_by_rel.get(&key).and_then(|v| {
-            v.iter()
-                .find(|(p, ..)| p == path_s)
-                .or_else(|| v.first())
+        let key = media_rel_key_for_config(&st.path, cfg);
+        let existing = in_db_by_rel.get(&key).and_then(|rows| {
+            rows.iter()
+                .find(|row| &row.path == path_s)
+                .or_else(|| rows.first())
         });
         match existing {
-            Some((db_path, id, sz, ts, dev, ino)) => {
-                let incomplete = need_probe.contains(&(*dev, *ino));
-                let mut live_dev = *dev;
-                let mut live_ino = *ino;
-                if restat_all || dirty_rels.contains(&key) || incomplete {
-                    if let Some(meta) = std::fs::metadata(&st.path).ok().filter(|m| m.is_file()) {
+            Some(row) => {
+                let mut live_dev = row.device;
+                let mut live_ino = row.inode;
+                if restat_all || dirty_rels.contains(&key) {
+                    let meta = match std::fs::metadata(&st.path) {
+                        Ok(meta) if meta.is_file() => Some(meta),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => return Err(scan_io(&st.path, error)),
+                        Ok(_) => None,
+                    };
+                    if let Some(meta) = meta {
                         let size = meta.len() as i64;
                         let mtime = file_mtime_unix(&meta);
                         let (new_dev, new_ino) = inode_key(&meta);
                         live_dev = new_dev as i64;
                         live_ino = new_ino as i64;
-                        let grew = size != *sz
-                            || mtime != *ts
-                            || live_dev != *dev
-                            || live_ino != *ino;
-                        if grew || incomplete {
-                            if grew && !file_is_viable(&st.path) {
-                                let _ = db.remove_path_and_symlink_aliases(db_path);
+                        let grew = size != row.size
+                            || mtime != row.timestamp
+                            || live_dev != row.device
+                            || live_ino != row.inode;
+                        if grew {
+                            if grew
+                                && !file_is_viable_with_timeout(
+                                    &st.path,
+                                    cfg.external_command_timeout,
+                                )
+                            {
+                                db.remove_path_and_symlink_aliases(&row.path)?;
                                 log_library_file(&st.path, "removed", "library file removed");
                                 removed += 1;
                                 continue;
@@ -2597,28 +4201,41 @@ pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, S
                                     file = st.path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
                                     action = "updated",
                                     path = %st.path.display(),
-                                    old_size = *sz,
+                                    old_size = row.size,
                                     size,
-                                    old_inode = *ino,
+                                    old_inode = row.inode,
                                     inode = live_ino,
                                     "file updated"
                                 );
-                                let _ = db.update_detail_stat(
-                                    *id, size, mtime, live_dev, live_ino,
-                                );
+                                db.update_detail_stat(row.id, size, mtime, live_dev, live_ino)?;
+                                let title = st
+                                    .path
+                                    .file_stem()
+                                    .and_then(|value| value.to_str())
+                                    .unwrap_or("item");
+                                db.reset_detail_tags_to_file_defaults(
+                                    row.id,
+                                    title,
+                                    &file_mtime_date(&st.path),
+                                )?;
                             }
-                            let probed = apply_or_reuse_probe(&db, &st.path, *id, live_dev, live_ino);
+                            let probed = apply_or_reuse_probe(
+                                &db, cfg, &st.path, row.id, live_dev, live_ino,
+                            )?;
                             if grew {
+                                apply_nfo(&db, cfg, &st.path, row.id)?;
                                 refresh_replaced_inode_aliases(
                                     &db,
-                                    *dev,
-                                    *ino,
-                                    *id,
-                                    live_dev,
-                                    live_ino,
-                                    size,
-                                    mtime,
-                                );
+                                    InodeReplacement {
+                                        old_device: row.device,
+                                        old_inode: row.inode,
+                                        source_id: row.id,
+                                        new_device: live_dev,
+                                        new_inode: live_ino,
+                                        size,
+                                        timestamp: mtime,
+                                    },
+                                )?;
                             }
                             if probed || grew {
                                 changed += 1;
@@ -2626,18 +4243,18 @@ pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, S
                         }
                     }
                 }
-                if attach_listed_if_missing(&db, cfg, &st.path, *id, live_dev, live_ino) {
+                if attach_listed_if_missing(&db, cfg, &st.path, row.id, live_dev, live_ino)? {
                     changed += 1;
                 }
             }
             None => {
                 // Rel-key miss is not "new": the row may already exist at
                 // this exact path (genre aliases) or under another prefix.
-                if db.find_detail_by_path(path_s).ok().flatten().is_some() {
+                if db.find_detail_by_path(path_s)?.is_some() {
                     continue;
                 }
-                if let Some(folder_id) = ensure_folder_chain(&db, cfg, &st.path) {
-                    if index_one_file(&db, cfg, &st.path, &folder_id) {
+                if let Some(folder_id) = ensure_folder_chain(&db, cfg, &st.path)? {
+                    if index_one_file(&db, cfg, &st.path, &folder_id)? {
                         log_library_file(&st.path, "added", "library file added");
                         added += 1;
                     }
@@ -2645,64 +4262,123 @@ pub fn monitor_dirty(cfg: &ScanConfig, dirty: &[PathBuf]) -> (Option<Catalog>, S
             }
         }
     }
+    let mut sidecar_changed = false;
     if restat_all {
+        tracing::info!(
+            target: "rusty_dlna",
+            files = listed.len(),
+            "library paths checked; reconciling metadata and sidecars"
+        );
+        let nfo_started = std::time::Instant::now();
+        sidecar_changed |= refresh_nfo_periodic(&db, cfg, &db.all_detail_stats()?)?;
+        tracing::info!(
+            target: "rusty_dlna",
+            elapsed_ms = nfo_started.elapsed().as_millis(),
+            "library NFO reconciliation complete"
+        );
         let mut parents = HashSet::new();
         for st in listed.values() {
             if let Some(p) = st.path.parent() {
                 parents.insert(p.to_path_buf());
             }
         }
-        for dir in parents {
-            if attach_album_art_in_dir(&db, cfg, &dir) {
-                changed += 1;
-            }
+        let artwork_started = std::time::Instant::now();
+        for dir in &parents {
+            sidecar_changed |= attach_album_art_in_dir(&db, cfg, dir)?;
         }
+        tracing::info!(
+            target: "rusty_dlna",
+            directories = parents.len(),
+            elapsed_ms = artwork_started.elapsed().as_millis(),
+            "library artwork reconciliation complete"
+        );
+        let captions_started = std::time::Instant::now();
+        for dir in &parents {
+            sidecar_changed |= refresh_captions_in_dir(&db, cfg, dir)?;
+        }
+        tracing::info!(
+            target: "rusty_dlna",
+            directories = parents.len(),
+            elapsed_ms = captions_started.elapsed().as_millis(),
+            "library caption reconciliation complete"
+        );
     }
+    let mut nfo_dirs: HashMap<PathBuf, bool> = HashMap::new();
     for d in dirty {
-        let name = d
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let name = d.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let Some(dir) = d.parent() else {
             continue;
         };
-        if is_album_art_name(name) {
-            if attach_album_art_in_dir(&db, cfg, dir) {
-                changed += 1;
-            }
+        if is_album_art_name_for_config(name, cfg) {
+            sidecar_changed |= refresh_artwork_event(&db, cfg, d)?;
             continue;
         }
-        if name.ends_with(".nfo") {
-            let recursive = name == "tvshow.nfo";
-            if apply_nfo_in_dir(&db, cfg, dir, recursive) {
-                changed += 1;
-            }
+        if is_caption_name(name) {
+            sidecar_changed |= refresh_caption_event(&db, cfg, d)?;
+            continue;
+        }
+        if ends_with_ci(name, ".nfo") {
+            let recursive = name.eq_ignore_ascii_case("tvshow.nfo");
+            nfo_dirs
+                .entry(dir.to_path_buf())
+                .and_modify(|current| *current |= recursive)
+                .or_insert(recursive);
         }
     }
-    let _ = db.commit();
-    removed += db.prune_empty_folders().unwrap_or(0);
+    for (dir, recursive) in nfo_dirs {
+        sidecar_changed |= apply_nfo_in_dir(&db, cfg, &dir, recursive)?;
+    }
+    changed += usize::from(sidecar_changed);
+    if playlist::sync_playlists(&db, cfg)? {
+        changed += 1;
+    }
+    if restat_all {
+        let expired_bookmarks =
+            db.prune_expired_bookmarks(cfg.bookmark_retention_days, unix_now_seconds())?;
+        if expired_bookmarks > 0 {
+            tracing::info!(
+                target: "rusty_dlna",
+                removed = expired_bookmarks,
+                retention_days = cfg.bookmark_retention_days,
+                "expired playback state pruned"
+            );
+            changed += expired_bookmarks;
+        }
+    }
+    removed += db.prune_empty_folders()?;
+    let stale_art = db.prune_unreferenced_album_art()?;
     let delta = ScanDelta {
         added,
         removed,
         changed,
     };
     if added + removed + changed == 0 {
-        return (None, delta);
+        transaction.commit()?;
+        remove_stale_cached_art(cfg, &stale_art);
+        if restat_all {
+            tracing::info!(
+                target: "rusty_dlna",
+                files = listed.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "library reconciliation complete; no changes"
+            );
+        }
+        return Ok((None, delta));
     }
-    let n = db.detail_count().unwrap_or(0);
+    transaction.commit()?;
+    remove_stale_cached_art(cfg, &stale_art);
+    let n = db.detail_count()?;
     tracing::info!(
         target: "rusty_dlna",
         added,
         removed,
         changed,
         details = n,
+        elapsed_ms = started.elapsed().as_millis(),
         path = %db.path.display(),
-        "library monitor"
+        "library reconciliation complete"
     );
-    (
-        db.load_catalog().ok(),
-        delta,
-    )
+    Ok((Some(load_catalog_with_policy(&db, cfg)?), delta))
 }
 
 #[derive(Clone)]
@@ -2710,59 +4386,99 @@ struct ListedFile {
     path: PathBuf,
 }
 
-fn apply_or_reuse_probe(db: &LibraryDb, path: &Path, id: i64, device: i64, inode: i64) -> bool {
-    if let Ok(Some(src)) = db.find_inode_probe_source(device, inode, id) {
-        return db.copy_stream_from(src, id).is_ok();
+fn apply_or_reuse_probe(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    path: &Path,
+    id: i64,
+    device: i64,
+    inode: i64,
+) -> ScanResult<bool> {
+    if let Some(src) = db.find_inode_probe_source(device, inode, id)? {
+        db.copy_stream_from(src, id)?;
+        return Ok(true);
     }
-    persist_probe(db, path, id)
+    persist_probe(db, cfg, path, id)
+}
+
+fn apply_or_reuse_prepared_probe(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    path: &Path,
+    id: i64,
+    device: i64,
+    inode: i64,
+    prepared: Option<&PreparedPhysicalFile>,
+) -> ScanResult<bool> {
+    // A preparation was requested only when every persisted alias was stale.
+    // Do not copy one of those old rows over the freshly obtained probe.
+    if let Some(prepared) = prepared.filter(|prepared| prepared.probe_attempted) {
+        return persist_prepared_probe(db, cfg, path, id, prepared.probe.clone());
+    }
+    if let Some(src) = db.find_inode_probe_source(device, inode, id)? {
+        db.copy_stream_from(src, id)?;
+        return Ok(true);
+    }
+    persist_probe(db, cfg, path, id)
 }
 
 /// When a path is replaced (new inode), sibling DETAILS rows that still
 /// name the old inode are restatted. Those that now resolve to the new
 /// file get the new SIZE/INODE and a copied probe — no second libav.
-fn refresh_replaced_inode_aliases(
-    db: &LibraryDb,
-    old_dev: i64,
-    old_ino: i64,
-    src_id: i64,
-    new_dev: i64,
-    new_ino: i64,
+#[derive(Clone, Copy, Debug)]
+struct InodeReplacement {
+    old_device: i64,
+    old_inode: i64,
+    source_id: i64,
+    new_device: i64,
+    new_inode: i64,
     size: i64,
-    mtime: i64,
-) {
-    if old_ino == 0 || (old_dev == new_dev && old_ino == new_ino) {
-        return;
+    timestamp: i64,
+}
+
+fn refresh_replaced_inode_aliases(db: &LibraryDb, replacement: InodeReplacement) -> ScanResult<()> {
+    let InodeReplacement {
+        old_device,
+        old_inode,
+        source_id,
+        new_device,
+        new_inode,
+        size,
+        timestamp,
+    } = replacement;
+    if old_inode == 0 || (old_device == new_device && old_inode == new_inode) {
+        return Ok(());
     }
-    let Ok(siblings) = db.details_with_inode(old_dev, old_ino) else {
-        return;
-    };
+    let siblings = db.details_with_inode(old_device, old_inode)?;
     for (sid, spath) in siblings {
-        if sid == src_id {
+        if sid == source_id {
             continue;
         }
-        let Ok(meta) = std::fs::metadata(&spath) else {
+        let decoded = path_from_db(&spath);
+        let Ok(meta) = std::fs::metadata(&decoded) else {
             continue;
         };
         if !meta.is_file() {
             continue;
         }
         let (d, i) = inode_key(&meta);
-        if d as i64 != new_dev || i as i64 != new_ino {
+        if d as i64 != new_device || i as i64 != new_inode {
             continue;
         }
-        let _ = db.update_detail_stat(sid, size, mtime, new_dev, new_ino);
-        let _ = db.copy_stream_from(src_id, sid);
+        db.update_detail_stat(sid, size, timestamp, new_device, new_inode)?;
+        db.copy_stream_from(source_id, sid)?;
         tracing::info!(
             target: "rusty_dlna",
-            file = Path::new(&spath).file_name().and_then(|s| s.to_str()).unwrap_or(""),
+            file = decoded.file_name().map(display_os_name).unwrap_or_default(),
             action = "updated",
-            path = %spath,
-            old_inode = old_ino,
-            inode = new_ino,
+            path = %decoded.display(),
+            old_inode,
+            inode = new_inode,
             size,
             "library alias updated"
         );
     }
+    Ok(())
 }
 
 fn attach_listed_if_missing(
@@ -2772,47 +4488,46 @@ fn attach_listed_if_missing(
     detail_id: i64,
     device: i64,
     inode: i64,
-) -> bool {
-    let Some(folder_id) = ensure_folder_chain(db, cfg, path) else {
-        return false;
+) -> ScanResult<bool> {
+    let Some(folder_id) = ensure_folder_chain(db, cfg, path)? else {
+        return Ok(false);
     };
-    let title = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let title = path.file_stem().map(display_os_name).unwrap_or_default();
     if title.is_empty() {
-        return false;
+        return Ok(false);
     }
-    if db.folder_has_inode_named(&folder_id, device, inode, title) {
-        return false;
+    if db.folder_has_inode_named(&folder_id, device, inode, &title)? {
+        return Ok(false);
     }
-    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    let (_, class, _) = mime_and_class(name);
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default();
+    let (_, class, _) = mime_and_class(&name);
     attach_objects(
         db,
         &folder_id,
         detail_id,
-        title,
+        &title,
         class,
         device as u64,
         inode as u64,
-    );
-    true
+    )?;
+    Ok(true)
 }
 
-fn list_media_files(cfg: &ScanConfig) -> HashMap<String, ListedFile> {
+fn list_media_files(cfg: &ScanConfig) -> ScanResult<HashMap<String, ListedFile>> {
     let mut out = HashMap::new();
     let mut walk_stack: HashMap<(u64, u64), ()> = HashMap::new();
     for root in &cfg.media_dirs {
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-        let title = root
-            .file_name()
-            .and_then(|s| s.to_str())
+        let title = cfg
+            .root_title_for_path(&root)
             .unwrap_or("media")
             .to_string();
-        list_into(&mut out, cfg, &mut walk_stack, &root, &title);
+        list_into(&mut out, cfg, &mut walk_stack, &root, &title)?;
     }
-    out
+    Ok(out)
 }
 
 fn list_into(
@@ -2821,37 +4536,38 @@ fn list_into(
     walk_stack: &mut HashMap<(u64, u64), ()>,
     dir: &Path,
     title: &str,
-) {
-    if path_excluded(dir, title, cfg) {
-        return;
-    }
-    let dir_key = std::fs::metadata(dir).ok().map(|m| inode_key(&m));
-    if let Some(key) = dir_key {
-        if walk_stack.contains_key(&key) {
-            return;
-        }
-        walk_stack.insert(key, ());
-    }
-    let rd = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return,
+) -> ScanResult<()> {
+    let Ok(metadata) = std::fs::metadata(dir) else {
+        return Ok(());
     };
-    for ent in rd.filter_map(|e| e.ok()) {
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let dir_key = inode_key(&metadata);
+    if walk_stack.contains_key(&dir_key) {
+        return Ok(());
+    }
+    if !path_is_allowed_dir(dir, cfg) || path_excluded(dir, title, cfg) {
+        return Ok(());
+    }
+    walk_stack.insert(dir_key, ());
+    let rd = std::fs::read_dir(dir).map_err(|error| scan_io(dir, error))?;
+    for ent in rd {
+        let ent = ent.map_err(|error| scan_io(dir, error))?;
         let path = ent.path();
         let name = ent.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
+        if !cfg.include_hidden && name.starts_with('.') {
             continue;
         }
-        let is_dir = match ent.file_type() {
-            Ok(t) if t.is_dir() => true,
-            Ok(t) if t.is_symlink() => path.is_dir(),
-            _ => false,
+        let Ok(file_type) = ent.file_type() else {
+            continue;
         };
+        let is_dir = file_type.is_dir() || (file_type.is_symlink() && path.is_dir());
         if is_dir {
             if is_skipped_dir(&name) || path_excluded(&path, &name, cfg) {
                 continue;
             }
-            list_into(out, cfg, walk_stack, &path, &name);
+            list_into(out, cfg, walk_stack, &path, &name)?;
             continue;
         }
         if is_unfinished_name(&name)
@@ -2860,107 +4576,147 @@ fn list_into(
             || ends_with_ci(&name, ".nfo")
             || name.ends_with(".probe.toml")
             || path_excluded(&path, &name, cfg)
-            || is_album_art_name(&name)
-            || !cfg.types.allows(&name)
+            || is_album_art_name_for_config(&name, cfg)
+            || !cfg
+                .root_types_for_path(&path)
+                .is_some_and(|types| types.allows(&name))
+            || (!file_type.is_file() && !file_type.is_symlink())
+            || (file_type.is_symlink() && !path_is_allowed_file(&path, cfg))
         {
             continue;
         }
         // Existence only. Stat the whole tree on every reconcile was
         // tens of thousands of HDD/NAS syscalls and stalled Browse.
-        let path_s = path.to_string_lossy().into_owned();
-        out.insert(
-            path_s,
-            ListedFile {
-                path,
-            },
-        );
+        let path_s = path_to_db(&path);
+        if let Some(progress) = &cfg.progress {
+            progress.record(&path);
+        }
+        out.insert(path_s, ListedFile { path });
+        if out.len().is_multiple_of(5_000) {
+            tracing::info!(
+                target: "rusty_dlna",
+                files = out.len(),
+                "library walk progress"
+            );
+        }
     }
-    if let Some(key) = dir_key {
-        walk_stack.remove(&key);
-    }
+    walk_stack.remove(&dir_key);
+    Ok(())
 }
 
-pub(crate) fn ensure_folder_chain(db: &LibraryDb, cfg: &ScanConfig, file: &Path) -> Option<String> {
-    let parent = file.parent()?;
+pub(crate) fn ensure_folder_chain(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    file: &Path,
+) -> ScanResult<Option<String>> {
+    let Some(parent) = file.parent() else {
+        return Ok(None);
+    };
     if cfg.media_dirs.is_empty() {
-        return None;
+        return Ok(None);
     }
     // Walked path only. Do not canonicalize — that collapses a directory
     // symlink (genres/BY_YEAR/2010/Movies/Despicable Me → kids/Movies/…)
     // into the real folder and every alias lands in the same Browse list.
-    let rel = media_rel_key(parent, &cfg.media_dirs);
-    if rel == parent.to_string_lossy() {
-        return None;
-    }
-    let root_title = matching_root_title(parent, &cfg.media_dirs).unwrap_or("media");
+    let Some(selected) = cfg.selected_root(parent) else {
+        return Ok(None);
+    };
+    let Ok(rel) = parent.strip_prefix(selected.relative_to) else {
+        return Ok(None);
+    };
+    let root_title = selected.title;
     if path_excluded(parent, root_title, cfg) {
-        return None;
+        return Ok(None);
     }
-    let mut folder_id = folder_object_id(db, BROWSEDIR_ID, root_title);
-    for comp in Path::new(&rel).components() {
-        let name = comp.as_os_str().to_string_lossy();
+    let mut folder_id = folder_object_id(db, BROWSEDIR_ID, root_title)?;
+    for comp in rel.components() {
+        let name = display_os_name(comp.as_os_str());
         if name.is_empty() || name == "." {
             continue;
         }
         if is_skipped_dir(&name) || path_excluded(parent, &name, cfg) {
-            return None;
+            return Ok(None);
         }
-        folder_id = folder_object_id(db, &folder_id, &name);
+        folder_id = folder_object_id(db, &folder_id, &name)?;
     }
-    Some(folder_id)
+    Ok(Some(folder_id))
 }
 
-fn matching_root_title<'a>(path: &Path, roots: &'a [PathBuf]) -> Option<&'a str> {
-    for root in roots {
-        if path.starts_with(root) {
-            return root.file_name().and_then(|s| s.to_str());
-        }
-        if let Some(key) = root.file_name() {
-            if path.components().any(|c| c.as_os_str() == key) {
-                return key.to_str();
-            }
-        }
-    }
-    roots
-        .first()
-        .and_then(|r| r.file_name())
-        .and_then(|s| s.to_str())
+pub(crate) fn index_one_file(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    path: &Path,
+    folder_id: &str,
+) -> ScanResult<bool> {
+    index_one_file_with_prepared(db, cfg, path, folder_id, None)
 }
 
-pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, folder_id: &str) -> bool {
+fn index_one_file_with_prepared(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    path: &Path,
+    folder_id: &str,
+    prepared: Option<&PreparedPhysicalFile>,
+) -> ScanResult<bool> {
     let name = path
         .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
-    if name.is_empty() || !cfg.types.allows(&name) {
-        return false;
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name.is_empty()
+        || !cfg
+            .root_types_for_path(path)
+            .is_some_and(|types| types.allows(&name))
+        || !path_is_allowed_file(path, cfg)
+    {
+        return Ok(false);
     }
     let meta = match std::fs::metadata(path) {
         Ok(m) if m.is_file() => m,
-        _ => return false,
+        Err(error) => return Err(scan_io(path, error)),
+        Ok(_) => return Ok(false),
     };
     let (dev, ino) = inode_key(&meta);
-    let (mime, class, _ext) = mime_and_class(&name);
+    let inode_source = db.find_inode_source(dev as i64, ino as i64)?;
+    let eager_probe = (prepared.is_none() && inode_source.is_none())
+        .then(|| {
+            media_format_for_name(&name)
+                .filter(|format| format.is_ambiguous())
+                .and_then(|_| probe_media_with_timeout(path, cfg.external_command_timeout))
+        })
+        .flatten();
+    let format_probe = prepared
+        .and_then(|prepared| prepared.probe.as_ref())
+        .or(eager_probe.as_ref());
+    let Some(format) = resolved_media_format_with_hint(
+        &name,
+        format_probe,
+        prepared
+            .and_then(|prepared| prepared.mime_hint.as_deref())
+            .or_else(|| inode_source.as_ref().map(|source| source.mime.as_str())),
+    ) else {
+        return Ok(false);
+    };
+    let mime = format.mime;
+    let class = format.upnp_class();
     let mtime = file_mtime_unix(&meta);
     let size = meta.len() as i64;
-    let path_s = path.to_string_lossy().into_owned();
+    let path_s = path_to_db(path);
     let title = path
         .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(&name)
-        .to_string();
-    let nfo = nfo_for_file(path, &cfg.media_dirs);
+        .map(display_os_name)
+        .unwrap_or_else(|| name.clone());
+    let nfo = nfo_for_file_with_policy_result(path, &cfg.media_dirs, cfg.wide_links)?;
     let display_title = nfo.title.as_deref().unwrap_or(&title);
 
-    if let Some((id, old_sz, old_ts, old_dev, old_ino)) =
-        db.find_detail_by_path(&path_s).ok().flatten()
-    {
-        if old_sz != size
-            || old_ts != mtime
-            || old_dev != dev as i64
-            || old_ino != ino as i64
-        {
+    if let Some(existing) = db.find_detail_by_path(&path_s)? {
+        let ExistingDetail {
+            id,
+            size: old_sz,
+            timestamp: old_ts,
+            device: old_dev,
+            inode: old_ino,
+        } = existing;
+        if old_sz != size || old_ts != mtime || old_dev != dev as i64 || old_ino != ino as i64 {
             tracing::info!(
                 target: "rusty_dlna",
                 file = name.as_str(),
@@ -2972,91 +4728,105 @@ pub(crate) fn index_one_file(db: &LibraryDb, cfg: &ScanConfig, path: &Path, fold
                 inode = ino,
                 "file updated"
             );
-            let _ = db.update_detail_stat(id, size, mtime, dev as i64, ino as i64);
-            let _ = apply_or_reuse_probe(db, path, id, dev as i64, ino as i64);
+            db.update_detail_stat(id, size, mtime, dev as i64, ino as i64)?;
+            db.reset_detail_tags_to_file_defaults(id, &title, &file_mtime_date(path))?;
+            apply_or_reuse_prepared_probe(db, cfg, path, id, dev as i64, ino as i64, prepared)?;
             refresh_replaced_inode_aliases(
                 db,
-                old_dev,
-                old_ino,
-                id,
-                dev as i64,
-                ino as i64,
-                size,
-                mtime,
-            );
+                InodeReplacement {
+                    old_device: old_dev,
+                    old_inode: old_ino,
+                    source_id: id,
+                    new_device: dev as i64,
+                    new_inode: ino as i64,
+                    size,
+                    timestamp: mtime,
+                },
+            )?;
         }
-        apply_nfo_to_detail(db, id, &nfo);
-        attach_objects(db, folder_id, id, &title, class, dev, ino);
-        attach_album_art(db, cfg, path, id);
-        return true;
+        apply_nfo_to_detail(db, id, &nfo)?;
+        attach_objects(db, folder_id, id, &title, class, dev, ino)?;
+        attach_album_art_for_index(db, cfg, path, id, prepared)?;
+        return Ok(true);
     }
 
     // rustyDLNA clone_detail_for_path: symlink/hardlink of a known inode
     // reuses TITLE/DATE/MIME/DLNA_PN — no GetVideoMetadata / ffprobe.
-    if let Ok(Some((src, src_ts, src_path))) = db.find_inode_source(dev as i64, ino as i64) {
-        let src_key = media_rel_key(Path::new(&src_path), &cfg.media_dirs);
-        let new_key = media_rel_key(path, &cfg.media_dirs);
+    if let Some(source) = inode_source {
+        let src_path_decoded = path_from_db(&source.path);
+        let src_key = media_rel_key_for_config(&src_path_decoded, cfg);
+        let new_key = media_rel_key_for_config(path, cfg);
         // Host realpath vs container mount of the same file — not a new alias.
         if !src_key.is_empty() && src_key == new_key {
-            if let Some((_, old_sz, old_ts, old_dev, old_ino)) =
-                db.find_detail_by_path(&src_path).ok().flatten()
-            {
+            if let Some(existing) = db.find_detail_by_path(&source.path)? {
+                let ExistingDetail {
+                    size: old_sz,
+                    timestamp: old_ts,
+                    device: old_dev,
+                    inode: old_ino,
+                    ..
+                } = existing;
                 if old_sz != size
                     || old_ts != mtime
                     || old_dev != dev as i64
                     || old_ino != ino as i64
                 {
-                    let _ = db.update_detail_stat(src, size, mtime, dev as i64, ino as i64);
-                    let _ = apply_or_reuse_probe(db, path, src, dev as i64, ino as i64);
+                    db.update_detail_stat(source.id, size, mtime, dev as i64, ino as i64)?;
+                    apply_or_reuse_prepared_probe(
+                        db, cfg, path, source.id, dev as i64, ino as i64, prepared,
+                    )?;
                 }
             }
-            attach_objects(db, folder_id, src, &title, class, dev, ino);
-            attach_album_art(db, cfg, path, src);
-            return true;
+            attach_objects(db, folder_id, source.id, &title, class, dev, ino)?;
+            attach_album_art_for_index(db, cfg, path, source.id, prepared)?;
+            return Ok(true);
         }
-        if src_ts >= mtime {
-            if let Ok(id) =
-                db.clone_detail_for_path(src, &path_s, size, mtime, dev as i64, ino as i64)
-            {
-                attach_objects(db, folder_id, id, &title, class, dev, ino);
-                attach_album_art(db, cfg, path, id);
-                return true;
-            }
+        if source.size == size && source.timestamp >= mtime {
+            let id =
+                db.clone_detail_for_path(source.id, &path_s, size, mtime, dev as i64, ino as i64)?;
+            attach_objects(db, folder_id, id, &title, class, dev, ino)?;
+            attach_album_art_for_index(db, cfg, path, id, prepared)?;
+            return Ok(true);
         }
     }
 
-    if !file_is_viable(path) {
-        return false;
+    if format_probe.is_none() && !file_is_viable_with_timeout(path, cfg.external_command_timeout) {
+        return Ok(false);
     }
     let date = nfo.date.clone().unwrap_or_else(|| file_mtime_date(path));
-    let Ok(detail) = db.insert_detail(
-        &path_s,
+    let detail = db.insert_detail(NewDetail {
+        path: &path_s,
         size,
-        mtime,
-        display_title,
-        &date,
+        timestamp: mtime,
+        title: display_title,
+        date: &date,
         mime,
-        dev as i64,
-        ino as i64,
-        None,
-    ) else {
-        return false;
-    };
-    apply_nfo_to_detail(db, detail, &nfo);
-    let caps = captions_for(path);
-    let _ = db.replace_captions(detail, &caps);
-    let _ = persist_probe(db, path, detail);
-    attach_objects(db, folder_id, detail, &title, class, dev, ino);
-    attach_album_art(db, cfg, path, detail);
-    true
+        device: dev as i64,
+        inode: ino as i64,
+        dlna_pn: None,
+    })?;
+    let caps = captions_for(path, cfg)?;
+    db.replace_captions(detail, &caps)?;
+    if let Some(prepared) = prepared.filter(|prepared| prepared.probe_attempted) {
+        persist_prepared_probe(db, cfg, path, detail, prepared.probe.clone())?;
+    } else {
+        persist_probe_with(db, cfg, path, detail, eager_probe)?;
+    }
+    // Explicit sidecars override embedded tags. Embedded audio/image tags
+    // override filename defaults, but video titles deliberately remain the
+    // filename stem unless an NFO supplies a curated title.
+    apply_nfo_to_detail(db, detail, &nfo)?;
+    attach_objects(db, folder_id, detail, &title, class, dev, ino)?;
+    attach_album_art_for_index(db, cfg, path, detail, prepared)?;
+    Ok(true)
 }
 
-fn allocate_child_id(db: &LibraryDb, parent_id: &str) -> String {
-    let mut n = db.next_child_seq(parent_id).unwrap_or(1);
+fn allocate_child_id(db: &LibraryDb, parent_id: &str) -> ScanResult<String> {
+    let mut n = db.next_child_seq(parent_id)?;
     loop {
         let id = format!("{parent_id}${n:X}");
-        if !db.object_exists(&id) {
-            return id;
+        if !db.object_exists(&id)? {
+            return Ok(id);
         }
         n += 1;
     }
@@ -3070,123 +4840,133 @@ fn attach_objects(
     class: &str,
     dev: u64,
     ino: u64,
-) {
-    if db.folder_has_inode_named(folder_id, dev as i64, ino as i64, title) {
+) -> ScanResult<()> {
+    if db.folder_has_inode_named(folder_id, dev as i64, ino as i64, title)? {
         let browse = db
-            .browse_object_for_detail(detail)
+            .browse_object_for_detail(detail)?
             .unwrap_or_else(|| format!("{folder_id}$0"));
         if class.contains("video") {
-            attach_video_virtuals(db, detail, class, &browse);
+            attach_video_virtuals(db, detail, class, &browse)?;
         } else if class.contains("audio") {
-            attach_audio_virtuals(db, detail, class, &browse);
+            attach_audio_virtuals(db, detail, class, &browse)?;
         } else if class.contains("image") {
-            attach_image_virtuals(db, detail, class, &browse);
+            attach_image_virtuals(db, detail, class, &browse)?;
         }
-        return;
+        return Ok(());
     }
-    let object_id = match db.find_child_object(folder_id, title) {
-        Some(oid) => match db.object_detail_id(&oid) {
+    let object_id = match db.find_child_object(folder_id, title)? {
+        Some(oid) => match db.object_detail_id(&oid)? {
             None => oid,
             Some(did) if did == detail => oid,
             // Same title, different file — never steal the other item's row.
-            Some(_) => allocate_child_id(db, folder_id),
+            Some(_) => allocate_child_id(db, folder_id)?,
         },
-        None => allocate_child_id(db, folder_id),
+        None => allocate_child_id(db, folder_id)?,
     };
-    let _ = db.upsert_object(&object_id, folder_id, class, Some(detail), title, None);
+    db.upsert_object(&object_id, folder_id, class, Some(detail), title, None)?;
     if class.contains("video") {
-        if !db
-            .all_video_has_inode(dev as i64, ino as i64)
-            .unwrap_or(false)
-        {
+        if !db.all_video_has_inode(dev as i64, ino as i64)? {
             let vid = format!("{VIDEO_ALL_ID}${detail:X}");
-            let _ = db.upsert_object(
+            db.upsert_object(
                 &vid,
                 VIDEO_ALL_ID,
                 class,
                 Some(detail),
                 title,
                 Some(&object_id),
-            );
+            )?;
         }
-        ensure_typed_dir_chain(db, folder_id, VIDEO_DIR_ID);
+        ensure_typed_dir_chain(db, folder_id, VIDEO_DIR_ID)?;
         let vdir = browse_to_typed_dir(folder_id, VIDEO_DIR_ID);
         let vobj = browse_to_typed_dir(&object_id, VIDEO_DIR_ID);
-        let _ = db.upsert_object(&vobj, &vdir, class, Some(detail), title, Some(&object_id));
-        attach_video_virtuals(db, detail, class, &object_id);
+        db.upsert_object(&vobj, &vdir, class, Some(detail), title, Some(&object_id))?;
+        attach_video_virtuals(db, detail, class, &object_id)?;
     } else if class.contains("audio") {
         let aid = format!("{MUSIC_ALL_ID}${detail:X}");
-        let _ = db.upsert_object(&aid, MUSIC_ALL_ID, class, Some(detail), title, Some(&object_id));
-        ensure_typed_dir_chain(db, folder_id, MUSIC_DIR_ID);
+        db.upsert_object(
+            &aid,
+            MUSIC_ALL_ID,
+            class,
+            Some(detail),
+            title,
+            Some(&object_id),
+        )?;
+        ensure_typed_dir_chain(db, folder_id, MUSIC_DIR_ID)?;
         let mdir = browse_to_typed_dir(folder_id, MUSIC_DIR_ID);
         let mobj = browse_to_typed_dir(&object_id, MUSIC_DIR_ID);
-        let _ = db.upsert_object(&mobj, &mdir, class, Some(detail), title, Some(&object_id));
-        attach_audio_virtuals(db, detail, class, &object_id);
+        db.upsert_object(&mobj, &mdir, class, Some(detail), title, Some(&object_id))?;
+        attach_audio_virtuals(db, detail, class, &object_id)?;
     } else if class.contains("image") {
         let iid = format!("{IMAGE_ALL_ID}${detail:X}");
-        let _ = db.upsert_object(&iid, IMAGE_ALL_ID, class, Some(detail), title, Some(&object_id));
-        ensure_typed_dir_chain(db, folder_id, IMAGE_DIR_ID);
+        db.upsert_object(
+            &iid,
+            IMAGE_ALL_ID,
+            class,
+            Some(detail),
+            title,
+            Some(&object_id),
+        )?;
+        ensure_typed_dir_chain(db, folder_id, IMAGE_DIR_ID)?;
         let idir = browse_to_typed_dir(folder_id, IMAGE_DIR_ID);
         let iobj = browse_to_typed_dir(&object_id, IMAGE_DIR_ID);
-        let _ = db.upsert_object(&iobj, &idir, class, Some(detail), title, Some(&object_id));
-        attach_image_virtuals(db, detail, class, &object_id);
+        db.upsert_object(&iobj, &idir, class, Some(detail), title, Some(&object_id))?;
+        attach_image_virtuals(db, detail, class, &object_id)?;
     }
+    Ok(())
 }
 
 /// Rebuild OBJECTS from live DETAILS paths without re-probing files.
 /// Fixes folder-id reuse that left children under the wrong title
 /// (e.g. a new show folder inheriting a deleted sibling's items).
-pub fn rebuild_objects(cfg: &ScanConfig) -> Catalog {
+pub fn rebuild_objects(cfg: &ScanConfig) -> ScanResult<Catalog> {
     let db = match &cfg.db_path {
-        Some(p) => LibraryDb::open(p).expect("open files.db"),
-        None => return Catalog::new(),
+        Some(p) => open_library_db(p)?,
+        None => return Ok(Catalog::new()),
     };
-    let _ = db.prune_missing_files();
-    let _ = db.prune_excluded_paths(cfg);
-    let rows = db.all_detail_stats().unwrap_or_default();
-    let saved = db.snapshot_objects().unwrap_or_default();
-    let live_details: HashSet<i64> = rows.iter().map(|(_, id, ..)| *id).collect();
-    let _ = db.clear_objects();
-    let _ = db.seed_virtual_containers();
-    let _ = db.begin();
+    let transaction = db.transaction()?;
+    db.prune_missing_files()?;
+    db.prune_excluded_paths(cfg)?;
+    let rows = db.all_detail_stats()?;
+    let saved = db.snapshot_objects()?;
+    let live_details: HashSet<i64> = rows.iter().map(|row| row.id).collect();
+    db.clear_objects()?;
+    db.seed_virtual_containers()?;
     // Put the old IDs back first so Infuse cached ObjectIDs still Browse.
     // Folders before items so find_child_object(parent, name) hits.
-    let (folders, items): (Vec<_>, Vec<_>) = saved
-        .into_iter()
-        .partition(|r| r.detail_id.is_none());
+    let (folders, items): (Vec<_>, Vec<_>) = saved.into_iter().partition(|r| r.detail_id.is_none());
     for row in folders {
-        let _ = db.restore_object(&row);
+        db.restore_object(&row)?;
     }
     for row in items {
         if row.detail_id.is_some_and(|d| live_details.contains(&d)) {
-            let _ = db.restore_object(&row);
+            db.restore_object(&row)?;
         }
     }
+    db.prune_duplicate_folder_inodes()?;
     let mut n = 0usize;
-    for (path, ..) in &rows {
-        let p = Path::new(path);
-        if !path_is_live_file(p) || path_is_unwanted(p, cfg) {
+    for row in &rows {
+        let p = path_from_db(&row.path);
+        if !path_is_live_file(&p) || path_is_unwanted(&p, cfg) {
             continue;
         }
-        if let Some(folder) = ensure_folder_chain(&db, cfg, p) {
-            if index_one_file(&db, cfg, p, &folder) {
+        if let Some(folder) = ensure_folder_chain(&db, cfg, &p)? {
+            if index_one_file(&db, cfg, &p, &folder)? {
                 n += 1;
             }
         }
     }
-    let _ = db.commit();
-    let _ = db.prune_empty_folders();
+    playlist::sync_playlists(&db, cfg)?;
+    db.prune_empty_folders()?;
+    transaction.commit()?;
     tracing::info!(target: "rusty_dlna", files = n, "objects rebuilt");
-    db.load_catalog().unwrap_or_else(|_| Catalog::new())
+    load_catalog_with_policy(&db, cfg)
 }
 
 /// Re-walk the tree into SQLite, drop missing/dangling paths (and their
 /// symlink aliases), return a fresh catalog + delta vs `prev`.
-pub fn rescan(cfg: &ScanConfig, prev: &Catalog) -> (Catalog, ScanDelta) {
-    match monitor(cfg) {
-        (Some(next), delta) => (next, delta),
-        (None, delta) => (prev.clone(), delta),
-    }
+pub fn rescan(cfg: &ScanConfig, prev: &Catalog) -> ScanResult<(Catalog, ScanDelta)> {
+    let (next, delta) = monitor(cfg)?;
+    Ok((next.unwrap_or_else(|| prev.clone()), delta))
 }
 
 fn browse_to_typed_dir(browse_id: &str, typed: &str) -> String {
@@ -3203,7 +4983,7 @@ fn parent_object_id(id: &str) -> Option<&str> {
     id.rfind('$').map(|i| &id[..i])
 }
 
-fn ensure_typed_dir_chain(db: &LibraryDb, browse_folder_id: &str, typed: &str) {
+fn ensure_typed_dir_chain(db: &LibraryDb, browse_folder_id: &str, typed: &str) -> ScanResult<()> {
     let mut chain = Vec::new();
     let mut cur = browse_folder_id.to_string();
     while cur != BROWSEDIR_ID {
@@ -3220,119 +5000,349 @@ fn ensure_typed_dir_chain(db: &LibraryDb, browse_folder_id: &str, typed: &str) {
         };
         let typed_id = browse_to_typed_dir(&browse, typed);
         let typed_parent = browse_to_typed_dir(parent_browse, typed);
-        let name = db.object_name(&browse).unwrap_or_else(|| browse.clone());
-        let _ = db.upsert_object(
+        let name = db.object_name(&browse)?.unwrap_or_else(|| browse.clone());
+        db.upsert_object(
             &typed_id,
             &typed_parent,
             "container.storageFolder",
             None,
             &name,
             Some(&browse),
-        );
+        )?;
+    }
+    Ok(())
+}
+
+fn folder_object_id(db: &LibraryDb, parent_id: &str, title: &str) -> ScanResult<String> {
+    if let Some(id) = db.find_child_object(parent_id, title)? {
+        return Ok(id);
+    }
+    let id = allocate_child_id(db, parent_id)?;
+    db.upsert_object(&id, parent_id, "container.storageFolder", None, title, None)?;
+    Ok(id)
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct PhysicalFileKey {
+    device: i64,
+    inode: i64,
+    size: i64,
+    timestamp: i64,
+    /// Only populated on platforms/filesystems without a useful inode.
+    fallback_path: Option<PathBuf>,
+}
+
+impl PhysicalFileKey {
+    fn new(path: &Path, meta: &std::fs::Metadata) -> Self {
+        let (device, inode) = inode_key(meta);
+        let fallback_path = (inode == 0)
+            .then(|| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+        Self {
+            device: device as i64,
+            inode: inode as i64,
+            size: meta.len() as i64,
+            timestamp: file_mtime_unix(meta),
+            fallback_path,
+        }
     }
 }
 
-fn folder_object_id(db: &LibraryDb, parent_id: &str, title: &str) -> String {
-    if let Some(id) = db.find_child_object(parent_id, title) {
-        return id;
-    }
-    let id = allocate_child_id(db, parent_id);
-    let _ = db.upsert_object(&id, parent_id, "container.storageFolder", None, title, None);
-    id
+#[derive(Clone, Debug)]
+struct PendingFile {
+    path: PathBuf,
+    folder_id: String,
+    physical: PhysicalFileKey,
 }
 
-fn walk_into_db(
+#[derive(Clone, Debug)]
+struct PreparedPhysicalFile {
+    probe_attempted: bool,
+    probe: Option<MediaProbe>,
+    mime_hint: Option<String>,
+    album_art: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct PreparationGroup {
+    physical: PhysicalFileKey,
+    representative: usize,
+    representative_is_direct: bool,
+    source: Option<InodeSource>,
+}
+
+#[derive(Debug, Default)]
+struct PreparedBatch {
+    by_physical: HashMap<PhysicalFileKey, PreparedPhysicalFile>,
+    worker_indices: HashSet<usize>,
+}
+
+fn is_direct_physical_path(path: &Path) -> bool {
+    std::fs::canonicalize(path)
+        .ok()
+        .is_some_and(|canonical| canonical == path)
+}
+
+/// Small reusable bounded pool. Jobs may finish out of order, but results are
+/// returned in input order so subsequent SQLite IDs stay deterministic.
+fn run_bounded_jobs<T, R, F>(jobs: &[T], workers: usize, function: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    let worker_count = workers.max(1).min(jobs.len());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<R>>> = (0..jobs.len())
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let function = &function;
+            let next = &next;
+            let results = &results;
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(job) = jobs.get(index) else {
+                    break;
+                };
+                let result = function(job);
+                *results[index]
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(result);
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(|error| error.into_inner())
+                .expect("bounded scan worker did not publish its result")
+        })
+        .collect()
+}
+
+fn prepare_pending_files(
     db: &LibraryDb,
     cfg: &ScanConfig,
-    walk_stack: &mut HashMap<(u64, u64), ()>,
-    dir: &Path,
-    parent_id: &str,
-    title: &str,
-    rebuild: bool,
-    indexed: &mut usize,
-) {
-    if path_excluded(dir, title, cfg) {
-        return;
-    }
-    let dir_key = std::fs::metadata(dir).ok().map(|m| inode_key(&m));
-    if let Some(key) = dir_key {
-        // Cycle only (symlink dir pointing at an ancestor). Alias trees stay walkable.
-        if walk_stack.contains_key(&key) {
-            return;
-        }
-        walk_stack.insert(key, ());
-    }
-    let rd = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    let folder_id = if parent_id == BROWSEDIR_ID {
-        folder_object_id(db, parent_id, title)
-    } else {
-        parent_id.to_string()
-    };
-
-    let mut ents: Vec<_> = rd.filter_map(|e| e.ok()).collect();
-    ents.sort_by_key(|e| e.file_name());
-    for ent in ents {
-        let path = ent.path();
-        let name = ent.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
+    pending: &[PendingFile],
+) -> ScanResult<PreparedBatch> {
+    let mut group_by_physical: HashMap<PhysicalFileKey, usize> = HashMap::new();
+    let mut groups: Vec<PreparationGroup> = Vec::new();
+    for (index, file) in pending.iter().enumerate() {
+        let direct = is_direct_physical_path(&file.path);
+        if let Some(group_index) = group_by_physical.get(&file.physical).copied() {
+            let group = &mut groups[group_index];
+            if direct && !group.representative_is_direct {
+                group.representative = index;
+                group.representative_is_direct = true;
+            }
             continue;
         }
-        let is_dir = match ent.file_type() {
-            Ok(t) if t.is_dir() => true,
-            Ok(t) if t.is_symlink() => path.is_dir(),
-            _ => false,
+        let source = if file.physical.inode == 0 {
+            None
+        } else {
+            db.find_inode_source(file.physical.device, file.physical.inode)?
         };
-        if is_dir {
-            if is_skipped_dir(&name) || path_excluded(&path, &name, cfg) {
+        group_by_physical.insert(file.physical.clone(), groups.len());
+        groups.push(PreparationGroup {
+            physical: file.physical.clone(),
+            representative: index,
+            representative_is_direct: direct,
+            source,
+        });
+    }
+
+    tracing::info!(
+        target: "rusty_dlna",
+        paths = pending.len(),
+        physical_files = groups.len(),
+        aliases = pending.len().saturating_sub(groups.len()),
+        workers = cfg.scan_workers.max(1),
+        "preparing scan files"
+    );
+    let started = std::time::Instant::now();
+    let results: Vec<ScanResult<PreparedPhysicalFile>> =
+        run_bounded_jobs(&groups, cfg.scan_workers, |group| {
+            let file = &pending[group.representative];
+            if let Some(progress) = &cfg.progress {
+                progress.record(&file.path);
+            }
+            let source_is_current = group.source.as_ref().is_some_and(|source| {
+                source.size == group.physical.size
+                    && source.timestamp >= group.physical.timestamp
+                    && source.stream_probe_rev >= 3
+            });
+            let probe_attempted = !source_is_current;
+            let probe = probe_attempted
+                .then(|| {
+                    let name = file
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("");
+                    if is_image(name) {
+                        probe_image_with_timeout(&file.path, cfg.external_command_timeout)
+                    } else {
+                        probe_media_with_timeout(&file.path, cfg.external_command_timeout)
+                    }
+                })
+                .flatten();
+            let album_art = prepare_album_art(cfg, &file.path)?;
+            Ok(PreparedPhysicalFile {
+                probe_attempted,
+                probe,
+                mime_hint: group.source.as_ref().map(|source| source.mime.clone()),
+                album_art,
+            })
+        });
+
+    let mut batch = PreparedBatch::default();
+    for (group, result) in groups.into_iter().zip(results) {
+        batch.worker_indices.insert(group.representative);
+        batch.by_physical.insert(group.physical, result?);
+    }
+    tracing::info!(
+        target: "rusty_dlna",
+        physical_files = batch.by_physical.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "scan file preparation complete"
+    );
+    Ok(batch)
+}
+
+struct DbWalker<'a> {
+    db: &'a LibraryDb,
+    cfg: &'a ScanConfig,
+    walk_stack: HashMap<(u64, u64), ()>,
+    rebuild: bool,
+    indexed: usize,
+    pending: Vec<PendingFile>,
+}
+
+impl DbWalker<'_> {
+    fn index_pending(&mut self) -> ScanResult<()> {
+        let prepared = prepare_pending_files(self.db, self.cfg, &self.pending)?;
+        for (index, file) in self.pending.iter().enumerate() {
+            if !prepared.worker_indices.contains(&index) {
+                if let Some(progress) = &self.cfg.progress {
+                    progress.record(&file.path);
+                }
+            }
+            if index_one_file_with_prepared(
+                self.db,
+                self.cfg,
+                &file.path,
+                &file.folder_id,
+                prepared.by_physical.get(&file.physical),
+            )? {
+                self.indexed += 1;
+                if self.indexed / 100 * 100 == self.indexed {
+                    tracing::info!(
+                        target: "rusty_dlna",
+                        indexed = self.indexed,
+                        "scan progress"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn walk(&mut self, dir: &Path, parent_id: &str, title: &str) -> ScanResult<()> {
+        if !path_is_allowed_dir(dir, self.cfg) || path_excluded(dir, title, self.cfg) {
+            return Ok(());
+        }
+        let dir_key = std::fs::metadata(dir).ok().map(|m| inode_key(&m));
+        if let Some(key) = dir_key {
+            // Cycle only (symlink dir pointing at an ancestor). Alias trees stay walkable.
+            if self.walk_stack.contains_key(&key) {
+                return Ok(());
+            }
+            self.walk_stack.insert(key, ());
+        }
+        let rd = std::fs::read_dir(dir).map_err(|error| scan_io(dir, error))?;
+        let folder_id = if parent_id == BROWSEDIR_ID {
+            folder_object_id(self.db, parent_id, title)?
+        } else {
+            parent_id.to_string()
+        };
+
+        let mut ents = Vec::new();
+        for entry in rd {
+            ents.push(entry.map_err(|error| scan_io(dir, error))?);
+        }
+        ents.sort_by_key(|e| e.file_name());
+        for ent in ents {
+            let path = ent.path();
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if !self.cfg.include_hidden && name.starts_with('.') {
                 continue;
             }
-            let child = folder_object_id(db, &folder_id, &name);
-            walk_into_db(db, cfg, walk_stack, &path, &child, &name, rebuild, indexed);
-            continue;
-        }
-        if is_unfinished_name(&name)
-            || looks_like_sample_file(&name)
-            || is_caption_name(&name)
-            || ends_with_ci(&name, ".nfo")
-            || name.ends_with(".probe.toml")
-            || path_excluded(&path, &name, cfg)
-            || is_album_art_name(&name)
-        {
-            continue;
-        }
-        if !cfg.types.allows(&name) {
-            continue;
-        }
-        let meta = match std::fs::metadata(&path) {
-            Ok(m) if m.is_file() => m,
-            _ => continue,
-        };
-        let path_s = path.to_string_lossy().into_owned();
-        let existing = db.find_detail_by_path(&path_s).ok().flatten();
-        let size = meta.len() as i64;
-        let mtime = file_mtime_unix(&meta);
-        let (dev, ino) = inode_key(&meta);
-        let unchanged = existing.as_ref().is_some_and(|(_, old_sz, old_ts, old_dev, old_ino)| {
-            *old_sz == size
-                && *old_ts == mtime
-                && *old_dev == dev as i64
-                && *old_ino == ino as i64
-        });
-        if unchanged && !rebuild {
-            continue;
-        }
-        if index_one_file(db, cfg, &path, &folder_id) {
-            *indexed += 1;
-            if *indexed % 100 == 0 {
-                tracing::info!(target: "rusty_dlna", indexed, "scan progress");
+            let is_dir = match ent.file_type() {
+                Ok(t) if t.is_dir() => true,
+                Ok(t) if t.is_symlink() => path.is_dir(),
+                _ => false,
+            };
+            if is_dir {
+                if is_skipped_dir(&name)
+                    || path_excluded(&path, &name, self.cfg)
+                    || !path_is_allowed_dir(&path, self.cfg)
+                {
+                    continue;
+                }
+                let folder_name = display_os_name(&ent.file_name());
+                let child = folder_object_id(self.db, &folder_id, &folder_name)?;
+                self.walk(&path, &child, &folder_name)?;
+                continue;
             }
+            if is_unfinished_name(&name)
+                || looks_like_sample_file(&name)
+                || is_caption_name(&name)
+                || ends_with_ci(&name, ".nfo")
+                || name.ends_with(".probe.toml")
+                || path_excluded(&path, &name, self.cfg)
+                || is_album_art_name_for_config(&name, self.cfg)
+            {
+                continue;
+            }
+            if !self
+                .cfg
+                .root_types_for_path(&path)
+                .is_some_and(|types| types.allows(&name))
+            {
+                continue;
+            }
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) if m.is_file() => m,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(scan_io(&path, error)),
+                Ok(_) => continue,
+            };
+            let physical = PhysicalFileKey::new(&path, &meta);
+            let existing = self.db.find_detail_by_path(&path_to_db(&path))?;
+            let unchanged = existing.as_ref().is_some_and(|existing| {
+                existing.size == physical.size
+                    && existing.timestamp == physical.timestamp
+                    && existing.device == physical.device
+                    && existing.inode == physical.inode
+            });
+            if unchanged && !self.rebuild {
+                continue;
+            }
+            self.pending.push(PendingFile {
+                path,
+                folder_id: folder_id.clone(),
+                physical,
+            });
         }
-    }
-    if let Some(key) = dir_key {
-        walk_stack.remove(&key);
+        if let Some(key) = dir_key {
+            self.walk_stack.remove(&key);
+        }
+        Ok(())
     }
 }
 
@@ -3358,10 +5368,7 @@ pub fn ensure_show_fixture(root: &Path) {
             "<tvshow><title>The Show</title><genre>Drama</genre><genre>Crime</genre></tvshow>\n",
         );
     }
-    for (stem, title, season, ep) in [
-        ("S01E01", "Pilot", 1, 1),
-        ("S01E02", "Second", 1, 2),
-    ] {
+    for (stem, title, season, ep) in [("S01E01", "Pilot", 1, 1), ("S01E02", "Second", 1, 2)] {
         let mkv = show.join(format!("{stem}.mkv"));
         if !file_is_viable(&mkv) {
             write_fake_mkv(&mkv, 64);
@@ -3382,9 +5389,103 @@ pub fn ensure_show_fixture(root: &Path) {
 mod tests {
     use super::*;
 
+    struct TempPath(PathBuf);
+
+    impl TempPath {
+        fn new(label: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "rusty-dlna-{label}-{}-{sequence}",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl std::ops::Deref for TempPath {
+        type Target = PathBuf;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempPath {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempPath {
+        fn drop(&mut self) {
+            if self.0.is_dir() {
+                let _ = std::fs::remove_dir_all(&self.0);
+            } else {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_virtual_views_match_minidlna_oracle() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("docs/oracle/containers.c");
+        let reference = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let scanner_path = path.with_file_name("scanner.h");
+        let scanner = std::fs::read_to_string(&scanner_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", scanner_path.display()));
+        let catalog = Catalog::new();
+
+        for (id, title) in [
+            (MUSIC_RECENT_ID, "Recently Added"),
+            (VIDEO_RECENT_ID, "Recently Added"),
+            (IMAGE_RECENT_ID, "Recently Added"),
+            (MUSIC_ALL_ID, "All Music"),
+            (VIDEO_ALL_ID, "All Video"),
+            (IMAGE_ALL_ID, "All Pictures"),
+            (MUSIC_GENRE_ID, "Genre"),
+            (MUSIC_ARTIST_ID, "Artist"),
+            (MUSIC_ALBUM_ID, "Album"),
+            (IMAGE_DATE_ID, "Date Taken"),
+            (IMAGE_CAMERA_ID, "Camera"),
+        ] {
+            assert!(
+                reference.contains(id) || scanner.contains(&format!("\"{id}\"")),
+                "reference missing virtual view {id}"
+            );
+            let container = catalog
+                .containers
+                .get(id)
+                .unwrap_or_else(|| panic!("catalog missing virtual view {id}"));
+            assert_eq!(container.title, title, "title for virtual view {id}");
+        }
+
+        for (alias, target) in [
+            ("4", MUSIC_ALL_ID),
+            ("5", MUSIC_GENRE_ID),
+            ("6", MUSIC_ARTIST_ID),
+            ("7", MUSIC_ALBUM_ID),
+            ("8", VIDEO_ALL_ID),
+            ("B", IMAGE_ALL_ID),
+            ("C", IMAGE_DATE_ID),
+            ("14", MUSIC_DIR_ID),
+            ("15", VIDEO_DIR_ID),
+            ("16", IMAGE_DIR_ID),
+            ("D2", IMAGE_CAMERA_ID),
+        ] {
+            assert!(
+                reference.contains(&format!("NULL, \"{alias}\", &")),
+                "reference missing alias {alias} -> {target}"
+            );
+            assert!(catalog.containers.contains_key(target));
+        }
+    }
+
     #[test]
     fn text_named_mkv_is_not_viable() {
-        let p = std::env::temp_dir().join(format!("rusty-not-video-{}.mkv", std::process::id()));
+        let p = TempPath::new("not-video.mkv");
         std::fs::write(&p, b"this is a readme pretending to be a movie\n").unwrap();
         assert!(!looks_like_av_container(&p));
         assert!(!file_is_viable(&p));
@@ -3423,7 +5524,13 @@ mod tests {
     #[test]
     fn page_children_matches_children_of_slice() {
         let mut cat = Catalog::new();
-        cat.add_container("64$1", BROWSEDIR_ID, "video", "container.storageFolder", true);
+        cat.add_container(
+            "64$1",
+            BROWSEDIR_ID,
+            "video",
+            "container.storageFolder",
+            true,
+        );
         cat.link_child(BROWSEDIR_ID, "64$1");
         for i in 0..20 {
             let oid = format!("64$1${i:X}");
@@ -3456,10 +5563,15 @@ mod tests {
                     creator: None,
                     comment: None,
                     artist: None,
+                    album_artist: None,
+                    composer: None,
+                    contributor: None,
                     album: None,
                     genre: None,
                     disc: None,
                     track: None,
+                    rating: None,
+                    rotation: None,
                     bookmark_sec: 0,
                     watch_count: 0,
                 },
@@ -3492,6 +5604,67 @@ mod tests {
         assert!(is_disc_structure_dir("VIDEO_TS"));
         assert!(is_skipped_dir("CERTIFICATE"));
         assert!(!is_skipped_dir("Movies"));
+    }
+
+    #[test]
+    fn exclusion_hidden_and_sidecar_policy_options_are_effective() {
+        assert!(basename_glob_matches("*-extra.?kv", "Movie-EXTRA.mkv"));
+        assert!(basename_glob_matches("foo?.mkv", "FOO1.MKV"));
+        assert!(!basename_glob_matches("foo?.mkv", "foo12.mkv"));
+
+        let tmp = TempPath::new("scan-policy");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join(".hidden-dir")).unwrap();
+        for path in [
+            tmp.join("keep.mkv"),
+            tmp.join("movie-extra.mkv"),
+            tmp.join(".hidden.mkv"),
+            tmp.join(".hidden-dir/inside.mkv"),
+        ] {
+            write_fake_mkv(&path, 64);
+        }
+        std::fs::write(tmp.join("keep.en.srt"), "caption").unwrap();
+        std::fs::write(tmp.join("MyArt.jpg"), TINY_JPEG).unwrap();
+        let base = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            types: MediaTypes::video_only(),
+            exclude_files: vec!["*-extra.*".into()],
+            album_art_names: vec!["MyArt.jpg".into()],
+            subtitles: false,
+            thumbnails: false,
+            ..Default::default()
+        };
+        assert!(is_album_art_name_for_config("myart.JPG", &base));
+        let catalog = scan(&base).unwrap();
+        let originals: Vec<_> = catalog
+            .items
+            .values()
+            .filter(|item| item.ref_id.is_none())
+            .collect();
+        assert_eq!(originals.len(), 1, "{originals:#?}");
+        assert_eq!(originals[0].path, tmp.join("keep.mkv"));
+        assert!(originals[0].captions.is_empty());
+        assert!(
+            originals[0].album_art > 0,
+            "configured sidecar remains enabled"
+        );
+
+        let visible = ScanConfig {
+            include_hidden: true,
+            album_art_names: Vec::new(),
+            ..base
+        };
+        let catalog = scan(&visible).unwrap();
+        let paths: HashSet<_> = catalog
+            .items
+            .values()
+            .filter(|item| item.ref_id.is_none())
+            .map(|item| item.path.clone())
+            .collect();
+        assert!(paths.contains(&tmp.join(".hidden.mkv")));
+        assert!(paths.contains(&tmp.join(".hidden-dir/inside.mkv")));
+        assert!(!paths.contains(&tmp.join("movie-extra.mkv")));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -3543,7 +5716,10 @@ mod tests {
         assert_eq!(parsed.disc, Some(1));
         assert_eq!(parsed.track, Some(2));
         assert!(
-            parsed.date.as_deref().is_some_and(|d| d.starts_with("2020-05-01")),
+            parsed
+                .date
+                .as_deref()
+                .is_some_and(|d| d.starts_with("2020-05-01")),
             "date={:?}",
             parsed.date
         );
@@ -3561,31 +5737,36 @@ mod tests {
         assert!(nfo_too_large(64 * 1024 + 1));
         assert!(!nfo_too_large(64 * 1024));
 
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-nfo-ep-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("nfo-ep");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("show")).unwrap();
         write_fake_mkv(&tmp.join("show/S01E01.mkv"), 64);
         std::fs::write(tmp.join("show/S01E01.nfo"), EPISODE_NFO).unwrap();
         let huge = "x".repeat(64 * 1024 + 1);
-        std::fs::write(tmp.join("show/huge.nfo"), format!("<title>TooBig</title>{huge}")).unwrap();
-        let huge_meta = nfo_for_file(&tmp.join("show/huge.mkv"), &[tmp.clone()]);
+        std::fs::write(
+            tmp.join("show/huge.nfo"),
+            format!("<title>TooBig</title>{huge}"),
+        )
+        .unwrap();
+        let huge_meta = nfo_for_file(&tmp.join("show/huge.mkv"), std::slice::from_ref(&tmp));
         assert!(huge_meta.title.is_none(), "skip >64KiB: {huge_meta:?}");
 
         let cat = scan(&ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             types: MediaTypes::video_only(),
             ..Default::default()
-        });
+        })
+        .unwrap();
         let ep = cat
             .items
             .values()
             .find(|i| i.title == "The Show - Pilot")
             .expect("episode title from nfo");
         assert!(
-            ep.comment.as_deref().is_some_and(|c| c.contains("The plot text")),
+            ep.comment
+                .as_deref()
+                .is_some_and(|c| c.contains("The plot text")),
             "comment={:?}",
             ep.comment
         );
@@ -3598,20 +5779,13 @@ mod tests {
         );
         assert_eq!(ep.disc, Some(1));
         assert_eq!(ep.track, Some(2));
-        assert!(
-            ep.date.starts_with("2020-05-01"),
-            "date={}",
-            ep.date
-        );
+        assert!(ep.date.starts_with("2020-05-01"), "date={}", ep.date);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn tvshow_nfo_inherited_by_episode() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-nfo-tv-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("nfo-tv");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("show")).unwrap();
         std::fs::write(
@@ -3638,10 +5812,12 @@ mod tests {
         .unwrap();
 
         let cat = scan(&ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             types: MediaTypes::video_only(),
             ..Default::default()
-        });
+        })
+        .unwrap();
         let ep1 = cat
             .items
             .values()
@@ -3665,10 +5841,7 @@ mod tests {
 
     #[test]
     fn series_and_genre_trees_from_nfo() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-series-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("series");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("The Show")).unwrap();
         std::fs::write(
@@ -3703,11 +5876,13 @@ mod tests {
         .unwrap();
 
         let cat = scan(&ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert!(cat.containers.contains_key(VIDEO_SERIES_ID));
         assert!(cat.containers.contains_key(VIDEO_GENRE_ID));
         let series = cat.children_of(VIDEO_SERIES_ID).expect("series");
@@ -3806,22 +5981,33 @@ mod tests {
 
     #[test]
     fn bookmark_survives_reopen() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-bookmark-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("bookmark");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let dbp = tmp.join("files.db");
+        let detail_id;
         {
             let db = LibraryDb::open(&dbp).unwrap();
-            db.set_bookmark(42, 120).unwrap();
-            db.set_watch_count(42, 3).unwrap();
-            assert_eq!(db.get_bookmark(42).unwrap(), Some((120, 3)));
+            detail_id = db
+                .insert_detail(NewDetail {
+                    path: "/media/bookmark.mp4",
+                    size: 1,
+                    timestamp: 1,
+                    title: "bookmark",
+                    date: "",
+                    mime: "video/mp4",
+                    device: 1,
+                    inode: 1,
+                    dlna_pn: None,
+                })
+                .unwrap();
+            db.set_bookmark(detail_id, 120).unwrap();
+            db.set_watch_count(detail_id, 3).unwrap();
+            assert_eq!(db.get_bookmark(detail_id).unwrap(), Some((120, 3)));
         }
         let db = LibraryDb::open(&dbp).unwrap();
         assert_eq!(
-            db.get_bookmark(42).unwrap(),
+            db.get_bookmark(detail_id).unwrap(),
             Some((120, 3)),
             "BOOKMARKS must survive LibraryDb::open"
         );
@@ -3830,11 +6016,94 @@ mod tests {
     }
 
     #[test]
+    fn bookmark_retention_uses_last_update_and_zero_is_indefinite() {
+        let db = LibraryDb::open_memory().unwrap();
+        let insert = |path: &'static str, inode| {
+            db.insert_detail(NewDetail {
+                path,
+                size: 1,
+                timestamp: 1,
+                title: path,
+                date: "",
+                mime: "video/mp4",
+                device: 1,
+                inode,
+                dlna_pn: None,
+            })
+            .unwrap()
+        };
+        let old = insert("/media/old.mp4", 1);
+        let fresh = insert("/media/fresh.mp4", 2);
+        db.update_bookmark(old, Some(120), Some(1)).unwrap();
+        db.update_bookmark(fresh, Some(240), Some(2)).unwrap();
+
+        let now = 20_000_000_i64;
+        db.connection()
+            .execute(
+                "UPDATE BOOKMARKS SET UPDATED_AT=?1 WHERE ID=?2",
+                rusqlite::params![now - 91 * 86_400, old],
+            )
+            .unwrap();
+        db.connection()
+            .execute(
+                "UPDATE BOOKMARKS SET UPDATED_AT=?1 WHERE ID=?2",
+                rusqlite::params![now - 90 * 86_400, fresh],
+            )
+            .unwrap();
+
+        assert_eq!(db.prune_expired_bookmarks(0, now).unwrap(), 0);
+        assert_eq!(db.get_bookmark(old).unwrap(), Some((120, 1)));
+        assert_eq!(db.prune_expired_bookmarks(90, now).unwrap(), 1);
+        assert_eq!(db.get_bookmark(old).unwrap(), None);
+        assert_eq!(
+            db.get_bookmark(fresh).unwrap(),
+            Some((240, 2)),
+            "state exactly on the retention boundary remains valid"
+        );
+    }
+
+    #[test]
+    fn full_reconciliation_prunes_expired_bookmarks_and_republishes_catalog() {
+        let tmp = TempPath::new("bookmark-reconcile");
+        let media = tmp.join("video");
+        std::fs::create_dir_all(&media).unwrap();
+        write_fake_mkv(&media.join("movie.mkv"), 64);
+        let cfg = ScanConfig {
+            media_dirs: vec![media],
+            db_path: Some(tmp.join("files.db")),
+            bookmark_retention_days: 90,
+            types: MediaTypes::video_only(),
+            ..ScanConfig::default()
+        };
+        let initial = scan(&cfg).unwrap();
+        let item = initial.items.values().next().unwrap().clone();
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        db.set_bookmark(item.detail_id, 120).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE BOOKMARKS SET UPDATED_AT=?1 WHERE ID=?2",
+                rusqlite::params![unix_now_seconds() - 91 * 86_400, item.detail_id],
+            )
+            .unwrap();
+        drop(db);
+
+        let (catalog, delta) = monitor(&cfg).unwrap();
+        assert_eq!(delta.changed, 1);
+        let catalog = catalog.expect("bookmark expiry must republish the catalog");
+        assert_eq!(
+            catalog
+                .get_item_by_detail(item.detail_id)
+                .unwrap()
+                .bookmark_sec,
+            0
+        );
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        assert_eq!(db.get_bookmark(item.detail_id).unwrap(), None);
+    }
+
+    #[test]
     fn scan_skips_junk_sample_exclude_and_reads_nfo_captions() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-scan-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("scan");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("video")).unwrap();
         std::fs::create_dir_all(tmp.join("sample")).unwrap();
@@ -3854,23 +6123,33 @@ mod tests {
         )
         .unwrap();
         write_fake_mkv(&tmp.join("video/dvp7.mkv"), 64);
-        std::fs::write(tmp.join("video/not-video.mkv"), b"this is a text file not a video").unwrap();
+        std::fs::write(
+            tmp.join("video/not-video.mkv"),
+            b"this is a text file not a video",
+        )
+        .unwrap();
         std::fs::write(tmp.join("video/notes.txt"), b"ignore").unwrap();
 
         let cat = scan(&ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             exclude_dirs: vec!["exclude_me".into()],
             exclude_files: vec![],
             ..Default::default()
-        });
+        })
+        .unwrap();
         assert!(
-            !cat.items.values().any(|i| i.title == "not-video" || i.title == "notes"),
+            !cat.items
+                .values()
+                .any(|i| i.title == "not-video" || i.title == "notes"),
             "text must not be indexed as video"
         );
         let titles: Vec<_> = cat.items.values().map(|i| i.title.as_str()).collect();
-        assert!(titles.iter().any(|t| *t == "movie"));
-        assert!(titles.iter().any(|t| *t == "dvp7"));
-        assert!(!titles.iter().any(|t| *t == "skip" || *t == "secret" || *t == "junk"));
+        assert!(titles.contains(&"movie"));
+        assert!(titles.contains(&"dvp7"));
+        assert!(!titles
+            .iter()
+            .any(|t| *t == "skip" || *t == "secret" || *t == "junk"));
         let movie = cat
             .items
             .values()
@@ -3885,10 +6164,7 @@ mod tests {
 
     #[test]
     fn inode_reuse_for_hardlink_alias() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-inode-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("inode");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("video")).unwrap();
         let a = tmp.join("video/orig.mkv");
@@ -3898,10 +6174,12 @@ mod tests {
         std::fs::hard_link(&a, &b).unwrap();
         let dbp = tmp.join("files.db");
         let cat = scan(&ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(dbp.clone()),
             ..Default::default()
-        });
+        })
+        .unwrap();
         let orig = cat
             .items
             .values()
@@ -3913,10 +6191,16 @@ mod tests {
             .find(|i| i.path.ends_with("alias.mkv"))
             .expect("alias.mkv");
         let db = LibraryDb::open(&dbp).unwrap();
-        let o = db.find_detail_by_path(&orig.path.to_string_lossy()).unwrap().unwrap();
-        let arow = db.find_detail_by_path(&alias.path.to_string_lossy()).unwrap().unwrap();
+        let o = db
+            .find_detail_by_path(&orig.path.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let arow = db
+            .find_detail_by_path(&alias.path.to_string_lossy())
+            .unwrap()
+            .unwrap();
         // rustyDLNA: one DETAILS row per path; same DEVICE+INODE.
-        assert_ne!(o.0, arow.0);
+        assert_ne!(o.id, arow.id);
         let all_video: Vec<_> = cat
             .items
             .values()
@@ -3928,20 +6212,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn bounded_scan_jobs_use_parallelism_without_exceeding_limit() {
+        let jobs: Vec<usize> = (0..24).collect();
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        let results = run_bounded_jobs(&jobs, 4, |job| {
+            let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            job * 2
+        });
+        assert_eq!(results, jobs.iter().map(|job| job * 2).collect::<Vec<_>>());
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) > 1);
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_preparation_prefers_real_path_and_groups_directory_symlink() {
+        let tmp = TempPath::new("prepare-alias");
+        std::fs::create_dir_all(tmp.join("zz-real")).unwrap();
+        let direct = tmp.join("zz-real/movie.mkv");
+        write_fake_mkv(&direct, 64);
+        let alias_dir = tmp.join("00-alias");
+        std::os::unix::fs::symlink(tmp.join("zz-real"), &alias_dir).unwrap();
+        let alias = alias_dir.join("movie.mkv");
+        let alias_meta = std::fs::metadata(&alias).unwrap();
+        let direct_meta = std::fs::metadata(&direct).unwrap();
+        let pending = vec![
+            PendingFile {
+                path: alias.clone(),
+                folder_id: "alias".into(),
+                physical: PhysicalFileKey::new(&alias, &alias_meta),
+            },
+            PendingFile {
+                path: direct.clone(),
+                folder_id: "direct".into(),
+                physical: PhysicalFileKey::new(&direct, &direct_meta),
+            },
+        ];
+        let db = LibraryDb::open_memory().unwrap();
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            types: MediaTypes::video_only(),
+            thumbnails: false,
+            scan_workers: 4,
+            ..Default::default()
+        };
+        let prepared = prepare_pending_files(&db, &cfg, &pending).unwrap();
+        assert_eq!(prepared.by_physical.len(), 1);
+        assert_eq!(prepared.worker_indices, HashSet::from([1]));
+        assert_eq!(
+            source_image_identity(&direct).unwrap(),
+            source_image_identity(&alias).unwrap(),
+            "cache identity must follow the physical file, not its alias path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_symlink_alias_reuses_one_generated_thumbnail() {
+        let tmp = TempPath::new("thumb-alias");
+        let real_dir = tmp.join("zz-real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let direct = real_dir.join("movie.mp4");
+        let generated = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=2:size=64x64:rate=2",
+                "-threads",
+                "1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&direct)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !generated {
+            eprintln!("skip alias thumbnail reuse (ffmpeg fixture unavailable)");
+            return;
+        }
+        let alias_dir = tmp.join("00-alias");
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).unwrap();
+        let alias = alias_dir.join("movie.mp4");
+        let db_path = tmp.join("cache/files.db");
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(db_path.clone()),
+            types: MediaTypes::video_only(),
+            thumbnails: true,
+            scan_workers: 4,
+            ..Default::default()
+        };
+        scan(&cfg).unwrap();
+        let db = LibraryDb::open(&db_path).unwrap();
+        let alias_detail = db
+            .find_detail_by_path(&path_to_db(&alias))
+            .unwrap()
+            .expect("alias detail");
+        let direct_detail = db
+            .find_detail_by_path(&path_to_db(&direct))
+            .unwrap()
+            .expect("direct detail");
+        let alias_art = db.detail_album_art(alias_detail.id).unwrap();
+        let direct_art = db.detail_album_art(direct_detail.id).unwrap();
+        assert!(alias_art > 0);
+        assert_eq!(alias_art, direct_art, "aliases must share one artwork row");
+        assert!(
+            db.details_missing_stream_meta().unwrap().is_empty(),
+            "the initial scan must persist its prepared probe for every alias"
+        );
+        let (_, unchanged) = monitor(&cfg).unwrap();
+        assert_eq!(unchanged, ScanDelta::default());
+        let thumbnails = std::fs::read_dir(tmp.join("cache/art"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("thumb-"))
+            .count();
+        assert_eq!(thumbnails, 1, "ffmpeg must generate one physical thumbnail");
+    }
+
     /// 1×1 JPEG (SOI + JFIF + EOI). Real enough for sidecar + HTTP magic checks.
     const TINY_JPEG: &[u8] = &[
-        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00,
-        0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06,
-        0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D,
-        0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12, 0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D,
-        0x1A, 0x1C, 0x1C, 0x20, 0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28,
-        0x37, 0x29, 0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
-        0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01,
-        0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0xFF, 0xC4,
-        0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00,
-        0x3F, 0x00, 0x2A, 0x1F, 0xFF, 0xD9,
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06,
+        0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B,
+        0x0C, 0x19, 0x12, 0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20,
+        0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29, 0x2C, 0x30, 0x31,
+        0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32, 0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF,
+        0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00,
+        0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x08, 0xFF, 0xC4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xDA, 0x00, 0x08,
+        0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x2A, 0x1F, 0xFF, 0xD9,
     ];
 
     #[test]
@@ -3957,22 +6371,20 @@ mod tests {
 
     #[test]
     fn art_sidecar_indexed_and_cloned() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-art-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("art");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         write_fake_mkv(&tmp.join("clip.mkv"), 64);
         std::fs::write(tmp.join("clip-poster.jpg"), TINY_JPEG).unwrap();
         let dbp = tmp.join("files.db");
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(dbp.clone()),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let cat = scan(&cfg);
+        let cat = scan(&cfg).unwrap();
         let video = cat
             .items
             .values()
@@ -3990,7 +6402,7 @@ mod tests {
         let alias = tmp.join("alias.mkv");
         let _ = std::fs::remove_file(&alias);
         std::fs::hard_link(tmp.join("clip.mkv"), &alias).unwrap();
-        let (cat2, _) = rescan(&cfg, &cat);
+        let (cat2, _) = rescan(&cfg, &cat).unwrap();
         let clip2 = cat2
             .items
             .values()
@@ -4009,7 +6421,7 @@ mod tests {
 
         let poster = tmp.join("clip-poster.jpg");
         let _ = std::fs::write(&poster, TINY_JPEG);
-        let (cat3, _) = monitor_dirty(&cfg, &[poster]);
+        let (cat3, _) = monitor_dirty(&cfg, &[poster]).unwrap();
         let cat3 = cat3.unwrap_or(cat2);
         let ids: Vec<i64> = cat3
             .items
@@ -4023,11 +6435,118 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_write_replace_and_delete_recompute_one_catalog_generation() {
+        let tmp = TempPath::new("sidecar-lifecycle");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let media = tmp.join("movie.mkv");
+        let nfo = tmp.join("movie.nfo");
+        let caption = tmp.join("movie.en.srt");
+        let unrelated_caption = tmp.join("movie2.srt");
+        let poster = tmp.join("movie-poster.jpg");
+        write_fake_mkv(&media, 64);
+        std::fs::write(
+            &nfo,
+            "<movie><title>Sidecar Title</title><genre>Drama</genre></movie>",
+        )
+        .unwrap();
+        std::fs::write(&caption, "first subtitle").unwrap();
+        std::fs::write(&unrelated_caption, "must not attach").unwrap();
+        std::fs::write(&poster, TINY_JPEG).unwrap();
+        let cfg = ScanConfig {
+            media_roots: Vec::new(),
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+
+        let initial = scan(&cfg).unwrap();
+        let item = initial
+            .items
+            .values()
+            .find(|item| item.path == media && item.ref_id.is_none())
+            .unwrap();
+        let detail_id = item.detail_id;
+        let sidecar_art_id = item.album_art;
+        assert_eq!(item.title, "Sidecar Title");
+        assert_eq!(item.captions.len(), 1, "movie2.srt must not attach");
+        assert!(sidecar_art_id > 0);
+
+        std::fs::write(&caption, "replacement subtitle bytes").unwrap();
+        let (catalog, delta) = monitor_dirty(&cfg, std::slice::from_ref(&caption)).unwrap();
+        assert!(catalog.is_some());
+        assert_eq!(delta.changed, 1, "one settled sidecar burst is one change");
+
+        // A replacement at the same path still invalidates clients even
+        // though its ALBUM_ART row/path is stable.
+        std::fs::write(&poster, TINY_JPEG).unwrap();
+        let (_, delta) = monitor_dirty(&cfg, std::slice::from_ref(&poster)).unwrap();
+        assert_eq!(delta.changed, 1);
+
+        // Malformed sidecar parsing is transactional: the last published DB
+        // generation remains fully readable and unchanged.
+        std::fs::write(&nfo, "<movie><title>broken</movie>").unwrap();
+        assert!(monitor_dirty(&cfg, std::slice::from_ref(&nfo)).is_err());
+        let retained = open_library_db(cfg.db_path.as_ref().unwrap())
+            .unwrap()
+            .load_catalog()
+            .unwrap();
+        assert_eq!(retained.by_detail[&detail_id], item.object_id);
+        assert_eq!(retained.items[&item.object_id].title, "Sidecar Title");
+
+        std::fs::remove_file(&nfo).unwrap();
+        std::fs::remove_file(&caption).unwrap();
+        std::fs::remove_file(&poster).unwrap();
+        let (catalog, delta) =
+            monitor_dirty(&cfg, &[nfo.clone(), caption.clone(), poster.clone()]).unwrap();
+        assert_eq!(delta.changed, 1, "a multi-sidecar burst bumps once");
+        let catalog = catalog.unwrap();
+        let item = &catalog.items[&catalog.by_detail[&detail_id]];
+        assert_eq!(item.title, "movie", "NFO deletion restores filename title");
+        assert!(item.captions.is_empty(), "caption deletion must propagate");
+        assert_ne!(
+            item.album_art, sidecar_art_id,
+            "deleted art cannot stay selected"
+        );
+        assert!(
+            !catalog.items.values().any(|candidate| {
+                candidate.detail_id == detail_id && candidate.parent_id.starts_with(VIDEO_GENRE_ID)
+            }),
+            "NFO deletion must remove stale genre aliases"
+        );
+        let db = open_library_db(cfg.db_path.as_ref().unwrap()).unwrap();
+        assert!(db.album_art_path(sidecar_art_id).unwrap().is_none());
+
+        // A periodic reconcile (no inotify paths) reaches the same desired
+        // state for sidecar additions and deletions.
+        std::fs::write(&nfo, "<movie><title>Periodic Title</title></movie>").unwrap();
+        std::fs::write(&caption, "periodic subtitle").unwrap();
+        std::fs::write(&poster, TINY_JPEG).unwrap();
+        let (catalog, delta) = monitor(&cfg).unwrap();
+        assert_eq!(delta.changed, 1);
+        let catalog = catalog.unwrap();
+        let item = &catalog.items[&catalog.by_detail[&detail_id]];
+        assert_eq!(item.title, "Periodic Title");
+        assert_eq!(item.captions.len(), 1);
+        assert!(item.album_art > 0);
+
+        std::fs::remove_file(&nfo).unwrap();
+        std::fs::remove_file(&caption).unwrap();
+        std::fs::remove_file(&poster).unwrap();
+        let (catalog, delta) = monitor(&cfg).unwrap();
+        assert_eq!(delta.changed, 1);
+        let catalog = catalog.unwrap();
+        let item = &catalog.items[&catalog.by_detail[&detail_id]];
+        assert_eq!(item.title, "movie");
+        assert!(item.captions.is_empty());
+        assert_eq!(item.album_art, 0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn art_embedded_and_thumbnail_fallback() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-embed-art-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("embed-art");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let poster = tmp.join("cover.jpg");
@@ -4075,21 +6594,20 @@ mod tests {
         write_fake_mkv(&bare, 64);
         let dbp = tmp.join("files.db");
         let cat = scan(&ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(dbp),
             types: MediaTypes::video_only(),
             ..Default::default()
-        });
+        })
+        .unwrap();
         let cover = cat
             .items
             .values()
             .find(|i| i.path.ends_with("withcover.mp4"))
             .expect("embedded");
         assert!(cover.album_art > 0, "attached pic must become ALBUM_ART");
-        let art_path = cat
-            .album_art_paths
-            .get(&cover.album_art)
-            .expect("art path");
+        let art_path = cat.album_art_paths.get(&cover.album_art).expect("art path");
         let bytes = std::fs::read(art_path).unwrap_or_default();
         assert!(is_jpeg_bytes(&bytes), "extracted art must be jpeg");
         let thumb = cat
@@ -4106,21 +6624,19 @@ mod tests {
 
     #[test]
     fn monitor_empty_dirty_attaches_new_poster() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-art-restat-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("art-restat");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         write_fake_mkv(&tmp.join("clip.mkv"), 64);
         let dbp = tmp.join("files.db");
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(dbp.clone()),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let cat = scan(&cfg);
+        let cat = scan(&cfg).unwrap();
         let before = cat
             .items
             .values()
@@ -4128,49 +6644,51 @@ mod tests {
             .expect("clip");
         let before_art = before.album_art;
         std::fs::write(tmp.join("clip-poster.jpg"), TINY_JPEG).unwrap();
-        let (cat2, delta) = monitor(&cfg);
+        let (cat2, delta) = monitor(&cfg).unwrap();
         let cat2 = cat2.expect("restat must notice new art");
         let after = cat2
             .items
             .values()
             .find(|i| i.path.ends_with("clip.mkv"))
             .expect("clip after restat");
-        assert!(after.album_art > 0, "periodic/startup monitor attaches poster");
+        assert!(
+            after.album_art > 0,
+            "periodic/startup monitor attaches poster"
+        );
         assert!(
             delta.changed >= 1 || after.album_art != before_art,
             "sidecar must attach or replace a generated thumb"
         );
-        let (none, delta2) = monitor(&cfg);
+        let (none, delta2) = monitor(&cfg).unwrap();
         assert!(none.is_none(), "second restat must not rewrite: {delta2:?}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn symlink_clones_known_detail_without_second_probe() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-clone-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("clone");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("movies")).unwrap();
         std::fs::create_dir_all(tmp.join("genre")).unwrap();
         write_fake_mkv(&tmp.join("movies/film.mkv"), 64);
         std::fs::write(tmp.join("movies/film.nfo"), "<year>1999</year>").unwrap();
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let c1 = scan(&cfg);
+        let c1 = scan(&cfg).unwrap();
         let orig = c1.items.values().find(|i| i.title == "film").unwrap();
-        assert!(orig.date.contains("1999"), "nfo date on original {}", orig.date);
-        std::os::unix::fs::symlink(
-            tmp.join("movies/film.mkv"),
-            tmp.join("genre/film-link.mkv"),
-        )
-        .unwrap();
-        let (next, d) = rescan(&cfg, &c1);
+        assert!(
+            orig.date.contains("1999"),
+            "nfo date on original {}",
+            orig.date
+        );
+        std::os::unix::fs::symlink(tmp.join("movies/film.mkv"), tmp.join("genre/film-link.mkv"))
+            .unwrap();
+        let (next, d) = rescan(&cfg, &c1).unwrap();
         assert!(d.added >= 1);
         let alias = next
             .items
@@ -4193,10 +6711,7 @@ mod tests {
 
     #[test]
     fn sqlite_files_db_roundtrip_and_delete_original_drops_symlinks() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-sql-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("sql");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("video")).unwrap();
         let orig = tmp.join("video/orig.mkv");
@@ -4205,12 +6720,13 @@ mod tests {
         std::os::unix::fs::symlink(&orig, &link).unwrap();
         let dbp = tmp.join("files.db");
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(dbp.clone()),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let cat = scan(&cfg);
+        let cat = scan(&cfg).unwrap();
         assert!(cat.items.values().any(|i| i.path.ends_with("orig.mkv")));
         assert!(cat.items.values().any(|i| i.path.ends_with("link.mkv")));
         assert!(dbp.is_file(), "files.db must exist on disk");
@@ -4226,14 +6742,17 @@ mod tests {
             .unwrap();
         assert!(n >= 1);
         let cat2 = db.load_catalog().unwrap();
-        assert!(!cat2.items.values().any(|i| i.title == "orig" || i.title == "link"));
+        assert!(!cat2
+            .items
+            .values()
+            .any(|i| i.title == "orig" || i.title == "link"));
 
         // rescan also prunes
         write_fake_mkv(&orig, 128);
-        std::os::unix::fs::symlink(&orig, &tmp.join("video/link2.mkv")).ok();
-        let _ = scan(&cfg);
+        std::os::unix::fs::symlink(&orig, tmp.join("video/link2.mkv")).ok();
+        let _ = scan(&cfg).unwrap();
         std::fs::remove_file(&orig).unwrap();
-        let cat3 = scan(&cfg);
+        let cat3 = scan(&cfg).unwrap();
         assert!(
             !cat3.items.values().any(|i| i.path.ends_with("link2.mkv")),
             "rescan must drop dangling symlink aliases"
@@ -4243,30 +6762,28 @@ mod tests {
 
     #[test]
     fn removing_old_path_keeps_live_symlink_aliases() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-live-alias-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("live-alias");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("old")).unwrap();
         std::fs::create_dir_all(tmp.join("action")).unwrap();
         std::fs::create_dir_all(tmp.join("genres/action")).unwrap();
         write_fake_mkv(&tmp.join("old/film.mkv"), 64);
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let _ = scan(&cfg);
+        let _ = scan(&cfg).unwrap();
         std::fs::rename(tmp.join("old/film.mkv"), tmp.join("action/film.mkv")).unwrap();
         std::os::unix::fs::symlink(
             tmp.join("action/film.mkv"),
             tmp.join("genres/action/film.mkv"),
         )
         .unwrap();
-        let _ = monitor(&cfg);
-        let n = forget_path(&cfg, &tmp.join("old/film.mkv"));
+        let _ = monitor(&cfg).unwrap();
+        let n = forget_path(&cfg, &tmp.join("old/film.mkv")).unwrap();
         let _ = n;
         let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
         let cat = db.load_catalog().unwrap();
@@ -4293,26 +6810,24 @@ mod tests {
 
     #[test]
     fn rescan_detects_new_and_removed() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-rescan-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("rescan");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("video")).unwrap();
         write_fake_mkv(&tmp.join("video/a.mkv"), 64);
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let c1 = scan(&cfg);
+        let c1 = scan(&cfg).unwrap();
         write_fake_mkv(&tmp.join("video/b.mkv"), 64);
-        let (c2, d) = rescan(&cfg, &c1);
+        let (c2, d) = rescan(&cfg, &c1).unwrap();
         assert!(d.added >= 1);
         assert!(c2.items.values().any(|i| i.title == "b"));
         std::fs::remove_file(tmp.join("video/b.mkv")).unwrap();
-        let (c3, d2) = rescan(&cfg, &c2);
+        let (c3, d2) = rescan(&cfg, &c2).unwrap();
         assert!(d2.removed >= 1);
         assert!(!c3.items.values().any(|i| i.title == "b"));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -4320,10 +6835,7 @@ mod tests {
 
     #[test]
     fn video_has_all_recent_and_folders() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-video-views-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("video-views");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("movies")).unwrap();
         write_fake_mkv(&tmp.join("movies/fresh.mkv"), 64);
@@ -4337,11 +6849,13 @@ mod tests {
         )
         .unwrap();
         let cat = scan(&ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
-        });
+        })
+        .unwrap();
         let video = cat.children_of(VIDEO_ID).expect("video");
         let titles: Vec<_> = video
             .iter()
@@ -4397,6 +6911,20 @@ mod tests {
             !recent_paths.iter().any(|p| p.contains("alias")),
             "recent must not list symlink alias: {recent_paths:?}"
         );
+        let restarted = load_existing(&ScanConfig {
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            recent_limit: 1,
+            recent_days: Some(90),
+            ..Default::default()
+        });
+        let restarted_recent = restarted.recent_videos();
+        assert_eq!(restarted_recent.len(), 1);
+        let CatalogChild::Item(restarted_item) = &restarted_recent[0] else {
+            panic!("recent must contain an item");
+        };
+        assert!(restarted_item.path.ends_with("fresh.mkv"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4434,10 +6962,15 @@ mod tests {
                     creator: None,
                     comment: None,
                     artist: None,
+                    album_artist: None,
+                    composer: None,
+                    contributor: None,
                     album: None,
                     genre: None,
                     disc: None,
                     track: None,
+                    rating: None,
+                    rotation: None,
                     bookmark_sec: 0,
                     watch_count: 0,
                 },
@@ -4472,10 +7005,15 @@ mod tests {
                     creator: None,
                     comment: None,
                     artist: None,
+                    album_artist: None,
+                    composer: None,
+                    contributor: None,
                     album: None,
                     genre: None,
                     disc: None,
                     track: None,
+                    rating: None,
+                    rotation: None,
                     bookmark_sec: 0,
                     watch_count: 0,
                 },
@@ -4508,27 +7046,49 @@ mod tests {
             panic!();
         };
         assert_eq!(last.title, "m050");
+
+        let now = 1_700_200_000i64;
+        let cutoff = now - 86_400;
+        cat.items.get_mut("64$1$F9").unwrap().mtime = now + 60; // future clock skew
+        cat.items.get_mut("64$2$F9").unwrap().mtime = now + 60;
+        cat.items.get_mut("64$1$F8").unwrap().mtime = cutoff * 1_000_000_000; // exact, nanos
+        cat.items.get_mut("64$2$F8").unwrap().mtime = cutoff * 1_000_000_000;
+        cat.items.get_mut("64$1$F7").unwrap().mtime = cutoff - 1;
+        cat.items.get_mut("64$2$F7").unwrap().mtime = cutoff - 1;
+        cat.configure_recent_policy_at(10, Some(1), now);
+        let bounded = cat.recent_videos();
+        assert_eq!(
+            bounded.len(),
+            2,
+            "window boundary + alias dedup: {bounded:#?}"
+        );
+        let titles: Vec<_> = bounded
+            .iter()
+            .filter_map(|child| match child {
+                CatalogChild::Item(item) => Some(item.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, ["m249", "m248"]);
     }
 
     #[test]
     fn monitor_skips_incomplete_and_only_applies_delta() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-monitor-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("monitor");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("movies")).unwrap();
         std::fs::create_dir_all(tmp.join("incomplete")).unwrap();
         write_fake_mkv(&tmp.join("movies/keep.mkv"), 64);
         write_fake_mkv(&tmp.join("incomplete/wip.mkv"), 64);
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             exclude_dirs: vec!["incomplete".into()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let c1 = scan(&cfg);
+        let c1 = scan(&cfg).unwrap();
         assert!(c1.items.values().any(|i| i.title == "keep"));
         assert!(
             !c1.items
@@ -4536,12 +7096,12 @@ mod tests {
                 .any(|i| i.path.to_string_lossy().contains("incomplete")),
             "incomplete must never be indexed"
         );
-        let (none, d0) = monitor(&cfg);
+        let (none, d0) = monitor(&cfg).unwrap();
         assert!(none.is_none(), "unchanged library must not rewrite");
         assert_eq!(d0, ScanDelta::default());
         write_fake_mkv(&tmp.join("movies/new.mkv"), 64);
         write_fake_mkv(&tmp.join("incomplete/another.mkv"), 64);
-        let (some, d) = monitor(&cfg);
+        let (some, d) = monitor(&cfg).unwrap();
         let c2 = some.expect("new file");
         assert!(d.added >= 1);
         assert!(c2.items.values().any(|i| i.title == "new"));
@@ -4556,20 +7116,18 @@ mod tests {
 
     #[test]
     fn load_existing_reads_db_without_walking() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-load-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("load");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("video")).unwrap();
         write_fake_mkv(&tmp.join("video/kept.mkv"), 64);
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let scanned = scan(&cfg);
+        let scanned = scan(&cfg).unwrap();
         assert!(scanned.items.values().any(|i| i.title == "kept"));
         let loaded = load_existing(&cfg);
         assert!(
@@ -4588,46 +7146,199 @@ mod tests {
 
     #[test]
     fn path_is_under_roots_rejects_escape_symlink() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-jail-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("jail");
         let _ = std::fs::remove_dir_all(&tmp);
         let root = tmp.join("video");
         std::fs::create_dir_all(&root).unwrap();
         let inside = root.join("poster.jpg");
         std::fs::write(&inside, b"ok").unwrap();
-        assert!(path_is_under_roots(&inside, &[root.clone()]));
+        assert!(path_is_under_roots(&inside, std::slice::from_ref(&root)));
         let outside = tmp.join("secret.txt");
         std::fs::write(&outside, b"no").unwrap();
-        assert!(!path_is_under_roots(&outside, &[root.clone()]));
+        assert!(!path_is_under_roots(&outside, std::slice::from_ref(&root)));
         let link = root.join("escape.jpg");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         assert!(path_is_symlink(&link));
         assert!(
-            !path_is_under_roots(&link, &[root.clone()]),
+            !path_is_under_roots(&link, std::slice::from_ref(&root)),
             "symlink out of media root must fail"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn rebase_media_path_maps_host_realpath_onto_media_root() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-rebase-{}",
-            std::process::id()
+    fn scanner_jails_directory_links_but_keeps_safe_aliases_and_wide_links_opt_in() {
+        let tmp = TempPath::new("tree-jail");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("media");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        write_fake_mkv(&root.join("real/inside.mkv"), 64);
+        write_fake_mkv(&outside.join("secret.mkv"), 64);
+        std::os::unix::fs::symlink(root.join("real"), root.join("inside-alias")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("outside-alias")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("missing"), root.join("broken-alias")).unwrap();
+        std::os::unix::fs::symlink(&root, root.join("real/loop-to-root")).unwrap();
+
+        let strict = ScanConfig {
+            media_roots: Vec::new(),
+            media_dirs: vec![root.clone()],
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let strict_cat = scan(&strict).unwrap();
+        assert!(strict_cat
+            .items
+            .values()
+            .any(|item| item.path.ends_with("inside-alias/inside.mkv")));
+        assert!(!strict_cat
+            .items
+            .values()
+            .any(|item| item.path.to_string_lossy().contains("outside-alias")));
+        assert!(!path_is_allowed_dir(&root.join("outside-alias"), &strict));
+        assert!(!path_is_allowed_dir(&root.join("broken-alias"), &strict));
+
+        let wide = ScanConfig {
+            media_roots: Vec::new(),
+            wide_links: true,
+            ..strict.clone()
+        };
+        let wide_cat = scan(&wide).unwrap();
+        assert!(wide_cat
+            .items
+            .values()
+            .any(|item| item.path.ends_with("outside-alias/secret.mkv")));
+        assert!(path_is_allowed_file(
+            &root.join("outside-alias/secret.mkv"),
+            &wide
         ));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_root_policy_also_jails_nfo_captions_and_artwork() {
+        let tmp = TempPath::new("sidecar-jail");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("media");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        write_fake_mkv(&root.join("clip.mkv"), 64);
+        std::fs::write(
+            outside.join("metadata.nfo"),
+            "<movie><title>Escaped</title></movie>",
+        )
+        .unwrap();
+        std::fs::write(outside.join("captions.srt"), "outside subtitle").unwrap();
+        std::fs::write(outside.join("poster.jpg"), TINY_JPEG).unwrap();
+        std::os::unix::fs::symlink(outside.join("metadata.nfo"), root.join("clip.nfo")).unwrap();
+        std::os::unix::fs::symlink(outside.join("captions.srt"), root.join("clip.srt")).unwrap();
+        std::os::unix::fs::symlink(outside.join("poster.jpg"), root.join("clip-poster.jpg"))
+            .unwrap();
+
+        let strict = ScanConfig {
+            media_roots: Vec::new(),
+            media_dirs: vec![root.clone()],
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let strict_cat = scan(&strict).unwrap();
+        let item = strict_cat
+            .items
+            .values()
+            .find(|item| item.path.ends_with("clip.mkv") && item.ref_id.is_none())
+            .unwrap();
+        assert_eq!(item.title, "clip");
+        assert!(item.captions.is_empty());
+        assert_eq!(item.album_art, 0);
+
+        let wide = ScanConfig {
+            media_roots: Vec::new(),
+            wide_links: true,
+            ..strict
+        };
+        let wide_cat = scan(&wide).unwrap();
+        let item = wide_cat
+            .items
+            .values()
+            .find(|item| item.path.ends_with("clip.mkv") && item.ref_id.is_none())
+            .unwrap();
+        assert_eq!(item.title, "Escaped");
+        assert_eq!(item.captions.len(), 1);
+        assert!(item.album_art > 0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn monitor_removes_an_inside_alias_retargeted_outside_the_root() {
+        let tmp = TempPath::new("retarget-jail");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("media");
+        let inside = root.join("inside");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        write_fake_mkv(&inside.join("movie.mkv"), 64);
+        write_fake_mkv(&outside.join("secret.mkv"), 64);
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&inside, &alias).unwrap();
+        let cfg = ScanConfig {
+            media_roots: Vec::new(),
+            media_dirs: vec![root.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let first = scan(&cfg).unwrap();
+        assert!(first
+            .items
+            .values()
+            .any(|item| item.path.ends_with("alias/movie.mkv")));
+
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+        let (updated, delta) = monitor(&cfg).unwrap();
+        assert!(delta.removed > 0);
+        let updated = updated.expect("retarget must publish a catalog update");
+        assert!(!updated
+            .items
+            .values()
+            .any(|item| item.path.to_string_lossy().contains("/alias/")));
+        assert!(!updated.items.values().any(|item| item.title == "secret"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rebase_media_path_uses_explicit_root_alias() {
+        let tmp = TempPath::new("rebase");
         let _ = std::fs::remove_dir_all(&tmp);
         let root = tmp.join("storage/video");
         let rel = PathBuf::from("shows/clip.mkv");
         write_fake_mkv(&root.join(&rel), 64);
         let stored = tmp.join("storage/pool/video").join(&rel);
         assert!(!stored.exists(), "stored realpath must be absent");
-        let got = rebase_media_path(&stored, &[root.clone()]);
+        let cfg = ScanConfig {
+            media_roots: vec![MediaRoot {
+                configured_path: root.clone(),
+                canonical_path: root.canonicalize().unwrap(),
+                key: "root-video".into(),
+                display_title: "video".into(),
+                types: MediaTypes::video_only(),
+                aliases: vec![tmp.join("storage/pool/video")],
+            }],
+            media_dirs: vec![root.clone()],
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let got = rebase_media_path_for_config(&stored, &cfg);
         assert_eq!(got, root.join(&rel));
         assert!(path_is_live_file(&got));
         let live = root.join(&rel);
-        assert_eq!(rebase_media_path(&live, &[root.clone()]), live);
+        assert_eq!(rebase_media_path_for_config(&live, &cfg), live);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4643,29 +7354,270 @@ mod tests {
     }
 
     #[test]
-    fn media_rel_key_equates_host_realpath_and_mount() {
+    fn root_qualified_key_equates_only_explicit_relocation_aliases() {
         let root = PathBuf::from("/storage/video");
+        let cfg = ScanConfig {
+            media_roots: vec![MediaRoot {
+                configured_path: root.clone(),
+                canonical_path: root.clone(),
+                key: "root-video".into(),
+                display_title: "video".into(),
+                types: MediaTypes::video_only(),
+                aliases: vec![PathBuf::from("/mnt/pool/video")],
+            }],
+            media_dirs: vec![root.clone()],
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
         assert_eq!(
-            media_rel_key(Path::new("/storage/video/Show/ep.mkv"), &[root.clone()]),
-            "Show/ep.mkv"
+            media_rel_key_for_config(Path::new("/storage/video/Show/ep.mkv"), &cfg),
+            "root-video:Show/ep.mkv"
         );
         assert_eq!(
-            media_rel_key(
-                Path::new("/mnt/pool/video/Show/ep.mkv"),
-                &[root.clone()]
-            ),
-            "Show/ep.mkv"
+            media_rel_key_for_config(Path::new("/mnt/pool/video/Show/ep.mkv"), &cfg),
+            "root-video:Show/ep.mkv"
         );
         assert!(paths_are_same_media(
             "/mnt/pool/video/Show/ep.mkv",
             Path::new("/storage/video/Show/ep.mkv"),
-            &[root.clone()]
+            &cfg
         ));
         assert!(path_is_under_watched(
             "/mnt/pool/video/Show/S01/ep.mkv",
             Path::new("/storage/video/Show"),
-            &[root]
+            &cfg
         ));
+    }
+
+    #[test]
+    fn root_qualified_path_normalization_is_reversible_and_collision_free() {
+        let roots = [
+            ("video-root", "/srv/video", "/mnt/video"),
+            ("audio-root", "/srv/audio", "/mnt/audio"),
+        ];
+        let cfg = ScanConfig {
+            media_roots: roots
+                .iter()
+                .map(|(key, configured, alias)| MediaRoot {
+                    configured_path: PathBuf::from(configured),
+                    canonical_path: PathBuf::from(configured),
+                    key: (*key).into(),
+                    display_title: (*key).into(),
+                    types: MediaTypes::all(),
+                    aliases: vec![PathBuf::from(alias)],
+                })
+                .collect(),
+            media_dirs: roots
+                .iter()
+                .map(|(_, configured, _)| PathBuf::from(configured))
+                .collect(),
+            types: MediaTypes::all(),
+            ..Default::default()
+        };
+
+        let relatives = ["one.mkv", "nested/two.flac", "space name/三.jpg"];
+        let mut keys = HashSet::new();
+        for (root_key, configured, alias) in roots {
+            for relative in relatives {
+                let canonical_key =
+                    media_rel_key_for_config(&PathBuf::from(configured).join(relative), &cfg);
+                let alias_key =
+                    media_rel_key_for_config(&PathBuf::from(alias).join(relative), &cfg);
+                assert_eq!(canonical_key, alias_key);
+                assert!(canonical_key.starts_with(&format!("{root_key}:")));
+                assert!(keys.insert(canonical_key), "normalized path collision");
+            }
+        }
+    }
+
+    #[test]
+    fn media_root_validation_rejects_missing_duplicate_nested_and_same_basename() {
+        let tmp = TempPath::new("root-validation");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("one/child")).unwrap();
+        std::fs::create_dir_all(tmp.join("two/child")).unwrap();
+
+        assert!(build_media_roots(["missing"], &tmp)
+            .unwrap_err()
+            .contains("does not exist"));
+        assert!(build_media_roots(["one", "one"], &tmp)
+            .unwrap_err()
+            .contains("duplicate"));
+        assert!(build_media_roots(["one", "one/child"], &tmp)
+            .unwrap_err()
+            .contains("nested"));
+        assert!(build_media_roots(["one/child", "two/child"], &tmp)
+            .unwrap_err()
+            .contains("distinct directory names"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn per_root_masks_keys_and_persisted_relocation_survive_reconcile() {
+        let tmp = TempPath::new("root-identity");
+        let old_parent = tmp.join("host");
+        let new_parent = tmp.join("container");
+        let video = old_parent.join("video");
+        let audio = old_parent.join("audio");
+        std::fs::create_dir_all(video.join("Show")).unwrap();
+        std::fs::create_dir_all(audio.join("Show")).unwrap();
+        write_fake_mkv(&video.join("Show/episode.mkv"), 64);
+        write_fake_mkv(&audio.join("wrong-video.mkv"), 64);
+        let mut flac = b"fLaC".to_vec();
+        flac.extend_from_slice(&[0; 48]);
+        std::fs::write(audio.join("Show/episode.flac"), &flac).unwrap();
+        std::fs::write(video.join("wrong-audio.flac"), &flac).unwrap();
+        let db_path = tmp.join("cache/files.db");
+
+        let mut roots = build_media_roots(
+            [
+                format!("V,{}", video.display()),
+                format!("A,{}", audio.display()),
+            ],
+            &tmp,
+        )
+        .unwrap();
+        load_and_persist_media_root_mappings(&mut roots, &db_path).unwrap();
+        let cfg = ScanConfig {
+            media_dirs: roots
+                .iter()
+                .map(|root| root.configured_path.clone())
+                .collect(),
+            media_roots: roots,
+            db_path: Some(db_path.clone()),
+            types: MediaTypes::all(),
+            ..Default::default()
+        };
+        assert_ne!(
+            media_rel_key_for_config(&video.join("Show/same.name"), &cfg),
+            media_rel_key_for_config(&audio.join("Show/same.name"), &cfg),
+            "identical relative paths in different roots must remain distinct"
+        );
+        let first = scan(&cfg).unwrap();
+        let titles: HashSet<_> = first
+            .items
+            .values()
+            .map(|item| item.title.as_str())
+            .collect();
+        assert!(titles.contains("episode"));
+        assert!(!titles.contains("wrong-video"));
+        assert!(!titles.contains("wrong-audio"));
+        let episode_paths: HashSet<_> = first
+            .items
+            .values()
+            .filter(|item| item.title == "episode")
+            .map(|item| item.path.clone())
+            .collect();
+        assert_eq!(episode_paths.len(), 2);
+
+        std::fs::create_dir_all(&new_parent).unwrap();
+        std::fs::rename(&video, new_parent.join("video")).unwrap();
+        std::fs::rename(&audio, new_parent.join("audio")).unwrap();
+        let mut moved_roots = build_media_roots(
+            [
+                format!("V,{}", new_parent.join("video").display()),
+                format!("A,{}", new_parent.join("audio").display()),
+            ],
+            &tmp,
+        )
+        .unwrap();
+        load_and_persist_media_root_mappings(&mut moved_roots, &db_path).unwrap();
+        assert!(
+            moved_roots.iter().all(|root| !root.aliases.is_empty()),
+            "old host paths must be explicit aliases"
+        );
+        let moved = ScanConfig {
+            media_dirs: moved_roots
+                .iter()
+                .map(|root| root.configured_path.clone())
+                .collect(),
+            media_roots: moved_roots,
+            db_path: Some(db_path),
+            types: MediaTypes::all(),
+            ..Default::default()
+        };
+        let (published, delta) = monitor(&moved).unwrap();
+        assert!(
+            published.is_none(),
+            "relocation alone must not rewrite catalog rows"
+        );
+        assert_eq!(delta, ScanDelta::default());
+        for item in load_existing(&moved).items.values() {
+            let live = rebase_media_path_for_config(&item.path, &moved);
+            assert!(live.is_file(), "{} did not rebase", item.path.display());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn every_supported_extension_scans_with_canonical_mime_class_and_image_probe() {
+        let tmp = TempPath::new("format-map");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let video_fixture = tmp.join("fixture-video.mkv");
+        write_fake_mkv(&video_fixture, 64);
+        let audio_fixture = tmp.join("fixture-audio.wav");
+        let mut wav = Vec::from(b"RIFF".as_slice());
+        wav.extend_from_slice(&36u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8_000u32.to_le_bytes());
+        wav.extend_from_slice(&16_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&audio_fixture, wav).unwrap();
+
+        let mut expected = Vec::new();
+        for (index, format) in rusty_dlna_protocol::MEDIA_FORMATS.iter().enumerate() {
+            let resolved = format.resolve(None);
+            let path = tmp.join(format!("format-{index}.{}", format.extension));
+            match resolved.kind {
+                MediaKind::Video => std::fs::copy(&video_fixture, &path).unwrap(),
+                MediaKind::Audio => std::fs::copy(&audio_fixture, &path).unwrap(),
+                MediaKind::Image => {
+                    std::fs::write(&path, TINY_JPEG).unwrap();
+                    TINY_JPEG.len() as u64
+                }
+            };
+            expected.push((path, resolved));
+
+            if format.is_ambiguous() {
+                let audio_path = tmp.join(format!("audio-only-{index}.{}", format.extension));
+                std::fs::copy(&audio_fixture, &audio_path).unwrap();
+                expected.push((audio_path, format.resolve(Some(MediaKind::Audio))));
+            }
+        }
+        let cfg = ScanConfig {
+            media_roots: Vec::new(),
+            media_dirs: vec![tmp.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::all(),
+            ..Default::default()
+        };
+        let catalog = scan(&cfg).unwrap();
+        for (path, resolved) in expected {
+            let items: Vec<_> = catalog
+                .items
+                .values()
+                .filter(|item| item.path == path)
+                .collect();
+            assert!(!items.is_empty(), "{} was not indexed", path.display());
+            for item in items {
+                assert_eq!(item.mime, resolved.mime, "{}", path.display());
+                assert_eq!(item.class, resolved.upnp_class(), "{}", path.display());
+                assert_ne!(item.mime, "application/octet-stream");
+                if resolved.kind == MediaKind::Image {
+                    assert_eq!(item.probe.container, "jpeg");
+                    assert!(item.probe.video.is_empty());
+                    assert!(item.probe.audio.is_empty());
+                    assert!(item.probe.hdr.is_empty());
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     fn container_named<'a>(cat: &'a Catalog, parent: &str, title: &str) -> Option<&'a str> {
@@ -4691,10 +7643,7 @@ mod tests {
 
     #[test]
     fn dir_symlink_does_not_duplicate_real_folder() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-dirlink-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("dirlink");
         let _ = std::fs::remove_dir_all(&tmp);
         let root = tmp.join("video");
         std::fs::create_dir_all(root.join("kids/Movies/Despicable Me")).unwrap();
@@ -4706,6 +7655,11 @@ mod tests {
             &root.join("kids/Movies/Despicable Me/02 - Despicable Me 2.mkv"),
             64,
         );
+        std::fs::write(
+            root.join("kids/Movies/Despicable Me/01 - Despicable Me.nfo"),
+            "<movie><genre>Animation</genre></movie>",
+        )
+        .unwrap();
         std::fs::create_dir_all(root.join("genres/BY_YEAR/2010/Movies")).unwrap();
         std::os::unix::fs::symlink(
             root.join("kids/Movies/Despicable Me"),
@@ -4713,12 +7667,13 @@ mod tests {
         )
         .unwrap();
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![root.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let cat = scan(&cfg);
+        let cat = scan(&cfg).unwrap();
         let kids = container_named(&cat, BROWSEDIR_ID, "video")
             .and_then(|id| container_named(&cat, id, "kids"))
             .and_then(|id| container_named(&cat, id, "Movies"))
@@ -4746,8 +7701,15 @@ mod tests {
                 "02 - Despicable Me 2".to_string()
             ]
         );
+        let animation =
+            container_named(&cat, VIDEO_GENRE_ID, "Animation").expect("Animation genre container");
+        assert_eq!(
+            item_titles(&cat, animation),
+            vec!["01 - Despicable Me"],
+            "physical video must occur once in a virtual view"
+        );
 
-        let rebuilt = rebuild_objects(&cfg);
+        let rebuilt = rebuild_objects(&cfg).unwrap();
         let kids = container_named(&rebuilt, BROWSEDIR_ID, "video")
             .and_then(|id| container_named(&rebuilt, id, "kids"))
             .and_then(|id| container_named(&rebuilt, id, "Movies"))
@@ -4761,32 +7723,60 @@ mod tests {
         );
         let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
         assert!(
-            !db.folders_have_duplicate_inodes(),
+            !db.folders_have_duplicate_inodes().unwrap(),
             "no inode+title twice in one folder"
         );
+        let alias_detail = db
+            .find_detail_by_path(&path_to_db(
+                &root.join("genres/BY_YEAR/2010/Movies/Despicable Me/01 - Despicable Me.mkv"),
+            ))
+            .unwrap()
+            .unwrap()
+            .id;
+        db.upsert_object(
+            &format!("{animation}$DEADBEEF"),
+            animation,
+            "item.videoItem",
+            Some(alias_detail),
+            "01 - Despicable Me",
+            None,
+        )
+        .unwrap();
+        assert!(db.folders_have_duplicate_inodes().unwrap());
+        drop(db);
+
+        let (repaired, delta) = repair_objects_if_needed(&cfg).unwrap();
+        assert_eq!(delta.removed, 1);
+        assert_eq!(
+            item_titles(&repaired.unwrap(), animation),
+            vec!["01 - Despicable Me"]
+        );
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        assert!(!db.folders_have_duplicate_inodes().unwrap());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn monitor_drops_moved_file_and_empty_folder() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-move-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("move");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("old")).unwrap();
         std::fs::create_dir_all(tmp.join("new")).unwrap();
         write_fake_mkv(&tmp.join("old/episode.mkv"), 64);
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let c1 = scan(&cfg);
-        assert!(c1.items.values().any(|i| i.path.ends_with("old/episode.mkv")));
+        let c1 = scan(&cfg).unwrap();
+        assert!(c1
+            .items
+            .values()
+            .any(|i| i.path.ends_with("old/episode.mkv")));
         std::fs::rename(tmp.join("old/episode.mkv"), tmp.join("new/episode.mkv")).unwrap();
-        let (c2, d) = rescan(&cfg, &c1);
+        let (c2, d) = rescan(&cfg, &c1).unwrap();
         assert!(d.removed >= 1, "move must drop the source: {d:?}");
         assert!(d.added >= 1, "move must index the dest: {d:?}");
         assert!(
@@ -4795,7 +7785,10 @@ mod tests {
                 .any(|i| i.path.to_string_lossy().contains("/old/")),
             "source path must leave the catalog"
         );
-        assert!(c2.items.values().any(|i| i.path.ends_with("new/episode.mkv")));
+        assert!(c2
+            .items
+            .values()
+            .any(|i| i.path.ends_with("new/episode.mkv")));
         assert!(
             !c2.containers.values().any(|c| c.title == "old"),
             "empty source folder must be pruned"
@@ -4805,43 +7798,47 @@ mod tests {
 
     #[test]
     fn forget_path_matches_host_realpath_prefix() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-forget-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("forget");
         let _ = std::fs::remove_dir_all(&tmp);
         let root = tmp.join("mnt/video");
         std::fs::create_dir_all(root.join("Show")).unwrap();
         write_fake_mkv(&root.join("Show/ep.mkv"), 64);
+        let old_root = tmp.join("host/z2/video");
         let cfg = ScanConfig {
+            media_roots: vec![MediaRoot {
+                configured_path: root.clone(),
+                canonical_path: root.canonicalize().unwrap(),
+                key: "root-video".into(),
+                display_title: "video".into(),
+                types: MediaTypes::video_only(),
+                aliases: vec![old_root.clone()],
+            }],
             media_dirs: vec![root.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let _ = scan(&cfg);
+        let _ = scan(&cfg).unwrap();
         let dbp = cfg.db_path.as_ref().unwrap();
         {
             let conn = rusqlite::Connection::open(dbp).unwrap();
             conn.execute(
                 "UPDATE DETAILS SET PATH = ?1 WHERE PATH = ?2",
                 rusqlite::params![
-                    tmp.join("host/z2/video/Show/ep.mkv")
-                        .to_string_lossy()
-                        .as_ref(),
+                    old_root.join("Show/ep.mkv").to_string_lossy().as_ref(),
                     root.join("Show/ep.mkv").to_string_lossy().as_ref(),
                 ],
             )
             .unwrap();
         }
-        let n = forget_path(&cfg, &root.join("Show/ep.mkv"));
+        let n = forget_path(&cfg, &root.join("Show/ep.mkv")).unwrap();
         assert!(n >= 1, "inotify mount path must delete the realpath row");
         let db = LibraryDb::open(dbp).unwrap();
         let left = db
             .all_detail_stats()
             .unwrap()
             .into_iter()
-            .filter(|(p, ..)| p.ends_with("ep.mkv"))
+            .filter(|row| row.path.ends_with("ep.mkv"))
             .count();
         assert_eq!(left, 0);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -4849,35 +7846,39 @@ mod tests {
 
     #[test]
     fn monitor_does_not_rewrite_equivalent_realpath_prefix() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-equiv-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("equiv");
         let _ = std::fs::remove_dir_all(&tmp);
         let root = tmp.join("mnt/video");
         std::fs::create_dir_all(root.join("Show")).unwrap();
         write_fake_mkv(&root.join("Show/ep.mkv"), 64);
+        let old_root = tmp.join("host/z2/video");
         let cfg = ScanConfig {
+            media_roots: vec![MediaRoot {
+                configured_path: root.clone(),
+                canonical_path: root.canonicalize().unwrap(),
+                key: "root-video".into(),
+                display_title: "video".into(),
+                types: MediaTypes::video_only(),
+                aliases: vec![old_root.clone()],
+            }],
             media_dirs: vec![root.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let _ = scan(&cfg);
+        let _ = scan(&cfg).unwrap();
         {
             let conn = rusqlite::Connection::open(cfg.db_path.as_ref().unwrap()).unwrap();
             conn.execute(
                 "UPDATE DETAILS SET PATH = ?1 WHERE PATH = ?2",
                 rusqlite::params![
-                    tmp.join("host/z2/video/Show/ep.mkv")
-                        .to_string_lossy()
-                        .as_ref(),
+                    old_root.join("Show/ep.mkv").to_string_lossy().as_ref(),
                     root.join("Show/ep.mkv").to_string_lossy().as_ref(),
                 ],
             )
             .unwrap();
         }
-        let (none, d) = monitor(&cfg);
+        let (none, d) = monitor(&cfg).unwrap();
         assert!(
             none.is_none(),
             "same file under host realpath must not be rewritten: {d:?}"
@@ -4888,10 +7889,7 @@ mod tests {
 
     #[test]
     fn next_child_seq_skips_gaps_so_upsert_cannot_rename_a_folder() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-seq-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("seq");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let dbp = tmp.join("files.db");
@@ -4899,10 +7897,24 @@ mod tests {
         db.seed_virtual_containers().unwrap();
         db.upsert_object("64$1", "64", "container.storageFolder", None, "video", None)
             .unwrap();
-        db.upsert_object("64$1$1", "64$1", "container.storageFolder", None, "keep", None)
-            .unwrap();
-        db.upsert_object("64$1$2", "64$1", "container.storageFolder", None, "mid", None)
-            .unwrap();
+        db.upsert_object(
+            "64$1$1",
+            "64$1",
+            "container.storageFolder",
+            None,
+            "keep",
+            None,
+        )
+        .unwrap();
+        db.upsert_object(
+            "64$1$2",
+            "64$1",
+            "container.storageFolder",
+            None,
+            "mid",
+            None,
+        )
+        .unwrap();
         db.upsert_object(
             "64$1$3",
             "64$1",
@@ -4922,18 +7934,15 @@ mod tests {
         let db = LibraryDb::open(&dbp).unwrap();
         let next = db.next_child_seq("64$1").unwrap();
         assert_eq!(next, 4, "must be max(2,3)+1, not count(*)+1=3");
-        assert!(db.object_exists("64$1$3"));
-        let name = db.object_name("64$1$3").unwrap();
+        assert!(db.object_exists("64$1$3").unwrap());
+        let name = db.object_name("64$1$3").unwrap().unwrap();
         assert_eq!(name, "sport");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn new_folder_after_sibling_delete_does_not_inherit_old_children() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-id-reuse-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("id-reuse");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("keep")).unwrap();
         std::fs::create_dir_all(tmp.join("mid")).unwrap();
@@ -4942,27 +7951,27 @@ mod tests {
         write_fake_mkv(&tmp.join("mid/mid.mkv"), 64);
         write_fake_mkv(&tmp.join("sport/game.mkv"), 64);
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let c1 = scan(&cfg);
+        let c1 = scan(&cfg).unwrap();
         let sport = c1
             .containers
             .values()
             .find(|c| c.title == "sport" && c.object_id.starts_with("64"))
             .expect("sport folder")
             .clone();
-        assert!(
-            c1.items
-                .values()
-                .any(|i| i.parent_id == sport.object_id && i.title == "game")
-        );
+        assert!(c1
+            .items
+            .values()
+            .any(|i| i.parent_id == sport.object_id && i.title == "game"));
 
         std::fs::remove_file(tmp.join("keep/keep.mkv")).unwrap();
         let _ = std::fs::remove_dir(tmp.join("keep"));
-        let (c2, _) = rescan(&cfg, &c1);
+        let (c2, _) = rescan(&cfg, &c1).unwrap();
         let sport2 = c2
             .containers
             .values()
@@ -4971,15 +7980,13 @@ mod tests {
             .clone();
         assert_eq!(sport2.object_id, sport.object_id);
 
-        std::fs::create_dir_all(
-            tmp.join("Fallout.S01.Hybrid.2160p.Remux.DoVi.HDR10Plus.H"),
-        )
-        .unwrap();
+        std::fs::create_dir_all(tmp.join("Fallout.S01.Hybrid.2160p.Remux.DoVi.HDR10Plus.H"))
+            .unwrap();
         write_fake_mkv(
             &tmp.join("Fallout.S01.Hybrid.2160p.Remux.DoVi.HDR10Plus.H/ep.mkv"),
             64,
         );
-        let (c3, d) = rescan(&cfg, &c2);
+        let (c3, d) = rescan(&cfg, &c2).unwrap();
         assert!(d.added >= 1, "Fallout episode must be added: {d:?}");
 
         let fallout = c3
@@ -4998,11 +8005,11 @@ mod tests {
             .map(|i| i.title.as_str())
             .collect();
         assert!(
-            fallout_titles.iter().any(|t| *t == "ep"),
+            fallout_titles.contains(&"ep"),
             "Fallout children={fallout_titles:?}"
         );
         assert!(
-            !fallout_titles.iter().any(|t| *t == "game"),
+            !fallout_titles.contains(&"game"),
             "sport file leaked into Fallout: {fallout_titles:?}"
         );
         let sport3 = c3
@@ -5021,64 +8028,89 @@ mod tests {
 
     #[test]
     fn monitor_second_pass_does_not_readd_existing_files() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-noop-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("noop");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("action")).unwrap();
         std::fs::create_dir_all(tmp.join("genres/crime")).unwrap();
         write_fake_mkv(&tmp.join("action/film.mkv"), 64);
+        std::fs::write(
+            tmp.join("action/film.nfo"),
+            "<movie><genre>Crime</genre></movie>",
+        )
+        .unwrap();
         std::os::unix::fs::symlink(
             tmp.join("action/film.mkv"),
             tmp.join("genres/crime/film.mkv"),
         )
         .unwrap();
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let _ = scan(&cfg);
-        let (first, d1) = monitor(&cfg);
+        let _ = scan(&cfg).unwrap();
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        db.connection()
+            .execute("UPDATE DETAILS SET STREAM_PROBE_REV = 0, GENRE = NULL", [])
+            .unwrap();
+        drop(db);
+        let (first, d1) = monitor(&cfg).unwrap();
         let _ = first;
         let _ = d1;
-        let (second, d2) = monitor(&cfg);
+        let (second, d2) = monitor(&cfg).unwrap();
         assert!(
             second.is_none(),
             "unchanged library must not rewrite: {d2:?}"
         );
         assert_eq!(d2.added, 0, "must not count already-indexed files as adds");
         assert_eq!(d2.removed, 0);
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        let reprobed: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM DETAILS WHERE STREAM_PROBE_REV != 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reprobed, 0, "periodic NFO refresh reopened unchanged media");
+        let restored_genres: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM DETAILS WHERE GENRE = 'Crime'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            restored_genres, 2,
+            "NFO override was not restored to aliases"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn symlink_dir_alias_does_not_steal_original_object() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-steal-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("steal");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("action/Now You See Me")).unwrap();
         std::fs::create_dir_all(tmp.join("genres/action")).unwrap();
-        write_fake_mkv(
-            &tmp.join("action/Now You See Me/film.mkv"),
-            64,
-        );
+        write_fake_mkv(&tmp.join("action/Now You See Me/film.mkv"), 64);
         std::os::unix::fs::symlink(
             tmp.join("action/Now You See Me"),
             tmp.join("genres/action/Now You See Me"),
         )
         .unwrap();
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let c1 = scan(&cfg);
+        let c1 = scan(&cfg).unwrap();
         let orig_path = tmp.join("action/Now You See Me/film.mkv");
         let orig = c1
             .items
@@ -5088,7 +8120,9 @@ mod tests {
             .clone();
         let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
         let alias = tmp.join("genres/action/Now You See Me/film.mkv");
-        let folder = ensure_folder_chain(&db, &cfg, &alias).expect("genre folder chain");
+        let folder = ensure_folder_chain(&db, &cfg, &alias)
+            .unwrap()
+            .expect("genre folder chain");
         assert!(
             folder.contains('$'),
             "genre path must get its own folder id: {folder}"
@@ -5097,7 +8131,7 @@ mod tests {
             folder, orig.parent_id,
             "symlink-dir walk must not collapse onto the original folder"
         );
-        assert!(index_one_file(&db, &cfg, &alias, &folder));
+        assert!(index_one_file(&db, &cfg, &alias, &folder).unwrap());
         let c2 = db.load_catalog().unwrap();
         let still = c2.items.get(&orig.object_id).expect("original object kept");
         assert_eq!(
@@ -5107,8 +8141,7 @@ mod tests {
         assert_eq!(still.parent_id, orig.parent_id);
         assert!(
             c2.items.values().any(|i| {
-                i.path.ends_with("genres/action/Now You See Me/film.mkv")
-                    && i.parent_id == folder
+                i.path.ends_with("genres/action/Now You See Me/film.mkv") && i.parent_id == folder
             }),
             "alias should live under the genre folder"
         );
@@ -5117,21 +8150,19 @@ mod tests {
 
     #[test]
     fn disc_structure_is_not_indexed() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-bdmv-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("bdmv");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("movie/BDMV/STREAM")).unwrap();
         write_fake_mkv(&tmp.join("movie/title.mkv"), 64);
         write_fake_mkv(&tmp.join("movie/BDMV/STREAM/00001.m2ts"), 64);
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let cat = scan(&cfg);
+        let cat = scan(&cfg).unwrap();
         assert!(cat.items.values().any(|i| i.title == "title"));
         assert!(
             !cat.items
@@ -5144,10 +8175,7 @@ mod tests {
 
     #[test]
     fn monitor_readds_real_path_kept_only_as_dir_symlink_alias() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-realias-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("realias");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("kids/Movies/The Incredibles")).unwrap();
         std::fs::create_dir_all(tmp.join("genres/BY_YEAR/2004/Movies")).unwrap();
@@ -5159,42 +8187,48 @@ mod tests {
         )
         .unwrap();
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let _ = scan(&cfg);
-        let n = forget_path(&cfg, &real);
+        let _ = scan(&cfg).unwrap();
+        let n = forget_path(&cfg, &real).unwrap();
         assert!(n >= 1, "real path row must drop; live alias stays: {n}");
         let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
         let after_forget = db.all_detail_stats().unwrap();
         assert!(
             after_forget
                 .iter()
-                .any(|(p, ..)| p.contains("genres/BY_YEAR")),
+                .any(|row| row.path.contains("genres/BY_YEAR")),
             "dir-symlink alias must survive deleting the real path: {after_forget:?}"
         );
         assert!(
-            !after_forget
-                .iter()
-                .any(|(p, ..)| p.ends_with("kids/Movies/The Incredibles/02 - Incredibles 2.mkv")),
+            !after_forget.iter().any(|row| row
+                .path
+                .ends_with("kids/Movies/The Incredibles/02 - Incredibles 2.mkv")),
             "real path must be gone before monitor: {after_forget:?}"
         );
         drop(db);
-        let (some, d) = monitor(&cfg);
+        let (some, d) = monitor(&cfg).unwrap();
         let _ = some;
-        assert!(d.added >= 1, "monitor must reindex the live real path: {d:?}");
+        assert!(
+            d.added >= 1,
+            "monitor must reindex the live real path: {d:?}"
+        );
         let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
         let rows = db.all_detail_stats().unwrap();
         assert!(
-            rows.iter()
-                .any(|(p, ..)| p.ends_with("kids/Movies/The Incredibles/02 - Incredibles 2.mkv")),
+            rows.iter().any(|row| row
+                .path
+                .ends_with("kids/Movies/The Incredibles/02 - Incredibles 2.mkv")),
             "real path back in DETAILS: {rows:?}"
         );
         assert!(
-            rows.iter()
-                .any(|(p, ..)| p.contains("genres/BY_YEAR") && p.ends_with("02 - Incredibles 2.mkv")),
+            rows.iter().any(|row| {
+                row.path.contains("genres/BY_YEAR") && row.path.ends_with("02 - Incredibles 2.mkv")
+            }),
             "alias path must stay: {rows:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -5202,10 +8236,7 @@ mod tests {
 
     #[test]
     fn monitor_rename_updates_real_path_and_dir_symlink_alias() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-renalias-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("renalias");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("action/Jason Bourne")).unwrap();
         std::fs::create_dir_all(tmp.join("genres/BY_YEAR/2004/Movies")).unwrap();
@@ -5217,26 +8248,31 @@ mod tests {
         )
         .unwrap();
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let c1 = scan(&cfg);
-        assert!(c1.items.values().any(|i| i.path.ends_with("action/Jason Bourne/old.mkv")));
+        let c1 = scan(&cfg).unwrap();
         assert!(c1
             .items
             .values()
-            .any(|i| i.path.to_string_lossy().contains("genres/BY_YEAR") && i.path.ends_with("old.mkv")));
+            .any(|i| i.path.ends_with("action/Jason Bourne/old.mkv")));
+        assert!(c1
+            .items
+            .values()
+            .any(|i| i.path.to_string_lossy().contains("genres/BY_YEAR")
+                && i.path.ends_with("old.mkv")));
         let new = tmp.join("action/Jason Bourne/02 - The Bourne Supremacy.mkv");
         std::fs::rename(&old, &new).unwrap();
-        let (c2, d) = rescan(&cfg, &c1);
+        let (c2, d) = rescan(&cfg, &c1).unwrap();
         assert!(d.removed >= 1, "old name must leave: {d:?}");
         assert!(d.added >= 1, "new name must be indexed: {d:?}");
         assert!(
-            c2.items
-                .values()
-                .any(|i| i.path.ends_with("action/Jason Bourne/02 - The Bourne Supremacy.mkv")),
+            c2.items.values().any(|i| i
+                .path
+                .ends_with("action/Jason Bourne/02 - The Bourne Supremacy.mkv")),
             "real folder must list the new name"
         );
         assert!(
@@ -5255,10 +8291,7 @@ mod tests {
 
     #[test]
     fn rebuild_objects_drops_missing_details() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-rebuild-miss-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("rebuild-miss");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("video")).unwrap();
         let keep = tmp.join("video/keep.mkv");
@@ -5266,22 +8299,23 @@ mod tests {
         write_fake_mkv(&keep, 64);
         write_fake_mkv(&gone, 64);
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let _ = scan(&cfg);
+        let _ = scan(&cfg).unwrap();
         std::fs::remove_file(&gone).unwrap();
-        let _ = rebuild_objects(&cfg);
+        let _ = rebuild_objects(&cfg).unwrap();
         let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
         let rows = db.all_detail_stats().unwrap();
         assert!(
-            rows.iter().any(|(p, ..)| p.ends_with("keep.mkv")),
+            rows.iter().any(|row| row.path.ends_with("keep.mkv")),
             "live file stays"
         );
         assert!(
-            !rows.iter().any(|(p, ..)| p.ends_with("gone.mkv")),
+            !rows.iter().any(|row| row.path.ends_with("gone.mkv")),
             "missing file must leave DETAILS, not just OBJECTS: {rows:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
@@ -5289,20 +8323,18 @@ mod tests {
 
     #[test]
     fn rebuild_objects_keeps_browse_folder_ids() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-rebuild-ids-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("rebuild-ids");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("video")).unwrap();
         write_fake_mkv(&tmp.join("video/keep.mkv"), 64);
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let first = scan(&cfg);
+        let first = scan(&cfg).unwrap();
         let before: Vec<String> = first
             .items
             .values()
@@ -5310,7 +8342,7 @@ mod tests {
             .map(|i| i.object_id.clone())
             .collect();
         assert!(!before.is_empty(), "scan must index keep.mkv");
-        let _ = rebuild_objects(&cfg);
+        let _ = rebuild_objects(&cfg).unwrap();
         let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
         let after = db.load_catalog().unwrap();
         for id in &before {
@@ -5329,6 +8361,7 @@ mod tests {
             Some("mkv"),
             Some("hevc"),
             Some("truehd,ac3"),
+            Some("1:0:truehd:8,2:1:ac3:6"),
             Some("dv-p8"),
             Some("3840x2160"),
         );
@@ -5336,7 +8369,7 @@ mod tests {
         assert_eq!(p.height, 2160);
         assert_eq!(p.audio, "truehd,ac3");
         assert_eq!(primary_codec(&p.audio), "truehd");
-        let empty = probe_from_stored("mkv", None, None, None, None, None);
+        let empty = probe_from_stored("mkv", None, None, None, None, None, None);
         assert!(empty.video.is_empty() && empty.hdr.is_empty() && empty.audio.is_empty());
         assert_eq!(empty.width, 0);
         assert_eq!(empty.container, "mkv");
@@ -5344,7 +8377,15 @@ mod tests {
 
     #[test]
     fn probe_from_stored_avi_other_is_mpeg4() {
-        let p = probe_from_stored("avi", Some("avi"), Some("other"), Some("ac3"), Some("sdr"), Some("720x480"));
+        let p = probe_from_stored(
+            "avi",
+            Some("avi"),
+            Some("other"),
+            Some("ac3"),
+            Some("1:0:ac3:6"),
+            Some("sdr"),
+            Some("720x480"),
+        );
         assert_eq!(p.video, "mpeg4");
         assert_eq!(p.width, 720);
         assert_eq!(p.height, 480);
@@ -5375,7 +8416,17 @@ mod tests {
     fn apply_probe_writes_dlna_pn_and_multi_audio() {
         let db = LibraryDb::open_memory().unwrap();
         let id = db
-            .insert_detail("/tmp/clip.mp4", 10, 1, "clip", "2024-01-01", "video/mp4", 1, 1, None)
+            .insert_detail(NewDetail {
+                path: "/tmp/clip.mp4",
+                size: 10,
+                timestamp: 1,
+                title: "clip",
+                date: "2024-01-01",
+                mime: "video/mp4",
+                device: 1,
+                inode: 1,
+                dlna_pn: None,
+            })
             .unwrap();
         let got = MediaProbe {
             probe: SourceProbe {
@@ -5383,6 +8434,7 @@ mod tests {
                 video: "h264".into(),
                 hdr: "sdr".into(),
                 audio: "aac,ac3".into(),
+                audio_streams: "1:0:aac:2,2:1:ac3:6".into(),
                 width: 1920,
                 height: 800,
             },
@@ -5393,8 +8445,9 @@ mod tests {
                 samplerate: Some(48000),
                 ..AvMeta::default()
             },
+            tags: EmbeddedTags::default(),
         };
-        apply_probe_to_detail(&db, id, &got);
+        apply_probe_to_detail(&db, id, &got).unwrap();
         db.upsert_object("64$1$1", "64$1", "item.videoItem", Some(id), "clip", None)
             .unwrap();
         let cat = db.load_catalog().unwrap();
@@ -5404,6 +8457,7 @@ mod tests {
             .find(|i| i.detail_id == id)
             .expect("item");
         assert_eq!(it.probe.audio, "aac,ac3");
+        assert_eq!(it.probe.audio_streams, "1:0:aac:2,2:1:ac3:6");
         assert_eq!(it.probe.width, 1920);
         assert_eq!(it.probe.height, 800);
         assert_eq!(it.dlna_pn.as_deref(), Some("AVC_MP4_MP_HD_AAC_MULT5"));
@@ -5411,10 +8465,7 @@ mod tests {
 
     #[test]
     fn sidecar_applies_when_libav_fails() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-sidecar-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("sidecar");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("video")).unwrap();
         let p = tmp.join("video/dvp7.mp4");
@@ -5425,12 +8476,13 @@ mod tests {
         )
         .unwrap();
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let cat = scan(&cfg);
+        let cat = scan(&cfg).unwrap();
         let it = cat
             .items
             .values()
@@ -5446,29 +8498,31 @@ mod tests {
     fn backfill_rewrites_avi_other_and_pn() {
         let db = LibraryDb::open_memory().unwrap();
         let id = db
-            .insert_detail(
-                "/media/clip.avi",
-                10,
-                1,
-                "clip",
-                "2024-01-01",
-                "video/x-msvideo",
-                1,
-                2,
-                None,
-            )
+            .insert_detail(NewDetail {
+                path: "/media/clip.avi",
+                size: 10,
+                timestamp: 1,
+                title: "clip",
+                date: "2024-01-01",
+                mime: "video/x-msvideo",
+                device: 1,
+                inode: 2,
+                dlna_pn: None,
+            })
             .unwrap();
         db.update_detail_stream(
             id,
-            Some("0:01:00.000"),
-            None,
-            Some("720x480"),
-            Some(2),
-            Some(48000),
-            Some("avi"),
-            Some("other"),
-            Some("ac3"),
-            Some("sdr"),
+            DetailStreamUpdate {
+                duration: Some("0:01:00.000"),
+                resolution: Some("720x480"),
+                channels: Some(2),
+                samplerate: Some(48000),
+                container: Some("avi"),
+                video: Some("other"),
+                audio: Some("ac3"),
+                hdr: Some("sdr"),
+                ..DetailStreamUpdate::default()
+            },
         )
         .unwrap();
         let n = db.backfill_derived_stream_fields().unwrap();
@@ -5484,10 +8538,7 @@ mod tests {
 
     #[test]
     fn monitor_updates_replaced_file_and_relinked_aliases() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-inode-replace-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("inode-replace");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("video")).unwrap();
         let a = tmp.join("video/orig.mp4");
@@ -5495,71 +8546,77 @@ mod tests {
         write_incomplete_mp4(&a, 64 * 1024);
         std::fs::hard_link(&a, &b).unwrap();
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let _ = scan(&cfg);
+        let _ = scan(&cfg).unwrap();
         let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
-        let (_, sz_a, _, _, ino_a) = db
+        let first_a = db
             .find_detail_by_path(&a.to_string_lossy())
             .unwrap()
             .unwrap();
-        let (_, _sz_b, _, _, ino_b) = db
+        let first_b = db
             .find_detail_by_path(&b.to_string_lossy())
             .unwrap()
             .unwrap();
-        assert_eq!(sz_a, 64 * 1024);
-        assert_eq!(ino_a, ino_b);
+        assert_eq!(first_a.size, 64 * 1024);
+        assert_eq!(first_a.inode, first_b.inode);
 
         std::fs::remove_file(&a).unwrap();
         write_incomplete_mp4(&a, 256 * 1024);
-        let (_, d) = monitor(&cfg);
+        let (_, d) = monitor(&cfg).unwrap();
         assert!(d.changed >= 1, "replace must count as a change: {d:?}");
-        let (_, sz_a2, _, _, ino_a2) = db
+        let second_a = db
             .find_detail_by_path(&a.to_string_lossy())
             .unwrap()
             .unwrap();
-        let (_, sz_b2, _, _, ino_b2) = db
+        let second_b = db
             .find_detail_by_path(&b.to_string_lossy())
             .unwrap()
             .unwrap();
-        assert_eq!(sz_a2, 256 * 1024, "replaced path must get new size");
-        assert_ne!(ino_a2, ino_a, "replaced path must get new inode");
-        assert_eq!(sz_b2, 64 * 1024, "untouched hardlink stays on old file");
-        assert_eq!(ino_b2, ino_b);
+        assert_eq!(second_a.size, 256 * 1024, "replaced path must get new size");
+        assert_ne!(
+            second_a.inode, first_a.inode,
+            "replaced path must get new inode"
+        );
+        assert_eq!(
+            second_b.size,
+            64 * 1024,
+            "untouched hardlink stays on old file"
+        );
+        assert_eq!(second_b.inode, first_b.inode);
 
         std::fs::remove_file(&b).unwrap();
         std::fs::hard_link(&a, &b).unwrap();
-        let (_, d2) = monitor(&cfg);
+        let (_, d2) = monitor(&cfg).unwrap();
         assert!(d2.changed >= 1, "relink must update alias: {d2:?}");
-        let (_, sz_b3, _, _, ino_b3) = db
+        let third_b = db
             .find_detail_by_path(&b.to_string_lossy())
             .unwrap()
             .unwrap();
-        assert_eq!(sz_b3, 256 * 1024);
-        assert_eq!(ino_b3, ino_a2);
+        assert_eq!(third_b.size, 256 * 1024);
+        assert_eq!(third_b.inode, second_a.inode);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn failed_probe_retries_after_size_change() {
-        let tmp = std::env::temp_dir().join(format!(
-            "rusty-dlna-reprobe-{}",
-            std::process::id()
-        ));
+        let tmp = TempPath::new("reprobe");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("video")).unwrap();
         let p = tmp.join("video/growing.mp4");
         write_incomplete_mp4(&p, 64 * 1024);
         let cfg = ScanConfig {
+            media_roots: Vec::new(),
             media_dirs: vec![tmp.clone()],
             db_path: Some(tmp.join("files.db")),
             types: MediaTypes::video_only(),
             ..Default::default()
         };
-        let c1 = scan(&cfg);
+        let c1 = scan(&cfg).unwrap();
         let it = c1
             .items
             .values()
@@ -5569,12 +8626,25 @@ mod tests {
             it.probe.hdr.is_empty() && it.duration.is_none(),
             "failed probe must not store fake sdr: {it:?}"
         );
-        write_fake_mkv(&p, 0);
-        let (c2, d) = rescan(&cfg, &c1);
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
         assert!(
-            d.changed >= 1 || c2.items.values().any(|i| {
-                i.path.ends_with("growing.mp4") && i.duration.is_some()
-            }),
+            db.details_missing_stream_meta().unwrap().is_empty(),
+            "a failed attempt must be recorded instead of retried forever"
+        );
+        let (_, unchanged) = monitor(&cfg).unwrap();
+        assert_eq!(
+            unchanged,
+            ScanDelta::default(),
+            "an unchanged failed file must not trigger another probe"
+        );
+        write_fake_mkv(&p, 0);
+        let (c2, d) = rescan(&cfg, &c1).unwrap();
+        assert!(
+            d.changed >= 1
+                || c2
+                    .items
+                    .values()
+                    .any(|i| { i.path.ends_with("growing.mp4") && i.duration.is_some() }),
             "size change must re-probe: {d:?}"
         );
         let it2 = c2
@@ -5586,6 +8656,659 @@ mod tests {
             it2.duration.is_some() && !it2.probe.hdr.is_empty(),
             "finished file must get stream metadata: {it2:?}"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn corrupt_database_is_backed_up_before_fresh_recovery() {
+        let tmp = TempPath::new("corrupt-recovery");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("files.db");
+        let corrupt = b"this is deliberately not a sqlite database";
+        std::fs::write(&path, corrupt).unwrap();
+
+        let db = open_library_db(&path).unwrap();
+        assert_eq!(db.detail_count().unwrap(), 0);
+        drop(db);
+        let backups: Vec<_> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("files.db.corrupt-"))
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "backup files: {backups:?}");
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), corrupt);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn failed_scan_transaction_preserves_previous_catalog_generation() {
+        let tmp = TempPath::new("atomic-scan");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("video");
+        std::fs::create_dir_all(&root).unwrap();
+        write_fake_mkv(&root.join("old.mkv"), 4096);
+        let cfg = ScanConfig {
+            media_roots: Vec::new(),
+            media_dirs: vec![root.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let before = scan(&cfg).unwrap();
+        assert!(before
+            .items
+            .values()
+            .any(|item| item.path.ends_with("old.mkv")));
+        let before_ids: HashSet<_> = before.items.keys().cloned().collect();
+        {
+            let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+            db.connection()
+                .execute_batch(
+                    "CREATE TRIGGER fail_new_detail BEFORE INSERT ON DETAILS BEGIN
+                       SELECT RAISE(ABORT, 'injected detail failure');
+                     END;",
+                )
+                .unwrap();
+        }
+        write_fake_mkv(&root.join("new.mkv"), 4096);
+        let error = scan_refresh(&cfg).unwrap_err();
+        assert!(error.to_string().contains("injected detail failure"));
+
+        let after = load_existing(&cfg);
+        let after_ids: HashSet<_> = after.items.keys().cloned().collect();
+        assert_eq!(after_ids, before_ids);
+        assert!(!after
+            .items
+            .values()
+            .any(|item| item.path.ends_with("new.mkv")));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tagged_audio_populates_metadata_views_and_sidecar_precedence() {
+        let tmp = TempPath::new("audio-tags");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("music");
+        std::fs::create_dir_all(&root).unwrap();
+        let audio = root.join("tagged.flac");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.1",
+                "-c:a",
+                "flac",
+                "-metadata",
+                "title=Tagged Song",
+                "-metadata",
+                "artist=Track Artist",
+                "-metadata",
+                "album_artist=Album Artist",
+                "-metadata",
+                "album=Tagged Album",
+                "-metadata",
+                "genre=Jazz",
+                "-metadata",
+                "composer=Composer Name",
+                "-metadata",
+                "performer=Guest Name",
+                "-metadata",
+                "track=3/12",
+                "-metadata",
+                "disc=2/2",
+                "-metadata",
+                "date=2024-02-03",
+                "-metadata",
+                "comment=Tagged comment",
+            ])
+            .arg(&audio)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let direct = probe_media(&audio).expect("tagged FLAC probe");
+        assert_eq!(
+            direct.tags.artist.as_deref(),
+            Some("Track Artist"),
+            "{direct:?}"
+        );
+        let cfg = ScanConfig {
+            media_roots: Vec::new(),
+            media_dirs: vec![root.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::audio_only(),
+            ..Default::default()
+        };
+        let catalog = scan(&cfg).unwrap();
+        let item = catalog
+            .items
+            .values()
+            .find(|item| item.path == audio)
+            .expect("tagged audio item");
+        assert_eq!(item.title, "Tagged Song");
+        assert_eq!(item.artist.as_deref(), Some("Track Artist"));
+        assert_eq!(item.album_artist.as_deref(), Some("Album Artist"));
+        assert_eq!(item.album.as_deref(), Some("Tagged Album"));
+        assert_eq!(item.genre.as_deref(), Some("Jazz"));
+        assert_eq!(item.composer.as_deref(), Some("Composer Name"));
+        assert_eq!(item.contributor.as_deref(), Some("Guest Name"));
+        assert_eq!(item.track, Some(3));
+        assert_eq!(item.disc, Some(2));
+        assert!(item.date.starts_with("2024-02-03"), "{}", item.date);
+        for (root_id, title) in [
+            (MUSIC_ARTIST_ID, "Track Artist"),
+            (MUSIC_ALBUM_ARTIST_ID, "Album Artist"),
+            (MUSIC_ALBUM_ID, "Tagged Album"),
+            (MUSIC_GENRE_ID, "Jazz"),
+            (MUSIC_COMPOSER_ID, "Composer Name"),
+            (MUSIC_CONTRIB_ARTIST_ID, "Guest Name"),
+        ] {
+            let children = catalog.children_of(root_id).unwrap();
+            assert!(
+                children.iter().any(|child| matches!(
+                    child,
+                    CatalogChild::Container(container) if container.title == title
+                )),
+                "missing {title} below {root_id}"
+            );
+        }
+
+        let nfo = root.join("tagged.nfo");
+        std::fs::write(&nfo, "<musicvideo><title>Sidecar Wins</title></musicvideo>").unwrap();
+        let (updated, delta) = monitor_dirty(&cfg, &[nfo]).unwrap();
+        assert_eq!(delta.changed, 1);
+        let updated = updated.unwrap();
+        let item = updated
+            .items
+            .values()
+            .find(|item| item.path == audio)
+            .expect("updated tagged audio item");
+        assert_eq!(item.title, "Sidecar Wins");
+        assert_eq!(item.artist.as_deref(), Some("Track Artist"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn video_audio_track_title_never_replaces_filename_or_nfo_title() {
+        let tmp = TempPath::new("video-track-title");
+        let root = tmp.join("video");
+        std::fs::create_dir_all(&root).unwrap();
+        let video = root.join("Actual Movie Name.mkv");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=64x64:rate=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:duration=1",
+                "-shortest",
+                "-threads",
+                "1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-metadata:s:a:0",
+                "title=MVO [HDRezka Studio]",
+                "-metadata",
+                "title=Rip_by_M@kSIMus",
+            ])
+            .arg(&video)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !status {
+            eprintln!("skip video track-title policy (ffmpeg fixture unavailable)");
+            return;
+        }
+        std::fs::write(
+            video.with_extension("nfo"),
+            "<movie><genre>Test Genre</genre></movie>",
+        )
+        .unwrap();
+        let direct = probe_media(&video).expect("video probe");
+        assert_eq!(direct.tags.title.as_deref(), Some("Rip_by_M@kSIMus"));
+
+        let db_path = tmp.join("files.db");
+        let cfg = ScanConfig {
+            media_dirs: vec![root],
+            db_path: Some(db_path.clone()),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let catalog = scan(&cfg).unwrap();
+        let item = catalog
+            .items
+            .values()
+            .find(|item| item.path == video)
+            .expect("video item");
+        assert_eq!(item.title, "Actual Movie Name");
+
+        let db = LibraryDb::open(&db_path).unwrap();
+        let id = db
+            .find_detail_by_path(&path_to_db(&video))
+            .unwrap()
+            .unwrap()
+            .id;
+        db.update_detail_title(id, "MVO").unwrap();
+        assert_eq!(
+            db.update_detail_names_under_root(id, VIDEO_GENRE_ID, "Нарезка")
+                .unwrap(),
+            1
+        );
+        db.set_setting("video_title_policy_rev", "2").unwrap();
+        drop(db);
+        let (repaired, delta) = repair_video_titles_if_needed(&cfg).unwrap();
+        assert_eq!(delta.changed, 1);
+        let repaired = repaired.unwrap();
+        assert_eq!(
+            repaired
+                .items
+                .values()
+                .find(|item| item.path == video)
+                .unwrap()
+                .title,
+            "Actual Movie Name"
+        );
+        let genre = container_named(&repaired, VIDEO_GENRE_ID, "Test Genre").unwrap();
+        assert_eq!(item_titles(&repaired, genre), vec!["Actual Movie Name"]);
+
+        std::fs::write(
+            video.with_extension("nfo"),
+            "<movie><title>Curated NFO Name</title></movie>",
+        )
+        .unwrap();
+        let db = LibraryDb::open(&db_path).unwrap();
+        db.update_detail_title(id, "MVO").unwrap();
+        db.set_setting("video_title_policy_rev", "0").unwrap();
+        drop(db);
+        let (repaired, delta) = repair_video_titles_if_needed(&cfg).unwrap();
+        assert_eq!(delta.changed, 1);
+        assert_eq!(
+            repaired
+                .unwrap()
+                .items
+                .values()
+                .find(|item| item.path == video)
+                .unwrap()
+                .title,
+            "Curated NFO Name"
+        );
+    }
+
+    fn jpeg_with_test_exif(base_jpeg: &[u8]) -> Vec<u8> {
+        let strings = [
+            (0x010f_u16, b"TestCam\0".as_slice()),
+            (0x0110_u16, b"Model X\0".as_slice()),
+            (0x010e_u16, b"A photo\0".as_slice()),
+            (0x0132_u16, b"2024:02:03 04:05:06\0".as_slice()),
+            (0x010d_u16, b"Vacation\0".as_slice()),
+        ];
+        let entry_count = 9_u16;
+        let data_start = 8 + 2 + usize::from(entry_count) * 12 + 4;
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42_u16.to_le_bytes());
+        tiff.extend_from_slice(&8_u32.to_le_bytes());
+        tiff.extend_from_slice(&entry_count.to_le_bytes());
+        let mut tail = Vec::new();
+        for (tag, value) in strings {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&2_u16.to_le_bytes());
+            tiff.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            let offset = (data_start + tail.len()) as u32;
+            tiff.extend_from_slice(&offset.to_le_bytes());
+            tail.extend_from_slice(value);
+        }
+        for (tag, value) in [(0x0100_u16, 2_u32), (0x0101_u16, 4_u32)] {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&4_u16.to_le_bytes());
+            tiff.extend_from_slice(&1_u32.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0x0112_u16.to_le_bytes());
+        tiff.extend_from_slice(&3_u16.to_le_bytes());
+        tiff.extend_from_slice(&1_u32.to_le_bytes());
+        tiff.extend_from_slice(&6_u16.to_le_bytes());
+        tiff.extend_from_slice(&0_u16.to_le_bytes());
+        tiff.extend_from_slice(&0x4746_u16.to_le_bytes());
+        tiff.extend_from_slice(&3_u16.to_le_bytes());
+        tiff.extend_from_slice(&1_u32.to_le_bytes());
+        tiff.extend_from_slice(&4_u16.to_le_bytes());
+        tiff.extend_from_slice(&0_u16.to_le_bytes());
+        let ifd1_offset = (data_start + tail.len()) as u32;
+        tiff.extend_from_slice(&ifd1_offset.to_le_bytes());
+        tiff.extend_from_slice(&tail);
+        let thumbnail_offset = ifd1_offset + 2 + 2 * 12 + 4;
+        tiff.extend_from_slice(&2_u16.to_le_bytes());
+        for (tag, value) in [
+            (0x0201_u16, thumbnail_offset),
+            (0x0202_u16, TINY_JPEG.len() as u32),
+        ] {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&4_u16.to_le_bytes());
+            tiff.extend_from_slice(&1_u32.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0_u32.to_le_bytes());
+        tiff.extend_from_slice(TINY_JPEG);
+
+        let mut app1 = b"Exif\0\0".to_vec();
+        app1.extend_from_slice(&tiff);
+        let mut jpeg = base_jpeg.to_vec();
+        let mut segment = vec![0xff, 0xe1];
+        segment.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+        segment.extend_from_slice(&app1);
+        jpeg.splice(2..2, segment);
+        jpeg
+    }
+
+    #[test]
+    fn jpeg_exif_populates_oriented_metadata_and_image_views() {
+        let tmp = TempPath::new("image-exif");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let root = tmp.join("pictures");
+        std::fs::create_dir_all(&root).unwrap();
+        let image = root.join("photo.jpg");
+        let base = tmp.join("base.jpg");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=2x4:d=0.1",
+                "-frames:v",
+                "1",
+            ])
+            .arg(&base)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(&image, jpeg_with_test_exif(&std::fs::read(&base).unwrap())).unwrap();
+        let cfg = ScanConfig {
+            media_roots: Vec::new(),
+            media_dirs: vec![root.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes {
+                video: false,
+                audio: false,
+                image: true,
+            },
+            ..Default::default()
+        };
+        let catalog = scan(&cfg).unwrap();
+        let item = catalog
+            .items
+            .values()
+            .find(|item| item.path == image)
+            .expect("EXIF image");
+        assert_eq!(item.title, "A photo");
+        assert_eq!(item.comment.as_deref(), Some("A photo"));
+        assert_eq!(item.creator.as_deref(), Some("TestCam Model X"));
+        assert_eq!(item.date, "2024-02-03T04:05:06Z");
+        assert_eq!(item.rotation, Some(90));
+        assert_eq!(item.album.as_deref(), Some("Vacation"));
+        assert_eq!(item.rating, Some(4));
+        assert_eq!(item.resolution.as_deref(), Some("4x2"));
+        assert!(item.album_art > 0, "EXIF thumbnail should become album art");
+        assert_eq!(
+            std::fs::read(catalog.album_art_paths.get(&item.album_art).unwrap()).unwrap(),
+            TINY_JPEG
+        );
+        for (root_id, title) in [
+            (IMAGE_DATE_ID, "2024-02-03"),
+            (IMAGE_CAMERA_ID, "TestCam Model X"),
+            (IMAGE_ALBUM_ID, "Vacation"),
+            (IMAGE_RATING_ID, "4"),
+        ] {
+            let children = catalog.children_of(root_id).unwrap();
+            assert!(children.iter().any(|child| matches!(
+                child,
+                CatalogChild::Container(container) if container.title == title
+            )));
+        }
+        let resized = tmp.join("resized.jpg");
+        assert!(scale_jpeg_result(&image, &resized, 20, 20).unwrap());
+        let resized_probe = probe_image(&resized).unwrap();
+        assert_eq!(
+            (resized_probe.probe.width, resized_probe.probe.height),
+            (20, 10),
+            "resized output must apply EXIF orientation"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn playlists_parse_refresh_and_keep_ids_across_rename() {
+        let tmp = TempPath::new("playlists");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let audio_root = tmp.join("audio");
+        let video_root = tmp.join("video");
+        let image_root = tmp.join("pictures");
+        for root in [&audio_root, &video_root, &image_root] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        let song = audio_root.join("café.flac");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=0.1",
+                "-c:a",
+                "flac",
+            ])
+            .arg(&song)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let movie = video_root.join("movie.mkv");
+        write_fake_mkv(&movie, 4096);
+        let picture = image_root.join("photo.jpg");
+        std::fs::write(&picture, TINY_JPEG).unwrap();
+        let outside = tmp.join("outside.mkv");
+        write_fake_mkv(&outside, 4096);
+
+        let playlist = audio_root.join("Mixed.m3u");
+        let mut latin1 = b"#EXTM3U\ncaf".to_vec();
+        latin1.push(0xe9);
+        latin1.extend_from_slice(
+            b".flac\n../video/movie.mkv\n../video/movie.mkv\n../pictures/photo.jpg\n../outside.mkv\nmissing.mp3\n",
+        );
+        std::fs::write(&playlist, latin1).unwrap();
+        std::fs::write(
+            audio_root.join("Ordered.pls"),
+            "[playlist]\nFile2=../video/movie.mkv\nFile1=café.flac\nNumberOfEntries=2\n",
+        )
+        .unwrap();
+        std::fs::write(audio_root.join("bad.m3u8"), [0xff, 0xfe]).unwrap();
+        let cfg = ScanConfig {
+            media_roots: Vec::new(),
+            media_dirs: vec![audio_root.clone(), video_root.clone(), image_root.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::all(),
+            ..Default::default()
+        };
+        let catalog = scan(&cfg).unwrap();
+        let roots = [MUSIC_PLIST_ID, VIDEO_PLIST_ID, IMAGE_PLIST_ID];
+        for root in roots {
+            let children = catalog.children_of(root).unwrap();
+            assert!(
+                children.iter().any(|child| matches!(
+                    child,
+                    CatalogChild::Container(container) if container.title == "Mixed"
+                )),
+                "missing Mixed below {root}"
+            );
+        }
+        let mixed = catalog
+            .children_of(VIDEO_PLIST_ID)
+            .unwrap()
+            .into_iter()
+            .find_map(|child| match child {
+                CatalogChild::Container(container) if container.title == "Mixed" => Some(container),
+                _ => None,
+            })
+            .unwrap();
+        let stable_id = mixed.object_id.clone();
+        let members = catalog.children_of(&mixed.object_id).unwrap();
+        assert_eq!(
+            members.len(),
+            2,
+            "duplicate entries are ordered and preserved"
+        );
+        assert!(members.iter().all(|member| matches!(
+            member,
+            CatalogChild::Item(item) if item.path == movie
+        )));
+
+        let renamed = audio_root.join("Renamed.m3u");
+        std::fs::rename(&playlist, &renamed).unwrap();
+        let (updated, delta) = monitor(&cfg).unwrap();
+        assert!(delta.changed >= 1);
+        let updated = updated.unwrap();
+        let renamed_container = updated
+            .children_of(VIDEO_PLIST_ID)
+            .unwrap()
+            .into_iter()
+            .find_map(|child| match child {
+                CatalogChild::Container(container) if container.title == "Renamed" => {
+                    Some(container)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(renamed_container.object_id, stable_id);
+
+        std::fs::write(&renamed, "../pictures/photo.jpg\n").unwrap();
+        let (updated, delta) = monitor_dirty(&cfg, std::slice::from_ref(&renamed)).unwrap();
+        assert!(delta.changed >= 1);
+        let updated = updated.unwrap();
+        assert!(!updated.children_of(VIDEO_PLIST_ID).unwrap().iter().any(
+            |child| matches!(child, CatalogChild::Container(container) if container.title == "Renamed")
+        ));
+        assert!(updated.children_of(IMAGE_PLIST_ID).unwrap().iter().any(
+            |child| matches!(child, CatalogChild::Container(container) if container.title == "Renamed")
+        ));
+
+        std::fs::remove_file(&renamed).unwrap();
+        let (updated, delta) = monitor(&cfg).unwrap();
+        assert!(delta.changed >= 1);
+        let updated = updated.unwrap();
+        assert!(!updated
+            .containers
+            .values()
+            .any(|container| container.title == "Renamed"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_survive_scan_restart_caption_and_rename() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let tmp = TempPath::new("nonutf8");
+        let media = tmp.join("video");
+        std::fs::create_dir_all(&media).unwrap();
+        let raw_path = |byte: u8| {
+            let mut name = b"clip-".to_vec();
+            name.push(byte);
+            name.extend_from_slice(b".mkv");
+            media.join(OsString::from_vec(name))
+        };
+        let first = raw_path(0x80);
+        let second = raw_path(0x81);
+        write_fake_mkv(&first, 64);
+        write_fake_mkv(&second, 64);
+        let mut caption_name = first.file_stem().unwrap().as_bytes().to_vec();
+        caption_name.extend_from_slice(b".en.srt");
+        let caption = media.join(OsString::from_vec(caption_name));
+        std::fs::write(&caption, "1\n00:00:00,000 --> 00:00:01,000\nhello\n").unwrap();
+
+        let cfg = ScanConfig {
+            media_roots: Vec::new(),
+            media_dirs: vec![media.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            ..Default::default()
+        };
+        let lossy_first = first.file_name().unwrap().to_string_lossy();
+        assert!(is_video(&lossy_first), "media classifier: {lossy_first:?}");
+        assert!(!is_unfinished_name(&lossy_first));
+        assert!(!is_caption_name(&lossy_first));
+        assert!(!is_album_art_name_for_config(&lossy_first, &cfg));
+        assert!(!path_excluded(&first, &lossy_first, &cfg));
+        assert!(cfg
+            .root_types_for_path(&first)
+            .is_some_and(|types| types.allows(&lossy_first)));
+        assert!(path_is_allowed_file(&first, &cfg));
+        assert!(file_is_viable(&first));
+        let catalog = scan(&cfg).unwrap();
+        let first_item = catalog
+            .items
+            .values()
+            .find(|item| item.ref_id.is_none() && item.path == first)
+            .expect("first invalid-byte path");
+        let second_item = catalog
+            .items
+            .values()
+            .find(|item| item.ref_id.is_none() && item.path == second)
+            .expect("second invalid-byte path");
+        assert_ne!(first_item.detail_id, second_item.detail_id);
+        assert_ne!(first_item.title, second_item.title);
+        assert_eq!(first_item.captions.len(), 1);
+        assert_eq!(first_item.captions[0].path, caption);
+        assert_eq!(first_item.captions[0].ext, "srt");
+        assert_eq!(path_from_db(&path_to_db(&first)), first);
+        assert_ne!(path_to_db(&first), path_to_db(&second));
+
+        let restarted = load_existing(&cfg);
+        assert!(restarted.items.values().any(|item| item.path == first));
+        assert!(restarted.items.values().any(|item| item.path == second));
+        assert!(restarted
+            .items
+            .values()
+            .find(|item| item.ref_id.is_none() && item.path == first)
+            .is_some_and(|item| item.captions.iter().any(|cap| cap.path == caption)));
+
+        let renamed = raw_path(0x82);
+        std::fs::rename(&first, &renamed).unwrap();
+        let (updated, delta) = monitor_dirty(&cfg, &[first.clone(), renamed.clone()]).unwrap();
+        assert!(delta.added >= 1 && delta.removed >= 1, "{delta:?}");
+        let updated = updated.expect("catalog changed");
+        assert!(!updated.items.values().any(|item| item.path == first));
+        assert!(updated.items.values().any(|item| item.path == second));
+        assert!(updated.items.values().any(|item| item.path == renamed));
+
+        let reserved = PathBuf::from(format!("{PATH_HEX_PREFIX}ordinary"));
+        assert_eq!(path_from_db(&path_to_db(&reserved)), reserved);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

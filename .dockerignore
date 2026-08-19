@@ -14,6 +14,7 @@ testdata
 docs
 scripts
 *.md
+!THIRD_PARTY_NOTICES.md
 docker-compose*.yaml
 docker-compose*.yml
 Dockerfile
