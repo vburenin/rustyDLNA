@@ -1018,14 +1018,18 @@ fn host_and_timeseek_errors() {
 #[test]
 fn sidecar_size_and_symlink_jail() {
     let app = testdata_app();
-    let (art_id, detail_id) = {
+    let (art_id, detail_id, caption_index) = {
         let cat = read_recover(&app.catalog);
         let movie = cat
             .items
             .values()
             .find(|i| i.path.ends_with("movie.mkv"))
             .expect("movie");
-        (movie.album_art, movie.detail_id)
+        (
+            movie.album_art,
+            movie.detail_id,
+            movie.captions.first().expect("caption fixture").index,
+        )
     };
     assert!(art_id > 0);
 
@@ -1078,6 +1082,55 @@ fn sidecar_size_and_symlink_jail() {
         "Kodi/21.0",
     )));
     assert_eq!(via_link.status, 404, "symlink out of tree must 404");
+
+    let set_caption_path = |path: &Path| {
+        let mut cat = write_recover(&app.catalog);
+        let object_id = cat.by_detail[&detail_id].clone();
+        let caption = cat
+            .items
+            .get_mut(&object_id)
+            .unwrap()
+            .captions
+            .iter_mut()
+            .find(|caption| caption.index == caption_index)
+            .unwrap();
+        caption.path = path.to_path_buf();
+        caption.ext = "srt".into();
+    };
+    let web_caption_url = format!("/Captions/{detail_id}/{caption_index}.srt?format=webvtt");
+    set_caption_path(&outside);
+    assert_eq!(
+        app.handle(&req(&get(&web_caption_url, "Browser/1.0")))
+            .status,
+        404,
+        "browser captions must retain the sidecar path jail"
+    );
+    set_caption_path(&big);
+    assert_eq!(
+        app.handle(&req(&get(&web_caption_url, "Browser/1.0")))
+            .status,
+        413,
+        "browser captions must retain the sidecar size bound"
+    );
+    set_caption_path(&link);
+    assert_eq!(
+        app.handle(&req(&get(&web_caption_url, "Browser/1.0")))
+            .status,
+        404,
+        "browser captions must reject a symlink retarget outside the roots"
+    );
+    let malformed = cache.join(format!(
+        "rdlna-malformed-{}-{detail_id}.srt",
+        std::process::id()
+    ));
+    std::fs::write(&malformed, b"not a subtitle cue").unwrap();
+    set_caption_path(&malformed);
+    let malformed_response = app.handle(&req(&get(&web_caption_url, "Browser/1.0")));
+    assert_eq!(malformed_response.status, 422);
+    let malformed_json: serde_json::Value =
+        serde_json::from_slice(&malformed_response.body).unwrap();
+    assert_eq!(malformed_json["error"]["code"], "caption_malformed");
+    let _ = std::fs::remove_file(malformed);
 
     let _ = std::fs::remove_file(&big);
     let _ = std::fs::remove_file(&link);
@@ -3370,6 +3423,7 @@ fn remux_finished_range_and_stale_rebuild() {
 
     let spec = RemuxJobSpec {
         detail_id: dvp7.detail_id,
+        web_request_id: None,
         mime: "video/mp4",
         job_key: format!("{}:{cache_key}:fixture", dvp7.detail_id),
         cache_key: cache_key.clone(),
@@ -3379,6 +3433,7 @@ fn remux_finished_range_and_stale_rebuild() {
         args: vec!["ffmpeg".into(), "-version".into()],
         fallback_args: None,
         continue_after_disconnect: true,
+        cacheable: true,
         remux_p8: true,
         audio_index: 0,
         audio: RemuxAudio::Copy,
@@ -3802,7 +3857,10 @@ fn status_lists_video_count() {
     let root = app.handle(&req(&get("/", "Kodi/21.0")));
     assert_eq!(root.status, 200);
     let root_body = String::from_utf8_lossy(&root.body);
-    assert!(root_body.contains("rustyDLNA Player"), "{root_body}");
+    assert!(
+        root_body.contains("<title>rustyDLNA</title>"),
+        "{root_body}"
+    );
     assert!(root_body.contains("/web/app.js"), "{root_body}");
 }
 
@@ -3817,27 +3875,24 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         Some("text/css; charset=utf-8")
     );
     assert_eq!(resp_header(&css, "Cache-Control"), Some("no-cache"));
-    let javascript = app.handle(&req(&get("/web/app.js", "Browser/1.0")));
-    let javascript = String::from_utf8_lossy(&javascript.body);
-    assert!(
-        javascript.contains("if (item.transcode_likely) return false"),
-        "{javascript}"
-    );
-    assert!(javascript.contains("player.controls = !useFallback"));
-    assert!(javascript.contains("folder.child_count"));
-    assert!(javascript.contains("createMediaElementSource"));
-    assert!(javascript.contains("full-card-title"));
-    assert!(javascript.contains("ArrowLeft: -10"));
-    assert!(javascript.contains("ArrowUp: 300"));
-    assert!(javascript.contains("{ capture: true }"));
-    assert!(javascript.contains("event.key.toLowerCase() === \"f\""));
-    assert!(javascript.contains("toggleFullscreen"));
-    assert!(javascript.contains("playerStage.addEventListener(\"mousemove\""));
-    assert!(javascript.contains("setTimeout(hideFullscreenControl, 5000)"));
-    assert!(javascript.contains("ResizeObserver"));
-    assert!(!javascript.contains("Jump anywhere"));
-    assert!(javascript.contains("Direct play · support uncertain"));
-    assert!(!javascript.contains("Direct mode is forcing the original file"));
+    for asset in [
+        "/web/app.js",
+        "/web/api.js",
+        "/web/core.js",
+        "/web/library.js",
+        "/web/player.js",
+        "/web/preferences.js",
+        "/web/store.js",
+    ] {
+        let response = app.handle(&req(&get(asset, "Browser/1.0")));
+        assert_eq!(response.status, 200, "{asset}");
+        assert_eq!(
+            resp_header(&response, "Content-Type"),
+            Some("text/javascript; charset=utf-8"),
+            "{asset}"
+        );
+        assert_eq!(resp_header(&response, "Cache-Control"), Some("no-cache"));
+    }
     assert!(css.body.starts_with(b":root"));
 
     let root = app.handle(&req(&get("/", "Browser/1.0")));
@@ -3847,26 +3902,70 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         root_html.contains("id=\"playback-controls\""),
         "{root_html}"
     );
-    assert!(root_html.contains("?v=fullscreen-19"), "{root_html}");
-    assert!(!root_html.contains("Full movie timeline"), "{root_html}");
+    assert!(!root_html.contains("?v="), "{root_html}");
     assert!(root_html.contains("id=\"timeline-status\""), "{root_html}");
     assert!(root_html.contains("id=\"volume-control\""), "{root_html}");
     assert!(
         root_html.contains("class=\"library-results\""),
         "{root_html}"
     );
-    assert!(!root_html.contains("YOUR MEDIA"), "{root_html}");
-    assert!(!root_html.contains("id=\"library-title\""), "{root_html}");
-    assert!(root_html.contains("max=\"200\""), "{root_html}");
+    assert!(root_html.contains("role=\"tabpanel\""), "{root_html}");
     assert!(root_html.contains("<select id=\"audio-track-controls\""));
-    assert!(root_html.contains("class=\"stage-fullscreen\""));
+    let stage_start = root_html.find("id=\"player-stage\"").unwrap();
+    let stage_end = root_html[stage_start..]
+        .find("<div class=\"player-message\"")
+        .unwrap()
+        + stage_start;
+    let stage = &root_html[stage_start..stage_end];
+    for control in [
+        "timeline",
+        "volume-control",
+        "captions-button",
+        "audio-track-controls",
+        "fullscreen-button",
+    ] {
+        assert!(
+            stage.contains(&format!("id=\"{control}\"")),
+            "{control} must be inside fullscreen stage"
+        );
+    }
 
     let folders = app.handle(&req(&get(
         "/api/web/library?view=folders&folder=64&offset=0&limit=200",
         "Browser/1.0",
     )));
     assert_eq!(folders.status, 200);
+    let folders_etag = resp_header(&folders, "ETag").unwrap().to_owned();
+    assert_eq!(
+        resp_header(&folders, "Cache-Control"),
+        Some("private, max-age=0, must-revalidate")
+    );
+    let conditional = req(&format!(
+        "GET /api/web/library?view=folders&folder=64&offset=0&limit=200 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\nIf-None-Match: {folders_etag}\r\n\r\n"
+    ));
+    let conditional = app.handle(&conditional);
+    assert_eq!(conditional.status, 304);
+    assert!(conditional.body.is_empty());
     let folders: serde_json::Value = serde_json::from_slice(&folders.body).unwrap();
+    assert_eq!(folders["schema_version"], 1);
+    assert!(folders["generation"].is_u64());
+    assert_eq!(folders["root_folder_id"], "64");
+    assert_eq!(folders["capabilities"]["resume"], "browser_local");
+    assert_eq!(folders["capabilities"]["transcoding"], true);
+    let profiles = folders["capabilities"]["quality_profiles"]
+        .as_array()
+        .expect("quality profiles");
+    assert_eq!(profiles.len(), 3);
+    assert_eq!(profiles[0]["id"], "auto");
+    assert_eq!(profiles[0]["max_width"], 3840);
+    assert_eq!(profiles[0]["max_height"], 2160);
+    assert_eq!(profiles[0]["max_fps"], 30);
+    assert_eq!(profiles[0]["h264_level"], "5.1");
+    assert_eq!(profiles[0]["max_video_kbps"], 25000);
+    assert_eq!(profiles[1]["id"], "full_hd");
+    assert_eq!(profiles[1]["max_video_kbps"], 8000);
+    assert_eq!(profiles[2]["id"], "data_saver");
+    assert_eq!(profiles[2]["max_video_kbps"], 3000);
     assert_eq!(folders["view"], "folders");
     assert_eq!(folders["folder"]["id"], "64");
     assert_eq!(folders["breadcrumbs"][0]["title"], "Media");
@@ -3894,6 +3993,28 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .status,
         404
     );
+    for invalid in [
+        "/api/web/library?view=unknown",
+        "/api/web/library?view=library&kind=photos",
+        "/api/web/library?view=library&offset=-1",
+        "/api/web/library?view=library&limit=201",
+        "/api/web/library?view=library&surprise=true",
+    ] {
+        let response = app.handle(&req(&get(invalid, "Browser/1.0")));
+        assert_eq!(response.status, 400, "{invalid}");
+        let error: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(error["schema_version"], 1);
+        assert!(error["error"]["code"].is_string());
+        assert!(error["error"]["message"].is_string());
+    }
+    let stale_generation = folders["generation"].as_u64().unwrap().saturating_add(1);
+    let stale = app.handle(&req(&get(
+        &format!("/api/web/library?view=library&generation={stale_generation}"),
+        "Browser/1.0",
+    )));
+    assert_eq!(stale.status, 409);
+    let stale: serde_json::Value = serde_json::from_slice(&stale.body).unwrap();
+    assert_eq!(stale["error"]["code"], "catalog_changed");
 
     let duplicate_template = app
         .catalog
@@ -3918,40 +4039,76 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         }
     }
     let deduplicated = app.handle(&req(&get(
-        "/api/web/library?kind=video&q=Web%20Alias%20Duplicate&limit=10",
+        "/api/web/library?view=library&kind=video&q=Web%20Alias%20Duplicate&limit=10",
         "Browser/1.0",
     )));
     let deduplicated: serde_json::Value = serde_json::from_slice(&deduplicated.body).unwrap();
     assert_eq!(deduplicated["total"], 1);
 
     let library = app.handle(&req(&get(
-        "/api/web/library?kind=audio&q=fixture&offset=0&limit=1",
+        "/api/web/library?view=library&kind=audio&q=fixture&offset=0&limit=1",
         "Browser/1.0",
     )));
     assert_eq!(library.status, 200);
     let value: serde_json::Value = serde_json::from_slice(&library.body).unwrap();
     assert_eq!(value["server_name"], "rustyDLNA-test");
-    assert_eq!(value["transcoding_enabled"], true);
-    assert_eq!(value["items"].as_array().unwrap().len(), 1);
-    assert_eq!(value["items"][0]["kind"], "audio");
-    assert!(value["items"][0]["title"].as_str().unwrap().contains('.'));
-    assert!(value["items"][0]["metadata_title"].is_string());
-    assert!(value["items"][0]["duration_seconds"].is_number());
-    assert!(value["items"][0]["source_url"]
+    assert_eq!(value["capabilities"]["transcoding"], true);
+    assert_eq!(value["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(value["entries"][0]["entry_type"], "media");
+    assert_eq!(value["entries"][0]["kind"], "audio");
+    assert!(value["entries"][0]["title"].is_string());
+    assert!(value["entries"][0]["file_name"]
         .as_str()
         .unwrap()
-        .starts_with("/MediaItems/"));
+        .contains('.'));
+    assert!(value["entries"][0]["duration_seconds"].is_number());
+    assert!(value["entries"][0]["source_url"]
+        .as_str()
+        .unwrap()
+        .starts_with("/web/media/"));
 
     let hdr = app.handle(&req(&get(
-        "/api/web/library?kind=video&q=dvp7&limit=10",
+        "/api/web/library?view=library&kind=video&q=dvp7&limit=10",
         "Browser/1.0",
     )));
     let hdr: serde_json::Value = serde_json::from_slice(&hdr.body).unwrap();
-    assert!(hdr["items"]
+    assert!(hdr["entries"]
         .as_array()
         .unwrap()
         .iter()
         .any(|item| item["transcode_likely"] == true));
+
+    let caption_page = app.handle(&req(&get(
+        "/api/web/library?view=library&kind=video&q=movie&limit=20",
+        "Browser/1.0",
+    )));
+    assert_eq!(caption_page.status, 200);
+    let caption_page_text = String::from_utf8_lossy(&caption_page.body);
+    assert!(!caption_page_text.contains("testdata/library"));
+    let caption_page: serde_json::Value = serde_json::from_slice(&caption_page.body).unwrap();
+    let caption_item = caption_page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| {
+            item["captions"]
+                .as_array()
+                .is_some_and(|captions| !captions.is_empty())
+        })
+        .expect("captioned movie in fixture library");
+    assert!(caption_item["captions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|caption| caption["language"] == "en"));
+    let caption_url = caption_item["captions"][0]["url"].as_str().unwrap();
+    let caption = app.handle(&req(&get(caption_url, "Browser/1.0")));
+    assert_eq!(caption.status, 200);
+    assert_eq!(
+        resp_header(&caption, "Content-Type"),
+        Some("text/vtt; charset=utf-8")
+    );
+    assert!(caption.body.starts_with(b"WEBVTT\n\n"));
 
     let dvp7 = app
         .catalog
@@ -3962,13 +4119,44 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .find(|item| item.path.ends_with("dvp7.mkv"))
         .cloned()
         .unwrap();
+    {
+        let mut catalog = app.catalog.write().unwrap();
+        let object_id = catalog.by_detail[&dvp7.detail_id].clone();
+        catalog
+            .items
+            .get_mut(&object_id)
+            .unwrap()
+            .probe
+            .audio_streams
+            .push_str(",@c:1250:4000:Intro%3A %D0%9A%D0%B8%D0%BD%D0%BE");
+    }
     let stream_details = app.handle(&req(&get(
         &format!("/api/web/item/{}", dvp7.detail_id),
         "Browser/1.0",
     )));
     assert_eq!(stream_details.status, 200);
+    assert!(resp_header(&stream_details, "ETag").is_some());
     let stream_details: serde_json::Value = serde_json::from_slice(&stream_details.body).unwrap();
+    assert_eq!(stream_details["item"]["id"], dvp7.detail_id);
     assert_eq!(stream_details["audio_tracks"][0]["codec"], "truehd");
+    assert_eq!(stream_details["item"]["stream_metadata_complete"], true);
+    assert_eq!(stream_details["chapters"][0]["title"], "Intro: Кино");
+    assert_eq!(stream_details["chapters"][0]["start_seconds"], 1.25);
+    assert_eq!(
+        stream_details["item"]["chapters"],
+        stream_details["chapters"]
+    );
+    let direct = app.handle(&req(&get(
+        &format!(
+            "/web/media/{}.mp4?mode=direct&reason=forced_original&request=8",
+            dvp7.detail_id
+        ),
+        "Browser/1.0",
+    )));
+    assert_eq!(direct.status, 200);
+    assert!(direct.remux_job.is_none());
+    assert!(direct.file_range.is_some() || !direct.body.is_empty());
+    assert_eq!(resp_header(&direct, "Accept-Ranges"), Some("bytes"));
     let compat = app.handle(&req(&get(
         &format!("/web/media/{}.mp4", dvp7.detail_id),
         "Browser/1.0",
@@ -3976,6 +4164,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     let spec = compat.remux_job.expect("browser compatibility job");
     assert_eq!(spec.mime, "video/mp4");
     assert!(!spec.continue_after_disconnect);
+    assert!(spec.cacheable);
     assert!(spec.fallback_args.is_none());
     let args = spec
         .args
@@ -4004,12 +4193,17 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         item.duration = Some("1:00:00.000".into());
     }
     let selected = app.handle(&req(&get(
-        &format!("/web/media/{}.mp4?audio=1&start=120", dvp7.detail_id),
+        &format!(
+            "/web/media/{}.mp4?audio=1&start=120&request=77",
+            dvp7.detail_id
+        ),
         "Browser/1.0",
     )));
     let selected = selected.remux_job.expect("selected browser audio job");
     assert_eq!(selected.audio_index, 1);
+    assert_eq!(selected.web_request_id, Some(77));
     assert!(selected.cache_key.ends_with("-start-120"));
+    assert!(!selected.cacheable);
     let selected_args = selected
         .args
         .iter()
@@ -4031,6 +4225,73 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .status,
         400
     );
+    let saver = app.handle(&req(&get(
+        &format!("/web/media/{}.mp4?quality=data_saver", dvp7.detail_id),
+        "Browser/1.0",
+    )));
+    let saver = saver.remux_job.expect("data saver browser job");
+    assert!(saver.args.iter().any(|arg| arg
+        .to_string_lossy()
+        .contains("scale=w='min(iw,1280)':h='min(ih,720)'")));
+    assert!(saver
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-maxrate", "3000k"]));
+    let full_hd = app.handle(&req(&get(
+        &format!("/web/media/{}.mp4?quality=full_hd", dvp7.detail_id),
+        "Browser/1.0",
+    )));
+    let full_hd = full_hd.remux_job.expect("1080p browser job");
+    assert!(full_hd.args.iter().any(|arg| arg
+        .to_string_lossy()
+        .contains("scale=w='min(iw,1920)':h='min(ih,1080)'")));
+    assert!(full_hd
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-maxrate", "8000k"]));
+    assert_eq!(
+        app.handle(&req(&get(
+            &format!("/web/media/{}.mp4?quality=ultra", dvp7.detail_id),
+            "Browser/1.0",
+        )))
+        .status,
+        400
+    );
+    let transcode_status = app.handle(&req(&get(
+        &format!("/api/web/transcode/{}", dvp7.detail_id),
+        "Browser/1.0",
+    )));
+    assert_eq!(transcode_status.status, 200);
+    let transcode_status: serde_json::Value =
+        serde_json::from_slice(&transcode_status.body).unwrap();
+    assert_eq!(transcode_status["state"], "idle");
+    let scoped_status = app.handle(&req(&get(
+        &format!("/api/web/transcode/{}?request=77", dvp7.detail_id),
+        "Browser/1.0",
+    )));
+    let scoped_status: serde_json::Value = serde_json::from_slice(&scoped_status.body).unwrap();
+    assert_eq!(scoped_status["request_id"], 77);
+    for invalid in [
+        format!("/web/media/{}.mp4?mode=maybe", dvp7.detail_id),
+        format!("/web/media/{}.mp4?request=-1", dvp7.detail_id),
+        format!(
+            "/web/media/{}.mp4?mode=direct&mode=compatible",
+            dvp7.detail_id
+        ),
+        format!("/web/media/{}.mp4?mode=direct&quality=auto", dvp7.detail_id),
+        format!("/web/media/{}.mp4?reason=", dvp7.detail_id),
+        format!("/web/media/{}.mp4?reason=%GG", dvp7.detail_id),
+        format!("/api/web/transcode/{}?request=nope", dvp7.detail_id),
+        format!("/api/web/transcode/{}?extra=1", dvp7.detail_id),
+        format!("/api/web/item/{}?enrich=maybe", dvp7.detail_id),
+        format!("/api/web/item/{}?extra=1", dvp7.detail_id),
+    ] {
+        let response = app.handle(&req(&get(&invalid, "Browser/1.0")));
+        assert_eq!(response.status, 400, "{invalid}");
+        let error: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(error["schema_version"], 1);
+        assert!(error["error"]["code"].is_string());
+    }
 
     app.cfg.web.encoder = "h264_nvenc".into();
     let accelerated = app.handle(&req(&get(
@@ -4084,14 +4345,30 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         "Browser/1.0",
     )));
     let accelerated_sdr = accelerated_sdr.remux_job.expect("NVENC SDR browser job");
-    assert!(accelerated_sdr
-        .args
-        .windows(2)
-        .any(|pair| pair == ["-vf", "scale_cuda=format=yuv420p"]));
+    assert!(accelerated_sdr.args.iter().any(|arg| arg
+        .to_string_lossy()
+        .contains("scale_cuda=w='min(iw,3840)':h='min(ih,2160)'")));
     assert!(!accelerated_sdr
         .args
         .iter()
         .any(|arg| arg.to_string_lossy().contains("libplacebo")));
+
+    let runtime = app.handle(&req(&get("/api/status", "Browser/1.0")));
+    let runtime: serde_json::Value = serde_json::from_slice(&runtime.body).unwrap();
+    assert!(runtime["transcode"]["web_player"]["requests_total"].is_number());
+    assert!(
+        runtime["transcode"]["web_player"]["startup_to_first_playable_ms"]["count"].is_number()
+    );
+
+    app.cfg.transcode.enable = false;
+    let disabled_compatible = app.handle(&req(&get(
+        &format!("/web/media/{}.mp4?mode=compatible", dvp7.detail_id),
+        "Browser/1.0",
+    )));
+    assert_eq!(disabled_compatible.status, 409);
+    let disabled_compatible: serde_json::Value =
+        serde_json::from_slice(&disabled_compatible.body).unwrap();
+    assert_eq!(disabled_compatible["error"]["code"], "transcode_disabled");
 
     app.cfg.web.enable = false;
     let disabled_root = app.handle(&req(&get("/", "Browser/1.0")));

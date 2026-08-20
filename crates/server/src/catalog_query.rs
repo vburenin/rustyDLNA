@@ -6,6 +6,7 @@ use rusty_dlna_protocol::ClientProfile;
 use rusty_dlna_scan::{
     Catalog, CatalogChild, CatalogDefaultOrder, CatalogQuery, CatalogQueryClause,
     CatalogQueryField, CatalogQueryOp, CatalogQueryPage, CatalogQuerySort, LibraryDb, MediaItem,
+    WebMediaKind, WebMediaSort,
 };
 use rusty_dlna_soap::{
     row_matches, DefaultOrder, DidlObject, FilterBits, SearchClause, SearchProp, SearchQuery,
@@ -199,6 +200,31 @@ pub(super) fn query_db_search(
         Ok(page) => Some(page),
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "catalog Search query fell back to memory");
+            None
+        }
+    }
+}
+
+pub(super) fn query_db_web_media(
+    pool: Option<&DbPool>,
+    db_path: Option<&Path>,
+    kind: WebMediaKind,
+    query: &str,
+    sort: WebMediaSort,
+    start: usize,
+    take: usize,
+) -> Option<CatalogQueryPage> {
+    let path = db_path?;
+    let query_page =
+        |database: &LibraryDb| database.query_web_media_page(kind, query, sort, start, take);
+    let result = match pool {
+        Some(pool) => pool.read(query_page),
+        None => LibraryDb::open_read_only(path).and_then(|database| query_page(&database)),
+    };
+    match result {
+        Ok(page) => Some(page),
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "web catalog query fell back to memory");
             None
         }
     }

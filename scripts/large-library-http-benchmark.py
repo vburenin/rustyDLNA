@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded SOAP latency driver used by large-library-benchmark.sh."""
+"""Bounded SOAP and web-library latency driver used by the 50k benchmark."""
 
 import argparse
 import http.client
@@ -50,6 +50,20 @@ def call(port: int, action: str, fields: dict[str, str]) -> tuple[bytes, float]:
     return payload, elapsed_ms
 
 
+def web_call(port: int, query: str) -> tuple[dict, float]:
+    started = time.perf_counter()
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    connection.request("GET", f"/api/web/library?{query}", headers={"Accept": "application/json", "Connection": "close"})
+    response = connection.getresponse()
+    payload = response.read()
+    connection.close()
+    elapsed_ms = (time.perf_counter() - started) * 1_000
+    parsed = json.loads(payload)
+    if response.status != 200 or parsed.get("schema_version") != 1:
+        raise RuntimeError(f"web library returned HTTP {response.status}: {payload[:500]!r}")
+    return parsed, elapsed_ms
+
+
 def fields(action: str) -> dict[str, str]:
     common = {
         "Filter": "dc:title,upnp:class,res",
@@ -76,7 +90,7 @@ def percentile(values: list[float], quantile: float) -> float:
     return ordered[index]
 
 
-def benchmark(port: int, requests: int, warmups: int) -> None:
+def benchmark(port: int, requests: int, warmups: int, web_p95_target_ms: float) -> None:
     output: dict[str, dict[str, float | int]] = {}
     for action in ("Browse", "Search"):
         request_fields = fields(action)
@@ -91,6 +105,27 @@ def benchmark(port: int, requests: int, warmups: int) -> None:
             "mean_ms": round(statistics.fmean(samples), 3),
             "max_ms": round(max(samples), 3),
         }
+    web_queries = {
+        "web_first_page": "view=library&kind=video&sort=title&offset=0&limit=64",
+        "web_later_page": "view=library&kind=video&sort=title&offset=40000&limit=64",
+        "web_search": "view=library&kind=video&sort=title&q=Title%204&offset=0&limit=64",
+    }
+    for name, query in web_queries.items():
+        for _ in range(warmups):
+            web_call(port, query)
+        samples = [web_call(port, query)[1] for _ in range(requests)]
+        p95 = percentile(samples, 0.95)
+        output[name] = {
+            "requests": requests,
+            "p50_ms": round(percentile(samples, 0.50), 3),
+            "p95_ms": round(p95, 3),
+            "p99_ms": round(percentile(samples, 0.99), 3),
+            "mean_ms": round(statistics.fmean(samples), 3),
+            "max_ms": round(max(samples), 3),
+            "p95_target_ms": web_p95_target_ms,
+        }
+        if p95 > web_p95_target_ms:
+            raise RuntimeError(f"{name} p95 {p95:.3f}ms exceeded {web_p95_target_ms:.3f}ms target")
     print(json.dumps(output, sort_keys=True))
 
 
@@ -130,13 +165,14 @@ def main() -> None:
     latency = subparsers.add_parser("latency")
     latency.add_argument("--requests", type=int, default=200)
     latency.add_argument("--warmups", type=int, default=10)
+    latency.add_argument("--web-p95-target-ms", type=float, default=250.0)
     update = subparsers.add_parser("wait-for-total")
     update.add_argument("--expected", type=int, required=True)
     update.add_argument("--timeout", type=float, default=120)
     update.add_argument("--create")
     args = parser.parse_args()
     if args.command == "latency":
-        benchmark(args.port, args.requests, args.warmups)
+        benchmark(args.port, args.requests, args.warmups, args.web_p95_target_ms)
     else:
         wait_for_total(args.port, args.expected, args.timeout, args.create)
 

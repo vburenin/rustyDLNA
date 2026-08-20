@@ -115,6 +115,89 @@ pub enum AudioAction {
     ToAac,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserQuality {
+    Auto,
+    FullHd,
+    DataSaver,
+}
+
+impl BrowserQuality {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::FullHd => "full_hd",
+            Self::DataSaver => "data_saver",
+        }
+    }
+
+    pub fn max_width(self) -> u32 {
+        match self {
+            Self::Auto => 3840,
+            Self::FullHd => 1920,
+            Self::DataSaver => 1280,
+        }
+    }
+
+    pub fn max_height(self) -> u32 {
+        match self {
+            Self::Auto => 2160,
+            Self::FullHd => 1080,
+            Self::DataSaver => 720,
+        }
+    }
+
+    pub fn max_fps(self) -> u32 {
+        30
+    }
+
+    pub fn h264_profile(self) -> &'static str {
+        match self {
+            Self::Auto | Self::FullHd => "high",
+            Self::DataSaver => "main",
+        }
+    }
+
+    pub fn h264_level(self) -> &'static str {
+        match self {
+            Self::Auto => "5.1",
+            Self::FullHd => "4.1",
+            Self::DataSaver => "3.1",
+        }
+    }
+
+    pub fn crf(self) -> u8 {
+        match self {
+            Self::Auto => 20,
+            Self::FullHd => 22,
+            Self::DataSaver => 25,
+        }
+    }
+
+    pub fn max_video_kbps(self) -> u32 {
+        match self {
+            Self::Auto => 25_000,
+            Self::FullHd => 8_000,
+            Self::DataSaver => 3_000,
+        }
+    }
+
+    pub fn buffer_kbps(self) -> u32 {
+        self.max_video_kbps() * 2
+    }
+
+    pub fn audio_kbps(self) -> u32 {
+        match self {
+            Self::Auto | Self::FullHd => 192,
+            Self::DataSaver => 128,
+        }
+    }
+
+    pub fn expected_bandwidth_kbps(self) -> u32 {
+        self.max_video_kbps() + self.audio_kbps() + 256
+    }
+}
+
 /// One software name or a list. `client = "CrKey"` or
 /// `clients = ["CrKey", "Kodi"]`. Empty = any software.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -178,6 +261,8 @@ pub struct TranscodePlan {
     pub container: &'static str,
     /// `0:a:{n}` among audio streams. Prefer a lossy track when known.
     pub audio_index: usize,
+    /// Explicit browser output envelope. Non-browser plans leave this unset.
+    pub browser_quality: Option<BrowserQuality>,
 }
 
 impl Default for TranscodePlan {
@@ -193,6 +278,7 @@ impl Default for TranscodePlan {
             audio: AudioAction::Copy,
             container: "original",
             audio_index: 0,
+            browser_quality: None,
         }
     }
 }
@@ -422,6 +508,7 @@ fn plan_from_rule(
             audio: rule.audio_out.unwrap_or(AudioAction::Copy),
             container: "mp4",
             audio_index: 0,
+            browser_quality: None,
         },
         RecodeAction::Hdr10 => TranscodePlan {
             decision: Decision::Recode,
@@ -447,6 +534,7 @@ fn plan_from_rule(
             ),
             container: "mp4",
             audio_index: 0,
+            browser_quality: None,
         },
         RecodeAction::AudioAc3 => TranscodePlan {
             decision: Decision::Recode,
@@ -459,6 +547,7 @@ fn plan_from_rule(
             audio: rule.audio_out.unwrap_or(AudioAction::ToAc3),
             container: "original",
             audio_index: 0,
+            browser_quality: None,
         },
         RecodeAction::Browser => TranscodePlan::default(),
     }
@@ -597,6 +686,7 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
         }
         RecodeAction::Browser => {
             a.extend(["-c:v".into(), plan.video_encoder.clone()]);
+            let quality = plan.browser_quality;
             if plan.video_encoder == "h264_nvenc" {
                 a.extend([
                     "-preset".into(),
@@ -606,28 +696,46 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
                     "-rc".into(),
                     "vbr".into(),
                     "-cq".into(),
-                    "22".into(),
+                    quality.map_or(22, BrowserQuality::crf).to_string(),
                     "-b:v".into(),
                     "0".into(),
                 ]);
                 if plan.hardware_decode == HardwareDecode::Cuda {
-                    a.extend(["-vf".into(), "scale_cuda=format=yuv420p".into()]);
+                    a.extend(["-vf".into(), browser_scale_filter(quality, true)]);
                 } else {
                     a.extend(["-pix_fmt".into(), "yuv420p".into()]);
+                    if quality.is_some() {
+                        a.extend(["-vf".into(), browser_scale_filter(quality, false)]);
+                    }
                 }
             } else {
                 a.extend([
                     "-preset".into(),
                     "veryfast".into(),
                     "-crf".into(),
-                    "22".into(),
+                    quality.map_or(22, BrowserQuality::crf).to_string(),
                     "-pix_fmt".into(),
                     "yuv420p".into(),
+                ]);
+                if quality.is_some() {
+                    a.extend(["-vf".into(), browser_scale_filter(quality, false)]);
+                }
+            }
+            if let Some(quality) = quality {
+                a.extend([
+                    "-maxrate".into(),
+                    format!("{}k", quality.max_video_kbps()),
+                    "-bufsize".into(),
+                    format!("{}k", quality.buffer_kbps()),
+                    "-fpsmax".into(),
+                    quality.max_fps().to_string(),
                 ]);
             }
             a.extend([
                 "-profile:v".into(),
-                "high".into(),
+                quality.map_or("high", BrowserQuality::h264_profile).into(),
+                "-level:v".into(),
+                quality.map_or("4.1", BrowserQuality::h264_level).into(),
                 "-force_key_frames".into(),
                 "expr:gte(t,n_forced*2)".into(),
             ]);
@@ -636,10 +744,40 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
     match plan.audio {
         AudioAction::Copy => a.extend(["-c:a".into(), "copy".into()]),
         AudioAction::ToAc3 => a.extend(["-c:a".into(), "ac3".into(), "-b:a".into(), "640k".into()]),
-        AudioAction::ToAac => a.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "256k".into()]),
+        AudioAction::ToAac => {
+            let audio_kbps = plan.browser_quality.map_or(256, BrowserQuality::audio_kbps);
+            a.extend([
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                format!("{audio_kbps}k"),
+            ]);
+            if plan.browser_quality.is_some() {
+                a.extend(["-ac".into(), "2".into()]);
+            }
+        }
     }
     a.extend(live_frag_tail(dst_path));
     a
+}
+
+fn browser_scale_filter(quality: Option<BrowserQuality>, cuda: bool) -> String {
+    let Some(quality) = quality else {
+        return "scale_cuda=format=yuv420p".into();
+    };
+    if cuda {
+        format!(
+            "scale_cuda=w='min(iw,{})':h='min(ih,{})':force_original_aspect_ratio=decrease:force_divisible_by=2:format=yuv420p",
+            quality.max_width(),
+            quality.max_height()
+        )
+    } else {
+        format!(
+            "scale=w='min(iw,{})':h='min(ih,{})':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear",
+            quality.max_width(),
+            quality.max_height()
+        )
+    }
 }
 
 /// Path-preserving variant used by the server. Command arguments remain
@@ -857,8 +995,25 @@ fn transcode_cache_key_from_identity(source: &str, plan: &TranscodePlan, remux_p
     } else {
         "unused".into()
     };
+    let browser_quality = plan
+        .browser_quality
+        .map(|quality| {
+            format!(
+                "{}:{}x{}:{}fps:{}:{}:crf{}:{}k:{}k",
+                quality.id(),
+                quality.max_width(),
+                quality.max_height(),
+                quality.max_fps(),
+                quality.h264_profile(),
+                quality.h264_level(),
+                quality.crf(),
+                quality.max_video_kbps(),
+                quality.audio_kbps(),
+            )
+        })
+        .unwrap_or_else(|| "none".into());
     let signature = format!(
-        "source={source}\naction={:?}\nencoder={}\nhardware_decode={:?}\naudio={:?}\naudio_index={}\ncontainer={}\nremux_p8={remux_p8}\nffmpeg={ffmpeg}\ndovi={dovi}\nbuild={}",
+        "source={source}\naction={:?}\nencoder={}\nhardware_decode={:?}\naudio={:?}\naudio_index={}\ncontainer={}\nbrowser_quality={browser_quality}\nremux_p8={remux_p8}\nffmpeg={ffmpeg}\ndovi={dovi}\nbuild={}",
         plan.action,
         plan.video_encoder,
         plan.hardware_decode,
@@ -925,6 +1080,7 @@ pub fn hdr10_fallback_plan(from: &TranscodePlan) -> TranscodePlan {
         audio: from.audio,
         container: "mp4",
         audio_index: from.audio_index,
+        browser_quality: from.browser_quality,
     }
 }
 
@@ -1798,6 +1954,38 @@ action = "audio-ac3"
             .windows(2)
             .any(|pair| pair == ["-vf", "scale_cuda=format=yuv420p"]));
         assert!(!cuda.iter().any(|arg| arg == "-pix_fmt"));
+
+        plan.browser_quality = Some(BrowserQuality::Auto);
+        let uhd = ffmpeg_grow_args("source.mkv", "output.mp4.part", &plan);
+        assert!(uhd
+            .iter()
+            .any(|arg| arg.contains("scale_cuda=w='min(iw,3840)':h='min(ih,2160)'")));
+        assert!(uhd.windows(2).any(|pair| pair == ["-cq", "20"]));
+        assert!(uhd.windows(2).any(|pair| pair == ["-profile:v", "high"]));
+        assert!(uhd.windows(2).any(|pair| pair == ["-level:v", "5.1"]));
+        assert!(uhd.windows(2).any(|pair| pair == ["-maxrate", "25000k"]));
+        assert!(uhd.windows(2).any(|pair| pair == ["-bufsize", "50000k"]));
+
+        plan.browser_quality = Some(BrowserQuality::FullHd);
+        let full_hd = ffmpeg_grow_args("source.mkv", "output.mp4.part", &plan);
+        assert!(full_hd
+            .iter()
+            .any(|arg| arg.contains("scale_cuda=w='min(iw,1920)':h='min(ih,1080)'")));
+        assert!(full_hd.windows(2).any(|pair| pair == ["-level:v", "4.1"]));
+        assert!(full_hd.windows(2).any(|pair| pair == ["-maxrate", "8000k"]));
+
+        plan.browser_quality = Some(BrowserQuality::DataSaver);
+        let saver = ffmpeg_grow_args("source.mkv", "output.mp4.part", &plan);
+        assert!(saver
+            .iter()
+            .any(|arg| arg.contains("scale_cuda=w='min(iw,1280)':h='min(ih,720)'")));
+        assert!(saver.windows(2).any(|pair| pair == ["-profile:v", "main"]));
+        assert!(saver.windows(2).any(|pair| pair == ["-level:v", "3.1"]));
+        assert!(saver.windows(2).any(|pair| pair == ["-maxrate", "3000k"]));
+        assert!(saver.windows(2).any(|pair| pair == ["-bufsize", "6000k"]));
+        assert!(saver.windows(2).any(|pair| pair == ["-fpsmax", "30"]));
+        assert!(saver.windows(2).any(|pair| pair == ["-b:a", "128k"]));
+        assert!(saver.windows(2).any(|pair| pair == ["-ac", "2"]));
     }
 
     #[cfg(unix)]
@@ -2265,6 +2453,12 @@ encoder = "copy"
         plan.audio = AudioAction::ToAc3;
         let audio_changed = transcode_cache_key(&src, &plan, false).unwrap();
         assert_ne!(audio_changed, encoder_changed);
+        plan.action = RecodeAction::Browser;
+        plan.browser_quality = Some(BrowserQuality::Auto);
+        let uhd = transcode_cache_key(&src, &plan, false).unwrap();
+        plan.browser_quality = Some(BrowserQuality::FullHd);
+        let full_hd = transcode_cache_key(&src, &plan, false).unwrap();
+        assert_ne!(full_hd, uhd);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

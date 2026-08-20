@@ -157,6 +157,7 @@ pub struct App {
     pub jobs: JobGate,
     pub(crate) helpers: Arc<HelperGate>,
     pub(crate) remuxes: Mutex<HashMap<String, Arc<remux::RemuxJob>>>,
+    pub(crate) recent_remux_states: Mutex<HashMap<(i64, u64), remux::RecentRemuxState>>,
     pub(crate) remux_metrics: remux::RemuxMetrics,
     events: Arc<Mutex<events::EventHub>>,
     notify_dispatcher: events::NotifyDispatcher,

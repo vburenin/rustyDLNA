@@ -49,9 +49,17 @@ pub struct MediaProbe {
     pub probe: SourceProbe,
     pub av: AvMeta,
     pub tags: EmbeddedTags,
-    /// Ordered audio streams with request-facing labels. These are collected
-    /// on demand by the web player and are not persisted in the catalog.
+    /// Ordered audio streams with request-facing labels. The compact catalog
+    /// stream descriptor persists these labels for ordinary playback.
     pub audio_tracks: Vec<AudioTrackProbe>,
+    pub chapters: Vec<ChapterProbe>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChapterProbe {
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub title: Option<String>,
 }
 
 /// One audio stream discovered by libavformat.
@@ -63,6 +71,7 @@ pub struct AudioTrackProbe {
     pub channels: u32,
     pub language: Option<String>,
     pub title: Option<String>,
+    pub default: bool,
 }
 
 static INIT: Once = Once::new();
@@ -400,12 +409,20 @@ unsafe fn probe_avformat(
             hdr: String::new(),
             audio: String::new(),
             audio_streams: String::new(),
+            video_profile: String::new(),
+            video_level: 0,
+            pixel_format: String::new(),
+            bit_depth: 0,
+            frame_rate: String::new(),
+            audio_layout: String::new(),
+            codec_string: String::new(),
             width: 0,
             height: 0,
         },
         av: AvMeta::default(),
         tags: EmbeddedTags::default(),
         audio_tracks: Vec::new(),
+        chapters: Vec::new(),
     };
     let fmt = (*ctx).iformat;
     if !fmt.is_null() {
@@ -468,6 +485,31 @@ unsafe fn probe_avformat(
                     } else {
                         out.probe.hdr = "sdr".into();
                     }
+                    out.probe.video_profile =
+                        c_str(sys::avcodec_profile_name((*par).codec_id, (*par).profile))
+                            .to_owned();
+                    out.probe.video_level = (*par).level.max(0) as u32;
+                    if (*par).format >= 0 {
+                        let pixel_format =
+                            std::mem::transmute::<i32, sys::AVPixelFormat>((*par).format);
+                        out.probe.pixel_format =
+                            c_str(sys::av_get_pix_fmt_name(pixel_format)).to_owned();
+                        out.probe.bit_depth = pixel_format_bit_depth(&out.probe.pixel_format).max(
+                            (*par)
+                                .bits_per_raw_sample
+                                .max((*par).bits_per_coded_sample)
+                                .max(0) as u32,
+                        );
+                    }
+                    let rate = (*st).avg_frame_rate;
+                    if rate.num > 0 && rate.den > 0 {
+                        out.probe.frame_rate = format!("{}/{}", rate.num, rate.den);
+                    }
+                    if (*par).codec_id == sys::AVCodecID::AV_CODEC_ID_H264 {
+                        out.probe.codec_string = h264_rfc6381(par).unwrap_or_default();
+                    } else if (*par).codec_id == sys::AVCodecID::AV_CODEC_ID_HEVC {
+                        out.probe.codec_string = hevc_rfc6381(par).unwrap_or_default();
+                    }
                 }
             }
             sys::AVMediaType::AVMEDIA_TYPE_AUDIO => {
@@ -478,19 +520,40 @@ unsafe fn probe_avformat(
                 let name = map_audio((*par).codec_id);
                 let first = audio_streams.is_empty();
                 let audio_ordinal = audio_streams.len();
+                let language = dictionary_value((*st).metadata, &["language"]);
+                let title = dictionary_value((*st).metadata, &["title"]);
+                let default = (*st).disposition & sys::AV_DISPOSITION_DEFAULT != 0;
                 out.audio_tracks.push(AudioTrackProbe {
                     index: audio_ordinal,
                     codec: name.to_owned(),
                     channels: (*par).ch_layout.nb_channels.max(0) as u32,
-                    language: dictionary_value((*st).metadata, &["language"]),
-                    title: dictionary_value((*st).metadata, &["title"]),
+                    language: language.clone(),
+                    title: title.clone(),
+                    default,
                 });
-                audio_streams.push(format!(
+                let mut descriptor = format!(
                     "{i}:{audio_ordinal}:{name}:{}",
                     (*par).ch_layout.nb_channels.max(0)
-                ));
-                push_unique(&mut audios, name);
+                );
+                if language.is_some() || title.is_some() || default {
+                    descriptor.push(':');
+                    descriptor.push_str(&compact_stream_field(language.as_deref().unwrap_or("")));
+                    descriptor.push(':');
+                    descriptor.push_str(&compact_stream_field(title.as_deref().unwrap_or("")));
+                    descriptor.push(':');
+                    descriptor.push(if default { '1' } else { '0' });
+                }
+                audio_streams.push(descriptor);
+                push_unique(&mut audios, name.clone());
                 if first {
+                    out.probe.audio_layout =
+                        channel_layout_label((*par).ch_layout.nb_channels.max(0) as u32).into();
+                    if name == "aac" {
+                        if !out.probe.codec_string.is_empty() {
+                            out.probe.codec_string.push(',');
+                        }
+                        out.probe.codec_string.push_str("mp4a.40.2");
+                    }
                     if (*par).ch_layout.nb_channels > 0 {
                         out.av.channels = Some((*par).ch_layout.nb_channels as i64);
                     }
@@ -508,11 +571,63 @@ unsafe fn probe_avformat(
     out.probe.video = videos.join(",");
     out.probe.audio = audios.join(",");
     out.probe.audio_streams = audio_streams.join(",");
+    let capability_record = format!(
+        "@v:{}:{}:{}:{}:{}:{}:{}",
+        compact_stream_field(&out.probe.video_profile),
+        out.probe.video_level,
+        compact_stream_field(&out.probe.pixel_format),
+        out.probe.bit_depth,
+        compact_stream_field(&out.probe.frame_rate),
+        compact_stream_field(&out.probe.codec_string),
+        compact_stream_field(&out.probe.audio_layout),
+    );
+    if !out.probe.audio_streams.is_empty() {
+        out.probe.audio_streams.push(',');
+    }
+    out.probe.audio_streams.push_str(&capability_record);
     if videos.is_empty() {
         fill_missing_tags(&mut out.tags, audio_stream_tags);
     }
     if !subs.is_empty() {
         out.av.subs = Some(subs.join(","));
+    }
+
+    for index in 0..(*ctx).nb_chapters as usize {
+        let chapter = *(*ctx).chapters.add(index);
+        if chapter.is_null() || (*chapter).time_base.den <= 0 {
+            continue;
+        }
+        let scale = (*chapter).time_base.num as f64 / (*chapter).time_base.den as f64;
+        let start_seconds = (*chapter).start as f64 * scale;
+        let end_seconds = (*chapter).end as f64 * scale;
+        if start_seconds.is_finite() && start_seconds >= 0.0 {
+            out.chapters.push(ChapterProbe {
+                start_seconds,
+                end_seconds: end_seconds.max(start_seconds),
+                title: dictionary_value((*chapter).metadata, &["title"]),
+            });
+        }
+    }
+    if !out.chapters.is_empty() {
+        out.probe.audio_streams.push_str(",@c:");
+        for (index, chapter) in out.chapters.iter().take(512).enumerate() {
+            if index > 0 {
+                out.probe.audio_streams.push('|');
+            }
+            let title = chapter
+                .title
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .take(256)
+                .collect::<String>();
+            out.probe.audio_streams.push_str(&format!(
+                "{}:{}:{}",
+                (chapter.start_seconds * 1000.0).round().max(0.0) as u64,
+                (chapter.end_seconds * 1000.0).round().max(0.0) as u64,
+                compact_stream_field(&title)
+            ));
+        }
     }
 
     sys::avformat_close_input(&mut ctx);
@@ -524,6 +639,100 @@ unsafe fn probe_avformat(
         out.probe.hdr = "sdr".into();
     }
     Some(out)
+}
+
+fn compact_stream_field(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b' ') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn pixel_format_bit_depth(pixel_format: &str) -> u32 {
+    if pixel_format.contains("12") {
+        12
+    } else if pixel_format.contains("10") || pixel_format.starts_with("p010") {
+        10
+    } else if pixel_format.is_empty() {
+        0
+    } else {
+        8
+    }
+}
+
+fn channel_layout_label(channels: u32) -> &'static str {
+    match channels {
+        1 => "mono",
+        2 => "stereo",
+        6 => "5.1",
+        8 => "7.1",
+        _ => "unknown",
+    }
+}
+
+unsafe fn h264_rfc6381(par: *mut sys::AVCodecParameters) -> Option<String> {
+    if (*par).extradata_size >= 4 && !(*par).extradata.is_null() {
+        let bytes = std::slice::from_raw_parts((*par).extradata, (*par).extradata_size as usize);
+        if bytes.first() == Some(&1) {
+            return Some(format!(
+                "avc1.{:02X}{:02X}{:02X}",
+                bytes[1], bytes[2], bytes[3]
+            ));
+        }
+    }
+    let profile = u8::try_from((*par).profile).ok()?;
+    let level = u8::try_from((*par).level).ok()?;
+    Some(format!("avc1.{profile:02X}00{level:02X}"))
+}
+
+unsafe fn hevc_rfc6381(par: *mut sys::AVCodecParameters) -> Option<String> {
+    if (*par).extradata_size < 13 || (*par).extradata.is_null() {
+        return None;
+    }
+    let bytes = std::slice::from_raw_parts((*par).extradata, (*par).extradata_size as usize);
+    hevc_codec_from_hvcc(bytes, (*par).codec_tag)
+}
+
+fn hevc_codec_from_hvcc(bytes: &[u8], codec_tag: u32) -> Option<String> {
+    if bytes.len() < 13 || bytes[0] != 1 {
+        return None;
+    }
+    let profile_space = match bytes[1] >> 6 {
+        1 => "A",
+        2 => "B",
+        3 => "C",
+        _ => "",
+    };
+    let tier = if bytes[1] & 0x20 != 0 { 'H' } else { 'L' };
+    let profile_idc = bytes[1] & 0x1f;
+    let compatibility = u32::from_be_bytes(bytes[2..6].try_into().ok()?).reverse_bits();
+    let prefix = if codec_tag == u32::from_le_bytes(*b"hev1") {
+        "hev1"
+    } else {
+        "hvc1"
+    };
+    let mut codec = format!(
+        "{prefix}.{profile_space}{profile_idc}.{compatibility:X}.{tier}{}",
+        bytes[12]
+    );
+    let constraint_len = bytes[6..12]
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |index| index + 1);
+    if constraint_len > 0 {
+        codec.push('.');
+        for byte in &bytes[6..6 + constraint_len] {
+            use std::fmt::Write as _;
+            let _ = write!(codec, "{byte:02X}");
+        }
+    }
+    Some(codec)
 }
 
 unsafe fn dovi_profile(par: *mut sys::AVCodecParameters) -> Option<u8> {
@@ -1499,7 +1708,7 @@ mod tests {
         assert_eq!(media.probe.video, "hevc");
         assert_eq!(media.probe.hdr, "dv-p7");
         assert_eq!(media.probe.audio, "truehd");
-        assert_eq!(media.probe.audio_streams, "1:0:truehd:6");
+        assert!(media.probe.audio_streams.starts_with("1:0:truehd:6,@v:"));
         assert_eq!((media.probe.width, media.probe.height), (256, 144));
     }
 
@@ -1523,7 +1732,7 @@ mod tests {
         let truehd = probe_media(&dir.join("truehd.mkv")).expect("probe genuine TrueHD");
         assert_eq!(truehd.probe.video, "h264");
         assert_eq!(truehd.probe.audio, "truehd");
-        assert_eq!(truehd.probe.audio_streams, "1:0:truehd:6");
+        assert!(truehd.probe.audio_streams.starts_with("1:0:truehd:6,@v:"));
 
         let hdr10 = probe_media(&dir.join("hdr10-mastering.mkv")).expect("probe genuine HDR10");
         assert_eq!(hdr10.probe.video, "hevc");
@@ -1534,7 +1743,10 @@ mod tests {
             probe_media(&dir.join("unusual-layout.mkv")).expect("probe unusual stream layout");
         assert_eq!(unusual.probe.video, "h264");
         assert_eq!(unusual.probe.audio, "truehd,ac3");
-        assert_eq!(unusual.probe.audio_streams, "0:0:truehd:6,2:1:ac3:1");
+        assert!(unusual
+            .probe
+            .audio_streams
+            .starts_with("0:0:truehd:6:::1,2:1:ac3:1,@v:"));
         assert_eq!(unusual.av.subs.as_deref(), Some("subrip"));
 
         let oversized = probe_media(&dir.join("oversized-metadata.mkv"))
@@ -1601,6 +1813,27 @@ mod tests {
         assert_eq!(map_video(sys::AVCodecID::AV_CODEC_ID_MPEG4), "mpeg4");
         assert_eq!(map_video(sys::AVCodecID::AV_CODEC_ID_MSMPEG4V3), "mpeg4");
         assert_eq!(map_video(sys::AVCodecID::AV_CODEC_ID_HEVC), "hevc");
+    }
+
+    #[test]
+    fn hevc_hvcc_metadata_becomes_an_rfc_6381_codec_string() {
+        let mut hvcc = [0u8; 23];
+        hvcc[0] = 1;
+        hvcc[1] = 1;
+        hvcc[2..6].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+        hvcc[6] = 0xb0;
+        hvcc[12] = 93;
+        assert_eq!(
+            hevc_codec_from_hvcc(&hvcc, u32::from_le_bytes(*b"hvc1")).as_deref(),
+            Some("hvc1.1.6.L93.B0")
+        );
+        assert_eq!(
+            hevc_codec_from_hvcc(&hvcc, u32::from_le_bytes(*b"hev1")).as_deref(),
+            Some("hev1.1.6.L93.B0")
+        );
+        let mut invalid = hvcc;
+        invalid[0] = 0;
+        assert_eq!(hevc_codec_from_hvcc(&invalid, 0), None);
     }
 
     #[test]

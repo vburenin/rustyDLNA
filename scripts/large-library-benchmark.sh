@@ -7,6 +7,7 @@ cd "$ROOT"
 FILES=${RUSTY_DLNA_BENCH_FILES:-50000}
 ALIASES=${RUSTY_DLNA_BENCH_ALIASES:-5000}
 REQUESTS=${RUSTY_DLNA_BENCH_REQUESTS:-200}
+WEB_P95_TARGET_MS=${RUSTY_DLNA_BENCH_WEB_P95_TARGET_MS:-250}
 SCAN_WORKERS=${RUSTY_DLNA_BENCH_SCAN_WORKERS:-16}
 HTTP_PORT=${RUSTY_DLNA_BENCH_HTTP_PORT:-18240}
 SSDP_PORT=${RUSTY_DLNA_BENCH_SSDP_PORT:-11940}
@@ -163,7 +164,7 @@ target/release/examples/benchmark_reconcile "$LIBRARY" "$DATABASE/files.db" >"$R
 
 echo "measuring Browse/Search latency ($REQUESTS requests each)" >&2
 python3 scripts/large-library-http-benchmark.py --port "$HTTP_PORT" latency \
-    --requests "$REQUESTS" >"$LATENCY_JSON"
+    --requests "$REQUESTS" --web-p95-target-ms "$WEB_P95_TARGET_MS" >"$LATENCY_JSON"
 
 echo "measuring targeted inotify update-to-Browse latency" >&2
 python3 scripts/large-library-http-benchmark.py --port "$HTTP_PORT" wait-for-total \

@@ -1,7 +1,8 @@
 #include <libavformat/avformat.h>
 
 /*
- * FFmpeg 8 exposes demuxer-level coded side data through AVCodecParameters.
+ * FFmpeg 6 and newer expose demuxer-level coded side data through
+ * AVCodecParameters.
  * Keep the header-version distinction in C instead of making the Rust scanner
  * guess the layout of the FFmpeg structs. Older libraries fall through to the
  * existing extradata parser; no deprecated AVStream API is used.
@@ -11,7 +12,7 @@ const uint8_t *rusty_dlna_codec_side_data(
     enum AVPacketSideDataType type,
     size_t *size)
 {
-#if LIBAVCODEC_VERSION_MAJOR >= 62
+#if LIBAVCODEC_VERSION_MAJOR >= 60
     const AVPacketSideData *side_data;
 
     if (parameters == NULL || size == NULL) {

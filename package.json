@@ -1,0 +1,14 @@
+{
+  "name": "rustydlna-web-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:web-unit": "node --test crates/server/web/core.test.js",
+    "test:web-browser": "playwright test",
+    "test:web": "npm run test:web-unit && npm run test:web-browser"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.13.0",
+    "@playwright/test": "^1.62.1"
+  }
+}

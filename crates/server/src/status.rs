@@ -388,6 +388,21 @@ fn status_value(app: &App, detailed: bool) -> (Health, Value) {
             "cache_evicted_bytes_total": remux.cache_evicted_bytes_total,
             "cache_bytes": remux.cache_bytes,
             "oldest_job_seconds": remux.oldest_job_secs,
+            "web_player": {
+                "requests_total": remux.web_requests_total,
+                "seek_restarts_total": remux.web_seek_restarts_total,
+                "cache_reuses_total": remux.web_cache_reuses_total,
+                "cancellations_total": remux.web_cancelled_total,
+                "failures": {
+                    "busy_total": remux.web_failures_busy_total,
+                    "producer_total": remux.web_failures_producer_total,
+                },
+                "startup_to_first_playable_ms": {
+                    "count": remux.web_startup_playable_count,
+                    "sum_ms": remux.web_startup_playable_sum_ms,
+                    "max_ms": remux.web_startup_playable_max_ms,
+                },
+            },
             "max_jobs": app.cfg.transcode.max_jobs,
             "required_tools_ready": app.required_tools_ready,
         },

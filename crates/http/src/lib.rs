@@ -45,6 +45,7 @@ pub enum HttpRoute {
     ApiStatus,
     WebLibrary,
     WebItem,
+    WebTranscodeStatus,
     WebMedia,
     WebAsset,
     Presentation,
@@ -79,9 +80,17 @@ pub fn route(method: &str, path: &str) -> HttpRoute {
         API_STATUS_PATH => HttpRoute::ApiStatus,
         "/api/web/library" => HttpRoute::WebLibrary,
         "/" => HttpRoute::Presentation,
+        p if p.starts_with("/api/web/transcode/") => HttpRoute::WebTranscodeStatus,
         p if p.starts_with("/api/web/item/") => HttpRoute::WebItem,
         p if p.starts_with("/web/media/") => HttpRoute::WebMedia,
-        "/web/app.css" | "/web/app.js" => HttpRoute::WebAsset,
+        "/web/app.css"
+        | "/web/app.js"
+        | "/web/api.js"
+        | "/web/core.js"
+        | "/web/library.js"
+        | "/web/player.js"
+        | "/web/preferences.js"
+        | "/web/store.js" => HttpRoute::WebAsset,
         p if p.starts_with(MEDIA_ITEMS_PREFIX) => HttpRoute::MediaItem,
         p if p.starts_with(TRANSCODE_PREFIX) => HttpRoute::Transcode,
         p if p.starts_with(THUMBNAILS_PREFIX) => HttpRoute::Thumbnail,
@@ -310,6 +319,9 @@ pub struct OpenFileRange {
 #[derive(Clone, Debug)]
 pub struct RemuxJobSpec {
     pub detail_id: i64,
+    /// Browser source-session identifier used only for pollable status. A
+    /// shared job may collect several IDs when compatible requests coalesce.
+    pub web_request_id: Option<u64>,
     /// HTTP media type for both growing and completed cached output.
     pub mime: &'static str,
     /// Complete immutable identity used for in-process job sharing.
@@ -328,6 +340,9 @@ pub struct RemuxJobSpec {
     /// Whether the producer may keep running after its last HTTP reader goes
     /// away. DLNA cache jobs may opt in; interactive browser streams do not.
     pub continue_after_disconnect: bool,
+    /// Whether a completed output may remain in the shared transcode cache.
+    /// Seek tails are ephemeral so historical seeks cannot consume the cache.
+    pub cacheable: bool,
     /// Try `dovi_tool` P8.1 convert first; `args` is the hdr10 fallback.
     pub remux_p8: bool,
     pub audio_index: usize,
@@ -531,6 +546,10 @@ mod tests {
         assert_eq!(route("GET", "/api/status"), HttpRoute::ApiStatus);
         assert_eq!(route("GET", "/api/web/library"), HttpRoute::WebLibrary);
         assert_eq!(route("GET", "/api/web/item/3"), HttpRoute::WebItem);
+        assert_eq!(
+            route("GET", "/api/web/transcode/3"),
+            HttpRoute::WebTranscodeStatus
+        );
         assert_eq!(route("GET", "/web/app.js"), HttpRoute::WebAsset);
         assert_eq!(route("GET", "/web/media/3.mp4"), HttpRoute::WebMedia);
     }

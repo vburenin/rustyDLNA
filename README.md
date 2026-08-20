@@ -54,16 +54,19 @@ rules means nobody is remuxed, including Cast.
 
 **Embedded web player.** The responsive player at `/` traverses physical media
 folders and also searches flat video/audio views without a separate frontend
-deployment. One-click controls cover seek, previous/next, speed, mute, loop,
-fit, picture-in-picture, fullscreen, and stream mode. Its HTML, CSS, and
-JavaScript are compiled into the server binary. The browser tries native
-playback first; when `[transcode].enable = true`, unsupported media falls back
-to cached, growing H.264/AAC MP4 (or AAC-in-MP4 for audio). Set
+deployment. Its single mouse/touch/keyboard control surface supports captions,
+audio tracks, chapters, browser-local resume/Continue watching, stable queues,
+Media Session, fullscreen, and Original/Compatible stream modes. Its HTML,
+CSS, and dependency-free JavaScript modules are compiled into the server
+binary. Auto tries browser-native playback first; when `[transcode].enable =
+true`, unsupported media falls back to bounded H.264/AAC fragmented MP4 with
+source-preserving output up to 4K30 plus explicit 1080p30 and 720p30 profiles,
+stereo downmix, and HDR/Dolby Vision to SDR tone mapping. Set
 `[web].encoder = "h264_nvenc"` to use an exposed NVIDIA GPU, with automatic
 CUDA decode and scaling for H.264/HEVC sources and automatic `libx264`
 fallback if the GPU path cannot start. Set `[web].enable = false` to remove all
 player routes and restore the status page at `/`; `/status` is always the
-operator status page.
+operator status page. See [the web-player guide](docs/WEB_PLAYER.md).
 
 **Operations.** TOML configuration with unknown keys rejected. A shared,
 cancellation-aware graceful-stop budget defaults to 15 seconds; scanner

@@ -47,6 +47,8 @@ enable = true
 encoder = "libx264"
 
 [transcode]
+# Original browser playback remains available when false; Compatible playback
+# and configured DLNA remap jobs require this gate.
 enable = true
 encoder = "libx264"
 max_jobs = 16

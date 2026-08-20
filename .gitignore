@@ -20,3 +20,8 @@ rusty-dlna.live.toml
 docker-compose.override.yaml
 # local experiments (converters, generated mappings)
 /dev/
+# Local web-test dependencies and reports
+node_modules/
+test-results/
+playwright-report/
+__pycache__/

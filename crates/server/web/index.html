@@ -2,132 +2,144 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#0b0d0f">
-  <title>rustyDLNA Player</title>
-  <link rel="stylesheet" href="/web/app.css?v=fullscreen-19">
-  <script src="/web/app.js?v=fullscreen-19" defer></script>
+  <title>rustyDLNA</title>
+  <link rel="stylesheet" href="/web/app.css">
+  <script type="module" src="/web/app.js"></script>
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="/" aria-label="Player home">
+    <a class="brand" href="/" aria-label="Media library home">
       <span class="brand-mark" aria-hidden="true"><i></i></span>
-      <span><strong id="server-name">rustyDLNA</strong><small>PLAYER</small></span>
+      <strong id="server-name">rustyDLNA</strong>
     </a>
-    <div class="top-now-playing">
-      <span>NOW PLAYING</span>
-      <strong id="now-playing-title">Nothing selected</strong>
+    <div class="now-playing" id="now-playing" hidden>
+      <div><p class="eyebrow">Now playing</p><h1 id="now-playing-title">Nothing selected</h1><p id="now-playing-meta"></p></div>
+      <div class="now-playing-context"><div class="playback-mode" id="playback-mode" hidden><span aria-hidden="true"></span><b id="mode-label"></b></div><small id="queue-position"></small></div>
     </div>
     <div class="top-actions">
-      <span class="server-state"><i></i><span id="library-count">Connecting</span></span>
+      <span class="server-state" id="server-state" data-state="connecting"><i aria-hidden="true"></i><span id="library-count">Connecting…</span></span>
+      <button type="button" class="text-action" id="library-retry-top" hidden>Retry</button>
       <a class="status-link" href="/status">Server status</a>
     </div>
   </header>
 
   <main>
     <section class="player-panel" aria-labelledby="now-playing-title">
-      <div class="player-stage" id="player-stage">
-        <video id="video-player" controls playsinline preload="metadata"></video>
-        <button type="button" class="stage-fullscreen" id="fullscreen-button" title="Full screen (Ctrl+F)" aria-label="Enter full screen" hidden>Full screen</button>
-        <div class="audio-stage" id="audio-stage" hidden>
-          <div class="disc-wrap"><img id="audio-art" alt=""><span class="disc"></span></div>
-          <audio id="audio-player" controls preload="metadata"></audio>
+      <div class="player-stage" id="player-stage" tabindex="0" aria-label="Media player">
+        <div class="media-viewport">
+          <video id="video-player" playsinline preload="metadata"></video>
+          <div class="audio-stage" id="audio-stage" hidden>
+            <div class="disc-wrap"><img id="audio-art" alt="" hidden><span class="disc" aria-hidden="true"></span></div>
+          </div>
+          <audio id="audio-player" preload="metadata"></audio>
+          <div class="player-empty" id="player-empty"><span class="empty-icon" aria-hidden="true"></span><p id="player-empty-text">Choose something from your library</p></div>
+          <div class="stage-progress" id="stage-progress" hidden><span class="spinner" aria-hidden="true"></span><span id="stage-progress-label">Loading media</span></div>
+
+          <div class="resume-prompt" id="resume-prompt" role="group" aria-labelledby="resume-title" hidden>
+            <strong id="resume-title">Continue watching?</strong><span id="resume-time"></span>
+            <div><button type="button" class="primary-control" id="resume-button">Resume</button><button type="button" id="start-over-button">Start over</button></div>
+          </div>
         </div>
-        <div class="player-empty" id="player-empty">
-          <span class="empty-icon" aria-hidden="true"></span>
-          <p>Choose something from your library</p>
-          <small>Video and audio play here, without leaving the page.</small>
-        </div>
-      </div>
-      <div class="now-playing">
-        <div>
-          <p id="now-playing-meta">Pick a title below to begin.</p>
-          <div class="playback-controls" id="playback-controls" hidden>
-            <div class="timeline-control">
-              <input id="timeline" type="range" min="0" max="0" value="0" step="1" aria-label="Seek through video">
-              <small class="timeline-status" id="timeline-status" role="status" hidden></small>
-              <div class="timeline-times"><span id="timeline-current">0:00</span><span id="timeline-duration">0:00</span></div>
-            </div>
+
+        <div class="control-surface" id="playback-controls" hidden>
+          <div class="caption-menu" id="caption-menu" hidden><fieldset><legend>Captions</legend><div id="caption-choices"></div></fieldset></div>
+          <div class="timeline-control">
+            <input id="timeline" type="range" min="0" max="0" value="0" step="0.1" list="chapter-markers" aria-label="Media position" aria-describedby="timeline-status">
+            <datalist id="chapter-markers"></datalist>
+            <span class="sr-only" id="timeline-status">No media selected</span>
+          </div>
+          <div class="control-row player-toolbar">
             <div class="transport-controls" aria-label="Playback controls">
-              <button type="button" id="previous-button" title="Previous item">Prev</button>
-              <button type="button" data-seek="-10" title="Go back 10 seconds">−10s</button>
-              <button type="button" class="primary-control" id="play-button">Pause</button>
-              <button type="button" data-seek="30" title="Go forward 30 seconds">+30s</button>
-              <button type="button" id="next-button" title="Next item">Next</button>
+              <button type="button" class="primary-control" id="play-button" aria-label="Play">Play</button>
+              <button type="button" id="previous-button" aria-label="Previous item">Previous</button>
+              <button type="button" data-seek="-10" aria-label="Go back 10 seconds">−10s</button>
+              <button type="button" data-seek="30" aria-label="Go forward 30 seconds">+30s</button>
+              <button type="button" id="next-button" aria-label="Next item">Next</button>
+              <button type="button" id="mute-button" aria-pressed="false" aria-label="Mute">Mute</button>
+              <label class="range-control volume-control" for="volume-control"><span class="sr-only">Volume</span><input id="volume-control" type="range" min="0" max="100" value="100" step="1" aria-describedby="volume-value"><output class="sr-only" id="volume-value" for="volume-control">100%</output></label>
+              <div class="timeline-times" aria-label="Playback time"><span id="timeline-current">0:00</span><span aria-hidden="true">/</span><span id="timeline-duration">0:00</span></div>
             </div>
-            <div class="toggle-controls" aria-label="Quick settings">
-              <button type="button" id="mute-button" aria-pressed="false">Mute</button>
-              <button type="button" id="loop-button" aria-pressed="false">Loop</button>
-              <button type="button" id="fit-button" aria-pressed="false">Fill</button>
-              <button type="button" id="pip-button">PiP</button>
-            </div>
-            <div class="choice-control volume-control">
-              <label for="volume-control">Volume</label>
-              <div>
-                <input id="volume-control" type="range" min="0" max="200" value="100" step="5" aria-describedby="volume-value">
-                <output id="volume-value" for="volume-control">100%</output>
-              </div>
-            </div>
-            <div class="choice-control">
-              <span>Speed</span>
-              <div id="speed-controls">
-                <button type="button" data-rate="0.75">.75×</button>
-                <button type="button" data-rate="1" class="active">1×</button>
-                <button type="button" data-rate="1.25">1.25×</button>
-                <button type="button" data-rate="1.5">1.5×</button>
-                <button type="button" data-rate="2">2×</button>
-              </div>
-            </div>
-            <div class="choice-control">
-              <span>Stream</span>
-              <div id="stream-controls">
-                <button type="button" data-play-mode="auto" class="active">Auto</button>
-                <button type="button" data-play-mode="direct">Direct</button>
-                <button type="button" data-play-mode="compat">Compatible</button>
-              </div>
-            </div>
-            <div class="choice-control audio-choice" id="audio-track-control" hidden>
-              <label for="audio-track-controls">Audio</label>
-              <select id="audio-track-controls" aria-label="Audio track"></select>
+            <div class="toggle-controls" aria-label="Player settings">
+              <button type="button" id="captions-button" aria-label="Captions" aria-expanded="false" aria-controls="caption-menu">CC</button>
+              <button type="button" id="pip-button" aria-pressed="false" aria-label="Enter picture in picture">PiP</button>
+              <button type="button" class="advanced-playback-button" id="advanced-playback-button" aria-label="Playback settings" aria-haspopup="dialog" aria-controls="advanced-playback-dialog">Settings</button>
+              <button type="button" id="fullscreen-button" aria-pressed="false" aria-label="Enter full screen">Full</button>
             </div>
           </div>
         </div>
-        <div class="playback-mode" id="playback-mode" hidden>
-          <span></span><b id="mode-label">Direct play</b>
-        </div>
+
+        <dialog class="advanced-playback-dialog" id="advanced-playback-dialog" aria-labelledby="advanced-playback-title">
+          <form method="dialog">
+            <div class="dialog-heading"><h2 id="advanced-playback-title">Playback settings</h2><button value="close">Done</button></div>
+            <div class="advanced-actions" aria-label="Additional player settings">
+              <button type="button" id="loop-button" aria-pressed="false" aria-label="Turn loop on">Loop</button>
+              <button type="button" id="fit-button" aria-pressed="false" aria-label="Fill video frame">Fill</button>
+              <button type="button" id="shortcut-help-button" aria-label="Keyboard shortcuts">Keys</button>
+            </div>
+            <fieldset id="stream-controls"><legend>Stream mode</legend><div class="stream-options"><label><input type="radio" name="stream-mode" value="auto" checked> Auto</label><label><input type="radio" name="stream-mode" value="direct"> Original</label><label><input type="radio" name="stream-mode" value="compat"> Compatible</label></div></fieldset>
+            <div class="advanced-selects">
+              <label for="speed-control">Playback speed<select id="speed-control"><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+              <label id="audio-track-control" for="audio-track-controls" hidden>Audio track<select id="audio-track-controls"></select></label><span id="audio-track-status" role="status" hidden></span>
+              <label id="chapter-control" for="chapter-controls" hidden>Chapter<select id="chapter-controls"></select></label>
+              <button type="button" class="text-action" id="audio-track-retry" hidden>Retry audio tracks</button>
+              <label for="quality-control">Compatible quality<select id="quality-control"><option value="auto">Auto</option></select></label>
+              <label for="caption-size-control">Caption size<select id="caption-size-control"><option value="normal">Normal</option><option value="large">Large</option><option value="extra_large">Extra large</option></select></label>
+              <label for="caption-background-control">Caption background<select id="caption-background-control"><option value="translucent">Translucent</option><option value="solid">Solid</option></select></label>
+            </div>
+            <label class="autoplay-option"><input id="autoplay-control" type="checkbox"> Automatically play the next queue item</label>
+          </form>
+        </dialog>
+
+        <dialog id="shortcut-dialog" aria-labelledby="shortcut-dialog-title">
+          <form method="dialog">
+            <div class="dialog-heading"><h2 id="shortcut-dialog-title">Keyboard shortcuts</h2><button aria-label="Close shortcuts">Close</button></div>
+            <dl><div><dt>Space or K</dt><dd>Play / pause</dd></div><div><dt>Left / Right</dt><dd>Back / forward 10 seconds</dd></div><div><dt>J / L</dt><dd>Back / forward 10 seconds</dd></div><div><dt>M</dt><dd>Mute / unmute</dd></div><div><dt>F</dt><dd>Enter / exit full screen</dd></div><div><dt>?</dt><dd>Show this help</dd></div></dl>
+          </form>
+        </dialog>
+        <dialog id="item-details-dialog" aria-labelledby="item-details-title">
+          <form method="dialog">
+            <div class="dialog-heading"><h2 id="item-details-title">Item details</h2><button aria-label="Close item details">Close</button></div>
+            <p id="item-details-summary"></p>
+            <dl id="item-details-facts"></dl>
+          </form>
+        </dialog>
       </div>
-      <p class="player-message" id="player-message" role="status" hidden></p>
+
+      <div class="player-message" id="player-message" hidden>
+        <p id="player-message-text"></p>
+        <div id="player-message-actions"><button type="button" id="player-retry" hidden>Retry</button><button type="button" id="try-compatible" hidden>Try compatible</button><button type="button" id="play-original" hidden>Play original</button><button type="button" id="return-library" hidden>Return to library</button></div>
+        <details id="technical-details" hidden><summary>Technical details</summary><pre id="technical-message"></pre></details>
+      </div>
+      <p class="sr-only" id="playback-live" role="status" aria-live="polite"></p>
     </section>
 
-    <section class="library" aria-label="Media browser">
+    <section class="library" aria-labelledby="library-heading">
       <div class="library-chrome">
-        <div class="library-heading">
-          <label class="search">
-            <span class="search-icon" aria-hidden="true"></span>
-            <span class="sr-only">Search library</span>
-            <input id="search-input" type="search" placeholder="Search titles, artists, albums…" autocomplete="off">
-          </label>
+        <div class="library-heading-row">
+          <h2 id="library-heading">Library</h2>
+          <label class="search"><span class="search-icon" aria-hidden="true"></span><span class="sr-only">Search library</span><input id="search-input" type="search" placeholder="Filter this folder…" autocomplete="off"></label>
+          <label class="sort-control" for="sort-control">Sort<select id="sort-control"><option value="title">Title</option><option value="date_desc">Recently added</option><option value="episode">Episode / track</option></select></label>
         </div>
-        <div class="filters" role="tablist" aria-label="Media type">
-          <button class="active" data-view="folders" data-kind="all" role="tab" aria-selected="true">Folders</button>
-          <button data-view="library" data-kind="all" role="tab" aria-selected="false">All media</button>
-          <button data-view="library" data-kind="video" role="tab" aria-selected="false">Videos</button>
-          <button data-view="library" data-kind="audio" role="tab" aria-selected="false">Audio</button>
+        <div class="filters" role="tablist" aria-label="Media view">
+          <button id="tab-folders" class="active" data-view="folders" data-kind="all" role="tab" aria-selected="true" aria-controls="library-panel" tabindex="0">Folders</button>
+          <button id="tab-all" data-view="library" data-kind="all" role="tab" aria-selected="false" aria-controls="library-panel" tabindex="-1">All media</button>
+          <button id="tab-video" data-view="library" data-kind="video" role="tab" aria-selected="false" aria-controls="library-panel" tabindex="-1">Videos</button>
+          <button id="tab-audio" data-view="library" data-kind="audio" role="tab" aria-selected="false" aria-controls="library-panel" tabindex="-1">Audio</button>
+          <button id="tab-continue" data-view="continue" data-kind="all" role="tab" aria-selected="false" aria-controls="library-panel" tabindex="-1">Continue watching</button>
         </div>
         <nav class="breadcrumbs" id="breadcrumbs" aria-label="Current folder"></nav>
+        <p class="results-summary" id="results-summary"></p>
       </div>
-      <div class="library-results">
-        <div class="media-grid" id="media-grid" aria-live="polite"></div>
-        <div class="library-empty" id="library-empty" hidden>
-          <p>No media found</p><small>Try another search or wait for the library scan to finish.</small>
-        </div>
-        <div class="loading" id="loading" hidden><span></span>Loading library…</div>
-        <button class="load-more" id="load-more" hidden>Load more</button>
+      <div class="library-results" id="library-panel" role="tabpanel" aria-labelledby="tab-folders" tabindex="-1">
+        <div class="media-grid" id="media-grid"></div>
+        <div class="library-empty" id="library-empty" hidden><p id="library-empty-title">No media found</p><small id="library-empty-detail">Try another search.</small><button type="button" id="library-retry" hidden>Retry</button></div>
+        <div class="loading" id="loading" role="status" hidden><span class="spinner" aria-hidden="true"></span>Loading library…</div>
+        <button class="load-more" id="load-more" type="button" hidden>Load more</button>
       </div>
     </section>
   </main>
-
-  <footer><span>rustyDLNA web player</span><span>Embedded in the server binary</span></footer>
 </body>
 </html>

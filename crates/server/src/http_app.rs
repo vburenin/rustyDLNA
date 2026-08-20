@@ -201,6 +201,7 @@ impl App {
             jobs: JobGate::new(max_jobs),
             helpers,
             remuxes: Mutex::new(HashMap::new()),
+            recent_remux_states: Mutex::new(HashMap::new()),
             remux_metrics: remux::RemuxMetrics::new(initial_cache_bytes),
             events,
             notify_dispatcher,
@@ -372,6 +373,7 @@ impl App {
             }
             HttpRoute::WebLibrary => web_ui::library(self, req),
             HttpRoute::WebItem => web_ui::item(self, req),
+            HttpRoute::WebTranscodeStatus => web_ui::transcode_status(self, req),
             HttpRoute::WebMedia => web_ui::media(self, req, peer),
             HttpRoute::WebAsset => web_ui::asset(self, &req.path),
             HttpRoute::Thumbnail => self.thumbnail(req),
@@ -1651,6 +1653,7 @@ impl App {
                 let mut r = live_transcode_response("video/mp4");
                 r.remux_job = Some(RemuxJobSpec {
                     detail_id: item.detail_id,
+                    web_request_id: None,
                     mime: "video/mp4",
                     job_key,
                     cache_key,
@@ -1660,6 +1663,7 @@ impl App {
                     args,
                     fallback_args,
                     continue_after_disconnect: self.cfg.transcode.continue_after_disconnect,
+                    cacheable: true,
                     remux_p8,
                     audio_index: plan.audio_index,
                     audio: match plan.audio {
@@ -2033,6 +2037,13 @@ impl App {
         let cap_path = rusty_dlna_scan::rebase_media_path_for_config(&cap.path, &self.scan_cfg);
         match self.read_sidecar(&cap_path) {
             Ok(body) => {
+                if req
+                    .query
+                    .split('&')
+                    .any(|parameter| parameter == "format=webvtt")
+                {
+                    return web_ui::browser_caption_response(self, &cap.ext, &body);
+                }
                 let mut r = HttpResponse::new(200, "OK");
                 r.set("Content-Type", caption_http_mime(&cap.ext));
                 r.set("Content-Length", body.len());

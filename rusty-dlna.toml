@@ -49,6 +49,8 @@ enable = true
 encoder = "libx264"
 
 [transcode]
+# Original browser playback remains available when false; only the browser's
+# Compatible mode and configured DLNA remap jobs are disabled.
 enable = false
 encoder = "libx264"
 max_jobs = 2

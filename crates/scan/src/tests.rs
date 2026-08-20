@@ -3376,6 +3376,7 @@ fn apply_probe_writes_dlna_pn_and_multi_audio() {
             audio_streams: "1:0:aac:2,2:1:ac3:6".into(),
             width: 1920,
             height: 800,
+            ..SourceProbe::default()
         },
         av: AvMeta {
             duration: Some("1:00:00.000".into()),
@@ -3386,6 +3387,7 @@ fn apply_probe_writes_dlna_pn_and_multi_audio() {
         },
         tags: EmbeddedTags::default(),
         audio_tracks: Vec::new(),
+        chapters: Vec::new(),
     };
     apply_probe_to_detail(&db, id, &got).unwrap();
     db.upsert_object("64$1$1", "64$1", "item.videoItem", Some(id), "clip", None)

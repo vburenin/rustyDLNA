@@ -409,6 +409,28 @@ pub struct CatalogQueryPage {
     pub population: u32,
 }
 
+/// Media-kind filter for the embedded web player's detail-deduplicated query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebMediaKind {
+    /// Audio and video.
+    All,
+    /// Video only.
+    Video,
+    /// Audio only.
+    Audio,
+}
+
+/// Stable sort choices exposed by the embedded web player.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebMediaSort {
+    /// Metadata title, then detail identity.
+    Title,
+    /// Metadata date newest first, then title and identity.
+    DateDescending,
+    /// Album/show, disc/season, track/episode, then title and identity.
+    EpisodeTrack,
+}
+
 const QUERY_TITLE: &str = "CASE \
     WHEN o.PARENT_ID = '2$E' OR o.PARENT_ID LIKE '2$E$%' \
       OR o.PARENT_ID = '2$9' OR o.PARENT_ID LIKE '2$9$%' \
@@ -807,6 +829,97 @@ impl LibraryDb {
             start,
             take,
         )
+    }
+
+    /// Query one stable web-player page directly from `DETAILS`, selecting one
+    /// representative object per physical file. Virtual aliases therefore do
+    /// not multiply results, and later pages do not materialize or sort the
+    /// complete catalog in memory.
+    pub fn query_web_media_page(
+        &self,
+        kind: WebMediaKind,
+        query: &str,
+        sort: WebMediaSort,
+        start: usize,
+        take: usize,
+    ) -> rusqlite::Result<CatalogQueryPage> {
+        let mime = match kind {
+            WebMediaKind::All => "(d.MIME LIKE 'video/%' OR d.MIME LIKE 'audio/%')",
+            WebMediaKind::Video => "d.MIME LIKE 'video/%'",
+            WebMediaKind::Audio => "d.MIME LIKE 'audio/%'",
+        };
+        let order = match sort {
+            WebMediaSort::Title => "LOWER(COALESCE(NULLIF(d.TITLE, ''), d.PATH)), d.ID",
+            WebMediaSort::DateDescending => {
+                "COALESCE(d.DATE, '') DESC, LOWER(COALESCE(NULLIF(d.TITLE, ''), d.PATH)), d.ID"
+            }
+            WebMediaSort::EpisodeTrack => {
+                "LOWER(COALESCE(d.ALBUM, '')), COALESCE(d.DISC, 0), COALESCE(d.TRACK, 0), \
+                 LOWER(COALESCE(NULLIF(d.TITLE, ''), d.PATH)), d.ID"
+            }
+        };
+        let escaped = query
+            .to_lowercase()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let needle = format!("%{escaped}%");
+        let cte = format!(
+            "WITH matching AS (\
+               SELECT MIN(d.ID) AS detail_id \
+               FROM DETAILS d \
+               WHERE {mime} AND (\
+                 LOWER(COALESCE(d.TITLE, '')) LIKE ?1 ESCAPE '\\' OR \
+                 LOWER(COALESCE(d.ARTIST, '')) LIKE ?1 ESCAPE '\\' OR \
+                 LOWER(COALESCE(d.ALBUM_ARTIST, '')) LIKE ?1 ESCAPE '\\' OR \
+                 LOWER(COALESCE(d.ALBUM, '')) LIKE ?1 ESCAPE '\\' OR \
+                 LOWER(COALESCE(d.PATH, '')) LIKE ?1 ESCAPE '\\'\
+               ) \
+               GROUP BY CASE WHEN COALESCE(d.INODE, 0) = 0 \
+                 THEN 'id:' || d.ID ELSE d.DEVICE || ':' || d.INODE END\
+             ), representatives AS (\
+               SELECT m.detail_id, COALESCE(\
+                 MIN(CASE WHEN o.REF_ID IS NULL THEN o.OBJECT_ID END), \
+                 MIN(o.OBJECT_ID)\
+               ) AS object_id \
+               FROM matching m JOIN OBJECTS o ON o.DETAIL_ID = m.detail_id \
+               GROUP BY m.detail_id\
+             ) "
+        );
+        let population_i64: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM OBJECTS WHERE OBJECT_ID <> ?1",
+            [ROOT_ID],
+            |row| row.get(0),
+        )?;
+        let total_i64: i64 = self
+            .conn
+            .prepare_cached(&format!("{cte}SELECT COUNT(*) FROM representatives"))?
+            .query_row([&needle], |row| row.get(0))?;
+        let total = u32::try_from(total_i64.max(0)).unwrap_or(u32::MAX);
+        let population = u32::try_from(population_i64.max(0)).unwrap_or(u32::MAX);
+        if take == 0 || start >= total_i64.max(0) as usize {
+            return Ok(CatalogQueryPage {
+                object_ids: Vec::new(),
+                total,
+                population,
+            });
+        }
+        let sql = format!(
+            "{cte}SELECT r.object_id FROM representatives r \
+             JOIN DETAILS d ON d.ID = r.detail_id \
+             ORDER BY {order} LIMIT {} OFFSET {}",
+            take.min(i64::MAX as usize),
+            start.min(i64::MAX as usize)
+        );
+        let mut statement = self.conn.prepare_cached(&sql)?;
+        let object_ids = statement
+            .query_map([&needle], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(CatalogQueryPage {
+            object_ids,
+            total,
+            population,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3400,6 +3513,91 @@ mod query_tests {
             .unwrap();
         assert_eq!(past_end.total, 3);
         assert!(past_end.object_ids.is_empty());
+    }
+
+    #[test]
+    fn web_media_query_deduplicates_aliases_and_physical_files_before_paging() {
+        let db = query_fixture();
+        db.conn
+            .execute(
+                "INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, REF_ID, CLASS, DETAIL_ID, NAME)
+                 VALUES ('alias-zulu', '2', '2$1', 'item.videoItem', 1, 'alias')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute("UPDATE DETAILS SET DEVICE = 9, INODE = 42 WHERE ID = 2", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO DETAILS (ID, PATH, TITLE, DATE, ALBUM, TRACK, MIME, DEVICE, INODE)
+                 VALUES (4, '/alias/alpha.mp4', 'Alpha duplicate', '2024-01-02', 'Album', 4, 'video/mp4', 9, 42)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID, NAME)
+                 VALUES ('2$4', '2', 'item.videoItem', 4, 'duplicate')",
+                [],
+            )
+            .unwrap();
+
+        let page = db
+            .query_web_media_page(WebMediaKind::Video, "", WebMediaSort::Title, 0, 2)
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.object_ids, ["2$2", "2$3"]);
+        let second = db
+            .query_web_media_page(WebMediaKind::Video, "", WebMediaSort::Title, 2, 2)
+            .unwrap();
+        assert_eq!(second.total, 3);
+        assert_eq!(second.object_ids, ["2$1"]);
+
+        let searched = db
+            .query_web_media_page(WebMediaKind::All, "zulu", WebMediaSort::Title, 0, 10)
+            .unwrap();
+        assert_eq!(searched.total, 1);
+        assert_eq!(searched.object_ids, ["2$1"]);
+    }
+
+    #[test]
+    #[ignore = "50k-row latency benchmark; run explicitly in release mode"]
+    fn web_media_50k_page_benchmark_stays_in_sqlite() {
+        let mut db = LibraryDb::open_memory().unwrap();
+        let transaction = db.conn.transaction().unwrap();
+        {
+            let mut detail = transaction
+                .prepare("INSERT INTO DETAILS (ID, PATH, TITLE, MIME, DEVICE, INODE, DATE) VALUES (?1, ?2, ?3, 'video/mp4', 1, ?1, '2026-01-01')")
+                .unwrap();
+            let mut object = transaction
+                .prepare("INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID, NAME) VALUES (?1, '64', 'item.videoItem', ?2, ?3)")
+                .unwrap();
+            for id in 1i64..=50_000 {
+                let title = format!("Title {id:05}");
+                detail
+                    .execute(params![id, format!("/media/{id}.mp4"), title])
+                    .unwrap();
+                object
+                    .execute(params![format!("64${id}"), id, format!("{id}.mp4")])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+
+        for offset in [0, 25_000, 49_800] {
+            let started = std::time::Instant::now();
+            let page = db
+                .query_web_media_page(WebMediaKind::Video, "", WebMediaSort::Title, offset, 200)
+                .unwrap();
+            assert_eq!(page.total, 50_000);
+            assert_eq!(page.object_ids.len(), 200);
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(750),
+                "50k page at offset {offset} exceeded the 750ms release target: {:?}",
+                started.elapsed()
+            );
+        }
     }
 
     #[test]

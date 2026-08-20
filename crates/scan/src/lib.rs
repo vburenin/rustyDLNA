@@ -18,7 +18,7 @@ pub use catalog::*;
 pub use db::{
     mime_to_ext, CatalogDefaultOrder, CatalogQuery, CatalogQueryClause, CatalogQueryField,
     CatalogQueryOp, CatalogQueryPage, CatalogQuerySort, DetailStat, DetailStreamUpdate,
-    ExistingDetail, InodeSource, LibraryDb, NewDetail,
+    ExistingDetail, InodeSource, LibraryDb, NewDetail, WebMediaKind, WebMediaSort,
 };
 pub use metadata::*;
 pub use nfo::{
@@ -3294,18 +3294,64 @@ pub fn probe_from_stored(
         video = "mpeg4".into();
     }
     let (width, height) = parse_resolution(resolution);
-    SourceProbe {
+    let audio_streams = audio_streams
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string();
+    let mut probe = SourceProbe {
         container,
         video,
         audio: audio.filter(|s| !s.is_empty()).unwrap_or("").to_string(),
-        audio_streams: audio_streams
-            .filter(|s| !s.is_empty())
-            .unwrap_or("")
-            .to_string(),
+        audio_streams,
         hdr: hdr.filter(|s| !s.is_empty()).unwrap_or("").to_string(),
         width,
         height,
+        ..SourceProbe::default()
+    };
+    if let Some(record) = probe
+        .audio_streams
+        .split(',')
+        .find(|record| record.starts_with("@v:"))
+    {
+        let mut fields = record.split(':');
+        let _marker = fields.next();
+        probe.video_profile = decode_compact_stream_field(fields.next().unwrap_or(""));
+        probe.video_level = fields
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        probe.pixel_format = decode_compact_stream_field(fields.next().unwrap_or(""));
+        probe.bit_depth = fields
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        probe.frame_rate = decode_compact_stream_field(fields.next().unwrap_or(""));
+        probe.codec_string = decode_compact_stream_field(fields.next().unwrap_or(""));
+        probe.audio_layout = decode_compact_stream_field(fields.next().unwrap_or(""));
     }
+    probe
+}
+
+fn decode_compact_stream_field(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let Some(high) = (bytes[index + 1] as char).to_digit(16) else {
+                return String::new();
+            };
+            let Some(low) = (bytes[index + 2] as char).to_digit(16) else {
+                return String::new();
+            };
+            decoded.push(((high << 4) | low) as u8);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).unwrap_or_default()
 }
 
 pub fn apply_probe_to_detail(db: &LibraryDb, id: i64, got: &MediaProbe) -> ScanResult<()> {
@@ -3459,6 +3505,7 @@ fn persist_prepared_probe(
             av: AvMeta::default(),
             tags: EmbeddedTags::default(),
             audio_tracks: Vec::new(),
+            chapters: Vec::new(),
         },
     )?;
     Ok(true)

@@ -11,8 +11,16 @@ pub struct SourceProbe {
     pub hdr: String,
     pub audio: String,
     /// Comma-separated `global-stream:audio-ordinal:codec:channels` records.
-    /// Unlike `audio`, this preserves duplicate codecs and real stream order.
+    /// Optional percent-encoded language, title, and default-disposition
+    /// fields follow. Unlike `audio`, this preserves stream order and labels.
     pub audio_streams: String,
+    pub video_profile: String,
+    pub video_level: u32,
+    pub pixel_format: String,
+    pub bit_depth: u32,
+    pub frame_rate: String,
+    pub audio_layout: String,
+    pub codec_string: String,
     pub width: u32,
     pub height: u32,
 }
@@ -36,6 +44,13 @@ pub fn parse_probe_toml(text: &str) -> SourceProbe {
             "hdr" => p.hdr = v.to_string(),
             "audio" => p.audio = v.to_string(),
             "audio_streams" => p.audio_streams = v.to_string(),
+            "video_profile" => p.video_profile = v.to_string(),
+            "video_level" => p.video_level = v.parse().unwrap_or(0),
+            "pixel_format" => p.pixel_format = v.to_string(),
+            "bit_depth" => p.bit_depth = v.parse().unwrap_or(0),
+            "frame_rate" => p.frame_rate = v.to_string(),
+            "audio_layout" => p.audio_layout = v.to_string(),
+            "codec_string" => p.codec_string = v.to_string(),
             "width" => p.width = v.parse().unwrap_or(0),
             "height" => p.height = v.parse().unwrap_or(0),
             _ => {}
