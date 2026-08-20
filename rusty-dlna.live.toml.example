@@ -41,6 +41,11 @@ bookmark_retention_days = 90
 # Generate a stable uuid so clients do not see a new device every rebuild.
 # uuid = "uuid:xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx"
 
+[web]
+enable = true
+# Use h264_nvenc with the NVIDIA Compose override documented in WEB_PLAYER.md.
+encoder = "libx264"
+
 [transcode]
 enable = true
 encoder = "libx264"

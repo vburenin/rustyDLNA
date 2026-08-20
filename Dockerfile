@@ -4,35 +4,32 @@
 
 FROM rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS build
 
+# Build and run against the same FFmpeg 8 ABI. The official Rust toolchain is
+# copied into the Ubuntu builder so ffmpeg-sys-next links to libavformat 62,
+# rather than to Debian bookworm's incompatible libavformat 59.
+FROM ubuntu:resolute-20260724.1@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03 AS app-build
+
+COPY --from=build /usr/local/cargo /usr/local/cargo
+COPY --from=build /usr/local/rustup /usr/local/rustup
+
 ARG TARGETARCH
 ARG DOVI_TOOL_VERSION=2.3.3
-ARG DEBIAN_SNAPSHOT=20260801T000000Z
+ARG FFMPEG_VERSION=7:8.0.1-3ubuntu2
 ARG SOURCE_DATE_EPOCH=0
 
-ENV SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH
-
-RUN printf '%s\n' \
-      'Types: deb' \
-      "URIs: https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}" \
-      'Suites: bookworm bookworm-updates' \
-      'Components: main' \
-      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
-      'Check-Valid-Until: no' \
-      '' \
-      'Types: deb' \
-      "URIs: https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}" \
-      'Suites: bookworm-security' \
-      'Components: main' \
-      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
-      'Check-Valid-Until: no' \
-      > /etc/apt/sources.list.d/debian.sources
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:$PATH \
+    SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH \
+    DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
         pkg-config \
         clang \
         curl \
         ca-certificates \
-        libavformat-dev \
+        libavformat-dev="$FFMPEG_VERSION" \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -44,7 +41,7 @@ COPY crates ./crates
 COPY assets ./assets
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+    --mount=type=cache,id=rusty-dlna-target-ffmpeg8,target=/src/target \
     cargo build --locked --release -p rusty-dlna \
     && cp target/release/rusty-dlna /tmp/rusty-dlna \
     && strip /tmp/rusty-dlna
@@ -64,13 +61,9 @@ RUN set -eux; \
     tar -xzf "/tmp/$archive" -C /opt/dovi/bin; \
     chmod 0755 /opt/dovi/bin/dovi_tool
 
-FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+FROM ubuntu:resolute-20260724.1@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03
 
-# bookworm-slim does not ship a CA bundle. Bootstrap it from the already
-# digest-pinned build image before switching APT to the HTTPS snapshot.
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-
-ARG DEBIAN_SNAPSHOT=20260801T000000Z
+ARG FFMPEG_VERSION=7:8.0.1-3ubuntu2
 ARG BUILD_VERSION=dev
 ARG VCS_REF=unknown
 ARG BUILD_DATE=1970-01-01T00:00:00Z
@@ -89,26 +82,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LC_ALL=C.UTF-8 \
     SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH
 
-RUN printf '%s\n' \
-      'Types: deb' \
-      "URIs: https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}" \
-      'Suites: bookworm bookworm-updates' \
-      'Components: main' \
-      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
-      'Check-Valid-Until: no' \
-      '' \
-      'Types: deb' \
-      "URIs: https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}" \
-      'Suites: bookworm-security' \
-      'Components: main' \
-      'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
-      'Check-Valid-Until: no' \
-      > /etc/apt/sources.list.d/debian.sources
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg \
+        ffmpeg="$FFMPEG_VERSION" \
         ca-certificates \
         curl \
+        libegl1 \
         tzdata \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone \
@@ -118,8 +96,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chown -R 10001:10001 /var/cache/rusty-dlna \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /tmp/rusty-dlna /usr/local/bin/rusty-dlna
-COPY --from=build /opt/dovi/bin/ /usr/local/bin/
+COPY --from=app-build /tmp/rusty-dlna /usr/local/bin/rusty-dlna
+COPY --from=app-build /opt/dovi/bin/ /usr/local/bin/
 COPY --chmod=0755 scripts/cache-volume-init.sh /usr/local/libexec/rusty-dlna-cache-volume-init
 COPY rusty-dlna.toml /etc/rusty-dlna.toml
 COPY LICENSE /usr/share/doc/rusty-dlna/LICENSE

@@ -6,6 +6,14 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use std::ptr;
+
+extern "C" {
+    fn rusty_dlna_codec_side_data(
+        parameters: *mut sys::AVCodecParameters,
+        kind: sys::AVPacketSideDataType,
+        size: *mut usize,
+    ) -> *const u8;
+}
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
@@ -41,6 +49,20 @@ pub struct MediaProbe {
     pub probe: SourceProbe,
     pub av: AvMeta,
     pub tags: EmbeddedTags,
+    /// Ordered audio streams with request-facing labels. These are collected
+    /// on demand by the web player and are not persisted in the catalog.
+    pub audio_tracks: Vec<AudioTrackProbe>,
+}
+
+/// One audio stream discovered by libavformat.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioTrackProbe {
+    /// Zero-based audio-stream ordinal used by ffmpeg's `0:a:N` selector.
+    pub index: usize,
+    pub codec: String,
+    pub channels: u32,
+    pub language: Option<String>,
+    pub title: Option<String>,
 }
 
 static INIT: Once = Once::new();
@@ -383,6 +405,7 @@ unsafe fn probe_avformat(
         },
         av: AvMeta::default(),
         tags: EmbeddedTags::default(),
+        audio_tracks: Vec::new(),
     };
     let fmt = (*ctx).iformat;
     if !fmt.is_null() {
@@ -431,7 +454,7 @@ unsafe fn probe_avformat(
                         out.probe.height = h;
                         out.av.resolution = Some(format!("{w}x{h}"));
                     }
-                    if let Some(p) = dovi_profile(st, par) {
+                    if let Some(p) = dovi_profile(par) {
                         out.probe.hdr = match p {
                             7 => "dv-p7".into(),
                             8 => "dv-p8".into(),
@@ -455,6 +478,13 @@ unsafe fn probe_avformat(
                 let name = map_audio((*par).codec_id);
                 let first = audio_streams.is_empty();
                 let audio_ordinal = audio_streams.len();
+                out.audio_tracks.push(AudioTrackProbe {
+                    index: audio_ordinal,
+                    codec: name.to_owned(),
+                    channels: (*par).ch_layout.nb_channels.max(0) as u32,
+                    language: dictionary_value((*st).metadata, &["language"]),
+                    title: dictionary_value((*st).metadata, &["title"]),
+                });
                 audio_streams.push(format!(
                     "{i}:{audio_ordinal}:{name}:{}",
                     (*par).ch_layout.nb_channels.max(0)
@@ -496,10 +526,10 @@ unsafe fn probe_avformat(
     Some(out)
 }
 
-unsafe fn dovi_profile(st: *mut sys::AVStream, par: *mut sys::AVCodecParameters) -> Option<u8> {
+unsafe fn dovi_profile(par: *mut sys::AVCodecParameters) -> Option<u8> {
     let kind = sys::AVPacketSideDataType::AV_PKT_DATA_DOVI_CONF;
     let mut sz = 0usize;
-    let from_st = sys::av_stream_get_side_data(st, kind, &mut sz);
+    let from_st = rusty_dlna_codec_side_data(par, kind, &mut sz);
     if !from_st.is_null() && sz >= 3 {
         return Some(*from_st.add(2));
     }

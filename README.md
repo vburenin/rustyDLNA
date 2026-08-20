@@ -52,6 +52,19 @@ player asked* — not titles. Actions are leave it, remux Dolby Vision
 Profile 7 to Profile 8.1, encode HDR10, or convert audio to AC3. Empty
 rules means nobody is remuxed, including Cast.
 
+**Embedded web player.** The responsive player at `/` traverses physical media
+folders and also searches flat video/audio views without a separate frontend
+deployment. One-click controls cover seek, previous/next, speed, mute, loop,
+fit, picture-in-picture, fullscreen, and stream mode. Its HTML, CSS, and
+JavaScript are compiled into the server binary. The browser tries native
+playback first; when `[transcode].enable = true`, unsupported media falls back
+to cached, growing H.264/AAC MP4 (or AAC-in-MP4 for audio). Set
+`[web].encoder = "h264_nvenc"` to use an exposed NVIDIA GPU, with automatic
+CUDA decode and scaling for H.264/HEVC sources and automatic `libx264`
+fallback if the GPU path cannot start. Set `[web].enable = false` to remove all
+player routes and restore the status page at `/`; `/status` is always the
+operator status page.
+
 **Operations.** TOML configuration with unknown keys rejected. A shared,
 cancellation-aware graceful-stop budget defaults to 15 seconds; scanner
 transactions roll back and helper process groups are terminated and reaped.
@@ -69,7 +82,7 @@ These are intentional, not missing todos. See
 
 - PNG, WebP, and HEIF/HEIC as library pictures
 - IPv6, mDNS/Avahi, TiVo, MiniSSDPd
-- Online sources, plugins, a web player, or remote access
+- Online sources, plugins, or built-in remote-access/authentication services
 - Upload / import APIs — media enters through read-only configured roots
 - Transcoding everything so an old TV can play any file. Remaps are
   explicit. There is no live “make it MPEG-TS” profile pack yet.
@@ -106,6 +119,8 @@ Do not commit `.env`, `rusty-dlna.live.toml`, or
 
 Shipped defaults are in [`rusty-dlna.toml`](rusty-dlna.toml). Remap
 examples and HDR notes are in [`docs/TRANSCODE.md`](docs/TRANSCODE.md).
+Web-player behavior and routes are in
+[`docs/WEB_PLAYER.md`](docs/WEB_PLAYER.md).
 Release and source obligations are in
 [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md).
 Capacity planning, alerts, persistent-volume ownership, and the native systemd

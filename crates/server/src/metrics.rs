@@ -12,7 +12,7 @@ use rusty_dlna_http::HttpRoute;
 use serde_json::{json, Map, Value};
 
 const LATENCY_BOUNDS_MS: [u64; 10] = [1, 5, 10, 25, 50, 100, 250, 500, 1_000, 5_000];
-const ROUTE_COUNT: usize = 20;
+const ROUTE_COUNT: usize = 24;
 const SOAP_ACTION_COUNT: usize = 14;
 const SOAP_FAULT_COUNT: usize = 12;
 
@@ -386,6 +386,10 @@ fn all_routes() -> [HttpRoute; ROUTE_COUNT] {
         HttpRoute::Status,
         HttpRoute::Health,
         HttpRoute::ApiStatus,
+        HttpRoute::WebLibrary,
+        HttpRoute::WebItem,
+        HttpRoute::WebMedia,
+        HttpRoute::WebAsset,
         HttpRoute::Presentation,
         HttpRoute::NotFound,
     ]
@@ -411,8 +415,12 @@ fn route_index(route: HttpRoute) -> usize {
         HttpRoute::Status => 15,
         HttpRoute::Health => 16,
         HttpRoute::ApiStatus => 17,
-        HttpRoute::Presentation => 18,
-        HttpRoute::NotFound => 19,
+        HttpRoute::WebLibrary => 18,
+        HttpRoute::WebItem => 19,
+        HttpRoute::WebMedia => 20,
+        HttpRoute::WebAsset => 21,
+        HttpRoute::Presentation => 22,
+        HttpRoute::NotFound => 23,
     }
 }
 
@@ -436,6 +444,10 @@ fn route_name(route: HttpRoute) -> &'static str {
         HttpRoute::Status => "status",
         HttpRoute::Health => "health",
         HttpRoute::ApiStatus => "api_status",
+        HttpRoute::WebLibrary => "web_library",
+        HttpRoute::WebItem => "web_item",
+        HttpRoute::WebMedia => "web_media",
+        HttpRoute::WebAsset => "web_asset",
         HttpRoute::Presentation => "presentation",
         HttpRoute::NotFound => "not_found",
     }

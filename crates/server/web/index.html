@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d0f">
+  <title>rustyDLNA Player</title>
+  <link rel="stylesheet" href="/web/app.css?v=fullscreen-19">
+  <script src="/web/app.js?v=fullscreen-19" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Player home">
+      <span class="brand-mark" aria-hidden="true"><i></i></span>
+      <span><strong id="server-name">rustyDLNA</strong><small>PLAYER</small></span>
+    </a>
+    <div class="top-now-playing">
+      <span>NOW PLAYING</span>
+      <strong id="now-playing-title">Nothing selected</strong>
+    </div>
+    <div class="top-actions">
+      <span class="server-state"><i></i><span id="library-count">Connecting</span></span>
+      <a class="status-link" href="/status">Server status</a>
+    </div>
+  </header>
+
+  <main>
+    <section class="player-panel" aria-labelledby="now-playing-title">
+      <div class="player-stage" id="player-stage">
+        <video id="video-player" controls playsinline preload="metadata"></video>
+        <button type="button" class="stage-fullscreen" id="fullscreen-button" title="Full screen (Ctrl+F)" aria-label="Enter full screen" hidden>Full screen</button>
+        <div class="audio-stage" id="audio-stage" hidden>
+          <div class="disc-wrap"><img id="audio-art" alt=""><span class="disc"></span></div>
+          <audio id="audio-player" controls preload="metadata"></audio>
+        </div>
+        <div class="player-empty" id="player-empty">
+          <span class="empty-icon" aria-hidden="true"></span>
+          <p>Choose something from your library</p>
+          <small>Video and audio play here, without leaving the page.</small>
+        </div>
+      </div>
+      <div class="now-playing">
+        <div>
+          <p id="now-playing-meta">Pick a title below to begin.</p>
+          <div class="playback-controls" id="playback-controls" hidden>
+            <div class="timeline-control">
+              <input id="timeline" type="range" min="0" max="0" value="0" step="1" aria-label="Seek through video">
+              <small class="timeline-status" id="timeline-status" role="status" hidden></small>
+              <div class="timeline-times"><span id="timeline-current">0:00</span><span id="timeline-duration">0:00</span></div>
+            </div>
+            <div class="transport-controls" aria-label="Playback controls">
+              <button type="button" id="previous-button" title="Previous item">Prev</button>
+              <button type="button" data-seek="-10" title="Go back 10 seconds">−10s</button>
+              <button type="button" class="primary-control" id="play-button">Pause</button>
+              <button type="button" data-seek="30" title="Go forward 30 seconds">+30s</button>
+              <button type="button" id="next-button" title="Next item">Next</button>
+            </div>
+            <div class="toggle-controls" aria-label="Quick settings">
+              <button type="button" id="mute-button" aria-pressed="false">Mute</button>
+              <button type="button" id="loop-button" aria-pressed="false">Loop</button>
+              <button type="button" id="fit-button" aria-pressed="false">Fill</button>
+              <button type="button" id="pip-button">PiP</button>
+            </div>
+            <div class="choice-control volume-control">
+              <label for="volume-control">Volume</label>
+              <div>
+                <input id="volume-control" type="range" min="0" max="200" value="100" step="5" aria-describedby="volume-value">
+                <output id="volume-value" for="volume-control">100%</output>
+              </div>
+            </div>
+            <div class="choice-control">
+              <span>Speed</span>
+              <div id="speed-controls">
+                <button type="button" data-rate="0.75">.75×</button>
+                <button type="button" data-rate="1" class="active">1×</button>
+                <button type="button" data-rate="1.25">1.25×</button>
+                <button type="button" data-rate="1.5">1.5×</button>
+                <button type="button" data-rate="2">2×</button>
+              </div>
+            </div>
+            <div class="choice-control">
+              <span>Stream</span>
+              <div id="stream-controls">
+                <button type="button" data-play-mode="auto" class="active">Auto</button>
+                <button type="button" data-play-mode="direct">Direct</button>
+                <button type="button" data-play-mode="compat">Compatible</button>
+              </div>
+            </div>
+            <div class="choice-control audio-choice" id="audio-track-control" hidden>
+              <label for="audio-track-controls">Audio</label>
+              <select id="audio-track-controls" aria-label="Audio track"></select>
+            </div>
+          </div>
+        </div>
+        <div class="playback-mode" id="playback-mode" hidden>
+          <span></span><b id="mode-label">Direct play</b>
+        </div>
+      </div>
+      <p class="player-message" id="player-message" role="status" hidden></p>
+    </section>
+
+    <section class="library" aria-label="Media browser">
+      <div class="library-chrome">
+        <div class="library-heading">
+          <label class="search">
+            <span class="search-icon" aria-hidden="true"></span>
+            <span class="sr-only">Search library</span>
+            <input id="search-input" type="search" placeholder="Search titles, artists, albums…" autocomplete="off">
+          </label>
+        </div>
+        <div class="filters" role="tablist" aria-label="Media type">
+          <button class="active" data-view="folders" data-kind="all" role="tab" aria-selected="true">Folders</button>
+          <button data-view="library" data-kind="all" role="tab" aria-selected="false">All media</button>
+          <button data-view="library" data-kind="video" role="tab" aria-selected="false">Videos</button>
+          <button data-view="library" data-kind="audio" role="tab" aria-selected="false">Audio</button>
+        </div>
+        <nav class="breadcrumbs" id="breadcrumbs" aria-label="Current folder"></nav>
+      </div>
+      <div class="library-results">
+        <div class="media-grid" id="media-grid" aria-live="polite"></div>
+        <div class="library-empty" id="library-empty" hidden>
+          <p>No media found</p><small>Try another search or wait for the library scan to finish.</small>
+        </div>
+        <div class="loading" id="loading" hidden><span></span>Loading library…</div>
+        <button class="load-more" id="load-more" hidden>Load more</button>
+      </div>
+    </section>
+  </main>
+
+  <footer><span>rustyDLNA web player</span><span>Embedded in the server binary</span></footer>
+</body>
+</html>

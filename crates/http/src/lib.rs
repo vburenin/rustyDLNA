@@ -43,6 +43,10 @@ pub enum HttpRoute {
     Status,
     Health,
     ApiStatus,
+    WebLibrary,
+    WebItem,
+    WebMedia,
+    WebAsset,
     Presentation,
     NotFound,
 }
@@ -73,7 +77,11 @@ pub fn route(method: &str, path: &str) -> HttpRoute {
         STATUS_PATH => HttpRoute::Status,
         HEALTH_PATH => HttpRoute::Health,
         API_STATUS_PATH => HttpRoute::ApiStatus,
+        "/api/web/library" => HttpRoute::WebLibrary,
         "/" => HttpRoute::Presentation,
+        p if p.starts_with("/api/web/item/") => HttpRoute::WebItem,
+        p if p.starts_with("/web/media/") => HttpRoute::WebMedia,
+        "/web/app.css" | "/web/app.js" => HttpRoute::WebAsset,
         p if p.starts_with(MEDIA_ITEMS_PREFIX) => HttpRoute::MediaItem,
         p if p.starts_with(TRANSCODE_PREFIX) => HttpRoute::Transcode,
         p if p.starts_with(THUMBNAILS_PREFIX) => HttpRoute::Thumbnail,
@@ -92,7 +100,10 @@ pub fn persist_for_route(
     conn_close: bool,
     conn_keep: bool,
 ) -> bool {
-    if route == HttpRoute::MediaItem || route == HttpRoute::Transcode {
+    if matches!(
+        route,
+        HttpRoute::MediaItem | HttpRoute::Transcode | HttpRoute::WebMedia
+    ) {
         return false;
     }
     http_should_persist(httpver, conn_close, conn_keep)
@@ -299,6 +310,8 @@ pub struct OpenFileRange {
 #[derive(Clone, Debug)]
 pub struct RemuxJobSpec {
     pub detail_id: i64,
+    /// HTTP media type for both growing and completed cached output.
+    pub mime: &'static str,
     /// Complete immutable identity used for in-process job sharing.
     pub job_key: String,
     /// Source/plan/tool digest stored beside the finished cache file.
@@ -309,6 +322,12 @@ pub struct RemuxJobSpec {
     pub source_file: Option<std::sync::Arc<std::fs::File>>,
     pub dest: std::path::PathBuf,
     pub args: Vec<std::ffi::OsString>,
+    /// Optional software command used only when a hardware producer fails
+    /// before it has emitted a playable first fragment.
+    pub fallback_args: Option<Vec<std::ffi::OsString>>,
+    /// Whether the producer may keep running after its last HTTP reader goes
+    /// away. DLNA cache jobs may opt in; interactive browser streams do not.
+    pub continue_after_disconnect: bool,
     /// Try `dovi_tool` P8.1 convert first; `args` is the hdr10 fallback.
     pub remux_p8: bool,
     pub audio_index: usize,
@@ -510,6 +529,10 @@ mod tests {
         assert_eq!(route("GET", "/Transcode/3.mp4"), HttpRoute::Transcode);
         assert_eq!(route("GET", "/health"), HttpRoute::Health);
         assert_eq!(route("GET", "/api/status"), HttpRoute::ApiStatus);
+        assert_eq!(route("GET", "/api/web/library"), HttpRoute::WebLibrary);
+        assert_eq!(route("GET", "/api/web/item/3"), HttpRoute::WebItem);
+        assert_eq!(route("GET", "/web/app.js"), HttpRoute::WebAsset);
+        assert_eq!(route("GET", "/web/media/3.mp4"), HttpRoute::WebMedia);
     }
 
     #[test]

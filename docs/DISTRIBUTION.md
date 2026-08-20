@@ -1,9 +1,9 @@
 # Distribution and reproducibility
 
 rustyDLNA is GPL-2.0-only. The official release artifact is the multi-architecture
-OCI image. A bare ELF is deliberately not published: the scanner links Debian's
+OCI image. A bare ELF is deliberately not published: the scanner links Ubuntu's
 FFmpeg libraries and such a file would not be portable without an exact runtime
-dependency contract. The image contains those libraries, Debian's FFmpeg command,
+dependency contract. The image contains those libraries, Ubuntu's FFmpeg command,
 and the pinned MIT-licensed `dovi_tool`. Distributors are responsible for all
 corresponding-source and notice obligations; an opaque image alone is insufficient.
 
@@ -25,7 +25,7 @@ For a `v*` tag, GitHub Actions:
 
 The Docker build accepts `BUILD_VERSION`, `VCS_REF`, `BUILD_DATE`, and
 `SOURCE_DATE_EPOCH`; the release workflow derives them from the signed tag
-commit. Base images, Debian snapshot timestamp, `dovi_tool` version/checksums,
+commit. Base images, FFmpeg package version, `dovi_tool` version/checksums,
 GitHub Actions, Cargo lockfile, and Rust toolchain are pinned.
 The current Rust toolchain is `1.97.1`; the scheduled updater changes this
 documentation, Cargo, Docker, and every CI/release/soak pin in one tested PR.
@@ -35,10 +35,10 @@ documentation, Cargo, Docker, and every CI/release/soak pin in one tested PR.
 Every public release must keep the repository tag and its lockfile available
 beside the binary/image for at least as long as the artifacts are offered. The
 release notes must link the tag source archive. System-package source is
-identified by package version in the image SBOM; Debian source and patches are
-available from `sources.debian.org`. `THIRD_PARTY_NOTICES.md` gives the stable
+identified by package version in the image SBOM; Ubuntu source and patches are
+available from the Ubuntu package archive. `THIRD_PARTY_NOTICES.md` gives the stable
 source locations and the complete dovi_tool MIT notice. The image retains
-Debian package copyright files under `/usr/share/doc` and copies the project
+distribution package copyright files under `/usr/share/doc` and copies the project
 license/notices to `/usr/share/doc/rusty-dlna`.
 
 Anyone redistributing a modified image must publish the corresponding modified

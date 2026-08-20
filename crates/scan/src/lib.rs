@@ -3458,6 +3458,7 @@ fn persist_prepared_probe(
             probe,
             av: AvMeta::default(),
             tags: EmbeddedTags::default(),
+            audio_tracks: Vec::new(),
         },
     )?;
     Ok(true)

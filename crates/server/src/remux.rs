@@ -1,5 +1,5 @@
-//! One background remux per title. Kodi opens several GETs at once;
-//! they all attach here. Probe disconnect does not kill ffmpeg.
+//! One background remux per title. Concurrent GETs share one producer; each
+//! route decides whether its producer may outlive the last HTTP reader.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -278,15 +278,38 @@ fn spawn_ffmpeg(
                     }
                 }
             }
-            let args = &spec.args;
+            let mut args = &spec.args;
             tracing::info!(id, dest = %dest.display(), "remux job start");
-            let result = run_ffmpeg_growing(
+            let mut result = run_ffmpeg_growing(
                 args,
                 spec.source_file.as_deref(),
                 &job,
                 deadline,
                 &app,
             );
+            let primary_failed = matches!(&result, Ok((status, _)) if !status.success());
+            if primary_failed
+                && !job.cancelled.load(Ordering::Acquire)
+                && current_len(&job) < FIRST_BYTES
+            {
+                if let Some(fallback) = spec.fallback_args.as_ref() {
+                    tracing::warn!(
+                        id,
+                        dest = %dest.display(),
+                        "hardware transcode unavailable; retrying with software encoder"
+                    );
+                    cleanup_intermediates(&part);
+                    job.transition(RemuxState::Starting);
+                    args = fallback;
+                    result = run_ffmpeg_growing(
+                        args,
+                        spec.source_file.as_deref(),
+                        &job,
+                        deadline,
+                        &app,
+                    );
+                }
+            }
             match result {
                 Ok((status, _)) if status.success() => {
                     let production_ffmpeg = args.first().is_some_and(|executable| {
@@ -713,7 +736,7 @@ fn generated_cache_mp4(path: &Path) -> bool {
     fields.next().is_some_and(|id| id.parse::<i64>().is_ok())
         && fields
             .next()
-            .is_some_and(|tag| matches!(tag, "hdr10" | "remux" | "ac3" | "orig"))
+            .is_some_and(|tag| matches!(tag, "hdr10" | "remux" | "ac3" | "web" | "orig"))
         && fields
             .next()
             .is_some_and(|key| key.len() == 40 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -958,7 +981,7 @@ pub async fn serve_remux(
     job.attach_client();
     let _client = RemuxClient {
         job: &job,
-        continue_after_disconnect: app.cfg.transcode.continue_after_disconnect,
+        continue_after_disconnect: spec.continue_after_disconnect,
     };
     let path = match wait_ready(&job).await {
         Ok(p) => p,
@@ -979,9 +1002,9 @@ pub async fn serve_remux(
         && job.dest.is_file()
         && job.dest.metadata().map(|m| m.len() > 0).unwrap_or(false);
     if finished {
-        return serve_finished(app, sock, req, &job.dest, head).await;
+        return serve_finished(app, sock, req, &job.dest, spec.mime, head).await;
     }
-    serve_growing(app, sock, req, &job, head).await
+    serve_growing(app, sock, req, &job, spec.mime, head).await
 }
 
 struct RemuxClient<'a> {
@@ -1074,6 +1097,7 @@ async fn serve_finished(
     sock: &mut tokio::net::TcpStream,
     req: &HttpRequest,
     dest: &Path,
+    mime: &str,
     head: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let size = dest.metadata()?.len();
@@ -1109,7 +1133,7 @@ async fn serve_finished(
     let mut resp = media_response(rusty_dlna_http::MediaResponseOptions {
         server: &app.server,
         date: &now_imf_date(),
-        mime: "video/mp4",
+        mime,
         size,
         range,
         body: Vec::new(),
@@ -1131,6 +1155,7 @@ async fn serve_growing(
     sock: &mut tokio::net::TcpStream,
     req: &HttpRequest,
     job: &Arc<RemuxJob>,
+    mime: &str,
     head: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let open = match req.header("Range") {
@@ -1159,7 +1184,7 @@ async fn serve_growing(
             }
             let have = current_len(job);
             let end = e.min(have.saturating_sub(1));
-            let mut resp = live_transcode_response("video/mp4");
+            let mut resp = live_transcode_response(mime);
             resp.status = 206;
             resp.reason = "OK".into();
             resp.set("Content-Range", format!("bytes {start}-{end}/*"));
@@ -1175,7 +1200,7 @@ async fn serve_growing(
             return Ok(());
         }
     }
-    let resp = live_transcode_response("video/mp4");
+    let resp = live_transcode_response(mime);
     crate::socket_write_all(app, sock, &resp.bytes_wire(&app.server, &now_imf_date())).await?;
     if head {
         return Ok(());
@@ -1364,12 +1389,15 @@ mod tests {
         }
         RemuxJobSpec {
             detail_id: 42,
+            mime: "video/mp4",
             job_key: format!("42:{key}:{command:?}"),
             cache_key: key.into(),
             src,
             source_file: None,
             dest: dir.join(format!("{key}.mp4")),
             args: command.into_iter().map(Into::into).collect(),
+            fallback_args: None,
+            continue_after_disconnect: true,
             remux_p8: false,
             audio_index: 0,
             audio: RemuxAudio::Copy,
@@ -1458,9 +1486,16 @@ mod tests {
         let server_dest = dest.clone();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            serve_finished(&server_app, &mut socket, &finished_req, &server_dest, true)
-                .await
-                .unwrap();
+            serve_finished(
+                &server_app,
+                &mut socket,
+                &finished_req,
+                &server_dest,
+                "video/mp4",
+                true,
+            )
+            .await
+            .unwrap();
         });
         let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
         let mut bytes = Vec::new();
@@ -1490,9 +1525,16 @@ mod tests {
         let server_job = growing.clone();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            serve_growing(&server_app, &mut socket, &growing_req, &server_job, true)
-                .await
-                .unwrap();
+            serve_growing(
+                &server_app,
+                &mut socket,
+                &growing_req,
+                &server_job,
+                "video/mp4",
+                true,
+            )
+            .await
+            .unwrap();
         });
         let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
         let mut bytes = Vec::new();
@@ -1616,6 +1658,7 @@ mod tests {
         let part = cache_part(&dest);
         let first = RemuxJobSpec {
             detail_id: 42,
+            mime: "video/mp4",
             job_key: format!("42:{first_key}:copy"),
             cache_key: first_key.clone(),
             src: src.clone(),
@@ -1626,6 +1669,8 @@ mod tests {
                 src.as_os_str().to_os_string(),
                 part.as_os_str().to_os_string(),
             ],
+            fallback_args: None,
+            continue_after_disconnect: true,
             remux_p8: false,
             audio_index: 0,
             audio: RemuxAudio::Copy,
@@ -1641,6 +1686,7 @@ mod tests {
         assert_ne!(first_key, second_key);
         let second = RemuxJobSpec {
             detail_id: 42,
+            mime: "video/mp4",
             job_key: format!("42:{second_key}:copy"),
             cache_key: second_key,
             src: src.clone(),
@@ -1651,6 +1697,8 @@ mod tests {
                 src.as_os_str().to_os_string(),
                 part.as_os_str().to_os_string(),
             ],
+            fallback_args: None,
+            continue_after_disconnect: true,
             remux_p8: false,
             audio_index: 0,
             audio: RemuxAudio::Copy,
@@ -1701,6 +1749,31 @@ mod tests {
             "child must be reaped"
         );
         assert!(!part.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_hardware_command_retries_software_before_publishing() {
+        let dir = temp_dir("hardware-fallback");
+        let app = test_app(&dir, 1);
+        let dest = dir.join("fallback.mp4");
+        let part = cache_part(&dest);
+        let mut spec = job_spec(
+            &dir,
+            "hardware-fallback",
+            vec!["sh".into(), "-c".into(), "exit 1".into()],
+        );
+        spec.dest = dest.clone();
+        spec.fallback_args = Some(vec![
+            "cp".into(),
+            spec.src.as_os_str().to_os_string(),
+            part.as_os_str().to_os_string(),
+        ]);
+        let expected = std::fs::read(&spec.src).unwrap();
+        let job = attach(app.clone(), spec).unwrap();
+        wait_for_terminal_cleanup(&app, &job);
+        assert_eq!(job.state(), RemuxState::Complete);
+        assert_eq!(std::fs::read(dest).unwrap(), expected);
         let _ = std::fs::remove_dir_all(dir);
     }
 

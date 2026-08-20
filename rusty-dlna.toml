@@ -41,6 +41,13 @@ cache_min_free_mb = 128
 # Kodi resume positions/play counts: 0 = retain indefinitely.
 bookmark_retention_days = 0
 
+# The browser player is compiled into the binary and served at `/`.
+# Set false to remove /web/* and /api/web/* and restore the status page at `/`.
+[web]
+enable = true
+# Use h264_nvenc when an NVIDIA GPU is exposed to the container.
+encoder = "libx264"
+
 [transcode]
 enable = false
 encoder = "libx264"

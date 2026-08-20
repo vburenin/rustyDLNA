@@ -247,6 +247,22 @@ album_art_names = ["AlbumArt.jpg", "{stem}-cover.png"]
         .unwrap_err()
         .to_string()
         .contains("unknown field"));
+    assert!(toml::from_str::<Config>("[web]\nenabel = true")
+        .unwrap_err()
+        .to_string()
+        .contains("unknown field"));
+    assert!(
+        !toml::from_str::<Config>("[web]\nenable = false")
+            .unwrap()
+            .web
+            .enable
+    );
+    let mut invalid_web_encoder = Config::default();
+    invalid_web_encoder.web.encoder = "hevc_nvenc".into();
+    assert!(validate_http_config(&invalid_web_encoder)
+        .unwrap_err()
+        .to_string()
+        .contains("web.encoder"));
     assert!(toml::from_str::<Config>("[[remap]]\nacton = \"original\"")
         .unwrap_err()
         .to_string()
@@ -2431,6 +2447,7 @@ audio_out = "copy"
         "GET /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: {crkey}\r\n\r\n"
     )));
     let global_spec = global_default.remux_job.expect("global encoder job");
+    assert!(global_spec.continue_after_disconnect);
     assert!(
         global_spec.args.iter().any(|arg| arg == "libx264"),
         "global encoder missing: {:?}",
@@ -3353,12 +3370,15 @@ fn remux_finished_range_and_stale_rebuild() {
 
     let spec = RemuxJobSpec {
         detail_id: dvp7.detail_id,
+        mime: "video/mp4",
         job_key: format!("{}:{cache_key}:fixture", dvp7.detail_id),
         cache_key: cache_key.clone(),
         src: src.clone(),
         source_file: None,
         dest: dest.clone(),
         args: vec!["ffmpeg".into(), "-version".into()],
+        fallback_args: None,
+        continue_after_disconnect: true,
         remux_p8: true,
         audio_index: 0,
         audio: RemuxAudio::Copy,
@@ -3781,7 +3801,319 @@ fn status_lists_video_count() {
     );
     let root = app.handle(&req(&get("/", "Kodi/21.0")));
     assert_eq!(root.status, 200);
-    assert_eq!(root.body, r.body);
+    let root_body = String::from_utf8_lossy(&root.body);
+    assert!(root_body.contains("rustyDLNA Player"), "{root_body}");
+    assert!(root_body.contains("/web/app.js"), "{root_body}");
+}
+
+#[test]
+fn web_player_is_embedded_searchable_and_independently_disabled() {
+    let mut app = testdata_app();
+
+    let css = app.handle(&req(&get("/web/app.css", "Browser/1.0")));
+    assert_eq!(css.status, 200);
+    assert_eq!(
+        resp_header(&css, "Content-Type"),
+        Some("text/css; charset=utf-8")
+    );
+    assert_eq!(resp_header(&css, "Cache-Control"), Some("no-cache"));
+    let javascript = app.handle(&req(&get("/web/app.js", "Browser/1.0")));
+    let javascript = String::from_utf8_lossy(&javascript.body);
+    assert!(
+        javascript.contains("if (item.transcode_likely) return false"),
+        "{javascript}"
+    );
+    assert!(javascript.contains("player.controls = !useFallback"));
+    assert!(javascript.contains("folder.child_count"));
+    assert!(javascript.contains("createMediaElementSource"));
+    assert!(javascript.contains("full-card-title"));
+    assert!(javascript.contains("ArrowLeft: -10"));
+    assert!(javascript.contains("ArrowUp: 300"));
+    assert!(javascript.contains("{ capture: true }"));
+    assert!(javascript.contains("event.key.toLowerCase() === \"f\""));
+    assert!(javascript.contains("toggleFullscreen"));
+    assert!(javascript.contains("playerStage.addEventListener(\"mousemove\""));
+    assert!(javascript.contains("setTimeout(hideFullscreenControl, 5000)"));
+    assert!(javascript.contains("ResizeObserver"));
+    assert!(!javascript.contains("Jump anywhere"));
+    assert!(javascript.contains("Direct play · support uncertain"));
+    assert!(!javascript.contains("Direct mode is forcing the original file"));
+    assert!(css.body.starts_with(b":root"));
+
+    let root = app.handle(&req(&get("/", "Browser/1.0")));
+    let root_html = String::from_utf8_lossy(&root.body);
+    assert!(root_html.contains("data-view=\"folders\""), "{root_html}");
+    assert!(
+        root_html.contains("id=\"playback-controls\""),
+        "{root_html}"
+    );
+    assert!(root_html.contains("?v=fullscreen-19"), "{root_html}");
+    assert!(!root_html.contains("Full movie timeline"), "{root_html}");
+    assert!(root_html.contains("id=\"timeline-status\""), "{root_html}");
+    assert!(root_html.contains("id=\"volume-control\""), "{root_html}");
+    assert!(
+        root_html.contains("class=\"library-results\""),
+        "{root_html}"
+    );
+    assert!(!root_html.contains("YOUR MEDIA"), "{root_html}");
+    assert!(!root_html.contains("id=\"library-title\""), "{root_html}");
+    assert!(root_html.contains("max=\"200\""), "{root_html}");
+    assert!(root_html.contains("<select id=\"audio-track-controls\""));
+    assert!(root_html.contains("class=\"stage-fullscreen\""));
+
+    let folders = app.handle(&req(&get(
+        "/api/web/library?view=folders&folder=64&offset=0&limit=200",
+        "Browser/1.0",
+    )));
+    assert_eq!(folders.status, 200);
+    let folders: serde_json::Value = serde_json::from_slice(&folders.body).unwrap();
+    assert_eq!(folders["view"], "folders");
+    assert_eq!(folders["folder"]["id"], "64");
+    assert_eq!(folders["breadcrumbs"][0]["title"], "Media");
+    let first_folder = folders["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["entry_type"] == "folder")
+        .expect("fixture media root folder");
+    assert!(first_folder["child_count"].is_number());
+    let first_folder_id = first_folder["id"].as_str().unwrap();
+    let child = app.handle(&req(&get(
+        &format!("/api/web/library?view=folders&folder={first_folder_id}&offset=0&limit=200"),
+        "Browser/1.0",
+    )));
+    assert_eq!(child.status, 200);
+    let child: serde_json::Value = serde_json::from_slice(&child.body).unwrap();
+    assert_eq!(child["breadcrumbs"].as_array().unwrap().len(), 2);
+    assert!(!child["entries"].as_array().unwrap().is_empty());
+    assert_eq!(
+        app.handle(&req(&get(
+            "/api/web/library?view=folders&folder=2",
+            "Browser/1.0"
+        )))
+        .status,
+        404
+    );
+
+    let duplicate_template = app
+        .catalog
+        .read()
+        .unwrap()
+        .items
+        .values()
+        .find(|item| item.path.ends_with("movie.mkv"))
+        .cloned()
+        .unwrap();
+    {
+        let mut catalog = app.catalog.write().unwrap();
+        for detail_id in [9_200_001, 9_200_002] {
+            let mut duplicate = duplicate_template.clone();
+            duplicate.detail_id = detail_id;
+            duplicate.object_id = format!("web-alias-{detail_id}");
+            duplicate.title = "Web Alias Duplicate".into();
+            catalog
+                .by_detail
+                .insert(detail_id, duplicate.object_id.clone());
+            catalog.items.insert(duplicate.object_id.clone(), duplicate);
+        }
+    }
+    let deduplicated = app.handle(&req(&get(
+        "/api/web/library?kind=video&q=Web%20Alias%20Duplicate&limit=10",
+        "Browser/1.0",
+    )));
+    let deduplicated: serde_json::Value = serde_json::from_slice(&deduplicated.body).unwrap();
+    assert_eq!(deduplicated["total"], 1);
+
+    let library = app.handle(&req(&get(
+        "/api/web/library?kind=audio&q=fixture&offset=0&limit=1",
+        "Browser/1.0",
+    )));
+    assert_eq!(library.status, 200);
+    let value: serde_json::Value = serde_json::from_slice(&library.body).unwrap();
+    assert_eq!(value["server_name"], "rustyDLNA-test");
+    assert_eq!(value["transcoding_enabled"], true);
+    assert_eq!(value["items"].as_array().unwrap().len(), 1);
+    assert_eq!(value["items"][0]["kind"], "audio");
+    assert!(value["items"][0]["title"].as_str().unwrap().contains('.'));
+    assert!(value["items"][0]["metadata_title"].is_string());
+    assert!(value["items"][0]["duration_seconds"].is_number());
+    assert!(value["items"][0]["source_url"]
+        .as_str()
+        .unwrap()
+        .starts_with("/MediaItems/"));
+
+    let hdr = app.handle(&req(&get(
+        "/api/web/library?kind=video&q=dvp7&limit=10",
+        "Browser/1.0",
+    )));
+    let hdr: serde_json::Value = serde_json::from_slice(&hdr.body).unwrap();
+    assert!(hdr["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["transcode_likely"] == true));
+
+    let dvp7 = app
+        .catalog
+        .read()
+        .unwrap()
+        .items
+        .values()
+        .find(|item| item.path.ends_with("dvp7.mkv"))
+        .cloned()
+        .unwrap();
+    let stream_details = app.handle(&req(&get(
+        &format!("/api/web/item/{}", dvp7.detail_id),
+        "Browser/1.0",
+    )));
+    assert_eq!(stream_details.status, 200);
+    let stream_details: serde_json::Value = serde_json::from_slice(&stream_details.body).unwrap();
+    assert_eq!(stream_details["audio_tracks"][0]["codec"], "truehd");
+    let compat = app.handle(&req(&get(
+        &format!("/web/media/{}.mp4", dvp7.detail_id),
+        "Browser/1.0",
+    )));
+    let spec = compat.remux_job.expect("browser compatibility job");
+    assert_eq!(spec.mime, "video/mp4");
+    assert!(!spec.continue_after_disconnect);
+    assert!(spec.fallback_args.is_none());
+    let args = spec
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>();
+    assert!(args.iter().any(|arg| arg == "libx264"), "{args:?}");
+    assert!(args.iter().any(|arg| arg == "aac"), "{args:?}");
+    assert!(args.iter().any(|arg| arg == "0:v:0?"), "{args:?}");
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["-init_hw_device", "vulkan=vk:0"]),
+        "{args:?}"
+    );
+    assert!(
+        args.iter()
+            .any(|arg| arg.contains("libplacebo=apply_dolbyvision=true")),
+        "{args:?}"
+    );
+
+    {
+        let mut catalog = app.catalog.write().unwrap();
+        let object_id = catalog.by_detail[&dvp7.detail_id].clone();
+        let item = catalog.items.get_mut(&object_id).unwrap();
+        item.probe.audio_streams = "1:0:truehd:6,2:1:ac3:2".into();
+        item.duration = Some("1:00:00.000".into());
+    }
+    let selected = app.handle(&req(&get(
+        &format!("/web/media/{}.mp4?audio=1&start=120", dvp7.detail_id),
+        "Browser/1.0",
+    )));
+    let selected = selected.remux_job.expect("selected browser audio job");
+    assert_eq!(selected.audio_index, 1);
+    assert!(selected.cache_key.ends_with("-start-120"));
+    let selected_args = selected
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>();
+    assert!(
+        selected_args.windows(2).any(|pair| pair == ["-ss", "120"]),
+        "{selected_args:?}"
+    );
+    assert!(
+        selected_args.iter().any(|arg| arg == "0:a:1?"),
+        "{selected_args:?}"
+    );
+    assert_eq!(
+        app.handle(&req(&get(
+            &format!("/web/media/{}.mp4?audio=2", dvp7.detail_id),
+            "Browser/1.0",
+        )))
+        .status,
+        400
+    );
+
+    app.cfg.web.encoder = "h264_nvenc".into();
+    let accelerated = app.handle(&req(&get(
+        &format!("/web/media/{}.mp4?start=60", dvp7.detail_id),
+        "Browser/1.0",
+    )));
+    let accelerated = accelerated.remux_job.expect("NVENC browser job");
+    assert!(accelerated.args.iter().any(|arg| arg == "h264_nvenc"));
+    assert!(accelerated
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-hwaccel", "cuda"]));
+    assert!(accelerated
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-init_hw_device", "vulkan=vk:0"]));
+    assert!(accelerated
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-filter_hw_device", "vk"]));
+    assert!(accelerated.args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg.contains("hwdownload,format=p010le,hwupload")
+            && arg.contains("libplacebo=apply_dolbyvision=true")
+            && arg.contains("colorspace=bt709")
+    }));
+    assert!(accelerated
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-color_trc", "bt709"]));
+    let fallback = accelerated
+        .fallback_args
+        .as_ref()
+        .expect("NVENC software fallback");
+    assert!(fallback.iter().any(|arg| arg == "libx264"));
+    assert!(!fallback.iter().any(|arg| arg == "-hwaccel"));
+    assert!(fallback.windows(2).any(|pair| pair == ["-ss", "60"]));
+    assert!(fallback.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg.contains("format=yuv420p10le,hwupload")
+            && arg.contains("libplacebo=apply_dolbyvision=true")
+    }));
+
+    {
+        let mut catalog = app.catalog.write().unwrap();
+        let object_id = catalog.by_detail[&dvp7.detail_id].clone();
+        catalog.items.get_mut(&object_id).unwrap().probe.hdr = "sdr".into();
+    }
+    let accelerated_sdr = app.handle(&req(&get(
+        &format!("/web/media/{}.mp4", dvp7.detail_id),
+        "Browser/1.0",
+    )));
+    let accelerated_sdr = accelerated_sdr.remux_job.expect("NVENC SDR browser job");
+    assert!(accelerated_sdr
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-vf", "scale_cuda=format=yuv420p"]));
+    assert!(!accelerated_sdr
+        .args
+        .iter()
+        .any(|arg| arg.to_string_lossy().contains("libplacebo")));
+
+    app.cfg.web.enable = false;
+    let disabled_root = app.handle(&req(&get("/", "Browser/1.0")));
+    let status = app.handle(&req(&get("/status", "Browser/1.0")));
+    assert_eq!(disabled_root.body, status.body);
+    assert_eq!(
+        app.handle(&req(&get("/api/web/library", "Browser/1.0")))
+            .status,
+        404
+    );
+    assert_eq!(
+        app.handle(&req(&get("/web/app.js", "Browser/1.0"))).status,
+        404
+    );
+    assert_eq!(
+        app.handle(&req(&get(
+            &format!("/api/web/item/{}", dvp7.detail_id),
+            "Browser/1.0",
+        )))
+        .status,
+        404
+    );
 }
 
 #[test]

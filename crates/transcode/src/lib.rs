@@ -62,6 +62,13 @@ pub enum HdrKind {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HardwareDecode {
+    #[default]
+    None,
+    Cuda,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AudioCodec {
@@ -93,6 +100,11 @@ pub enum RecodeAction {
     Hdr10,
     /// Copy video; convert or pick a lossy audio track.
     AudioAc3,
+    /// Internal browser-compatibility MP4/AAC output.
+    ///
+    /// This action is constructed by the embedded web player and is rejected
+    /// in user-authored `[[remap]]` rules.
+    Browser,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -161,6 +173,7 @@ pub struct TranscodePlan {
     pub keep_hdr10: bool,
     pub drop_dolby_vision: bool,
     pub video_encoder: String,
+    pub hardware_decode: HardwareDecode,
     pub audio: AudioAction,
     pub container: &'static str,
     /// `0:a:{n}` among audio streams. Prefer a lossy track when known.
@@ -176,6 +189,7 @@ impl Default for TranscodePlan {
             keep_hdr10: true,
             drop_dolby_vision: false,
             video_encoder: "copy".into(),
+            hardware_decode: HardwareDecode::None,
             audio: AudioAction::Copy,
             container: "original",
             audio_index: 0,
@@ -220,6 +234,16 @@ pub fn pick_audio_index_from_streams(descriptors: &str, fallback_audio_csv: &str
 
 fn audio_map_arg(plan: &TranscodePlan) -> String {
     format!("0:a:{}?", plan.audio_index)
+}
+
+/// Select an H.264 encoder suitable for browser compatibility output. The
+/// global encoder may be HEVC for DLNA HDR rules, which browsers cannot use
+/// as a general fallback format.
+pub fn browser_video_encoder(configured: &str) -> &str {
+    match configured {
+        "h264_nvenc" => "h264_nvenc",
+        _ => "libx264",
+    }
 }
 
 fn hdr10_encode_args(plan: &TranscodePlan) -> Vec<String> {
@@ -394,6 +418,7 @@ fn plan_from_rule(
             keep_hdr10: false,
             drop_dolby_vision: false,
             video_encoder: rule.encoder.clone().unwrap_or_else(|| "copy".into()),
+            hardware_decode: HardwareDecode::None,
             audio: rule.audio_out.unwrap_or(AudioAction::Copy),
             container: "mp4",
             audio_index: 0,
@@ -409,6 +434,7 @@ fn plan_from_rule(
                 .clone()
                 .or_else(|| default_encoder.map(str::to_owned))
                 .unwrap_or_else(|| "hevc_nvenc".into()),
+            hardware_decode: HardwareDecode::None,
             audio: rule.audio_out.unwrap_or(
                 if matches!(
                     src.audio,
@@ -429,10 +455,12 @@ fn plan_from_rule(
             keep_hdr10: !matches!(src.hdr, HdrKind::Sdr),
             drop_dolby_vision: false,
             video_encoder: rule.encoder.clone().unwrap_or_else(|| "copy".into()),
+            hardware_decode: HardwareDecode::None,
             audio: rule.audio_out.unwrap_or(AudioAction::ToAc3),
             container: "original",
             audio_index: 0,
         },
+        RecodeAction::Browser => TranscodePlan::default(),
     }
 }
 
@@ -516,6 +544,11 @@ pub fn validate_remap_rules(remaps: &[RemapRule], default_encoder: &str) -> Resu
                     ));
                 }
             }
+            RecodeAction::Browser => {
+                return Err(format!(
+                    "{label}: action=browser is reserved for the embedded web player"
+                ));
+            }
         }
     }
     Ok(())
@@ -530,13 +563,27 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
         "-nostats".into(),
         "-y".into(),
         "-nostdin".into(),
+    ];
+    if plan.hardware_decode == HardwareDecode::Cuda {
+        a.extend([
+            "-hwaccel".into(),
+            "cuda".into(),
+            "-hwaccel_output_format".into(),
+            "cuda".into(),
+        ]);
+    }
+    a.extend([
         "-i".into(),
         src_path.into(),
         "-map".into(),
-        "0:v:0".into(),
+        if plan.action == RecodeAction::Browser {
+            "0:v:0?".into()
+        } else {
+            "0:v:0".into()
+        },
         "-map".into(),
         audio_map_arg(plan),
-    ];
+    ]);
     match plan.action {
         RecodeAction::Original => {}
         RecodeAction::RemuxP8 | RecodeAction::AudioAc3 => {
@@ -544,6 +591,46 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
         }
         RecodeAction::Hdr10 => {
             a.extend(hdr10_encode_args(plan));
+        }
+        RecodeAction::Browser if plan.video_encoder == "copy" => {
+            a.extend(["-c:v".into(), "copy".into()]);
+        }
+        RecodeAction::Browser => {
+            a.extend(["-c:v".into(), plan.video_encoder.clone()]);
+            if plan.video_encoder == "h264_nvenc" {
+                a.extend([
+                    "-preset".into(),
+                    "p4".into(),
+                    "-tune".into(),
+                    "hq".into(),
+                    "-rc".into(),
+                    "vbr".into(),
+                    "-cq".into(),
+                    "22".into(),
+                    "-b:v".into(),
+                    "0".into(),
+                ]);
+                if plan.hardware_decode == HardwareDecode::Cuda {
+                    a.extend(["-vf".into(), "scale_cuda=format=yuv420p".into()]);
+                } else {
+                    a.extend(["-pix_fmt".into(), "yuv420p".into()]);
+                }
+            } else {
+                a.extend([
+                    "-preset".into(),
+                    "veryfast".into(),
+                    "-crf".into(),
+                    "22".into(),
+                    "-pix_fmt".into(),
+                    "yuv420p".into(),
+                ]);
+            }
+            a.extend([
+                "-profile:v".into(),
+                "high".into(),
+                "-force_key_frames".into(),
+                "expr:gte(t,n_forced*2)".into(),
+            ]);
         }
     }
     match plan.audio {
@@ -567,8 +654,12 @@ pub fn ffmpeg_grow_os_args(
         .into_iter()
         .map(OsString::from)
         .collect();
-    // The string builder always places input at argv[6] and output last.
-    args[6] = src_path.as_os_str().to_os_string();
+    let input = args
+        .iter()
+        .position(|argument| argument == "-i")
+        .map(|index| index + 1)
+        .expect("ffmpeg argument builder must include an input");
+    args[input] = src_path.as_os_str().to_os_string();
     if let Some(output) = args.last_mut() {
         *output = dst_path.as_os_str().to_os_string();
     }
@@ -646,6 +737,7 @@ pub fn cache_dest_for_key(
         RecodeAction::Hdr10 => "hdr10",
         RecodeAction::RemuxP8 => "remux",
         RecodeAction::AudioAc3 => "ac3",
+        RecodeAction::Browser => "web",
         RecodeAction::Original => "orig",
     };
     cache_dir.join(format!("{detail_id}-{tag}-{cache_key}.mp4"))
@@ -766,9 +858,10 @@ fn transcode_cache_key_from_identity(source: &str, plan: &TranscodePlan, remux_p
         "unused".into()
     };
     let signature = format!(
-        "source={source}\naction={:?}\nencoder={}\naudio={:?}\naudio_index={}\ncontainer={}\nremux_p8={remux_p8}\nffmpeg={ffmpeg}\ndovi={dovi}\nbuild={}",
+        "source={source}\naction={:?}\nencoder={}\nhardware_decode={:?}\naudio={:?}\naudio_index={}\ncontainer={}\nremux_p8={remux_p8}\nffmpeg={ffmpeg}\ndovi={dovi}\nbuild={}",
         plan.action,
         plan.video_encoder,
+        plan.hardware_decode,
         plan.audio,
         plan.audio_index,
         plan.container,
@@ -825,6 +918,7 @@ pub fn hdr10_fallback_plan(from: &TranscodePlan) -> TranscodePlan {
         } else {
             from.video_encoder.clone()
         },
+        hardware_decode: HardwareDecode::None,
         // A fallback changes only the video treatment.  In particular, a
         // caller that selected audio copy must not get a surprise AAC encode
         // merely because dovi_tool is unavailable.
@@ -1678,6 +1772,34 @@ action = "audio-ac3"
         assert!(grow.iter().any(|s| s.contains("delay_moov")));
     }
 
+    #[test]
+    fn browser_encoder_uses_nvenc_quality_options_with_software_default() {
+        assert_eq!(browser_video_encoder("h264_nvenc"), "h264_nvenc");
+        assert_eq!(browser_video_encoder("hevc_nvenc"), "libx264");
+        assert_eq!(browser_video_encoder("libx264"), "libx264");
+
+        let mut plan = TranscodePlan {
+            decision: Decision::Recode,
+            action: RecodeAction::Browser,
+            video_encoder: "h264_nvenc".into(),
+            audio: AudioAction::ToAac,
+            container: "mp4",
+            ..TranscodePlan::default()
+        };
+        let args = ffmpeg_grow_args("source.mkv", "output.mp4.part", &plan);
+        assert!(args.windows(2).any(|pair| pair == ["-preset", "p4"]));
+        assert!(args.windows(2).any(|pair| pair == ["-cq", "22"]));
+        assert!(!args.iter().any(|arg| arg == "-crf"));
+
+        plan.hardware_decode = HardwareDecode::Cuda;
+        let cuda = ffmpeg_grow_args("source.mkv", "output.mp4.part", &plan);
+        assert!(cuda.windows(2).any(|pair| pair == ["-hwaccel", "cuda"]));
+        assert!(cuda
+            .windows(2)
+            .any(|pair| pair == ["-vf", "scale_cuda=format=yuv420p"]));
+        assert!(!cuda.iter().any(|arg| arg == "-pix_fmt"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn growing_argv_preserves_non_utf8_path_bytes() {
@@ -1686,7 +1808,8 @@ action = "audio-ac3"
         let src = std::path::PathBuf::from(OsString::from_vec(b"/media/movie-\x80.mkv".to_vec()));
         let dst = std::path::PathBuf::from(OsString::from_vec(b"/cache/movie-\x81.part".to_vec()));
         let args = ffmpeg_grow_os_args(&src, &dst, &TranscodePlan::default());
-        assert_eq!(args[6].as_bytes(), src.as_os_str().as_bytes());
+        let input = args.iter().position(|argument| argument == "-i").unwrap() + 1;
+        assert_eq!(args[input].as_bytes(), src.as_os_str().as_bytes());
         assert_eq!(args.last().unwrap().as_bytes(), dst.as_os_str().as_bytes());
     }
 

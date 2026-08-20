@@ -2,7 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use rusty_dlna_transcode::{validate_remap_rules, AudioAction, RecodeAction, RemapRule};
+use rusty_dlna_transcode::{
+    browser_video_encoder, validate_remap_rules, AudioAction, RecodeAction, RemapRule,
+};
 
 /// A rejected configuration or unavailable/invalid external tool.
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +115,9 @@ pub struct Config {
     pub wide_links: bool,
     #[serde(default)]
     pub transcode: TranscodeCfg,
+    /// Embedded browser player and its same-origin API/media routes.
+    #[serde(default)]
+    pub web: WebCfg,
     #[serde(default)]
     pub remap: Vec<RemapRule>,
     #[serde(default)]
@@ -193,6 +198,7 @@ impl Default for Config {
             recent_days: None,
             wide_links: false,
             transcode: TranscodeCfg::default(),
+            web: WebCfg::default(),
             remap: Vec::new(),
             uuid: None,
             cache_dir: None,
@@ -308,6 +314,28 @@ pub struct TranscodeCfg {
     pub cache_max_age_days: u32,
     #[serde(default = "default_scan_timeout")]
     pub verify_timeout_secs: u64,
+}
+
+/// Embedded browser player configuration.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebCfg {
+    /// Serve the player at `/` and enable its `/api/web/*` and `/web/*` routes.
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    /// H.264 encoder used for browser-compatible video. `h264_nvenc` uses an
+    /// NVIDIA GPU; `libx264` is the portable software fallback.
+    #[serde(default = "default_encoder")]
+    pub encoder: String,
+}
+
+impl Default for WebCfg {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            encoder: default_encoder(),
+        }
+    }
 }
 
 impl Default for TranscodeCfg {
@@ -602,6 +630,13 @@ pub(crate) fn validate_http_config(cfg: &Config) -> Result<(), ConfigValidationE
         }
     }
     validate_remap_rules(&cfg.remap, &cfg.transcode.encoder)?;
+    if !matches!(cfg.web.encoder.as_str(), "libx264" | "h264_nvenc") {
+        return Err(format!(
+            "web.encoder must be libx264 or h264_nvenc, got {:?}",
+            cfg.web.encoder
+        )
+        .into());
+    }
     if cfg.transcode.enable {
         if !(1..=86_400).contains(&cfg.transcode.max_runtime_secs) {
             return Err("transcode.max_runtime_secs must be between 1 and 86400".into());
@@ -664,6 +699,18 @@ pub fn validate_transcode_tools(
     default_encoder: &str,
     remaps: &[RemapRule],
 ) -> Result<Vec<String>, ConfigValidationError> {
+    validate_transcode_tools_with_web(enabled, default_encoder, remaps, false, "libx264")
+}
+
+/// Validate transcode tools, including the embedded player's H.264/AAC
+/// compatibility output when that module is enabled.
+pub fn validate_transcode_tools_with_web(
+    enabled: bool,
+    default_encoder: &str,
+    remaps: &[RemapRule],
+    web_enabled: bool,
+    web_encoder: &str,
+) -> Result<Vec<String>, ConfigValidationError> {
     if !enabled {
         return Ok(Vec::new());
     }
@@ -681,6 +728,13 @@ pub fn validate_transcode_tools(
     let encoder_text = String::from_utf8_lossy(&output.stdout);
     let mut encoders = std::collections::BTreeSet::new();
     let mut audio_encoders = std::collections::BTreeSet::new();
+    if web_enabled {
+        encoders.insert(browser_video_encoder(web_encoder));
+        // Hardware browser jobs retry with this portable encoder if NVENC
+        // cannot initialize before the first fragment is published.
+        encoders.insert("libx264");
+        audio_encoders.insert("aac");
+    }
     for rule in remaps {
         match rule.action {
             RecodeAction::Hdr10 => {
@@ -701,6 +755,7 @@ pub fn validate_transcode_tools(
                     audio_encoders.insert("ac3");
                 }
             }
+            RecodeAction::Browser => {}
             RecodeAction::Original => {}
         }
         match rule.audio_out {
@@ -734,7 +789,7 @@ pub fn validate_transcode_tools(
                     "-f",
                     "lavfi",
                     "-i",
-                    "color=size=64x64:duration=0.05",
+                    "color=size=320x180:duration=0.05",
                     "-frames:v",
                     "1",
                     "-c:v",

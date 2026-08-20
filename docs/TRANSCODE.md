@@ -47,6 +47,12 @@ Unset match fields are wildcards. `hdr = "dvhe.07"` is an alias for `dv-p7`.
 
 Empty `[[remap]]` list → every client, including Cast, gets the original.
 
+The embedded web player is the exception to the DLNA remap decision: its
+dedicated `/web/media/` compatibility route uses an internal browser plan,
+not a `[[remap]]` rule, and selects its H.264 encoder through `web.encoder`.
+See [`WEB_PLAYER.md`](WEB_PLAYER.md). It remains disabled whenever
+`transcode.enable = false`.
+
 `transcode.encoder` is the default only for `action = "hdr10"`; a rule-level
 `encoder` overrides it. `remux-p8` and `audio-ac3` must copy video. Run
 `rusty-dlna --config ... --check` on the deployed host to verify ffmpeg,

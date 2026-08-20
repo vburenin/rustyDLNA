@@ -164,16 +164,22 @@ fn run_check(app: &App, server: &str) -> Result<(), Box<dyn std::error::Error>> 
         cfg.transcode.enable, cfg.transcode.encoder, cfg.transcode.max_jobs
     );
     println!(
+        "  web player   enable={} encoder={}",
+        cfg.web.enable, cfg.web.encoder
+    );
+    println!(
         "  helpers       max_jobs={} queue={} timeout={}s",
         cfg.helper_max_jobs, cfg.helper_queue_capacity, cfg.helper_queue_timeout_secs
     );
     println!("  ifaces        {:?}", cfg.network_interface);
     println!("  media_dir     {:?}", cfg.media_dir);
     println!("  wide_links    {}", cfg.wide_links);
-    for note in rusty_dlna::validate_transcode_tools(
+    for note in rusty_dlna::validate_transcode_tools_with_web(
         cfg.transcode.enable,
         &cfg.transcode.encoder,
         &app.remaps,
+        cfg.web.enable,
+        &cfg.web.encoder,
     )? {
         println!("  tool          {note}");
     }

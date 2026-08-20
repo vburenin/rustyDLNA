@@ -4,6 +4,10 @@ services:
   rusty-dlna:
     environment:
       TZ: UTC
+      # Vulkan tone mapping also needs the NVIDIA "graphics" capability.
+      # NVIDIA_DRIVER_CAPABILITIES: compute,video,utility,graphics
+    # Uncomment with NVIDIA Container Toolkit for NVENC/NVDEC/Vulkan access.
+    # gpus: all
     volumes:
       - /path/to/your/videos:/storage/video:ro
       # If DETAILS.PATH used a different host realpath, bind that path

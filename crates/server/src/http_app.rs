@@ -347,7 +347,7 @@ impl App {
             HttpRoute::AlbumArt => self.album_art(req),
             HttpRoute::Caption => self.caption(req),
             HttpRoute::Icon => icon_response(&req.path),
-            HttpRoute::Status | HttpRoute::Presentation => {
+            HttpRoute::Status => {
                 let body = status::status_html(self);
                 let mut r = HttpResponse::new(200, "OK");
                 r.set("Content-Type", "text/html");
@@ -370,11 +370,19 @@ impl App {
                 response.set("Content-Length", response.body.len());
                 response
             }
+            HttpRoute::WebLibrary => web_ui::library(self, req),
+            HttpRoute::WebItem => web_ui::item(self, req),
+            HttpRoute::WebMedia => web_ui::media(self, req, peer),
+            HttpRoute::WebAsset => web_ui::asset(self, &req.path),
             HttpRoute::Thumbnail => self.thumbnail(req),
             HttpRoute::Resized => self.resized(req),
+            HttpRoute::Presentation => web_ui::presentation(self),
             HttpRoute::NotFound => HttpResponse::html(404, "Not Found", "not found"),
         };
-        if r == HttpRoute::MediaItem || r == HttpRoute::Transcode {
+        if matches!(
+            r,
+            HttpRoute::MediaItem | HttpRoute::Transcode | HttpRoute::WebMedia
+        ) {
             resp.persist = false;
         } else {
             resp.persist = persist && !is_chunked(req);
@@ -1535,7 +1543,12 @@ impl App {
         }
     }
 
-    fn media(&self, req: &HttpRequest, transcode: bool, peer: SocketAddr) -> HttpResponse {
+    pub(crate) fn media(
+        &self,
+        req: &HttpRequest,
+        transcode: bool,
+        peer: SocketAddr,
+    ) -> HttpResponse {
         let id = if transcode {
             transcode_id_from_path(&req.path)
         } else {
@@ -1604,7 +1617,9 @@ impl App {
                     cache_dest_for_key(&self.cache_dir, item.detail_id, plan.action, &cache_key);
                 let part = cache_part(&dest);
                 let grow_plan = if remux_p8 {
-                    hdr10_fallback_plan(&plan)
+                    let mut fallback = hdr10_fallback_plan(&plan);
+                    fallback.video_encoder = self.cfg.transcode.encoder.clone();
+                    fallback
                 } else {
                     plan.clone()
                 };
@@ -1621,16 +1636,30 @@ impl App {
                     "transcode GET"
                 );
                 let args = ffmpeg_grow_os_args(Path::new("/proc/self/fd/3"), &part, &grow_plan);
+                let fallback_args = if grow_plan.video_encoder.ends_with("_nvenc") {
+                    let mut software = grow_plan.clone();
+                    software.video_encoder = "libx264".into();
+                    Some(ffmpeg_grow_os_args(
+                        Path::new("/proc/self/fd/3"),
+                        &part,
+                        &software,
+                    ))
+                } else {
+                    None
+                };
                 let job_key = format!("{}:{cache_key}:{args:?}", item.detail_id);
                 let mut r = live_transcode_response("video/mp4");
                 r.remux_job = Some(RemuxJobSpec {
                     detail_id: item.detail_id,
+                    mime: "video/mp4",
                     job_key,
                     cache_key,
                     src: opened.resolved_path.clone(),
                     source_file: Some(Arc::new(opened.file)),
                     dest: dest.clone(),
                     args,
+                    fallback_args,
+                    continue_after_disconnect: self.cfg.transcode.continue_after_disconnect,
                     remux_p8,
                     audio_index: plan.audio_index,
                     audio: match plan.audio {

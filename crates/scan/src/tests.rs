@@ -3385,6 +3385,7 @@ fn apply_probe_writes_dlna_pn_and_multi_audio() {
             ..AvMeta::default()
         },
         tags: EmbeddedTags::default(),
+        audio_tracks: Vec::new(),
     };
     apply_probe_to_detail(&db, id, &got).unwrap();
     db.upsert_object("64$1$1", "64$1", "item.videoItem", Some(id), "clip", None)

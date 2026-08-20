@@ -52,8 +52,8 @@ use rusty_dlna_ssdp::{
 use rusty_dlna_transcode::{
     cache_dest_for_key, cache_part, decide_for_with_default_encoder, ffmpeg_grow_os_args,
     hdr10_fallback_plan, pick_audio_index_from_streams, probe_to_source, source_identity_file,
-    transcode_cache_key_file, AudioAction, Decision, JobGate, RecodeAction, RemapRule,
-    TranscodePlan,
+    transcode_cache_key_file, AudioAction, Decision, HardwareDecode, HdrKind, JobGate,
+    RecodeAction, RemapRule, TranscodePlan,
 };
 
 mod catalog_query;
@@ -64,14 +64,16 @@ mod lifecycle;
 mod metrics;
 mod remux;
 mod status;
+mod web_ui;
 
 use catalog_query::*;
 #[cfg(test)]
 use config::normalize_uuid;
 use config::{command_version, load_or_create_uuid, validate_http_config};
 pub use config::{
-    load_config, resolve_http_port, resolve_ssdp_port, validate_transcode_tools, Config,
-    ConfigLoadError, ConfigValidationError, TranscodeCfg,
+    load_config, resolve_http_port, resolve_ssdp_port, validate_transcode_tools,
+    validate_transcode_tools_with_web, Config, ConfigLoadError, ConfigValidationError,
+    TranscodeCfg, WebCfg,
 };
 pub(crate) use http_app::available_filesystem_bytes;
 #[cfg(test)]

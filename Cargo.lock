@@ -738,6 +738,7 @@ dependencies = [
 name = "rusty-dlna-scan"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "ffmpeg-sys-next",
  "inotify",
  "kamadak-exif",
