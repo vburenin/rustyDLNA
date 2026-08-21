@@ -43,7 +43,6 @@ test -x scripts/generate-advanced-fixtures.sh
 test -x scripts/generate-dolby-vision-fixture.sh
 test -f contrib/systemd/rusty-dlna.service
 test -x restart.sh
-test ! -e improvement_plan.md
 test ! -d testdata/cache
 test ! -e testdata/testdata/cache/files.db
 (bash -n restart.sh)

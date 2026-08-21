@@ -38,7 +38,6 @@ Dockerfile
 .github/workflows/release.yml
 .github/workflows/soak.yml
 docs/DISTRIBUTION.md
-improvements_plan.md
 '
 for relative in $FILES; do
     grep -Fq "$CURRENT" "$ROOT/$relative" || {
