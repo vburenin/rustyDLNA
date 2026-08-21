@@ -687,7 +687,8 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
         RecodeAction::Browser => {
             a.extend(["-c:v".into(), plan.video_encoder.clone()]);
             let quality = plan.browser_quality;
-            if plan.video_encoder == "h264_nvenc" {
+            let hevc_nvenc = plan.video_encoder == "hevc_nvenc";
+            if matches!(plan.video_encoder.as_str(), "h264_nvenc" | "hevc_nvenc") {
                 a.extend([
                     "-preset".into(),
                     "p4".into(),
@@ -696,16 +697,36 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
                     "-rc".into(),
                     "vbr".into(),
                     "-cq".into(),
-                    quality.map_or(22, BrowserQuality::crf).to_string(),
+                    quality
+                        .map_or(22, BrowserQuality::crf)
+                        .saturating_sub(u8::from(hevc_nvenc) * 2)
+                        .to_string(),
                     "-b:v".into(),
                     "0".into(),
                 ]);
                 if plan.hardware_decode == HardwareDecode::Cuda {
-                    a.extend(["-vf".into(), browser_scale_filter(quality, true)]);
+                    a.extend([
+                        "-vf".into(),
+                        browser_scale_filter(
+                            quality,
+                            true,
+                            if hevc_nvenc { "p010le" } else { "yuv420p" },
+                        ),
+                    ]);
                 } else {
-                    a.extend(["-pix_fmt".into(), "yuv420p".into()]);
+                    a.extend([
+                        "-pix_fmt".into(),
+                        if hevc_nvenc { "p010le" } else { "yuv420p" }.into(),
+                    ]);
                     if quality.is_some() {
-                        a.extend(["-vf".into(), browser_scale_filter(quality, false)]);
+                        a.extend([
+                            "-vf".into(),
+                            browser_scale_filter(
+                                quality,
+                                false,
+                                if hevc_nvenc { "p010le" } else { "yuv420p" },
+                            ),
+                        ]);
                     }
                 }
             } else {
@@ -718,7 +739,10 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
                     "yuv420p".into(),
                 ]);
                 if quality.is_some() {
-                    a.extend(["-vf".into(), browser_scale_filter(quality, false)]);
+                    a.extend([
+                        "-vf".into(),
+                        browser_scale_filter(quality, false, "yuv420p"),
+                    ]);
                 }
             }
             if let Some(quality) = quality {
@@ -731,11 +755,32 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
                     quality.max_fps().to_string(),
                 ]);
             }
+            if hevc_nvenc {
+                a.extend([
+                    "-profile:v".into(),
+                    "main10".into(),
+                    "-level:v".into(),
+                    "5.1".into(),
+                ]);
+                if plan.keep_hdr10 {
+                    a.extend([
+                        "-color_primaries".into(),
+                        "bt2020".into(),
+                        "-color_trc".into(),
+                        "smpte2084".into(),
+                        "-colorspace".into(),
+                        "bt2020nc".into(),
+                    ]);
+                }
+            } else {
+                a.extend([
+                    "-profile:v".into(),
+                    quality.map_or("high", BrowserQuality::h264_profile).into(),
+                    "-level:v".into(),
+                    quality.map_or("4.1", BrowserQuality::h264_level).into(),
+                ]);
+            }
             a.extend([
-                "-profile:v".into(),
-                quality.map_or("high", BrowserQuality::h264_profile).into(),
-                "-level:v".into(),
-                quality.map_or("4.1", BrowserQuality::h264_level).into(),
                 "-force_key_frames".into(),
                 "expr:gte(t,n_forced*2)".into(),
             ]);
@@ -761,19 +806,23 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
     a
 }
 
-fn browser_scale_filter(quality: Option<BrowserQuality>, cuda: bool) -> String {
+fn browser_scale_filter(
+    quality: Option<BrowserQuality>,
+    cuda: bool,
+    pixel_format: &str,
+) -> String {
     let Some(quality) = quality else {
-        return "scale_cuda=format=yuv420p".into();
+        return format!("scale_cuda=format={pixel_format}");
     };
     if cuda {
         format!(
-            "scale_cuda=w='min(iw,{})':h='min(ih,{})':force_original_aspect_ratio=decrease:force_divisible_by=2:format=yuv420p",
+            "scale_cuda=w='min(iw,{})':h='min(ih,{})':force_original_aspect_ratio=decrease:force_divisible_by=2:format={pixel_format}",
             quality.max_width(),
             quality.max_height()
         )
     } else {
         format!(
-            "scale=w='min(iw,{})':h='min(ih,{})':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear",
+            "scale=w='min(iw,{})':h='min(ih,{})':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,format={pixel_format}",
             quality.max_width(),
             quality.max_height()
         )
@@ -806,6 +855,11 @@ pub fn ffmpeg_grow_os_args(
 
 fn live_frag_tail(out: &str) -> Vec<String> {
     vec![
+        // Input-side seeks and copied B-frames can leave the first fragment
+        // with negative DTS/PTS. Chrome may repeatedly present and discard
+        // those frames, which looks like playback moving forward then back.
+        "-avoid_negative_ts".into(),
+        "make_zero".into(),
         "-flush_packets".into(),
         "1".into(),
         "-frag_duration".into(),
@@ -1926,6 +1980,9 @@ action = "audio-ac3"
         assert!(!grow.iter().any(|s| s.contains("faststart")));
         assert!(grow.iter().any(|s| s.contains("frag_keyframe")));
         assert!(grow.iter().any(|s| s.contains("delay_moov")));
+        assert!(grow
+            .windows(2)
+            .any(|pair| pair == ["-avoid_negative_ts", "make_zero"]));
     }
 
     #[test]
@@ -1986,6 +2043,25 @@ action = "audio-ac3"
         assert!(saver.windows(2).any(|pair| pair == ["-fpsmax", "30"]));
         assert!(saver.windows(2).any(|pair| pair == ["-b:a", "128k"]));
         assert!(saver.windows(2).any(|pair| pair == ["-ac", "2"]));
+
+        plan.video_encoder = "hevc_nvenc".into();
+        plan.hardware_decode = HardwareDecode::Cuda;
+        plan.browser_quality = Some(BrowserQuality::Auto);
+        plan.keep_hdr10 = true;
+        let repaired_hevc = ffmpeg_grow_args("source.mp4", "output.mp4.part", &plan);
+        assert!(repaired_hevc
+            .iter()
+            .any(|arg| arg.contains("format=p010le")));
+        assert!(repaired_hevc.windows(2).any(|pair| pair == ["-cq", "18"]));
+        assert!(repaired_hevc
+            .windows(2)
+            .any(|pair| pair == ["-profile:v", "main10"]));
+        assert!(repaired_hevc
+            .windows(2)
+            .any(|pair| pair == ["-color_trc", "smpte2084"]));
+        assert!(!repaired_hevc
+            .windows(2)
+            .any(|pair| pair == ["-profile:v", "high"]));
     }
 
     #[cfg(unix)]

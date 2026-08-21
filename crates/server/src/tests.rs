@@ -3875,6 +3875,14 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         Some("text/css; charset=utf-8")
     );
     assert_eq!(resp_header(&css, "Cache-Control"), Some("no-cache"));
+    let favicon = app.handle(&req(&get("/favicon.ico", "Browser/1.0")));
+    assert_eq!(favicon.status, 200);
+    assert_eq!(resp_header(&favicon, "Content-Type"), Some("image/png"));
+    assert_eq!(
+        resp_header(&favicon, "Cache-Control"),
+        Some("public, max-age=86400")
+    );
+    assert!(favicon.body.starts_with(b"\x89PNG\r\n\x1a\n"));
     for asset in [
         "/web/app.js",
         "/web/api.js",
@@ -3902,6 +3910,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         root_html.contains("id=\"playback-controls\""),
         "{root_html}"
     );
+    assert!(root_html.contains("href=\"/favicon.ico\""), "{root_html}");
     assert!(!root_html.contains("?v="), "{root_html}");
     assert!(root_html.contains("id=\"timeline-status\""), "{root_html}");
     assert!(root_html.contains("id=\"volume-control\""), "{root_html}");
@@ -3920,6 +3929,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     for control in [
         "timeline",
         "volume-control",
+        "stream-info-button",
         "captions-button",
         "audio-track-controls",
         "fullscreen-button",
@@ -4066,6 +4076,51 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .as_str()
         .unwrap()
         .starts_with("/web/media/"));
+    let audio_item_id = value["entries"][0]["id"].as_i64().unwrap();
+    {
+        let mut catalog = app.catalog.write().unwrap();
+        let object_id = catalog.by_detail[&audio_item_id].clone();
+        let item = catalog.items.get_mut(&object_id).unwrap();
+        item.probe.audio = "aac".into();
+        item.probe.audio_streams = "0:0:aac:2".into();
+        item.duration = Some("00:01:00.000".into());
+    }
+    let audio_page = app.handle(&req(&get(
+        "/api/web/library?view=library&kind=audio&q=fixture&offset=0&limit=1",
+        "Browser/1.0",
+    )));
+    let audio_page: serde_json::Value = serde_json::from_slice(&audio_page.body).unwrap();
+    assert_eq!(
+        audio_page["entries"][0]["audio_tracks"][0]["content_type"],
+        "audio/mp4; codecs=\"mp4a.40.2\""
+    );
+    let copied_audio = app.handle(&req(&get(
+        &format!(
+            "/web/media/{audio_item_id}.mp4?quality=auto&video_mode=transcode&audio_mode=copy"
+        ),
+        "Browser/1.0",
+    )));
+    assert_eq!(
+        copied_audio.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&copied_audio.body)
+    );
+    let copied_audio_spec = copied_audio
+        .remux_job
+        .expect("browser audio-only copy job");
+    assert!(copied_audio_spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-c:a", "copy"]));
+    assert!(copied_audio_spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-bsf:a", "aac_adtstoasc"]));
+    assert!(copied_audio_spec
+        .fallback_args
+        .as_ref()
+        .is_some_and(|args| args.windows(2).any(|pair| pair == ["-c:a", "aac"])));
 
     let hdr = app.handle(&req(&get(
         "/api/web/library?view=library&kind=video&q=dvp7&limit=10",
@@ -4109,6 +4164,295 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         Some("text/vtt; charset=utf-8")
     );
     assert!(caption.body.starts_with(b"WEBVTT\n\n"));
+
+    let h264_audio_fallback = app
+        .catalog
+        .read()
+        .unwrap()
+        .items
+        .values()
+        .find(|item| item.path.ends_with("tagged.mp4"))
+        .cloned()
+        .unwrap();
+    let enriched_video = app.handle(&req(&get(
+        &format!(
+            "/api/web/item/{}?enrich=1",
+            h264_audio_fallback.detail_id
+        ),
+        "Browser/1.0",
+    )));
+    assert_eq!(
+        enriched_video.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&enriched_video.body)
+    );
+    let enriched_video: serde_json::Value =
+        serde_json::from_slice(&enriched_video.body).unwrap();
+    assert_eq!(
+        enriched_video["item"]["stream_metadata_complete"],
+        true
+    );
+    assert!(enriched_video["item"]["video_content_type"]
+        .as_str()
+        .is_some_and(|content_type| content_type.starts_with("video/mp4; codecs=\"avc1.")),
+        "{enriched_video}"
+    );
+    assert!(enriched_video["item"]["video_profile"].is_string());
+    assert!(enriched_video["item"]["pixel_format"].is_string());
+    {
+        let mut catalog = app.catalog.write().unwrap();
+        let object_id = catalog.by_detail[&h264_audio_fallback.detail_id].clone();
+        let item = catalog.items.get_mut(&object_id).unwrap();
+        item.probe.video = "h264".into();
+        item.probe.video_profile = "High".into();
+        item.probe.video_level = 41;
+        item.probe.pixel_format = "yuv420p".into();
+        item.probe.bit_depth = 8;
+        item.probe.codec_string = "avc1.640029,ac-3".into();
+        item.probe.hdr = "sdr".into();
+        item.probe.audio = "ac3".into();
+        item.probe.audio_streams = "1:0:ac3:6".into();
+        item.duration = Some("00:01:00.000".into());
+    }
+    let h264_page = app.handle(&req(&get(
+        "/api/web/library?view=library&kind=video&q=tagged&limit=10",
+        "Browser/1.0",
+    )));
+    let h264_page: serde_json::Value = serde_json::from_slice(&h264_page.body).unwrap();
+    let h264_dto = h264_page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == h264_audio_fallback.detail_id)
+        .unwrap();
+    assert_eq!(
+        h264_dto["video_content_type"],
+        "video/mp4; codecs=\"avc1.640029\""
+    );
+    assert_eq!(
+        h264_dto["audio_tracks"][0]["content_type"],
+        "audio/mp4; codecs=\"ac-3\""
+    );
+    assert_eq!(h264_dto["codec_string"], "avc1.640029,ac-3");
+    assert_eq!(h264_dto["compatible_video_encoder"], "libx264");
+    let audio_only_compat = app.handle(&req(&get(
+        &format!(
+            "/web/media/{}.mp4?quality=auto&video_mode=copy&audio_mode=transcode",
+            h264_audio_fallback.detail_id
+        ),
+        "Browser/1.0",
+    )));
+    assert_eq!(
+        audio_only_compat.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&audio_only_compat.body)
+    );
+    let audio_only_spec = audio_only_compat
+        .remux_job
+        .expect("browser audio-only compatibility job");
+    assert!(audio_only_spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-c:v", "copy"]));
+    assert!(audio_only_spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-c:a", "aac"]));
+    assert!(audio_only_spec
+        .fallback_args
+        .as_ref()
+        .is_some_and(|args| args.iter().any(|arg| arg == "libx264")));
+    let resized_compat = app.handle(&req(&get(
+        &format!(
+            "/web/media/{}.mp4?quality=full_hd&video_mode=transcode&audio_mode=copy",
+            h264_audio_fallback.detail_id
+        ),
+        "Browser/1.0",
+    )));
+    let resized_spec = resized_compat
+        .remux_job
+        .expect("explicit browser quality job");
+    assert!(resized_spec.args.iter().any(|arg| arg == "libx264"));
+    assert!(resized_spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-c:a", "copy"]));
+    assert!(!resized_spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-c:v", "copy"]));
+
+    {
+        let mut catalog = app.catalog.write().unwrap();
+        let object_id = catalog.by_detail[&h264_audio_fallback.detail_id].clone();
+        let item = catalog.items.get_mut(&object_id).unwrap();
+        item.probe.video = "hevc".into();
+        item.probe.video_profile = "Main 10".into();
+        item.probe.video_level = 120;
+        item.probe.pixel_format = "yuv420p10le".into();
+        item.probe.bit_depth = 10;
+        item.probe.codec_string = "hev1.1.6.L120.B0,mp4a.40.2".into();
+        item.probe.hdr = "dv-p8".into();
+        item.probe.audio = "aac".into();
+        item.probe.audio_streams = "1:0:aac:2".into();
+    }
+    let hevc_page = app.handle(&req(&get(
+        "/api/web/library?view=library&kind=video&q=tagged&limit=10",
+        "Browser/1.0",
+    )));
+    let hevc_page: serde_json::Value = serde_json::from_slice(&hevc_page.body).unwrap();
+    assert_eq!(
+        hevc_page["entries"][0]["video_content_type"],
+        "video/mp4; codecs=\"hvc1.1.6.L120.B0\""
+    );
+    let copied_compat = app.handle(&req(&get(
+        &format!(
+            "/web/media/{}.mp4?quality=auto&video_mode=copy&audio_mode=copy",
+            h264_audio_fallback.detail_id
+        ),
+        "Browser/1.0",
+    )));
+    let copied_spec = copied_compat
+        .remux_job
+        .expect("fully copied HEVC/AAC browser job");
+    assert!(copied_spec.cache_key.contains("timeline-zero-v1"));
+    assert!(copied_spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-c:v", "copy"]));
+    assert!(copied_spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-tag:v", "hvc1"]));
+    assert!(copied_spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-c:a", "copy"]));
+    assert!(copied_spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-bsf:a", "aac_adtstoasc"]));
+    assert!(copied_spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-avoid_negative_ts", "make_zero"]));
+    let portable = copied_spec
+        .fallback_args
+        .as_ref()
+        .expect("portable fallback for negotiated copies");
+    assert!(portable.iter().any(|arg| arg == "libx264"));
+    assert!(portable
+        .windows(2)
+        .any(|pair| pair == ["-c:a", "aac"]));
+    app.cfg.web.encoder = "h264_nvenc".into();
+    {
+        let mut catalog = app.catalog.write().unwrap();
+        let object_id = catalog.by_detail[&h264_audio_fallback.detail_id].clone();
+        let item = catalog.items.get_mut(&object_id).unwrap();
+        item.probe.hdr = "hdr10".into();
+        item.probe.video_timestamp_mode = "broken-reordered".into();
+        item.probe.audio_streams.push_str(",@t:broken-reordered");
+    }
+    let repair_page = app.handle(&req(&get(
+        "/api/web/library?view=library&kind=video&q=tagged&limit=10",
+        "Browser/1.0",
+    )));
+    let repair_page: serde_json::Value = serde_json::from_slice(&repair_page.body).unwrap();
+    assert_eq!(repair_page["entries"][0]["video_repair_required"], true);
+    assert_eq!(repair_page["entries"][0]["repair_video_encoder"], "hevc_nvenc");
+    assert!(repair_page["entries"][0]["video_content_type"].is_string());
+    let unsafe_copy = app.handle(&req(&get(
+        &format!(
+            "/web/media/{}.mp4?quality=auto&video_mode=copy&audio_mode=copy",
+            h264_audio_fallback.detail_id
+        ),
+        "Browser/1.0",
+    )));
+    assert_eq!(unsafe_copy.status, 400);
+    let repaired = app.handle(&req(&get(
+        &format!(
+            "/web/media/{}.mp4?quality=auto&video_mode=repair&audio_mode=copy",
+            h264_audio_fallback.detail_id
+        ),
+        "Browser/1.0",
+    )));
+    let repaired_spec = repaired.remux_job.expect("HEVC frame-order repair job");
+    assert!(repaired_spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-c:v", "hevc_nvenc"]));
+    assert!(repaired_spec.args.iter().any(|arg| arg == "format=p010le")
+        || repaired_spec
+            .args
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("format=p010le")));
+    assert!(repaired_spec
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-tag:v", "hvc1"]));
+    assert!(!repaired_spec
+        .args
+        .iter()
+        .any(|arg| arg.to_string_lossy().contains("libplacebo")));
+    assert!(repaired_spec
+        .fallback_args
+        .as_ref()
+        .is_some_and(|args| args
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("libplacebo"))));
+    app.cfg.web.encoder = "libx264".into();
+    {
+        let mut catalog = app.catalog.write().unwrap();
+        let object_id = catalog.by_detail[&h264_audio_fallback.detail_id].clone();
+        let item = catalog.items.get_mut(&object_id).unwrap();
+        item.probe.codec_string = "hevc,mp4a.40.2".into();
+        item.probe.hdr = "dv-p8".into();
+        item.probe.video_timestamp_mode = "valid".into();
+    }
+    let legacy_metadata_copy = app.handle(&req(&get(
+        &format!(
+            "/web/media/{}.mp4?quality=auto&video_mode=copy&audio_mode=copy",
+            h264_audio_fallback.detail_id
+        ),
+        "Browser/1.0",
+    )));
+    assert_eq!(
+        legacy_metadata_copy.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&legacy_metadata_copy.body)
+    );
+    assert!(legacy_metadata_copy
+        .remux_job
+        .expect("legacy HEVC metadata copy job")
+        .args
+        .windows(2)
+        .any(|pair| pair == ["-c:v", "copy"]));
+    let invalid_resized_copy = app.handle(&req(&get(
+        &format!(
+            "/web/media/{}.mp4?quality=full_hd&video_mode=copy&audio_mode=copy",
+            h264_audio_fallback.detail_id
+        ),
+        "Browser/1.0",
+    )));
+    assert_eq!(invalid_resized_copy.status, 400);
+    {
+        let mut catalog = app.catalog.write().unwrap();
+        let object_id = catalog.by_detail[&h264_audio_fallback.detail_id].clone();
+        let item = catalog.items.get_mut(&object_id).unwrap();
+        item.probe.audio = "truehd".into();
+        item.probe.audio_streams = "1:0:truehd:8".into();
+    }
+    let invalid_audio_copy = app.handle(&req(&get(
+        &format!(
+            "/web/media/{}.mp4?quality=auto&video_mode=copy&audio_mode=copy",
+            h264_audio_fallback.detail_id
+        ),
+        "Browser/1.0",
+    )));
+    assert_eq!(invalid_audio_copy.status, 400);
 
     let dvp7 = app
         .catalog

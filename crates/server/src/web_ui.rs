@@ -19,12 +19,14 @@ const LIBRARY_JS: &str = include_str!("../web/library.js");
 const PLAYER_JS: &str = include_str!("../web/player.js");
 const PREFERENCES_JS: &str = include_str!("../web/preferences.js");
 const STORE_JS: &str = include_str!("../web/store.js");
+const FAVICON_PNG: &[u8] = include_bytes!("../../../assets/icon-48.png");
 const WEB_MEDIA_PREFIX: &str = "/web/media/";
 const WEB_ITEM_PREFIX: &str = "/api/web/item/";
 const WEB_TRANSCODE_STATUS_PREFIX: &str = "/api/web/transcode/";
 const DEFAULT_PAGE_SIZE: usize = 60;
 const MAX_PAGE_SIZE: usize = 200;
 const SDR_TONEMAP_CACHE_REVISION: &str = "sdr-tonemap-libplacebo-v1";
+const BROWSER_TIMELINE_CACHE_REVISION: &str = "timeline-zero-v1";
 const WEB_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Serialize)]
@@ -164,9 +166,12 @@ struct WebMediaItem {
     pixel_format: Option<String>,
     bit_depth: Option<u32>,
     frame_rate: Option<String>,
+    video_timestamp_mode: Option<String>,
+    video_repair_required: bool,
     audio_codec: String,
     audio_layout: Option<String>,
     codec_string: Option<String>,
+    video_content_type: Option<String>,
     hdr: String,
     audio_tracks: Vec<WebAudioTrack>,
     default_audio_index: usize,
@@ -177,12 +182,15 @@ struct WebMediaItem {
     source_url: String,
     fallback_url: String,
     transcode_likely: bool,
+    compatible_video_encoder: String,
+    repair_video_encoder: String,
 }
 
 #[derive(Clone, Serialize)]
 struct WebAudioTrack {
     index: usize,
     codec: String,
+    content_type: Option<String>,
     channels: u32,
     language: Option<String>,
     title: Option<String>,
@@ -328,6 +336,9 @@ pub(crate) fn presentation(app: &App) -> HttpResponse {
 pub(crate) fn asset(app: &App, path: &str) -> HttpResponse {
     if !app.cfg.web.enable {
         return not_found();
+    }
+    if path == "/favicon.ico" {
+        return bytes_response("image/png", FAVICON_PNG, "public, max-age=86400");
     }
     let (mime, body) = match path {
         "/web/app.css" => ("text/css; charset=utf-8", APP_CSS),
@@ -889,10 +900,20 @@ fn stored_chapters(item: &MediaItem) -> Vec<WebChapter> {
 }
 
 fn stream_metadata_complete(item: &MediaItem) -> bool {
-    item.probe
+    let has_video_capabilities = item
+        .probe
         .audio_streams
         .split(',')
-        .any(|record| record.starts_with("@v:"))
+        .any(|record| record.starts_with("@v:"));
+    let needs_timestamp_check = item.mime.starts_with("video/")
+        && matches!(item.probe.container.as_str(), "mp4" | "mov")
+        && matches!(item.probe.video.as_str(), "h264" | "hevc");
+    let has_timestamp_check = item
+        .probe
+        .audio_streams
+        .split(',')
+        .any(|record| record.starts_with("@t:"));
+    has_video_capabilities && (!needs_timestamp_check || has_timestamp_check)
 }
 
 fn audio_track_dto(
@@ -906,11 +927,44 @@ fn audio_track_dto(
     WebAudioTrack {
         index,
         codec: codec.to_owned(),
+        content_type: browser_audio_content_type(codec),
         channels,
         language: language.map(str::to_owned),
         title: title.map(str::to_owned),
         default,
     }
+}
+
+fn browser_direct_codec_string(
+    item: &MediaItem,
+    tracks: &[WebAudioTrack],
+    default_audio_index: usize,
+) -> Option<String> {
+    if !item.mime.starts_with("video/") {
+        return (!item.probe.codec_string.is_empty()).then(|| item.probe.codec_string.clone());
+    }
+    let video = item
+        .probe
+        .codec_string
+        .split(',')
+        .next()
+        .map(str::trim)
+        .filter(|codec| !codec.is_empty())
+        .or_else(|| item.probe.video.split(',').next().map(str::trim));
+    let audio = tracks
+        .iter()
+        .find(|track| track.index == default_audio_index)
+        .map(|track| {
+            browser_audio_codec_string(&track.codec)
+                .map(str::to_owned)
+                .unwrap_or_else(|| track.codec.clone())
+        });
+    let codecs = video
+        .into_iter()
+        .map(str::to_owned)
+        .chain(audio)
+        .collect::<Vec<_>>();
+    (!codecs.is_empty()).then(|| codecs.join(","))
 }
 
 fn caption_language(item: &MediaItem, caption: &rusty_dlna_scan::Caption) -> Option<String> {
@@ -1016,7 +1070,25 @@ fn media_dto(app: &App, item: &MediaItem) -> WebMediaItem {
         .unwrap_or_else(|| {
             pick_audio_index_from_streams(&item.probe.audio_streams, &item.probe.audio)
         });
+    let direct_codec_string = browser_direct_codec_string(item, &audio_tracks, default_audio_index);
     let file_name = media_file_name(item);
+    let video_content_type = browser_video_content_type(item, &source);
+    let compatible_video_encoder = if media_kind == "video" {
+        rusty_dlna_transcode::browser_video_encoder(&app.cfg.web.encoder).to_owned()
+    } else {
+        "none".to_owned()
+    };
+    let video_repair_required = item.probe.video_timestamp_mode == "broken-reordered";
+    let repair_video_encoder = if media_kind == "video"
+        && video_repair_required
+        && source.video_codec == rusty_dlna_transcode::VideoCodec::Hevc
+        && item.probe.bit_depth > 8
+        && app.cfg.web.encoder == "h264_nvenc"
+    {
+        "hevc_nvenc".to_owned()
+    } else {
+        compatible_video_encoder.clone()
+    };
     WebMediaItem {
         id: item.detail_id,
         title: item.title.clone(),
@@ -1052,11 +1124,14 @@ fn media_dto(app: &App, item: &MediaItem) -> WebMediaItem {
             .then(|| item.probe.pixel_format.clone()),
         bit_depth: (item.probe.bit_depth > 0).then_some(item.probe.bit_depth),
         frame_rate: (!item.probe.frame_rate.is_empty()).then(|| item.probe.frame_rate.clone()),
+        video_timestamp_mode: (!item.probe.video_timestamp_mode.is_empty())
+            .then(|| item.probe.video_timestamp_mode.clone()),
+        video_repair_required,
         audio_codec: item.probe.audio.clone(),
         audio_layout: (!item.probe.audio_layout.is_empty())
             .then(|| item.probe.audio_layout.clone()),
-        codec_string: (!item.probe.codec_string.is_empty())
-            .then(|| item.probe.codec_string.clone()),
+        codec_string: direct_codec_string,
+        video_content_type,
         hdr: item.probe.hdr.clone(),
         audio_tracks,
         default_audio_index,
@@ -1067,6 +1142,8 @@ fn media_dto(app: &App, item: &MediaItem) -> WebMediaItem {
         source_url: format!("{WEB_MEDIA_PREFIX}{}.mp4?mode=direct", item.detail_id),
         fallback_url: format!("{WEB_MEDIA_PREFIX}{}.mp4", item.detail_id),
         transcode_likely: !likely_browser_native(item, &source),
+        compatible_video_encoder,
+        repair_video_encoder,
     }
 }
 
@@ -1192,43 +1269,17 @@ pub(crate) fn item(app: &App, req: &HttpRequest) -> HttpResponse {
                 Some("retry_item"),
             );
         };
-        audio_tracks = probe
-            .audio_tracks
-            .iter()
-            .map(|track| {
-                audio_track_dto(
-                    track.index,
-                    &track.codec,
-                    track.channels,
-                    track.language.as_deref(),
-                    track.title.as_deref(),
-                    track.default,
-                )
-            })
-            .collect();
-        chapters = probe
-            .chapters
-            .iter()
-            .enumerate()
-            .map(|(index, chapter)| WebChapter {
-                index,
-                title: chapter
-                    .title
-                    .clone()
-                    .filter(|title| !title.trim().is_empty())
-                    .unwrap_or_else(|| format!("Chapter {}", index + 1)),
-                start_seconds: chapter.start_seconds,
-                end_seconds: chapter.end_seconds,
-            })
-            .collect();
-        item_dto.audio_tracks.clone_from(&audio_tracks);
-        item_dto.chapters.clone_from(&chapters);
+        let mut enriched = item.clone();
+        enriched.probe = probe.probe;
+        enriched.duration = probe.av.duration.or(enriched.duration);
+        enriched.bitrate = probe.av.bitrate.or(enriched.bitrate);
+        enriched.resolution = probe.av.resolution.or(enriched.resolution);
+        enriched.channels = probe.av.channels.or(enriched.channels);
+        enriched.samplerate = probe.av.samplerate.or(enriched.samplerate);
+        item_dto = media_dto(app, &enriched);
         item_dto.stream_metadata_complete = true;
-        item_dto.default_audio_index = audio_tracks
-            .iter()
-            .find(|track| track.default)
-            .map(|track| track.index)
-            .unwrap_or(item_dto.default_audio_index);
+        audio_tracks.clone_from(&item_dto.audio_tracks);
+        chapters.clone_from(&item_dto.chapters);
     }
     let mut response = json_response_with_status_and_cache_control(
         200,
@@ -1773,7 +1824,16 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
     }
 
     let params = QueryParams::parse(&req.query);
-    if params.has_unknown(&["audio", "start", "quality", "reason", "request", "mode"]) {
+    if params.has_unknown(&[
+        "audio",
+        "start",
+        "quality",
+        "reason",
+        "request",
+        "mode",
+        "video_mode",
+        "audio_mode",
+    ]) {
         return api_error(
             400,
             "invalid_parameter",
@@ -1833,6 +1893,33 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             )
         }
     };
+    let requested_video_mode = match params.get("video_mode").unwrap_or("transcode") {
+        "copy" | "repair" | "transcode" => params.get("video_mode").unwrap_or("transcode"),
+        _ => {
+            return api_error(
+                400,
+                "invalid_video_mode",
+                "Choose copy, repair, or transcode video mode.",
+                false,
+                None,
+            )
+        }
+    };
+    let copy_video_requested = requested_video_mode == "copy";
+    let repair_video_requested = requested_video_mode == "repair";
+    let copy_audio_requested = match params.get("audio_mode").unwrap_or("transcode") {
+        "copy" => true,
+        "transcode" => false,
+        _ => {
+            return api_error(
+                400,
+                "invalid_audio_mode",
+                "Choose copy or transcode audio mode.",
+                false,
+                None,
+            )
+        }
+    };
     let fallback_reason = params.get("reason").unwrap_or("unspecified");
     if fallback_reason.is_empty()
         || fallback_reason.len() > 64
@@ -1850,7 +1937,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
     }
 
     if source_mode == "direct" {
-        if ["audio", "start", "quality"]
+        if ["audio", "start", "quality", "video_mode", "audio_mode"]
             .iter()
             .any(|name| params.get(name).is_some())
         {
@@ -1908,7 +1995,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         .duration
         .as_deref()
         .and_then(media_duration_seconds)
-        .is_some_and(|duration| start_seconds >= duration)
+        .is_some_and(|duration| duration > 0 && start_seconds >= duration)
     {
         return api_error(
             400,
@@ -1927,14 +2014,90 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         item.probe.width,
         item.probe.height,
     );
-    let tone_map_to_sdr = is_video && browser_requires_sdr_tonemap(source.hdr);
-    let video_encoder = if !is_video {
+    let copy_video = if copy_video_requested {
+        if !is_video
+            || quality != rusty_dlna_transcode::BrowserQuality::Auto
+            || !browser_can_remux_video(&item, &source)
+        {
+            return api_error(
+                400,
+                "video_copy_unavailable",
+                "The source video cannot be copied into compatible playback.",
+                false,
+                None,
+            );
+        }
+        true
+    } else {
+        false
+    };
+    if repair_video_requested
+        && (!is_video
+            || quality != rusty_dlna_transcode::BrowserQuality::Auto
+            || !matches!(
+                source.video_codec,
+                rusty_dlna_transcode::VideoCodec::H264
+                    | rusty_dlna_transcode::VideoCodec::Hevc
+            ))
+    {
+        return api_error(
+            400,
+            "video_repair_unavailable",
+            "This source cannot use display-order repair playback.",
+            false,
+            None,
+        );
+    }
+    let selected_audio_codec = tracks
+        .iter()
+        .find(|track| track.index == audio_index)
+        .map(|track| track.codec.as_str())
+        .or_else(|| {
+            item.probe
+                .audio
+                .split(',')
+                .map(str::trim)
+                .filter(|codec| !codec.is_empty())
+                .nth(audio_index)
+        })
+        .unwrap_or("");
+    let copy_audio = if copy_audio_requested {
+        if !browser_can_remux_audio(selected_audio_codec) {
+            return api_error(
+                400,
+                "audio_copy_unavailable",
+                "The selected audio track cannot be copied into compatible playback.",
+                false,
+                None,
+            );
+        }
+        true
+    } else {
+        false
+    };
+    let source_requires_sdr_tonemap = is_video && browser_requires_sdr_tonemap(source.hdr);
+    let repair_with_hevc = repair_video_requested
+        && source.video_codec == rusty_dlna_transcode::VideoCodec::Hevc
+        && item.probe.bit_depth > 8
+        && app.cfg.web.encoder == "h264_nvenc";
+    let preserve_hevc_hdr = repair_with_hevc
+        && matches!(
+            source.hdr,
+            rusty_dlna_transcode::HdrKind::Hdr10
+                | rusty_dlna_transcode::HdrKind::DolbyVisionProfile8
+        );
+    let tone_map_to_sdr = source_requires_sdr_tonemap && !copy_video && !preserve_hevc_hdr;
+    let video_encoder = if !is_video || copy_video {
         "copy"
+    } else if repair_with_hevc {
+        "hevc_nvenc"
     } else {
         rusty_dlna_transcode::browser_video_encoder(&app.cfg.web.encoder)
     };
     let hardware_decode =
-        if video_encoder == "h264_nvenc" && matches!(item.probe.video.as_str(), "h264" | "hevc") {
+        if matches!(video_encoder, "h264_nvenc" | "hevc_nvenc")
+            && matches!(item.probe.video.as_str(), "h264" | "hevc")
+        {
             HardwareDecode::Cuda
         } else {
             HardwareDecode::None
@@ -1943,11 +2106,15 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         decision: Decision::Recode,
         action: RecodeAction::Browser,
         rule: Some("embedded-web-player".into()),
-        keep_hdr10: false,
+        keep_hdr10: preserve_hevc_hdr,
         drop_dolby_vision: true,
         video_encoder: video_encoder.into(),
         hardware_decode,
-        audio: AudioAction::ToAac,
+        audio: if copy_audio {
+            AudioAction::Copy
+        } else {
+            AudioAction::ToAac
+        },
         container: "mp4",
         audio_index,
         browser_quality: Some(quality),
@@ -1989,6 +2156,8 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             Some("retry_media"),
         );
     };
+    cache_key.push('-');
+    cache_key.push_str(BROWSER_TIMELINE_CACHE_REVISION);
     if tone_map_to_sdr {
         cache_key.push('-');
         cache_key.push_str(SDR_TONEMAP_CACHE_REVISION);
@@ -2005,8 +2174,32 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
     let part = cache_part(&destination);
     let transcode_args = |selected_plan: &TranscodePlan| {
         let mut args = ffmpeg_grow_os_args(Path::new("/proc/self/fd/3"), &part, selected_plan);
-        if tone_map_to_sdr {
+        if source_requires_sdr_tonemap
+            && selected_plan.video_encoder != "copy"
+            && selected_plan.video_encoder != "hevc_nvenc"
+        {
             apply_browser_sdr_tonemap(&mut args, selected_plan.hardware_decode, quality);
+        }
+        if matches!(selected_plan.audio, AudioAction::Copy)
+            && selected_audio_codec.eq_ignore_ascii_case("aac")
+        {
+            let output = args.len().saturating_sub(1);
+            args.splice(
+                output..output,
+                [
+                    OsString::from("-bsf:a"),
+                    OsString::from("aac_adtstoasc"),
+                ],
+            );
+        }
+        if source.video_codec == rusty_dlna_transcode::VideoCodec::Hevc
+            && matches!(selected_plan.video_encoder.as_str(), "copy" | "hevc_nvenc")
+        {
+            let output = args.len().saturating_sub(1);
+            args.splice(
+                output..output,
+                [OsString::from("-tag:v"), OsString::from("hvc1")],
+            );
         }
         if start_seconds > 0 {
             let input = args
@@ -2024,10 +2217,15 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         args
     };
     let args = transcode_args(&plan);
-    let fallback_args = if is_video && plan.video_encoder != "libx264" {
+    let fallback_args = if (is_video && plan.video_encoder != "libx264")
+        || plan.audio != AudioAction::ToAac
+    {
         let mut fallback = plan.clone();
-        fallback.video_encoder = "libx264".into();
+        if is_video {
+            fallback.video_encoder = "libx264".into();
+        }
         fallback.hardware_decode = HardwareDecode::None;
+        fallback.audio = AudioAction::ToAac;
         Some(transcode_args(&fallback))
     } else {
         None
@@ -2043,6 +2241,9 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         hardware_decode = ?plan.hardware_decode,
         source_hdr = ?source.hdr,
         tone_map_to_sdr,
+        copy_video,
+        repair_video = repair_video_requested,
+        copy_audio,
         audio_index = plan.audio_index,
         start_seconds,
         source_mode = "compatible",
@@ -2066,7 +2267,11 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         cacheable: start_seconds == 0,
         remux_p8: false,
         audio_index: plan.audio_index,
-        audio: RemuxAudio::Aac,
+        audio: if copy_audio {
+            RemuxAudio::Copy
+        } else {
+            RemuxAudio::Aac
+        },
     });
     response
 }
@@ -2081,6 +2286,97 @@ fn likely_browser_native(item: &MediaItem, source: &rusty_dlna_transcode::Source
         && source.video_codec == rusty_dlna_transcode::VideoCodec::H264
         && source.audio == rusty_dlna_transcode::AudioCodec::Aac)
         || item.mime == "video/webm"
+}
+
+fn browser_video_content_type(
+    item: &MediaItem,
+    source: &rusty_dlna_transcode::SourceMedia,
+) -> Option<String> {
+    if !browser_video_codec_compatible(item, source) {
+        return None;
+    }
+    let stored = item.probe.codec_string.split(',').next()?.trim();
+    let codec = match source.video_codec {
+        rusty_dlna_transcode::VideoCodec::H264 if stored.starts_with("avc1.") => {
+            stored.to_owned()
+        }
+        rusty_dlna_transcode::VideoCodec::Hevc if stored.starts_with("hvc1.") => {
+            stored.to_owned()
+        }
+        rusty_dlna_transcode::VideoCodec::Hevc if stored.starts_with("hev1.") => {
+            format!("hvc1.{}", &stored[5..])
+        }
+        _ => return None,
+    };
+    Some(format!("video/mp4; codecs=\"{codec}\""))
+}
+
+fn browser_can_remux_video(
+    item: &MediaItem,
+    source: &rusty_dlna_transcode::SourceMedia,
+) -> bool {
+    item.probe.video_timestamp_mode != "broken-reordered"
+        && browser_video_codec_compatible(item, source)
+}
+
+fn browser_video_codec_compatible(
+    item: &MediaItem,
+    source: &rusty_dlna_transcode::SourceMedia,
+) -> bool {
+    let codec = item
+        .probe
+        .codec_string
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .trim();
+    match source.video_codec {
+        rusty_dlna_transcode::VideoCodec::H264 => {
+            let profile = item.probe.video_profile.trim().to_ascii_lowercase();
+            let profile_safe = profile.is_empty()
+                || matches!(
+                    profile.as_str(),
+                    "baseline" | "constrained baseline" | "main" | "high"
+                );
+            let pixel_format_safe =
+                matches!(item.probe.pixel_format.as_str(), "yuv420p" | "yuvj420p");
+            let bit_depth_safe = item.probe.bit_depth == 0 || item.probe.bit_depth <= 8;
+            let level_safe = item.probe.video_level == 0 || item.probe.video_level <= 51;
+            codec.starts_with("avc1.")
+                && profile_safe
+                && pixel_format_safe
+                && bit_depth_safe
+                && level_safe
+                && !browser_requires_sdr_tonemap(source.hdr)
+        }
+        rusty_dlna_transcode::VideoCodec::Hevc => {
+            matches!(
+                source.hdr,
+                rusty_dlna_transcode::HdrKind::Sdr
+                    | rusty_dlna_transcode::HdrKind::Hdr10
+                    | rusty_dlna_transcode::HdrKind::DolbyVisionProfile8
+            )
+        }
+        _ => false,
+    }
+}
+
+fn browser_audio_codec_string(codec: &str) -> Option<&'static str> {
+    Some(match codec.trim().to_ascii_lowercase().as_str() {
+        "aac" => "mp4a.40.2",
+        "ac3" => "ac-3",
+        "eac3" => "ec-3",
+        "mp3" => "mp4a.6B",
+        _ => return None,
+    })
+}
+
+fn browser_audio_content_type(codec: &str) -> Option<String> {
+    browser_audio_codec_string(codec).map(|codec| format!("audio/mp4; codecs=\"{codec}\""))
+}
+
+fn browser_can_remux_audio(codec: &str) -> bool {
+    browser_audio_content_type(codec).is_some()
 }
 
 fn serve_original(

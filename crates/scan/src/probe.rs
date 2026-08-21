@@ -414,6 +414,7 @@ unsafe fn probe_avformat(
             pixel_format: String::new(),
             bit_depth: 0,
             frame_rate: String::new(),
+            video_timestamp_mode: String::new(),
             audio_layout: String::new(),
             codec_string: String::new(),
             width: 0,
@@ -442,6 +443,8 @@ unsafe fn probe_avformat(
     }
 
     let mut videos: Vec<String> = Vec::new();
+    let mut primary_video_index = None;
+    let mut primary_video_delay = 0;
     let mut audios: Vec<String> = Vec::new();
     let mut audio_streams: Vec<String> = Vec::new();
     let mut audio_stream_tags = EmbeddedTags::default();
@@ -464,6 +467,8 @@ unsafe fn probe_avformat(
                 }
                 push_unique(&mut videos, name);
                 if out.probe.width == 0 {
+                    primary_video_index = Some(i as i32);
+                    primary_video_delay = (*par).video_delay.max(0);
                     let w = (*par).width as u32;
                     let h = (*par).height as u32;
                     if w > 0 && h > 0 {
@@ -494,12 +499,19 @@ unsafe fn probe_avformat(
                             std::mem::transmute::<i32, sys::AVPixelFormat>((*par).format);
                         out.probe.pixel_format =
                             c_str(sys::av_get_pix_fmt_name(pixel_format)).to_owned();
-                        out.probe.bit_depth = pixel_format_bit_depth(&out.probe.pixel_format).max(
-                            (*par)
-                                .bits_per_raw_sample
-                                .max((*par).bits_per_coded_sample)
-                                .max(0) as u32,
-                        );
+                        let parameter_depth = [
+                            (*par).bits_per_raw_sample,
+                            (*par).bits_per_coded_sample,
+                        ]
+                        .into_iter()
+                        .filter(|depth| (1..=16).contains(depth))
+                        .max()
+                        .unwrap_or(0) as u32;
+                        // Some demuxers report total packed pixel width (for
+                        // example 24 for 8-bit YUV) as bits_per_coded_sample.
+                        // Browser capability checks need per-component depth.
+                        out.probe.bit_depth =
+                            pixel_format_bit_depth(&out.probe.pixel_format).max(parameter_depth);
                     }
                     let rate = (*st).avg_frame_rate;
                     if rate.num > 0 && rate.den > 0 {
@@ -570,6 +582,12 @@ unsafe fn probe_avformat(
     }
     out.probe.video = videos.join(",");
     out.probe.audio = audios.join(",");
+    out.probe.video_timestamp_mode = primary_video_index.map_or_else(
+        || "valid".to_owned(),
+        |stream_index| {
+            classify_video_timestamps(ctx, stream_index, primary_video_delay).to_owned()
+        },
+    );
     out.probe.audio_streams = audio_streams.join(",");
     let capability_record = format!(
         "@v:{}:{}:{}:{}:{}:{}:{}",
@@ -585,6 +603,10 @@ unsafe fn probe_avformat(
         out.probe.audio_streams.push(',');
     }
     out.probe.audio_streams.push_str(&capability_record);
+    out.probe.audio_streams.push_str(",@t:");
+    out.probe
+        .audio_streams
+        .push_str(&out.probe.video_timestamp_mode);
     if videos.is_empty() {
         fill_missing_tags(&mut out.tags, audio_stream_tags);
     }
@@ -639,6 +661,49 @@ unsafe fn probe_avformat(
         out.probe.hdr = "sdr".into();
     }
     Some(out)
+}
+
+/// Detect muxes which contain reordered/B frames but assign decode timestamps
+/// as presentation timestamps. Such files decode successfully, yet present in
+/// a forward/forward/back cadence when their video packets are stream-copied.
+unsafe fn classify_video_timestamps(
+    ctx: *mut sys::AVFormatContext,
+    stream_index: i32,
+    video_delay: i32,
+) -> &'static str {
+    if ctx.is_null() || video_delay <= 0 {
+        return "valid";
+    }
+    let mut packet = sys::av_packet_alloc();
+    if packet.is_null() {
+        return "valid";
+    }
+    let mut matching_timestamps = 0usize;
+    let mut differing_timestamps = 0usize;
+    let mut packets_read = 0usize;
+    while packets_read < 512 && matching_timestamps + differing_timestamps < 64 {
+        if sys::av_read_frame(ctx, packet) < 0 {
+            break;
+        }
+        packets_read += 1;
+        if (*packet).stream_index == stream_index
+            && (*packet).pts != sys::AV_NOPTS_VALUE
+            && (*packet).dts != sys::AV_NOPTS_VALUE
+        {
+            if (*packet).pts == (*packet).dts {
+                matching_timestamps += 1;
+            } else {
+                differing_timestamps += 1;
+            }
+        }
+        sys::av_packet_unref(packet);
+    }
+    sys::av_packet_free(&mut packet);
+    if matching_timestamps >= 12 && differing_timestamps == 0 {
+        "broken-reordered"
+    } else {
+        "valid"
+    }
 }
 
 fn compact_stream_field(value: &str) -> String {
@@ -1709,6 +1774,8 @@ mod tests {
         assert_eq!(media.probe.hdr, "dv-p7");
         assert_eq!(media.probe.audio, "truehd");
         assert!(media.probe.audio_streams.starts_with("1:0:truehd:6,@v:"));
+        assert_eq!(media.probe.video_timestamp_mode, "valid");
+        assert!(media.probe.audio_streams.contains(",@t:valid"));
         assert_eq!((media.probe.width, media.probe.height), (256, 144));
     }
 

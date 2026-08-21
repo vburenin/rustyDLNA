@@ -22,6 +22,8 @@ use crate::{
     EmbeddedTags, MediaItem, NfoMeta, ScanConfig,
 };
 
+pub(crate) const STREAM_PROBE_REVISION: i64 = 5;
+
 #[derive(Clone, Debug)]
 pub struct ObjectSnap {
     pub object_id: String,
@@ -1209,11 +1211,11 @@ impl LibraryDb {
                 "SELECT ID FROM DETAILS
                  WHERE DEVICE = ?1 AND INODE = ?2 AND ID != ?3
                    AND MIME IS NOT NULL
-                   AND STREAM_PROBE_REV >= 3
+                   AND STREAM_PROBE_REV >= ?4
                    AND SIZE = (SELECT SIZE FROM DETAILS WHERE ID = ?3)
                    AND TIMESTAMP = (SELECT TIMESTAMP FROM DETAILS WHERE ID = ?3)
                  LIMIT 1",
-                params![device, inode, not_id],
+                params![device, inode, not_id, STREAM_PROBE_REVISION],
                 |r| r.get::<_, i64>(0),
             )
             .optional()
@@ -1613,10 +1615,10 @@ impl LibraryDb {
         let mut stmt = self.conn.prepare(
             "SELECT MIN(ID), MIN(PATH) FROM DETAILS
              WHERE MIME IS NOT NULL AND PATH IS NOT NULL
-               AND STREAM_PROBE_REV < 3
+               AND STREAM_PROBE_REV < ?1
              GROUP BY DEVICE, INODE",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map([STREAM_PROBE_REVISION], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1631,9 +1633,9 @@ impl LibraryDb {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT DEVICE, INODE FROM DETAILS
              WHERE MIME IS NOT NULL AND INODE != 0
-               AND STREAM_PROBE_REV < 3",
+               AND STREAM_PROBE_REV < ?1",
         )?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map([STREAM_PROBE_REVISION], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1646,9 +1648,9 @@ impl LibraryDb {
             "UPDATE DETAILS SET DURATION = NULL, BITRATE = NULL, RESOLUTION = NULL,
                  CHANNELS = NULL, SAMPLERATE = NULL,
                  CONTAINER = NULL, VIDEO = NULL, AUDIO = NULL, AUDIO_STREAMS = NULL, HDR = NULL,
-                 DLNA_PN = NULL, STREAM_PROBE_REV = 3
+                 DLNA_PN = NULL, STREAM_PROBE_REV = ?2
              WHERE ID = ?1",
-            [id],
+            params![id, STREAM_PROBE_REVISION],
         )?;
         self.copy_stream_to_inode_aliases(id)?;
         Ok(())
@@ -1660,8 +1662,8 @@ impl LibraryDb {
 
     pub fn mark_detail_stream_probed(&self, id: i64) -> rusqlite::Result<()> {
         self.conn.execute(
-            "UPDATE DETAILS SET STREAM_PROBE_REV = 3 WHERE ID = ?1",
-            [id],
+            "UPDATE DETAILS SET STREAM_PROBE_REV = ?2 WHERE ID = ?1",
+            params![id, STREAM_PROBE_REVISION],
         )?;
         Ok(())
     }
@@ -3290,17 +3292,6 @@ fn migrate_schema_inner(
             "ALTER TABLE DETAILS ADD COLUMN STREAM_PROBE_REV INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
-        // Existing populated rows have already survived a probe under the
-        // previous schema. Keep genuinely empty rows eligible for the one-time
-        // startup backfill.
-        tx.execute(
-            "UPDATE DETAILS SET STREAM_PROBE_REV = 3
-             WHERE NULLIF(HDR, '') IS NOT NULL
-                OR NULLIF(DURATION, '') IS NOT NULL
-                OR NULLIF(CONTAINER, '') IS NOT NULL
-                OR NULLIF(RESOLUTION, '') IS NOT NULL",
-            [],
-        )?;
     }
     if version < 9 {
         if !table_has_column(&tx, "BOOKMARKS", "UPDATED_AT")? {
@@ -3334,10 +3325,38 @@ fn migrate_schema_inner(
                  AUDIO_STREAMS = NULL, CONTAINER = NULL, STREAM_PROBE_REV = 0",
             [],
         )?;
+    }
+    if rev < 4 {
+        // Revision 4 adds the compact @v capability record needed for exact
+        // RFC 6381 browser negotiation. Preserve already-capable rows and
+        // schedule only legacy rows for the startup probe backfill.
         tx.execute(
-            "INSERT INTO SETTINGS (KEY, VALUE) VALUES ('stream_probe_rev', '3')
-             ON CONFLICT(KEY) DO UPDATE SET VALUE = excluded.VALUE",
+            "UPDATE DETAILS SET STREAM_PROBE_REV =
+                 CASE WHEN COALESCE(AUDIO_STREAMS, '') LIKE '%@v:%'
+                      THEN 4 ELSE 0 END",
             [],
+        )?;
+    }
+    if rev < 5 {
+        // Revision 5 samples compressed packet timestamps. Reprobe only MP4
+        // H.264/HEVC sources, where decode-order timestamps are both plausible
+        // and eligible for browser stream copy. Other current rows do not need
+        // the new marker to retain their existing behavior.
+        tx.execute(
+            "UPDATE DETAILS SET STREAM_PROBE_REV =
+                 CASE WHEN COALESCE(AUDIO_STREAMS, '') NOT LIKE '%@v:%' THEN 0
+                      WHEN MIME LIKE 'video/%'
+                       AND CONTAINER IN ('mp4', 'mov')
+                       AND (VIDEO = 'h264' OR VIDEO = 'hevc') THEN 0
+                      ELSE ?1 END",
+            [STREAM_PROBE_REVISION],
+        )?;
+    }
+    if rev < STREAM_PROBE_REVISION {
+        tx.execute(
+            "INSERT INTO SETTINGS (KEY, VALUE) VALUES ('stream_probe_rev', ?1)
+             ON CONFLICT(KEY) DO UPDATE SET VALUE = excluded.VALUE",
+            [STREAM_PROBE_REVISION.to_string()],
         )?;
     }
     migration_checkpoint(4, fail_after_step)?;
@@ -3737,6 +3756,64 @@ mod query_tests {
             .is_err());
         drop(db);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn capability_and_timing_revisions_schedule_only_affected_rows() {
+        let mut db = LibraryDb::open_memory().unwrap();
+        db.conn
+            .execute(
+                "UPDATE SETTINGS SET VALUE = '3' WHERE KEY = 'stream_probe_rev'",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO DETAILS
+                    (ID, PATH, MIME, CONTAINER, VIDEO, STREAM_PROBE_REV, AUDIO_STREAMS)
+                 VALUES (1, '/media/legacy.mkv', 'video/x-matroska', 'mkv', 'hevc', 3,
+                         '1:0:eac3:6'),
+                        (2, '/media/current.mkv', 'video/x-matroska', 'mkv', 'hevc', 3,
+                         '1:0:eac3:6,@v:Main%2010:153:yuv420p10le:10:24000/1001:hvc1.2.4.L153.B0:5.1'),
+                        (3, '/media/reordered.mp4', 'video/mp4', 'mp4', 'hevc', 3,
+                         '1:0:eac3:6,@v:Main%2010:153:yuv420p10le:10:24000/1001:hvc1.2.4.L153.B0:5.1')",
+                [],
+            )
+            .unwrap();
+
+        migrate_schema(&mut db.conn).unwrap();
+
+        let legacy_revision: i64 = db
+            .conn
+            .query_row(
+                "SELECT STREAM_PROBE_REV FROM DETAILS WHERE ID = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let current_revision: i64 = db
+            .conn
+            .query_row(
+                "SELECT STREAM_PROBE_REV FROM DETAILS WHERE ID = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let timing_revision: i64 = db
+            .conn
+            .query_row(
+                "SELECT STREAM_PROBE_REV FROM DETAILS WHERE ID = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_revision, 0);
+        assert_eq!(current_revision, STREAM_PROBE_REVISION);
+        assert_eq!(timing_revision, 0);
+        assert_eq!(
+            db.setting("stream_probe_rev").unwrap().as_deref(),
+            Some("5")
+        );
     }
 
     #[test]

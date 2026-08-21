@@ -379,6 +379,18 @@ fn find_album_art_for_config(video_path: &Path, cfg: &ScanConfig) -> Option<Path
     find_album_art(video_path)
 }
 
+/// Prefer artwork beside the browsed path, then beside its physical target.
+/// The latter lets a symlink-only library entry inherit the poster maintained
+/// with the real media file without requiring poster symlinks in every view.
+fn find_album_art_for_media_path(video_path: &Path, cfg: &ScanConfig) -> Option<PathBuf> {
+    find_album_art_for_config(video_path, cfg).or_else(|| {
+        let canonical = std::fs::canonicalize(video_path).ok()?;
+        (canonical != video_path)
+            .then(|| find_album_art_for_config(&canonical, cfg))
+            .flatten()
+    })
+}
+
 fn find_album_art_in_inventory(
     media_path: &Path,
     cfg: &ScanConfig,
@@ -631,7 +643,8 @@ fn prepare_album_art(
     opened: &RootedFile,
 ) -> ScanResult<Option<PathBuf>> {
     cfg.check_cancelled()?;
-    if let Some(src) = find_album_art_for_config(path, cfg).filter(|p| path_is_allowed_file(p, cfg))
+    if let Some(src) =
+        find_album_art_for_media_path(path, cfg).filter(|p| path_is_allowed_file(p, cfg))
     {
         if let Some(stored) = persist_album_art_file(cfg, &src)? {
             return Ok(Some(stored));
@@ -1396,7 +1409,25 @@ fn refresh_artwork_event(db: &LibraryDb, cfg: &ScanConfig, sidecar: &Path) -> Sc
     Ok(touched)
 }
 
-fn attach_album_art_in_dir(db: &LibraryDb, cfg: &ScanConfig, dir: &Path) -> ScanResult<bool> {
+fn recoverable_artwork_error(cfg: &ScanConfig, error: &ScanError) -> bool {
+    if cfg.cancellation.is_cancelled() {
+        return false;
+    }
+    match error {
+        ScanError::Io { source, .. } => source.kind() != std::io::ErrorKind::Interrupted,
+        ScanError::HelperAdmission(
+            HelperAdmissionError::Rejected | HelperAdmissionError::TimedOut,
+        ) => true,
+        _ => false,
+    }
+}
+
+fn attach_album_art_in_dir(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    dir: &Path,
+    failed_inodes: &mut HashSet<(i64, i64)>,
+) -> ScanResult<bool> {
     if !path_is_allowed_dir(dir, cfg) {
         return Ok(false);
     }
@@ -1419,7 +1450,14 @@ fn attach_album_art_in_dir(db: &LibraryDb, cfg: &ScanConfig, dir: &Path) -> Scan
     for path in media {
         let path_s = path_to_db(&path);
         if let Some(existing) = db.find_detail_by_path(&path_s)? {
-            let sidecar = find_album_art_in_inventory(&path, cfg, &files);
+            let sidecar = find_album_art_in_inventory(&path, cfg, &files).or_else(|| {
+                find_album_art_for_media_path(&path, cfg)
+                    .filter(|candidate| path_is_allowed_file(candidate, cfg))
+            });
+            let physical = (existing.device, existing.inode);
+            if sidecar.is_none() && failed_inodes.contains(&physical) {
+                continue;
+            }
             let art_id = db.detail_album_art(existing.id)?;
             let current = (art_id > 0)
                 .then(|| db.album_art_path(art_id))
@@ -1427,16 +1465,34 @@ fn attach_album_art_in_dir(db: &LibraryDb, cfg: &ScanConfig, dir: &Path) -> Scan
                 .flatten()
                 .map(|stored| path_from_db(&stored));
             if let Some(current) = current.as_ref().filter(|stored| stored.is_file()) {
-                let generated = current
+                let cached = current
                     .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.starts_with("thumb-") || name.starts_with("embed-"));
-                if (generated && sidecar.is_none()) || (!generated && sidecar.is_some()) {
+                if cached && sidecar.is_none() {
+                    continue;
+                }
+                // A real sidecar selected through another hardlink/symlink is
+                // authoritative for the inode. A poster-less alias must never
+                // replace it with embedded art or a generated video frame.
+                if !cached
+                    && (!is_direct_physical_path(&path)
+                        || sidecar.as_ref().is_none_or(|candidate| candidate == current))
+                {
                     continue;
                 }
             }
-            if attach_album_art(db, cfg, &path, existing.id)? {
-                any = true;
+            match attach_album_art(db, cfg, &path, existing.id) {
+                Ok(changed) => any |= changed,
+                Err(error) if recoverable_artwork_error(cfg, &error) => {
+                    failed_inodes.insert(physical);
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "artwork preparation failed; preserving existing artwork and continuing"
+                    );
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -3329,6 +3385,13 @@ pub fn probe_from_stored(
         probe.codec_string = decode_compact_stream_field(fields.next().unwrap_or(""));
         probe.audio_layout = decode_compact_stream_field(fields.next().unwrap_or(""));
     }
+    if let Some(mode) = probe
+        .audio_streams
+        .split(',')
+        .find_map(|record| record.strip_prefix("@t:"))
+    {
+        probe.video_timestamp_mode = mode.to_owned();
+    }
     probe
 }
 
@@ -4209,14 +4272,17 @@ fn monitor_dirty_inner(
         }
         let artwork_started = std::time::Instant::now();
         let mut artwork_changed = false;
+        let mut artwork_failures = HashSet::new();
         for dir in &parents {
             cfg.check_cancelled()?;
-            artwork_changed |= attach_album_art_in_dir(&db, cfg, dir)?;
+            artwork_changed |=
+                attach_album_art_in_dir(&db, cfg, dir, &mut artwork_failures)?;
         }
         sidecar_changed |= artwork_changed;
         tracing::info!(
             target: "rusty_dlna",
             directories = parents.len(),
+            failed_physical_files = artwork_failures.len(),
             elapsed_ms = artwork_started.elapsed().as_millis(),
             "library artwork reconciliation complete"
         );
@@ -5237,7 +5303,7 @@ fn prepare_pending_files(
                 && group.source.as_ref().is_some_and(|source| {
                     source.size == current_physical.size
                         && source.timestamp >= current_physical.timestamp
-                        && source.stream_probe_rev >= 3
+                        && source.stream_probe_rev >= db::STREAM_PROBE_REVISION
                 });
             let probe_attempted = !source_is_current;
             let _probe_permit = if probe_attempted {

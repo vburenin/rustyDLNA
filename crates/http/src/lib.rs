@@ -83,7 +83,8 @@ pub fn route(method: &str, path: &str) -> HttpRoute {
         p if p.starts_with("/api/web/transcode/") => HttpRoute::WebTranscodeStatus,
         p if p.starts_with("/api/web/item/") => HttpRoute::WebItem,
         p if p.starts_with("/web/media/") => HttpRoute::WebMedia,
-        "/web/app.css"
+        "/favicon.ico"
+        | "/web/app.css"
         | "/web/app.js"
         | "/web/api.js"
         | "/web/core.js"
@@ -334,8 +335,8 @@ pub struct RemuxJobSpec {
     pub source_file: Option<std::sync::Arc<std::fs::File>>,
     pub dest: std::path::PathBuf,
     pub args: Vec<std::ffi::OsString>,
-    /// Optional software command used only when a hardware producer fails
-    /// before it has emitted a playable first fragment.
+    /// Optional portable command used when negotiated stream copying or a
+    /// hardware producer fails before emitting a playable first fragment.
     pub fallback_args: Option<Vec<std::ffi::OsString>>,
     /// Whether the producer may keep running after its last HTTP reader goes
     /// away. DLNA cache jobs may opt in; interactive browser streams do not.
@@ -551,6 +552,7 @@ mod tests {
             HttpRoute::WebTranscodeStatus
         );
         assert_eq!(route("GET", "/web/app.js"), HttpRoute::WebAsset);
+        assert_eq!(route("GET", "/favicon.ico"), HttpRoute::WebAsset);
         assert_eq!(route("GET", "/web/media/3.mp4"), HttpRoute::WebMedia);
     }
 
