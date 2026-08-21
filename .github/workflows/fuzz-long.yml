@@ -24,7 +24,7 @@ jobs:
         target: [http_request, http_range, ssdp, soap_xml, nfo, url_ids, sidecars]
         sanitizer: [address, leak]
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
       - name: Pinned fuzz toolchain
