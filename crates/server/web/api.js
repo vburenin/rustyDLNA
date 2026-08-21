@@ -84,8 +84,12 @@ export class WebApi {
     return responseJson(response);
   }
 
-  async transcodeStatus(id, requestId = null, signal = null) {
-    const query = requestId === null ? "" : `?request=${encodeURIComponent(String(requestId))}`;
+  async transcodeStatus(id, requestId = null, sessionId = null, signal = null) {
+    const params = new URLSearchParams();
+    if (requestId !== null) params.set("request", String(requestId));
+    if (sessionId !== null) params.set("session", String(sessionId));
+    const encoded = params.toString();
+    const query = encoded ? `?${encoded}` : "";
     const response = await fetch(`/api/web/transcode/${encodeURIComponent(String(id))}${query}`, {
       headers: { Accept: "application/json" },
       signal,
@@ -93,9 +97,10 @@ export class WebApi {
     return responseJson(response);
   }
 
-  async cancelTranscode(id, requestId) {
-    const query = `?request=${encodeURIComponent(String(requestId))}`;
-    const response = await fetch(`/api/web/transcode/${encodeURIComponent(String(id))}${query}`, {
+  async cancelTranscode(id, requestId, sessionId = null) {
+    const params = new URLSearchParams({ request: String(requestId) });
+    if (sessionId !== null) params.set("session", String(sessionId));
+    const response = await fetch(`/api/web/transcode/${encodeURIComponent(String(id))}?${params}`, {
       method: "DELETE",
       headers: { Accept: "application/json" },
       keepalive: true,

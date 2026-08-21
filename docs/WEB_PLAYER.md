@@ -135,9 +135,14 @@ latency without putting source filesystem paths in browser responses.
 Compatibility jobs reuse the existing bounded helper/job gate, runtime
 deadline, cache-size and age limits, cancellation, process reaping, and
 finished-file verification. Concurrent equivalent requests share a job. A
-zero-offset completed stream can be reused from cache. Seek restarts are
-session artifacts: the player coalesces rapid scrubs and explicitly cancels a
-producer when a new seek supersedes it. An unintentional dropped connection
+zero-offset completed stream can be reused from cache. The browser assigns one
+stable playback-session ID to the selected title and a newer generation ID to
+each replacement source. The player waits for a short pause in rapid keyboard
+or timeline scrubbing; when the next generation arrives, the server cancels
+every older producer owned only by that playback session. Another browser or
+tab sharing an equivalent producer keeps it alive. Explicit cancellation also
+records the generation before looking up its job, so a late media GET cannot
+restart work that was already abandoned. An unintentional dropped connection
 still gets a 30-second reconnect window, and reopening the same source attaches
 to that producer. Completed
 nonzero-offset output remains reconnectable for 30 seconds after its final
@@ -199,9 +204,11 @@ polls, or errors from an older session are ignored.
 User-facing failures distinguish missing media, unsupported Original playback,
 disabled Compatible playback, a busy transcode queue, cancelled/failed
 transcoding, network/offline failure, and browser autoplay policy. Busy or
-cancelled replacement streams retry automatically up to three times. Depending on
-the category, recovery offers Retry, Try compatible, Play original, or Return
-to library. Raw helper output is never primary copy; limited technical details
+cancelled replacement streams retry automatically up to three times. A media
+connection that fails while its producer is still healthy also starts a newer
+generation automatically and cancels the abandoned one. Depending on the
+category, recovery offers Retry, Try compatible, Play original, or Return to
+library. Raw helper output is never primary copy; limited technical details
 remain in a disclosure.
 
 ## Versioned API and caching
@@ -218,9 +225,9 @@ validated strictly.
 | `/web/{app,api,core,library,player,preferences,store}.js` | Embedded ES modules |
 | `/api/web/library` | Versioned folder or flat-library page, server root, capabilities, generation, and item DTOs |
 | `/api/web/item/{id}` | One item; `enrich=1` explicitly probes legacy stream metadata |
-| `/api/web/transcode/{id}?request={request_id}` | GET returns request-scoped `queued`, `starting`, `producing`, `complete`, `cancelled`, or `failed` state; DELETE cancels an exclusively owned, superseded request |
+| `/api/web/transcode/{id}?session={session_id}&request={generation_id}` | GET returns generation-scoped `queued`, `starting`, `producing`, `ready`, `cancelled`, or `failed` state; DELETE records and cancels an abandoned generation |
 | `/web/media/{id}.mp4?mode=direct` | Original jailed media with byte ranges |
-| `/web/media/{id}.mp4?...` | Compatible stream with validated audio track, start, quality, negotiated `video_mode`/`audio_mode`, reason, and request parameters |
+| `/web/media/{id}.mp4?...` | Compatible stream with validated audio track, start, quality, negotiated `video_mode`/`audio_mode`, reason, playback session, and generation parameters |
 | `/Captions/{id}/{index}...?format=webvtt` | Jailed browser caption conversion |
 | `/status` and `/api/status` | Operator status and metrics |
 

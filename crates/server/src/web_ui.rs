@@ -236,14 +236,8 @@ fn web_capabilities(app: &App) -> WebCapabilities {
                 rusty_dlna_transcode::BrowserQuality::Auto,
                 "Auto · up to 4K",
             ),
-            quality(
-                rusty_dlna_transcode::BrowserQuality::FullHd,
-                "1080p",
-            ),
-            quality(
-                rusty_dlna_transcode::BrowserQuality::DataSaver,
-                "720p",
-            ),
+            quality(rusty_dlna_transcode::BrowserQuality::FullHd, "1080p"),
+            quality(rusty_dlna_transcode::BrowserQuality::DataSaver, "720p"),
         ],
     }
 }
@@ -1314,7 +1308,7 @@ pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
         );
     }
     let params = QueryParams::parse(&req.query);
-    if params.has_unknown(&["request"]) {
+    if params.has_unknown(&["request", "session"]) {
         return api_error(
             400,
             "invalid_parameter",
@@ -1330,6 +1324,18 @@ pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
                 400,
                 "invalid_request",
                 "The playback request ID is invalid.",
+                false,
+                None,
+            )
+        }
+    };
+    let session_id = match params.optional_u64("session") {
+        Ok(value) => value,
+        Err(()) => {
+            return api_error(
+                400,
+                "invalid_session",
+                "The playback session ID is invalid.",
                 false,
                 None,
             )
@@ -1373,7 +1379,7 @@ pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
         );
     }
     let cancelled = cancel_request
-        && crate::remux::cancel_web_request(app, id, request_id.unwrap_or_default());
+        && crate::remux::cancel_web_request(app, id, session_id, request_id.unwrap_or_default());
     let (state, retry_after_seconds) = if cancelled {
         ("cancelled", None)
     } else {
@@ -1885,6 +1891,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         "quality",
         "reason",
         "request",
+        "session",
         "mode",
         "video_mode",
         "audio_mode",
@@ -1916,6 +1923,18 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
                 400,
                 "invalid_request",
                 "The playback request ID is invalid.",
+                false,
+                None,
+            )
+        }
+    };
+    let session_id = match params.optional_u64("session") {
+        Ok(value) => value,
+        Err(()) => {
+            return api_error(
+                400,
+                "invalid_session",
+                "The playback session ID is invalid.",
                 false,
                 None,
             )
@@ -2091,8 +2110,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             || quality != rusty_dlna_transcode::BrowserQuality::Auto
             || !matches!(
                 source.video_codec,
-                rusty_dlna_transcode::VideoCodec::H264
-                    | rusty_dlna_transcode::VideoCodec::Hevc
+                rusty_dlna_transcode::VideoCodec::H264 | rusty_dlna_transcode::VideoCodec::Hevc
             ))
     {
         return api_error(
@@ -2149,14 +2167,13 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
     } else {
         rusty_dlna_transcode::browser_video_encoder(&app.cfg.web.encoder)
     };
-    let hardware_decode =
-        if matches!(video_encoder, "h264_nvenc" | "hevc_nvenc")
-            && matches!(item.probe.video.as_str(), "h264" | "hevc")
-        {
-            HardwareDecode::Cuda
-        } else {
-            HardwareDecode::None
-        };
+    let hardware_decode = if matches!(video_encoder, "h264_nvenc" | "hevc_nvenc")
+        && matches!(item.probe.video.as_str(), "h264" | "hevc")
+    {
+        HardwareDecode::Cuda
+    } else {
+        HardwareDecode::None
+    };
     let plan = TranscodePlan {
         decision: Decision::Recode,
         action: RecodeAction::Browser,
@@ -2241,10 +2258,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             let output = args.len().saturating_sub(1);
             args.splice(
                 output..output,
-                [
-                    OsString::from("-bsf:a"),
-                    OsString::from("aac_adtstoasc"),
-                ],
+                [OsString::from("-bsf:a"), OsString::from("aac_adtstoasc")],
             );
         }
         if source.video_codec == rusty_dlna_transcode::VideoCodec::Hevc
@@ -2266,19 +2280,18 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         args
     };
     let args = transcode_args(&plan);
-    let fallback_args = if (is_video && plan.video_encoder != "libx264")
-        || plan.audio != AudioAction::ToAac
-    {
-        let mut fallback = plan.clone();
-        if is_video {
-            fallback.video_encoder = "libx264".into();
-        }
-        fallback.hardware_decode = HardwareDecode::None;
-        fallback.audio = AudioAction::ToAac;
-        Some(transcode_args(&fallback))
-    } else {
-        None
-    };
+    let fallback_args =
+        if (is_video && plan.video_encoder != "libx264") || plan.audio != AudioAction::ToAac {
+            let mut fallback = plan.clone();
+            if is_video {
+                fallback.video_encoder = "libx264".into();
+            }
+            fallback.hardware_decode = HardwareDecode::None;
+            fallback.audio = AudioAction::ToAac;
+            Some(transcode_args(&fallback))
+        } else {
+            None
+        };
     let job_key = format!("web:{}:{cache_key}:{args:?}", item.detail_id);
     let output_mime = if is_video { "video/mp4" } else { "audio/mp4" };
 
@@ -2303,6 +2316,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
     let mut response = live_transcode_response(output_mime);
     response.remux_job = Some(RemuxJobSpec {
         detail_id: item.detail_id,
+        web_session_id: session_id,
         web_request_id: request_id,
         mime: output_mime,
         job_key,
@@ -2346,12 +2360,8 @@ fn browser_video_content_type(
     }
     let stored = item.probe.codec_string.split(',').next()?.trim();
     let codec = match source.video_codec {
-        rusty_dlna_transcode::VideoCodec::H264 if stored.starts_with("avc1.") => {
-            stored.to_owned()
-        }
-        rusty_dlna_transcode::VideoCodec::Hevc if stored.starts_with("hvc1.") => {
-            stored.to_owned()
-        }
+        rusty_dlna_transcode::VideoCodec::H264 if stored.starts_with("avc1.") => stored.to_owned(),
+        rusty_dlna_transcode::VideoCodec::Hevc if stored.starts_with("hvc1.") => stored.to_owned(),
         rusty_dlna_transcode::VideoCodec::Hevc if stored.starts_with("hev1.") => {
             format!("hvc1.{}", &stored[5..])
         }
@@ -2360,10 +2370,7 @@ fn browser_video_content_type(
     Some(format!("video/mp4; codecs=\"{codec}\""))
 }
 
-fn browser_can_remux_video(
-    item: &MediaItem,
-    source: &rusty_dlna_transcode::SourceMedia,
-) -> bool {
+fn browser_can_remux_video(item: &MediaItem, source: &rusty_dlna_transcode::SourceMedia) -> bool {
     item.probe.video_timestamp_mode != "broken-reordered"
         && browser_video_codec_compatible(item, source)
 }

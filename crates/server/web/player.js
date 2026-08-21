@@ -23,11 +23,13 @@ import {
 } from "./preferences.js";
 
 const CONTROLS_IDLE_MS = 3000;
+const COMPATIBLE_SEEK_DEBOUNCE_MS = 400;
 const MAX_AUTOMATIC_TRANSCODE_RETRIES = 3;
 
 function playbackSessionSeed() {
   if (globalThis.crypto?.getRandomValues) {
-    return (globalThis.crypto.getRandomValues(new Uint32Array(1))[0] + 1) * 1_048_576;
+    const words = globalThis.crypto.getRandomValues(new Uint32Array(2));
+    return (words[0] & 0x000f_ffff) * 4_294_967_296 + words[1] + 1;
   }
   return Date.now() * 1_024 + Math.floor(Math.random() * 1_024);
 }
@@ -79,6 +81,7 @@ export class PlaybackController {
   #api;
   #dom;
   #session = 0;
+  #playbackSession = 0;
   #sourceController = null;
   #seekTimer = null;
   #controlsTimer = null;
@@ -97,6 +100,7 @@ export class PlaybackController {
     this.#api = api;
     this.#dom = dom;
     this.#session = playbackSessionSeed();
+    this.#playbackSession = playbackSessionSeed();
     this.#progressWriter = createProgressWriter(() => this.#writeProgress());
     this.#bindControls();
     this.#applyInitialPreferences();
@@ -110,6 +114,7 @@ export class PlaybackController {
       this.#store.dispatch({ type: "QUEUE_SUCCESS", entries: [item], generation: null });
     }
     this.#cancelSource();
+    this.#playbackSession = playbackSessionSeed();
     const sessionId = ++this.#session;
     this.#dom.resumePrompt.hidden = true;
     this.#store.dispatch({ type: "PLAYBACK_SELECT", sessionId, item, duration: itemDuration(item) });
@@ -221,7 +226,7 @@ export class PlaybackController {
         message: `Starting at ${clockLabel(target)}…`,
         messageKind: "seek",
       });
-    }, 140);
+    }, COMPATIBLE_SEEK_DEBOUNCE_MS);
   }
 
   playRelative(delta) {
@@ -388,6 +393,7 @@ export class PlaybackController {
       return;
     }
     const sessionId = ++this.#session;
+    const playbackSessionId = this.#playbackSession;
     const controller = new AbortController();
     this.#sourceController = controller;
     const sourceMode = selected.mode;
@@ -517,6 +523,7 @@ export class PlaybackController {
       params.set("audio_mode", streamNegotiation.audio);
       params.set("reason", selected.reason);
       params.set("request", String(sessionId));
+      params.set("session", String(playbackSessionId));
       sourceUrl = `${item.fallback_url}${item.fallback_url.includes("?") ? "&" : "?"}${params}`;
     } else {
       params.set("reason", selected.reason);
@@ -525,7 +532,9 @@ export class PlaybackController {
     }
     player.src = sourceUrl;
     player.load();
-    if (sourceMode === "compatible") this.#pollTranscodeState(item.id, sessionId, controller.signal);
+    if (sourceMode === "compatible") {
+      this.#pollTranscodeState(item.id, sessionId, playbackSessionId, controller.signal);
+    }
   }
 
   #decodingInfo(configuration) {
@@ -540,12 +549,17 @@ export class PlaybackController {
     return this.#capabilityCache.get(key);
   }
 
-  #pollTranscodeState(itemId, sessionId, signal) {
+  #pollTranscodeState(itemId, sessionId, playbackSessionId, signal) {
     const poll = async () => {
       if (signal.aborted || sessionId !== this.#store.getState().playback.sessionId) return;
       if (!["loading", "waiting", "seeking"].includes(this.#store.getState().playback.status)) return;
       try {
-        const payload = await this.#api.transcodeStatus(itemId, sessionId, signal);
+        const payload = await this.#api.transcodeStatus(
+          itemId,
+          sessionId,
+          playbackSessionId,
+          signal,
+        );
         const message = {
           queued: "Waiting for a transcode slot…",
           starting: "Starting compatible playback…",
@@ -646,12 +660,18 @@ export class PlaybackController {
     let code = sourceMode === "direct"
       ? (!capabilities.transcoding && sourceReason === "transcoding_disabled" ? "transcode_disabled" : "unsupported_direct")
       : "transcode_failed";
+    let producerState = null;
     // navigator.onLine is only a hint and WebKit can leave it false after an
     // intentionally aborted request. Ask the typed API for the real cause.
     if (sourceMode === "compatible") {
       try {
-        const payload = await this.#api.transcodeStatus(item.id, sessionId);
+        const payload = await this.#api.transcodeStatus(
+          item.id,
+          sessionId,
+          this.#playbackSession,
+        );
         if (sessionId !== this.#store.getState().playback.sessionId) return;
+        producerState = payload.state;
         if (["queued", "cancelled", "idle"].includes(payload.state)) {
           if (this.#scheduleCompatibleRetry({
             sessionId,
@@ -699,6 +719,20 @@ export class PlaybackController {
       });
       return;
     }
+    // A browser can terminate its media connection even though the server is
+    // still producing valid fragments (for example after a socket backpressure
+    // timeout). Replace that generation automatically instead of presenting a
+    // terminal transcode error. #loadSource assigns the retry a newer
+    // generation, which also cancels the abandoned producer server-side.
+    if (sourceMode === "compatible"
+      && ["producing", "ready"].includes(producerState)
+      && this.#scheduleCompatibleRetry({
+        sessionId,
+        item,
+        start: this.globalTime() || start,
+        intent,
+        streamNegotiation,
+      })) return;
     if (sessionId !== this.#store.getState().playback.sessionId) return;
     this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId, error: playbackError(code, mediaCode ? `MediaError code ${mediaCode}` : "Media element error") });
   }
@@ -1211,7 +1245,11 @@ export class PlaybackController {
       && this.#sourceController
       && playback.sourceMode === "compatible"
       && playback.item
-      ? { itemId: playback.item.id, requestId: playback.sessionId }
+      ? {
+        itemId: playback.item.id,
+        requestId: playback.sessionId,
+        playbackSessionId: this.#playbackSession,
+      }
       : null;
     this.#progressWriter.flush();
     this.#sourceController?.abort();
@@ -1224,7 +1262,11 @@ export class PlaybackController {
     this.#announceTimer = null;
     if (!keepElement) this.#resetMediaElement(this.activePlayer());
     if (abandonedRequest) {
-      this.#api.cancelTranscode(abandonedRequest.itemId, abandonedRequest.requestId).catch(() => {});
+      this.#api.cancelTranscode(
+        abandonedRequest.itemId,
+        abandonedRequest.requestId,
+        abandonedRequest.playbackSessionId,
+      ).catch(() => {});
     }
   }
 

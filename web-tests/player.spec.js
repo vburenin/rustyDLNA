@@ -554,6 +554,37 @@ test("a missing direct file is not mislabeled as unsupported", async ({ page }) 
   await expect(page.locator("#technical-message")).not.toContainText("raw path");
 });
 
+test("a dropped compatible-media connection retries a healthy producer", async ({ page }) => {
+  await usePreference(page, "stream", "compat");
+  const fixture = await readFile(compatibleFixture);
+  const requests = [];
+  const cancellations = [];
+  page.on("request", (request) => {
+    if (request.method() === "DELETE" && request.url().includes("/api/web/transcode/")) {
+      cancellations.push(new URL(request.url()));
+    }
+  });
+  await page.route("**/api/web/transcode/*", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ schema_version: 1, item_id: 9, request_id: 1, state: "producing", retry_after_seconds: null }),
+  }));
+  await page.route("**/web/media/*.mp4?**", async (route) => {
+    requests.push(new URL(route.request().url()));
+    if (requests.length === 1) return route.abort("failed");
+    return route.fulfill({ status: 200, contentType: "video/mp4", body: fixture });
+  });
+
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+
+  await expect.poll(() => requests.length).toBeGreaterThan(1);
+  await expect.poll(() => cancellations.length).toBeGreaterThan(0);
+  expect(requests[1].searchParams.get("session")).toBe(requests[0].searchParams.get("session"));
+  expect(Number(requests[1].searchParams.get("request"))).toBeGreaterThan(Number(requests[0].searchParams.get("request")));
+  await expect(page.locator("#player-message[role=alert]")).toBeHidden();
+});
+
 test("rapid item switching suppresses an older media failure", async ({ page }) => {
   await usePreference(page, "stream", "direct");
   const fixture = await readFile(compatibleFixture);
@@ -625,10 +656,16 @@ test("repeated compatible seeks coalesce and audio switching preserves global ti
   await expect.poll(() => requests.filter((url) => url.searchParams.get("start") !== "0").length).toBe(1);
   await expect.poll(() => cancellations.length).toBeGreaterThan(0);
   expect(cancellations[0].searchParams.get("request")).toMatch(/^\d+$/);
+  expect(cancellations[0].searchParams.get("session")).toMatch(/^\d+$/);
   expect(requests.findLast((url) => url.searchParams.get("start") !== "0")?.searchParams.get("start")).toBe("20");
   await openAdvancedPlayback(page);
   await page.locator("#audio-track-controls").selectOption("1");
   await expect.poll(() => requests.findLast((url) => url.searchParams.get("audio") === "1")?.searchParams.get("start")).toBe("20");
+  const playbackSessions = new Set(requests
+    .filter((url) => url.searchParams.get("mode") === "compatible")
+    .map((url) => url.searchParams.get("session")));
+  expect(playbackSessions.size).toBe(1);
+  expect([...playbackSessions][0]).toMatch(/^\d+$/);
   expect(await page.locator("#audio-track-controls").evaluate((select) => select.getBoundingClientRect().width)).toBeLessThanOrEqual(145);
   await page.locator('#advanced-playback-dialog button[value="close"]').click();
   await expect(page.locator("#mode-label")).toHaveText("Compatible playback");
@@ -661,11 +698,14 @@ test("repeated compatible keyboard seeks preserve playing intent", async ({ page
   await expect.poll(() => page.evaluate(() => window.__playCalls)).toBeGreaterThan(0);
   const initialPlayCalls = await page.evaluate(() => window.__playCalls);
   await page.locator("#player-stage").focus();
-  await page.evaluate(() => {
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+  await page.evaluate(async () => {
+    for (let press = 0; press < 6; press += 1) {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
   });
-  await expect.poll(() => requests.findLast((url) => url.searchParams.get("start") !== "0")?.searchParams.get("start")).toBe("20");
+  await expect.poll(() => requests.findLast((url) => url.searchParams.get("start") !== "0")?.searchParams.get("start")).toBe("60");
+  expect(requests.filter((url) => url.searchParams.get("start") !== "0")).toHaveLength(1);
   await expect.poll(() => page.evaluate(() => window.__playCalls)).toBeGreaterThan(initialPlayCalls);
   await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Pause");
 });
@@ -680,6 +720,7 @@ test("captions convert to WebVTT and survive a compatible source restart", async
   });
   expect(captioned).toBeTruthy();
   await page.locator(`[data-media-id="${captioned.id}"] .card-button`).click();
+  await showPlayerControls(page);
   await page.locator("#captions-button").click();
   const caption = captioned.captions.find((entry) => entry.browser_supported);
   await page.locator(`input[name="caption-choice"][value="${caption.index}"]`).check();
@@ -997,6 +1038,7 @@ test("fullscreen controls remain reachable and Escape exits", async ({ page, bro
   await selectTaggedVideo(page);
   const stage = page.locator("#player-stage");
   const controls = page.locator("#playback-controls");
+  await showPlayerControls(page);
   await page.locator("#fullscreen-button").click();
   await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id || null)).toBe("player-stage");
   await expect(page.locator("#fullscreen-button")).toBeVisible();

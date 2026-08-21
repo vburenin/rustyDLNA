@@ -202,6 +202,7 @@ impl App {
             helpers,
             remuxes: Mutex::new(HashMap::new()),
             recent_remux_states: Mutex::new(HashMap::new()),
+            web_playback_sessions: Mutex::new(HashMap::new()),
             remux_metrics: remux::RemuxMetrics::new(initial_cache_bytes),
             events,
             notify_dispatcher,
@@ -1655,6 +1656,7 @@ impl App {
                 let mut r = live_transcode_response("video/mp4");
                 r.remux_job = Some(RemuxJobSpec {
                     detail_id: item.detail_id,
+                    web_session_id: None,
                     web_request_id: None,
                     mime: "video/mp4",
                     job_key,

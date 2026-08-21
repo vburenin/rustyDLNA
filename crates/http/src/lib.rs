@@ -320,8 +320,12 @@ pub struct OpenFileRange {
 #[derive(Clone, Debug)]
 pub struct RemuxJobSpec {
     pub detail_id: i64,
-    /// Browser source-session identifier used only for pollable status. A
-    /// shared job may collect several IDs when compatible requests coalesce.
+    /// Stable browser player identity shared by every source generation for
+    /// one selected title. A newer generation supersedes older jobs owned by
+    /// the same player without disturbing other players sharing the output.
+    pub web_session_id: Option<u64>,
+    /// Browser source-generation identifier used for pollable status and
+    /// explicit cancellation. Reconnects for one source reuse the same ID.
     pub web_request_id: Option<u64>,
     /// HTTP media type for both growing and completed cached output.
     pub mime: &'static str,

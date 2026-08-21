@@ -3423,6 +3423,7 @@ fn remux_finished_range_and_stale_rebuild() {
 
     let spec = RemuxJobSpec {
         detail_id: dvp7.detail_id,
+        web_session_id: None,
         web_request_id: None,
         mime: "video/mp4",
         job_key: format!("{}:{cache_key}:fixture", dvp7.detail_id),
@@ -4107,9 +4108,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         "{}",
         String::from_utf8_lossy(&copied_audio.body)
     );
-    let copied_audio_spec = copied_audio
-        .remux_job
-        .expect("browser audio-only copy job");
+    let copied_audio_spec = copied_audio.remux_job.expect("browser audio-only copy job");
     assert!(copied_audio_spec
         .args
         .windows(2)
@@ -4176,10 +4175,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .cloned()
         .unwrap();
     let enriched_video = app.handle(&req(&get(
-        &format!(
-            "/api/web/item/{}?enrich=1",
-            h264_audio_fallback.detail_id
-        ),
+        &format!("/api/web/item/{}?enrich=1", h264_audio_fallback.detail_id),
         "Browser/1.0",
     )));
     assert_eq!(
@@ -4188,15 +4184,12 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         "{}",
         String::from_utf8_lossy(&enriched_video.body)
     );
-    let enriched_video: serde_json::Value =
-        serde_json::from_slice(&enriched_video.body).unwrap();
-    assert_eq!(
-        enriched_video["item"]["stream_metadata_complete"],
-        true
-    );
-    assert!(enriched_video["item"]["video_content_type"]
-        .as_str()
-        .is_some_and(|content_type| content_type.starts_with("video/mp4; codecs=\"avc1.")),
+    let enriched_video: serde_json::Value = serde_json::from_slice(&enriched_video.body).unwrap();
+    assert_eq!(enriched_video["item"]["stream_metadata_complete"], true);
+    assert!(
+        enriched_video["item"]["video_content_type"]
+            .as_str()
+            .is_some_and(|content_type| content_type.starts_with("video/mp4; codecs=\"avc1.")),
         "{enriched_video}"
     );
     assert!(enriched_video["item"]["video_profile"].is_string());
@@ -4366,9 +4359,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .as_ref()
         .expect("portable fallback for negotiated copies");
     assert!(portable.iter().any(|arg| arg == "libx264"));
-    assert!(portable
-        .windows(2)
-        .any(|pair| pair == ["-c:a", "aac"]));
+    assert!(portable.windows(2).any(|pair| pair == ["-c:a", "aac"]));
     app.cfg.web.encoder = "h264_nvenc".into();
     {
         let mut catalog = app.catalog.write().unwrap();
@@ -4384,7 +4375,10 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     )));
     let repair_page: serde_json::Value = serde_json::from_slice(&repair_page.body).unwrap();
     assert_eq!(repair_page["entries"][0]["video_repair_required"], true);
-    assert_eq!(repair_page["entries"][0]["repair_video_encoder"], "hevc_nvenc");
+    assert_eq!(
+        repair_page["entries"][0]["repair_video_encoder"],
+        "hevc_nvenc"
+    );
     assert!(repair_page["entries"][0]["video_content_type"].is_string());
     let unsafe_copy = app.handle(&req(&get(
         &format!(
@@ -4406,11 +4400,13 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .args
         .windows(2)
         .any(|pair| pair == ["-c:v", "hevc_nvenc"]));
-    assert!(repaired_spec.args.iter().any(|arg| arg == "format=p010le")
-        || repaired_spec
-            .args
-            .iter()
-            .any(|arg| arg.to_string_lossy().contains("format=p010le")));
+    assert!(
+        repaired_spec.args.iter().any(|arg| arg == "format=p010le")
+            || repaired_spec
+                .args
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("format=p010le"))
+    );
     assert!(repaired_spec
         .args
         .windows(2)
@@ -4419,12 +4415,9 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .args
         .iter()
         .any(|arg| arg.to_string_lossy().contains("libplacebo")));
-    assert!(repaired_spec
-        .fallback_args
-        .as_ref()
-        .is_some_and(|args| args
-            .iter()
-            .any(|arg| arg.to_string_lossy().contains("libplacebo"))));
+    assert!(repaired_spec.fallback_args.as_ref().is_some_and(|args| args
+        .iter()
+        .any(|arg| arg.to_string_lossy().contains("libplacebo"))));
     app.cfg.web.encoder = "libx264".into();
     {
         let mut catalog = app.catalog.write().unwrap();
@@ -4561,13 +4554,14 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     }
     let selected = app.handle(&req(&get(
         &format!(
-            "/web/media/{}.mp4?audio=1&start=120&request=77",
+            "/web/media/{}.mp4?audio=1&start=120&session=12&request=77",
             dvp7.detail_id
         ),
         "Browser/1.0",
     )));
     let selected = selected.remux_job.expect("selected browser audio job");
     assert_eq!(selected.audio_index, 1);
+    assert_eq!(selected.web_session_id, Some(12));
     assert_eq!(selected.web_request_id, Some(77));
     assert!(selected.cache_key.ends_with("-start-120"));
     assert!(!selected.cacheable);
@@ -4640,12 +4634,13 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     let scoped_status: serde_json::Value = serde_json::from_slice(&scoped_status.body).unwrap();
     assert_eq!(scoped_status["request_id"], 77);
     let cancel_status = app.handle(&req(&format!(
-        "DELETE /api/web/transcode/{}?request=77 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\n\r\n",
+        "DELETE /api/web/transcode/{}?request=77&session=12 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\n\r\n",
         dvp7.detail_id
     )));
     assert_eq!(cancel_status.status, 200);
     let cancel_status: serde_json::Value = serde_json::from_slice(&cancel_status.body).unwrap();
     assert_eq!(cancel_status["request_id"], 77);
+    assert_eq!(cancel_status["state"], "cancelled");
     let unscoped_cancel = app.handle(&req(&format!(
         "DELETE /api/web/transcode/{} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\n\r\n",
         dvp7.detail_id
@@ -4654,6 +4649,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     for invalid in [
         format!("/web/media/{}.mp4?mode=maybe", dvp7.detail_id),
         format!("/web/media/{}.mp4?request=-1", dvp7.detail_id),
+        format!("/web/media/{}.mp4?session=-1", dvp7.detail_id),
         format!(
             "/web/media/{}.mp4?mode=direct&mode=compatible",
             dvp7.detail_id
@@ -4662,6 +4658,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         format!("/web/media/{}.mp4?reason=", dvp7.detail_id),
         format!("/web/media/{}.mp4?reason=%GG", dvp7.detail_id),
         format!("/api/web/transcode/{}?request=nope", dvp7.detail_id),
+        format!("/api/web/transcode/{}?session=nope", dvp7.detail_id),
         format!("/api/web/transcode/{}?extra=1", dvp7.detail_id),
         format!("/api/web/item/{}?enrich=maybe", dvp7.detail_id),
         format!("/api/web/item/{}?extra=1", dvp7.detail_id),

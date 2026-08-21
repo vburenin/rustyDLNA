@@ -1,7 +1,7 @@
 //! One background remux per title. Concurrent GETs share one producer; each
 //! route decides whether its producer may outlive the last HTTP reader.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,8 @@ const CHILD_TERM_GRACE: Duration = Duration::from_millis(200);
 // next request instead of treating that normal gap as abandonment.
 const WEB_RECONNECT_GRACE: Duration = Duration::from_secs(30);
 const WEB_EPHEMERAL_RETENTION: Duration = Duration::from_secs(30);
+const WEB_SESSION_RETENTION: Duration = Duration::from_secs(10 * 60);
+const WEB_REQUEST_CANCELLED: &str = "web playback request superseded";
 
 fn terminate_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
@@ -178,6 +180,7 @@ pub(crate) enum RemuxState {
 pub struct RemuxJob {
     detail_id: i64,
     web_request_ids: Mutex<HashSet<u64>>,
+    web_sessions: Mutex<HashMap<u64, u64>>,
     web: bool,
     cache_hit: bool,
     playable_observed: AtomicBool,
@@ -186,7 +189,6 @@ pub struct RemuxJob {
     pub(crate) state: Mutex<RemuxState>,
     pub(crate) changed: tokio::sync::Notify,
     cancelled: AtomicBool,
-    cancel_when_idle: AtomicBool,
     clients: AtomicUsize,
     ever_had_client: AtomicBool,
     client_epoch: AtomicU64,
@@ -201,11 +203,52 @@ pub(crate) struct RecentRemuxState {
     at: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WebPlaybackSessionState {
+    latest_request_id: u64,
+    cancelled: bool,
+    at: Instant,
+}
+
 impl RemuxJob {
-    fn add_web_request(&self, request_id: Option<u64>) {
-        if let Some(request_id) = request_id {
-            crate::lock_recover(&self.web_request_ids).insert(request_id);
+    fn add_web_request(&self, session_id: Option<u64>, request_id: Option<u64>) -> Option<u64> {
+        let replaced = session_id
+            .zip(request_id)
+            .and_then(|(session_id, request_id)| {
+                crate::lock_recover(&self.web_sessions).insert(session_id, request_id)
+            });
+        let mut request_ids = crate::lock_recover(&self.web_request_ids);
+        if let Some(replaced) = replaced.filter(|replaced| Some(*replaced) != request_id) {
+            request_ids.remove(&replaced);
         }
+        if let Some(request_id) = request_id {
+            request_ids.insert(request_id);
+        }
+        replaced
+    }
+
+    fn remove_web_request(&self, session_id: Option<u64>, request_id: u64) -> bool {
+        let mut sessions = crate::lock_recover(&self.web_sessions);
+        if let Some(session_id) = session_id {
+            if sessions.get(&session_id) != Some(&request_id) {
+                return false;
+            }
+            sessions.remove(&session_id);
+        } else {
+            sessions.retain(|_, attached_request_id| *attached_request_id != request_id);
+        }
+        drop(sessions);
+        crate::lock_recover(&self.web_request_ids).remove(&request_id)
+    }
+
+    fn remove_web_session(&self, session_id: u64) -> Option<u64> {
+        let request_id = crate::lock_recover(&self.web_sessions).remove(&session_id)?;
+        crate::lock_recover(&self.web_request_ids).remove(&request_id);
+        Some(request_id)
+    }
+
+    fn has_web_requests(&self) -> bool {
+        !crate::lock_recover(&self.web_request_ids).is_empty()
     }
 
     fn matches_web_request(&self, request_id: Option<u64>) -> bool {
@@ -251,7 +294,6 @@ impl RemuxJob {
 
     fn attach_client(&self) {
         let mut deadline = crate::lock_recover(&self.disconnect_deadline);
-        self.cancel_when_idle.store(false, Ordering::Release);
         self.clients.fetch_add(1, Ordering::Relaxed);
         self.ever_had_client.store(true, Ordering::Release);
         self.client_epoch.fetch_add(1, Ordering::AcqRel);
@@ -269,12 +311,6 @@ impl RemuxJob {
         let mut deadline = crate::lock_recover(&self.disconnect_deadline);
         let previous = self.clients.fetch_sub(1, Ordering::AcqRel);
         self.client_epoch.fetch_add(1, Ordering::AcqRel);
-        if previous <= 1 && self.cancel_when_idle.swap(false, Ordering::AcqRel) {
-            *deadline = None;
-            drop(deadline);
-            self.cancel();
-            return;
-        }
         if previous <= 1 && !continue_after_disconnect {
             match self.state() {
                 RemuxState::Starting | RemuxState::Preprocessing | RemuxState::Growing => {
@@ -283,12 +319,7 @@ impl RemuxJob {
                 RemuxState::Complete if !self.cacheable => {
                     *deadline = None;
                     drop(deadline);
-                    schedule_ephemeral_cleanup(
-                        app,
-                        job_key,
-                        self.clone(),
-                        ephemeral_retention,
-                    );
+                    schedule_ephemeral_cleanup(app, job_key, self.clone(), ephemeral_retention);
                     return;
                 }
                 RemuxState::Complete | RemuxState::Failed(_) | RemuxState::Cancelled => {
@@ -512,7 +543,7 @@ fn spawn_ffmpeg(
                         tracing::info!(
                             id,
                             dest = %dest.display(),
-                            "remux job cancelled after its reconnect window expired"
+                            "remux job cancelled"
                         );
                         job.transition(RemuxState::Cancelled);
                     } else {
@@ -663,6 +694,27 @@ fn remove_job(app: &App, key: &str, job: &Arc<RemuxJob>) {
     }
 }
 
+fn record_recent_web_state(app: &App, detail_id: i64, request_id: u64, state: &'static str) {
+    let mut recent = crate::lock_recover(&app.recent_remux_states);
+    recent.retain(|_, value| value.at.elapsed() < Duration::from_secs(60));
+    if recent.len() >= 128 && !recent.contains_key(&(detail_id, request_id)) {
+        if let Some(oldest) = recent
+            .iter()
+            .min_by_key(|(_, value)| value.at)
+            .map(|(id, _)| *id)
+        {
+            recent.remove(&oldest);
+        }
+    }
+    recent.insert(
+        (detail_id, request_id),
+        RecentRemuxState {
+            state,
+            at: Instant::now(),
+        },
+    );
+}
+
 fn finish_job(app: &Arc<App>, key: &str, job: &Arc<RemuxJob>) {
     let state = job.state();
     app.remux_metrics.record(&state);
@@ -686,27 +738,9 @@ fn finish_job(app: &Arc<App>, key: &str, job: &Arc<RemuxJob>) {
         RemuxState::Starting | RemuxState::Preprocessing => "starting",
         RemuxState::Growing => "producing",
     };
-    let mut recent = crate::lock_recover(&app.recent_remux_states);
-    recent.retain(|_, value| value.at.elapsed() < Duration::from_secs(60));
-    if recent.len() >= 128 {
-        if let Some(oldest) = recent
-            .iter()
-            .min_by_key(|(_, value)| value.at)
-            .map(|(id, _)| *id)
-        {
-            recent.remove(&oldest);
-        }
-    }
     for request_id in crate::lock_recover(&job.web_request_ids).iter().copied() {
-        recent.insert(
-            (job.detail_id, request_id),
-            RecentRemuxState {
-                state: public_state,
-                at: Instant::now(),
-            },
-        );
+        record_recent_web_state(app, job.detail_id, request_id, public_state);
     }
-    drop(recent);
     if matches!(state, RemuxState::Complete) && !job.cacheable {
         if job.web && job.ever_had_client.load(Ordering::Acquire) {
             schedule_ephemeral_cleanup(
@@ -891,9 +925,77 @@ fn attach_job(
             .web_requests
             .fetch_add(1, Ordering::Relaxed);
     }
+    let mut newer_generation = false;
+    let playback_sessions = if web {
+        if let (Some(session_id), Some(request_id)) = (spec.web_session_id, spec.web_request_id) {
+            let mut sessions = crate::lock_recover(&app.web_playback_sessions);
+            sessions.retain(|_, state| state.at.elapsed() < WEB_SESSION_RETENTION);
+            if sessions.len() >= 1024 && !sessions.contains_key(&session_id) {
+                if let Some(oldest) = sessions
+                    .iter()
+                    .min_by_key(|(_, state)| state.at)
+                    .map(|(session_id, _)| *session_id)
+                {
+                    sessions.remove(&oldest);
+                }
+            }
+            match sessions.get_mut(&session_id) {
+                Some(state) if request_id < state.latest_request_id => {
+                    return Err(WEB_REQUEST_CANCELLED.into());
+                }
+                Some(state) if request_id == state.latest_request_id && state.cancelled => {
+                    return Err(WEB_REQUEST_CANCELLED.into());
+                }
+                Some(state) if request_id > state.latest_request_id => {
+                    state.latest_request_id = request_id;
+                    state.cancelled = false;
+                    state.at = Instant::now();
+                    newer_generation = true;
+                }
+                Some(state) => state.at = Instant::now(),
+                None => {
+                    sessions.insert(
+                        session_id,
+                        WebPlaybackSessionState {
+                            latest_request_id: request_id,
+                            cancelled: false,
+                            at: Instant::now(),
+                        },
+                    );
+                    newer_generation = true;
+                }
+            }
+            Some(sessions)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     // The map lock serializes cache validation/replacement with all attaches
-    // for this process. A source or plan change gets a different key/path.
+    // for this process. Taking it before releasing the playback-session lock
+    // makes registration atomic with an explicit cancellation.
     let mut map = crate::lock_recover(&app.remuxes);
+    drop(playback_sessions);
+    if newer_generation {
+        if let Some(session_id) = spec.web_session_id {
+            let mut superseded = Vec::new();
+            for (job_key, job) in map.iter() {
+                if job_key == &spec.job_key || !job.web {
+                    continue;
+                }
+                if let Some(request_id) = job.remove_web_session(session_id) {
+                    superseded.push((job.detail_id, request_id));
+                    if !job.has_web_requests() {
+                        job.cancel();
+                    }
+                }
+            }
+            for (detail_id, request_id) in superseded {
+                record_recent_web_state(app.as_ref(), detail_id, request_id, "cancelled");
+            }
+        }
+    }
     let protected = map
         .values()
         .flat_map(|job| [job.dest.clone(), job.part.clone()])
@@ -915,6 +1017,12 @@ fn attach_job(
         let job = Arc::new(RemuxJob {
             detail_id: spec.detail_id,
             web_request_ids: Mutex::new(spec.web_request_id.into_iter().collect()),
+            web_sessions: Mutex::new(
+                spec.web_session_id
+                    .zip(spec.web_request_id)
+                    .into_iter()
+                    .collect(),
+            ),
             web,
             cache_hit: true,
             playable_observed: AtomicBool::new(false),
@@ -923,7 +1031,6 @@ fn attach_job(
             state: Mutex::new(RemuxState::Complete),
             changed: tokio::sync::Notify::new(),
             cancelled: AtomicBool::new(false),
-            cancel_when_idle: AtomicBool::new(false),
             clients: AtomicUsize::new(0),
             ever_had_client: AtomicBool::new(false),
             client_epoch: AtomicU64::new(0),
@@ -938,7 +1045,11 @@ fn attach_job(
     }
     if let Some(job) = map.get(&spec.job_key) {
         if job.err().is_none() {
-            job.add_web_request(spec.web_request_id);
+            if let Some(replaced) = job.add_web_request(spec.web_session_id, spec.web_request_id) {
+                if Some(replaced) != spec.web_request_id {
+                    record_recent_web_state(app.as_ref(), spec.detail_id, replaced, "cancelled");
+                }
+            }
             app.remux_metrics
                 .coalesced_requests
                 .fetch_add(1, Ordering::Relaxed);
@@ -1005,6 +1116,12 @@ fn attach_job(
     let job = Arc::new(RemuxJob {
         detail_id: spec.detail_id,
         web_request_ids: Mutex::new(spec.web_request_id.into_iter().collect()),
+        web_sessions: Mutex::new(
+            spec.web_session_id
+                .zip(spec.web_request_id)
+                .into_iter()
+                .collect(),
+        ),
         web,
         cache_hit: false,
         playable_observed: AtomicBool::new(false),
@@ -1013,7 +1130,6 @@ fn attach_job(
         state: Mutex::new(RemuxState::Starting),
         changed: tokio::sync::Notify::new(),
         cancelled: AtomicBool::new(false),
-        cancel_when_idle: AtomicBool::new(false),
         clients: AtomicUsize::new(0),
         ever_had_client: AtomicBool::new(false),
         client_epoch: AtomicU64::new(0),
@@ -1076,28 +1192,74 @@ pub(crate) fn web_job_state(
     }
 }
 
-/// Cancel an explicitly superseded browser request without disturbing a
-/// coalesced job that is also serving a different playback request.
-pub(crate) fn cancel_web_request(app: &App, detail_id: i64, request_id: u64) -> bool {
-    let job = app.remuxes.lock().ok().and_then(|jobs| {
-        jobs.values()
-            .find(|job| {
-                if !job.web || job.detail_id != detail_id {
-                    return false;
-                }
-                let request_ids = crate::lock_recover(&job.web_request_ids);
-                request_ids.len() == 1 && request_ids.contains(&request_id)
-            })
-            .cloned()
+/// Cancel an explicitly superseded browser generation without disturbing a
+/// producer that is still owned by another playback session. Recording the
+/// cancellation before inspecting jobs also rejects a late media GET whose
+/// DELETE won the network race.
+pub(crate) fn cancel_web_request(
+    app: &App,
+    detail_id: i64,
+    session_id: Option<u64>,
+    request_id: u64,
+) -> bool {
+    let playback_sessions = session_id.map(|session_id| {
+        let mut sessions = crate::lock_recover(&app.web_playback_sessions);
+        sessions.retain(|_, state| state.at.elapsed() < WEB_SESSION_RETENTION);
+        if sessions.len() >= 1024 && !sessions.contains_key(&session_id) {
+            if let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, state)| state.at)
+                .map(|(session_id, _)| *session_id)
+            {
+                sessions.remove(&oldest);
+            }
+        }
+        match sessions.get_mut(&session_id) {
+            Some(state) if request_id >= state.latest_request_id => {
+                state.latest_request_id = request_id;
+                state.cancelled = true;
+                state.at = Instant::now();
+            }
+            Some(state) => state.at = Instant::now(),
+            None => {
+                sessions.insert(
+                    session_id,
+                    WebPlaybackSessionState {
+                        latest_request_id: request_id,
+                        cancelled: true,
+                        at: Instant::now(),
+                    },
+                );
+            }
+        }
+        sessions
     });
-    let Some(job) = job else {
-        return false;
-    };
-    job.cancel_when_idle.store(true, Ordering::Release);
-    if job.clients.load(Ordering::Acquire) == 0 {
-        job.cancel();
+    let mut jobs = crate::lock_recover(&app.remuxes);
+    drop(playback_sessions);
+    let mut matched = false;
+    for job in jobs.values_mut() {
+        if !job.web || job.detail_id != detail_id {
+            continue;
+        }
+        if job.remove_web_request(session_id, request_id) {
+            matched = true;
+            if !job.has_web_requests()
+                && matches!(
+                    job.state(),
+                    RemuxState::Starting | RemuxState::Preprocessing | RemuxState::Growing
+                )
+            {
+                job.cancel();
+            }
+        }
     }
-    true
+    drop(jobs);
+    if matched || session_id.is_some() {
+        record_recent_web_state(app, detail_id, request_id, "cancelled");
+        true
+    } else {
+        false
+    }
 }
 
 fn generated_cache_mp4(path: &Path) -> bool {
@@ -1347,10 +1509,14 @@ pub async fn serve_remux(
                 "{e}"
             );
             let err = if req.path.starts_with("/web/media/") {
-                app.remux_metrics
-                    .web_failures_busy
-                    .fetch_add(1, Ordering::Relaxed);
-                crate::web_ui::transcode_stream_error(503, "transcode_busy")
+                if e == WEB_REQUEST_CANCELLED {
+                    crate::web_ui::transcode_stream_error(409, "transcode_cancelled")
+                } else {
+                    app.remux_metrics
+                        .web_failures_busy
+                        .fetch_add(1, Ordering::Relaxed);
+                    crate::web_ui::transcode_stream_error(503, "transcode_busy")
+                }
             } else {
                 let mut response = HttpResponse::html(503, "Service Unavailable", &e);
                 response.set("Retry-After", "1");
@@ -1825,6 +1991,7 @@ mod tests {
         }
         RemuxJobSpec {
             detail_id: 42,
+            web_session_id: None,
             web_request_id: None,
             mime: "video/mp4",
             job_key: format!("42:{key}:{command:?}"),
@@ -1871,6 +2038,7 @@ mod tests {
         let job = Arc::new(RemuxJob {
             detail_id: 42,
             web_request_ids: Mutex::new(HashSet::new()),
+            web_sessions: Mutex::new(HashMap::new()),
             web: false,
             cache_hit: false,
             playable_observed: AtomicBool::new(false),
@@ -1879,7 +2047,6 @@ mod tests {
             state: Mutex::new(RemuxState::Preprocessing),
             changed: tokio::sync::Notify::new(),
             cancelled: AtomicBool::new(false),
-            cancel_when_idle: AtomicBool::new(false),
             clients: AtomicUsize::new(0),
             ever_had_client: AtomicBool::new(false),
             client_epoch: AtomicU64::new(0),
@@ -1957,6 +2124,7 @@ mod tests {
         let growing = Arc::new(RemuxJob {
             detail_id: 43,
             web_request_ids: Mutex::new(HashSet::new()),
+            web_sessions: Mutex::new(HashMap::new()),
             web: false,
             cache_hit: false,
             playable_observed: AtomicBool::new(false),
@@ -1965,7 +2133,6 @@ mod tests {
             state: Mutex::new(RemuxState::Growing),
             changed: tokio::sync::Notify::new(),
             cancelled: AtomicBool::new(false),
-            cancel_when_idle: AtomicBool::new(false),
             clients: AtomicUsize::new(0),
             ever_had_client: AtomicBool::new(false),
             client_epoch: AtomicU64::new(0),
@@ -2116,6 +2283,7 @@ mod tests {
         let part = cache_part(&dest);
         let first = RemuxJobSpec {
             detail_id: 42,
+            web_session_id: None,
             web_request_id: None,
             mime: "video/mp4",
             job_key: format!("42:{first_key}:copy"),
@@ -2146,6 +2314,7 @@ mod tests {
         assert_ne!(first_key, second_key);
         let second = RemuxJobSpec {
             detail_id: 42,
+            web_session_id: None,
             web_request_id: None,
             mime: "video/mp4",
             job_key: format!("42:{second_key}:copy"),
@@ -2241,7 +2410,7 @@ mod tests {
     }
 
     #[test]
-    fn superseded_web_request_cancels_as_soon_as_its_reader_detaches() {
+    fn explicit_web_cancellation_stops_its_only_producer_immediately() {
         let dir = temp_dir("web-explicit-cancel");
         let app = test_app(&dir, 1);
         let mut spec = job_spec(
@@ -2250,20 +2419,14 @@ mod tests {
             vec!["sleep".into(), "30".into()],
         );
         spec.job_key = "web:42:explicit-cancel".into();
+        spec.web_session_id = Some(9);
         spec.web_request_id = Some(77);
         spec.cacheable = false;
         spec.continue_after_disconnect = false;
         let job = attach_for_client(app.clone(), spec).unwrap();
 
-        assert!(cancel_web_request(&app, 42, 77));
-        assert!(!job.cancelled.load(Ordering::Acquire));
-        job.detach_client(
-            app.clone(),
-            "web:42:explicit-cancel".into(),
-            false,
-            WEB_RECONNECT_GRACE,
-            Duration::ZERO,
-        );
+        assert!(cancel_web_request(&app, 42, Some(9), 77));
+        assert!(job.cancelled.load(Ordering::Acquire));
         wait_for_terminal_cleanup(&app, &job);
         assert_eq!(job.state(), RemuxState::Cancelled);
     }
@@ -2272,34 +2435,89 @@ mod tests {
     fn cancelling_one_request_does_not_kill_a_shared_web_job() {
         let dir = temp_dir("web-shared-cancel");
         let app = test_app(&dir, 1);
-        let mut first = job_spec(
-            &dir,
-            "web-shared-cancel",
-            vec!["sleep".into(), "30".into()],
-        );
+        let mut first = job_spec(&dir, "web-shared-cancel", vec!["sleep".into(), "30".into()]);
         first.job_key = "web:42:shared-cancel".into();
+        first.web_session_id = Some(9);
         first.web_request_id = Some(77);
         first.cacheable = false;
         first.continue_after_disconnect = false;
         let mut second = first.clone();
+        second.web_session_id = Some(10);
         second.web_request_id = Some(88);
         let job = attach_for_client(app.clone(), first).unwrap();
         let shared = attach_for_client(app.clone(), second).unwrap();
         assert!(Arc::ptr_eq(&job, &shared));
 
-        assert!(!cancel_web_request(&app, 42, 77));
+        assert!(cancel_web_request(&app, 42, Some(9), 77));
         assert!(!job.cancelled.load(Ordering::Acquire));
-        for attached in [job.clone(), shared] {
-            attached.detach_client(
-                app.clone(),
-                "web:42:shared-cancel".into(),
-                false,
-                Duration::from_millis(20),
-                Duration::ZERO,
-            );
-        }
+        assert!(cancel_web_request(&app, 42, Some(10), 88));
+        assert!(job.cancelled.load(Ordering::Acquire));
         wait_for_terminal_cleanup(&app, &job);
         assert_eq!(job.state(), RemuxState::Cancelled);
+    }
+
+    #[test]
+    fn cancellation_that_arrives_before_media_get_rejects_the_late_request() {
+        let dir = temp_dir("web-cancel-before-get");
+        let app = test_app(&dir, 1);
+        assert!(cancel_web_request(&app, 42, Some(9), 77));
+
+        let mut spec = job_spec(
+            &dir,
+            "web-cancel-before-get",
+            vec!["sleep".into(), "30".into()],
+        );
+        spec.job_key = "web:42:cancel-before-get".into();
+        spec.web_session_id = Some(9);
+        spec.web_request_id = Some(77);
+        spec.cacheable = false;
+
+        assert_eq!(
+            attach_for_client(app.clone(), spec).err().as_deref(),
+            Some(WEB_REQUEST_CANCELLED)
+        );
+        assert_eq!(app.jobs.in_use(), 0);
+        assert!(app.remuxes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn newer_playback_generation_cancels_every_older_session_job() {
+        let dir = temp_dir("web-generation-supersede");
+        let app = test_app(&dir, 2);
+        let mut first = job_spec(
+            &dir,
+            "web-generation-first",
+            vec!["sleep".into(), "30".into()],
+        );
+        first.job_key = "web:42:generation-first".into();
+        first.web_session_id = Some(9);
+        first.web_request_id = Some(77);
+        first.cacheable = false;
+        let stale = first.clone();
+        let first_job = attach_for_client(app.clone(), first).unwrap();
+
+        let mut second = job_spec(
+            &dir,
+            "web-generation-second",
+            vec!["sleep".into(), "30".into()],
+        );
+        second.job_key = "web:42:generation-second".into();
+        second.web_session_id = Some(9);
+        second.web_request_id = Some(78);
+        second.cacheable = false;
+        let second_job = attach_for_client(app.clone(), second).unwrap();
+
+        assert!(first_job.cancelled.load(Ordering::Acquire));
+        assert!(!second_job.cancelled.load(Ordering::Acquire));
+        assert_eq!(
+            attach_for_client(app.clone(), stale).err().as_deref(),
+            Some(WEB_REQUEST_CANCELLED)
+        );
+        assert_eq!(web_job_state(&app, 42, Some(77)), ("cancelled", None));
+
+        assert!(cancel_web_request(&app, 42, Some(9), 78));
+        wait_for_terminal_cleanup(&app, &first_job);
+        wait_for_terminal_cleanup(&app, &second_job);
     }
 
     #[test]
@@ -2344,7 +2562,10 @@ mod tests {
         let reconnected = attach_for_client(app.clone(), retry).unwrap();
         assert!(Arc::ptr_eq(&job, &reconnected));
         std::thread::sleep(Duration::from_millis(100));
-        assert!(dest.is_file(), "an active reconnect must retain the completed output");
+        assert!(
+            dest.is_file(),
+            "an active reconnect must retain the completed output"
+        );
 
         reconnected.detach_client(
             app.clone(),
@@ -2473,6 +2694,7 @@ mod tests {
         let idle = Arc::new(RemuxJob {
             detail_id: 44,
             web_request_ids: Mutex::new(HashSet::new()),
+            web_sessions: Mutex::new(HashMap::new()),
             web: false,
             cache_hit: false,
             playable_observed: AtomicBool::new(false),
@@ -2481,7 +2703,6 @@ mod tests {
             state: Mutex::new(RemuxState::Starting),
             changed: tokio::sync::Notify::new(),
             cancelled: AtomicBool::new(false),
-            cancel_when_idle: AtomicBool::new(false),
             clients: AtomicUsize::new(0),
             ever_had_client: AtomicBool::new(false),
             client_epoch: AtomicU64::new(0),

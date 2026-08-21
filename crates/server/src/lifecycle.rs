@@ -128,9 +128,9 @@ pub(super) async fn accept_loop(listener: tokio::net::TcpListener, app: Arc<App>
             if let Err(e) = handle_conn(app.clone(), sock, peer).await {
                 let msg = e.to_string();
                 if msg.contains("Broken pipe") || msg.contains("Connection reset") {
-                    tracing::debug!("conn: {e}");
+                    tracing::debug!(%peer, "conn: {e}");
                 } else {
-                    tracing::error!("conn: {e}");
+                    tracing::error!(%peer, "conn: {e}");
                 }
             }
             app.runtime_metrics.connection_closed();
@@ -1460,11 +1460,15 @@ pub(super) async fn handle_conn(
         request_number = request_number.saturating_add(1);
         persist_left = persist_left.saturating_sub(1);
         if let Some(spec) = resp.remux_job.clone() {
-            remux::serve_remux(&app, &mut sock, &req, spec).await?;
+            remux::serve_remux(&app, &mut sock, &req, spec)
+                .await
+                .map_err(|error| format!("{} {}: {error}", req.method, req.path))?;
             break;
         }
         let wire = resp.bytes_wire(&app.server, &now_imf_date());
-        socket_write_all(&app, &mut sock, &wire).await?;
+        socket_write_all(&app, &mut sock, &wire)
+            .await
+            .map_err(|error| format!("{} {} response: {error}", req.method, req.path))?;
         if let Some(range) = resp.file_range.as_ref() {
             stream_open_file_range(
                 &app,
@@ -1473,7 +1477,8 @@ pub(super) async fn handle_conn(
                 range.start,
                 range.end,
             )
-            .await?;
+            .await
+            .map_err(|error| format!("{} {} media: {error}", req.method, req.path))?;
         }
         if !resp.persist || persist_left == 0 {
             break;
