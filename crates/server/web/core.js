@@ -74,6 +74,115 @@ export function chooseSource({ requestedMode, directSupport, transcoding }) {
     : { mode: "direct", reason: "transcoding_disabled" };
 }
 
+function positiveNumber(value, fallback) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : fallback;
+}
+
+function parsedFrameRate(value) {
+  const [numerator, denominator = "1"] = String(value || "").split("/");
+  return positiveNumber(Number(numerator) / positiveNumber(denominator, 1), 30);
+}
+
+export function videoDecodingConfiguration(item) {
+  if (item?.kind !== "video" || !item.video_content_type) return null;
+  const video = {
+    contentType: item.video_content_type,
+    width: positiveNumber(item.width, 1920),
+    height: positiveNumber(item.height, 1080),
+    bitrate: positiveNumber(Number(item.bitrate) * 8, 8_000_000),
+    framerate: parsedFrameRate(item.frame_rate),
+  };
+  if (String(item.hdr).toLowerCase() === "hdr10") {
+    video.hdrMetadataType = "smpteSt2086";
+    video.colorGamut = "bt2020";
+    video.transferFunction = "pq";
+  }
+  return { type: "file", video };
+}
+
+export function audioDecodingConfiguration(item, track) {
+  if (!track?.content_type) return null;
+  const codec = String(track.codec || "").toLowerCase();
+  const bitrate = { aac: 320_000, ac3: 640_000, eac3: 1_536_000, mp3: 320_000 }[codec] || 320_000;
+  return {
+    type: "file",
+    audio: {
+      contentType: track.content_type,
+      channels: String(positiveNumber(track.channels || item?.channels, 2)),
+      bitrate,
+      samplerate: positiveNumber(item?.sample_rate, 48_000),
+    },
+  };
+}
+
+async function supportsConfiguration(configuration, canPlayType, decodingInfo) {
+  if (!configuration) {
+    return {
+      supported: false,
+      canPlayType: "not tested",
+      mediaCapabilities: "not tested",
+    };
+  }
+  const contentType = configuration.video?.contentType || configuration.audio?.contentType;
+  let canPlayTypeResult = "";
+  try {
+    canPlayTypeResult = String(canPlayType(contentType) || "");
+  } catch (_) {
+    // An invalid or overly specific candidate is simply not supported.
+  }
+  const basicSupport = Boolean(canPlayTypeResult);
+  if (!decodingInfo) {
+    return {
+      supported: basicSupport,
+      canPlayType: canPlayTypeResult || "unsupported",
+      mediaCapabilities: "unavailable",
+    };
+  }
+  try {
+    const capabilities = await decodingInfo(configuration);
+    const capabilitiesSupport = Boolean(capabilities.supported);
+    return {
+      // In practice, HEVC-capable browsers can disagree between these two
+      // APIs. Either positive answer is sufficient to try stream copy.
+      supported: capabilitiesSupport || basicSupport,
+      canPlayType: canPlayTypeResult || "unsupported",
+      mediaCapabilities: capabilitiesSupport ? "supported" : "unsupported",
+    };
+  } catch (_) {
+    return {
+      supported: basicSupport,
+      canPlayType: canPlayTypeResult || "unsupported",
+      mediaCapabilities: "error",
+    };
+  }
+}
+
+export async function negotiateCompatibleStreams({
+  item,
+  track,
+  quality,
+  canPlayType,
+  decodingInfo = null,
+}) {
+  const videoConfiguration = quality === "auto" ? videoDecodingConfiguration(item) : null;
+  const audioConfiguration = audioDecodingConfiguration(item, track);
+  const [videoProbe, audioProbe] = await Promise.all([
+    supportsConfiguration(videoConfiguration, canPlayType, decodingInfo),
+    supportsConfiguration(audioConfiguration, canPlayType, decodingInfo),
+  ]);
+  return {
+    video: item?.kind === "video" && quality === "auto" && videoProbe.supported
+      ? (item.video_repair_required ? "repair" : "copy")
+      : "transcode",
+    audio: audioProbe.supported ? "copy" : "transcode",
+    videoContentType: videoConfiguration?.video.contentType || null,
+    audioContentType: audioConfiguration?.audio.contentType || null,
+    videoProbe,
+    audioProbe,
+  };
+}
+
 export function queuePosition(queue, itemId) {
   return queue.findIndex((item) => String(item.id) === String(itemId));
 }

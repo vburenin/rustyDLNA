@@ -23,6 +23,11 @@ const FIRST_BYTES: u64 = 16 * 1024;
 const FIRST_WAIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(50);
 const CHILD_TERM_GRACE: Duration = Duration::from_millis(200);
+// Chromium commonly pauses range reads while it parses a new fragmented MP4
+// or refills its media pipeline. Keep the producer around long enough for the
+// next request instead of treating that normal gap as abandonment.
+const WEB_RECONNECT_GRACE: Duration = Duration::from_secs(30);
+const WEB_EPHEMERAL_RETENTION: Duration = Duration::from_secs(30);
 
 fn terminate_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
@@ -182,6 +187,9 @@ pub struct RemuxJob {
     pub(crate) changed: tokio::sync::Notify,
     cancelled: AtomicBool,
     clients: AtomicUsize,
+    ever_had_client: AtomicBool,
+    client_epoch: AtomicU64,
+    disconnect_deadline: Mutex<Option<Instant>>,
     cacheable: bool,
     started: Instant,
 }
@@ -241,23 +249,58 @@ impl RemuxJob {
     }
 
     fn attach_client(&self) {
+        let mut deadline = crate::lock_recover(&self.disconnect_deadline);
         self.clients.fetch_add(1, Ordering::Relaxed);
+        self.ever_had_client.store(true, Ordering::Release);
+        self.client_epoch.fetch_add(1, Ordering::AcqRel);
+        *deadline = None;
     }
 
-    fn detach_client(&self, app: &App, continue_after_disconnect: bool) {
+    fn detach_client(
+        self: &Arc<Self>,
+        app: Arc<App>,
+        job_key: String,
+        continue_after_disconnect: bool,
+        reconnect_grace: Duration,
+        ephemeral_retention: Duration,
+    ) {
+        let mut deadline = crate::lock_recover(&self.disconnect_deadline);
         let previous = self.clients.fetch_sub(1, Ordering::AcqRel);
-        if previous <= 1
-            && !continue_after_disconnect
-            && !matches!(
-                self.state(),
-                RemuxState::Complete | RemuxState::Failed(_) | RemuxState::Cancelled
-            )
-        {
-            self.cancel();
+        self.client_epoch.fetch_add(1, Ordering::AcqRel);
+        if previous <= 1 && !continue_after_disconnect {
+            match self.state() {
+                RemuxState::Starting | RemuxState::Preprocessing | RemuxState::Growing => {
+                    *deadline = Some(Instant::now() + reconnect_grace);
+                }
+                RemuxState::Complete if !self.cacheable => {
+                    *deadline = None;
+                    drop(deadline);
+                    schedule_ephemeral_cleanup(
+                        app,
+                        job_key,
+                        self.clone(),
+                        ephemeral_retention,
+                    );
+                    return;
+                }
+                RemuxState::Complete | RemuxState::Failed(_) | RemuxState::Cancelled => {
+                    *deadline = None;
+                }
+            }
         }
-        if previous <= 1 && !self.cacheable && matches!(self.state(), RemuxState::Complete) {
-            remove_ephemeral_output(app, self);
+    }
+
+    fn reconnect_grace_expired(&self) -> bool {
+        let mut deadline = crate::lock_recover(&self.disconnect_deadline);
+        if self.clients.load(Ordering::Acquire) != 0 {
+            *deadline = None;
+            return false;
         }
+        let expired = deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        if expired {
+            *deadline = None;
+        }
+        expired
     }
 }
 
@@ -275,6 +318,37 @@ fn remove_ephemeral_output(app: &App, job: &RemuxJob) {
         );
     }
     let _ = std::fs::remove_file(rusty_dlna_transcode::cache_stamp_path(&job.dest));
+}
+
+fn schedule_ephemeral_cleanup(
+    app: Arc<App>,
+    job_key: String,
+    job: Arc<RemuxJob>,
+    retention: Duration,
+) {
+    let epoch = job.client_epoch.load(Ordering::Acquire);
+    let id = job.detail_id;
+    let spawned = std::thread::Builder::new()
+        .name(format!("remux-retain-{id}"))
+        .spawn(move || {
+            std::thread::sleep(retention);
+            let mut jobs = crate::lock_recover(&app.remuxes);
+            let same_job = jobs
+                .get(&job_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &job));
+            if same_job
+                && job.clients.load(Ordering::Acquire) == 0
+                && job.client_epoch.load(Ordering::Acquire) == epoch
+                && matches!(job.state(), RemuxState::Complete)
+            {
+                remove_ephemeral_output(&app, &job);
+                jobs.remove(&job_key);
+                tracing::debug!(id, "expired reconnectable web segment");
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(id, %error, "could not schedule web segment cleanup");
+    }
 }
 
 fn spawn_ffmpeg(
@@ -342,9 +416,6 @@ fn spawn_ffmpeg(
                                 tracing::warn!(id, dest = %dest.display(), %error, "cache stamp write failed");
                             }
                         }
-                        if !spec.cacheable && job.clients.load(Ordering::Acquire) == 0 {
-                            remove_ephemeral_output(&app, &job);
-                        }
                         finish_job(&app, &spec.job_key, &job);
                         return;
                     }
@@ -379,7 +450,7 @@ fn spawn_ffmpeg(
                     tracing::warn!(
                         id,
                         dest = %dest.display(),
-                        "hardware transcode unavailable; retrying with software encoder"
+                        "negotiated compatible output failed; retrying with portable encoders"
                     );
                     cleanup_intermediates(&part);
                     job.transition(RemuxState::Starting);
@@ -429,17 +500,19 @@ fn spawn_ffmpeg(
                     let _ = std::fs::remove_file(&part);
                 }
                 Err(error) => {
-                    tracing::error!(id, dest = %dest.display(), %error, "ffmpeg spawn failed");
                     if job.cancelled.load(Ordering::Acquire) || error == "cancelled" {
+                        tracing::info!(
+                            id,
+                            dest = %dest.display(),
+                            "remux job cancelled after its reconnect window expired"
+                        );
                         job.transition(RemuxState::Cancelled);
                     } else {
+                        tracing::error!(id, dest = %dest.display(), %error, "ffmpeg spawn failed");
                         job.transition(RemuxState::Failed(error));
                     }
                     cleanup_intermediates(&part);
                 }
-            }
-            if !spec.cacheable && job.clients.load(Ordering::Acquire) == 0 {
-                remove_ephemeral_output(&app, &job);
             }
             finish_job(&app, &spec.job_key, &job);
         });
@@ -525,6 +598,12 @@ fn run_ffmpeg_growing(
             let _ = stderr_reader.join();
             return Err("cancelled".into());
         }
+        if job.reconnect_grace_expired() {
+            job.cancel();
+            terminate_process_group(&mut child);
+            let _ = stderr_reader.join();
+            return Err("cancelled".into());
+        }
         if Instant::now() >= deadline {
             terminate_process_group(&mut child);
             let _ = stderr_reader.join();
@@ -576,7 +655,7 @@ fn remove_job(app: &App, key: &str, job: &Arc<RemuxJob>) {
     }
 }
 
-fn finish_job(app: &App, key: &str, job: &Arc<RemuxJob>) {
+fn finish_job(app: &Arc<App>, key: &str, job: &Arc<RemuxJob>) {
     let state = job.state();
     app.remux_metrics.record(&state);
     if job.web {
@@ -592,7 +671,7 @@ fn finish_job(app: &App, key: &str, job: &Arc<RemuxJob>) {
             _ => 0,
         };
     }
-    let public_state = match state {
+    let public_state = match &state {
         RemuxState::Complete => "ready",
         RemuxState::Failed(_) => "failed",
         RemuxState::Cancelled => "cancelled",
@@ -620,7 +699,21 @@ fn finish_job(app: &App, key: &str, job: &Arc<RemuxJob>) {
         );
     }
     drop(recent);
-    remove_job(app, key, job);
+    if matches!(state, RemuxState::Complete) && !job.cacheable {
+        if job.web && job.ever_had_client.load(Ordering::Acquire) {
+            schedule_ephemeral_cleanup(
+                app.clone(),
+                key.to_owned(),
+                job.clone(),
+                WEB_EPHEMERAL_RETENTION,
+            );
+        } else {
+            remove_ephemeral_output(app, job);
+            remove_job(app, key, job);
+        }
+    } else {
+        remove_job(app, key, job);
+    }
     app.jobs.release();
 }
 
@@ -770,7 +863,20 @@ fn tail_str(s: &str, max: usize) -> String {
 }
 
 /// Start or attach. `started` is true when this call launched ffmpeg.
+#[cfg(test)]
 pub fn attach(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String> {
+    attach_job(app, spec, false)
+}
+
+fn attach_for_client(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String> {
+    attach_job(app, spec, true)
+}
+
+fn attach_job(
+    app: Arc<App>,
+    spec: RemuxJobSpec,
+    register_client: bool,
+) -> Result<Arc<RemuxJob>, String> {
     let web = spec.job_key.starts_with("web:");
     if web {
         app.remux_metrics
@@ -798,7 +904,7 @@ pub fn attach(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String
                 "web compatible transcode cache hit"
             );
         }
-        return Ok(Arc::new(RemuxJob {
+        let job = Arc::new(RemuxJob {
             detail_id: spec.detail_id,
             web_request_ids: Mutex::new(spec.web_request_id.into_iter().collect()),
             web,
@@ -810,9 +916,16 @@ pub fn attach(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String
             changed: tokio::sync::Notify::new(),
             cancelled: AtomicBool::new(false),
             clients: AtomicUsize::new(0),
+            ever_had_client: AtomicBool::new(false),
+            client_epoch: AtomicU64::new(0),
+            disconnect_deadline: Mutex::new(None),
             cacheable: true,
             started: Instant::now(),
-        }));
+        });
+        if register_client {
+            job.attach_client();
+        }
+        return Ok(job);
     }
     if let Some(job) = map.get(&spec.job_key) {
         if job.err().is_none() {
@@ -832,6 +945,9 @@ pub fn attach(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String
                 cache_reuse = web,
                 "remux attach"
             );
+            if register_client {
+                job.attach_client();
+            }
             return Ok(job.clone());
         }
         map.remove(&spec.job_key);
@@ -889,10 +1005,16 @@ pub fn attach(app: Arc<App>, spec: RemuxJobSpec) -> Result<Arc<RemuxJob>, String
         changed: tokio::sync::Notify::new(),
         cancelled: AtomicBool::new(false),
         clients: AtomicUsize::new(0),
+        ever_had_client: AtomicBool::new(false),
+        client_epoch: AtomicU64::new(0),
+        disconnect_deadline: Mutex::new(None),
         cacheable: spec.cacheable,
         started: Instant::now(),
     });
     map.insert(spec.job_key.clone(), job.clone());
+    if register_client {
+        job.attach_client();
+    }
     drop(map);
     spawn_ffmpeg(app, spec, job.clone(), helper_permit);
     Ok(job)
@@ -1181,7 +1303,7 @@ pub async fn serve_remux(
     spec: RemuxJobSpec,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let head = req.method.eq_ignore_ascii_case("HEAD");
-    let job = match attach(app.clone(), spec.clone()) {
+    let job = match attach_for_client(app.clone(), spec.clone()) {
         Ok(j) => j,
         Err(e) => {
             tracing::error!(
@@ -1205,10 +1327,10 @@ pub async fn serve_remux(
             return Ok(());
         }
     };
-    job.attach_client();
     let _client = RemuxClient {
-        app,
-        job: &job,
+        app: app.clone(),
+        job: job.clone(),
+        job_key: spec.job_key.clone(),
         continue_after_disconnect: spec.continue_after_disconnect,
     };
     let path = match wait_ready(&job).await {
@@ -1258,16 +1380,22 @@ pub async fn serve_remux(
     serve_growing(app, sock, req, &job, spec.mime, head).await
 }
 
-struct RemuxClient<'a> {
-    app: &'a App,
-    job: &'a RemuxJob,
+struct RemuxClient {
+    app: Arc<App>,
+    job: Arc<RemuxJob>,
+    job_key: String,
     continue_after_disconnect: bool,
 }
 
-impl Drop for RemuxClient<'_> {
+impl Drop for RemuxClient {
     fn drop(&mut self) {
-        self.job
-            .detach_client(self.app, self.continue_after_disconnect);
+        self.job.detach_client(
+            self.app.clone(),
+            self.job_key.clone(),
+            self.continue_after_disconnect,
+            WEB_RECONNECT_GRACE,
+            WEB_EPHEMERAL_RETENTION,
+        );
     }
 }
 
@@ -1718,6 +1846,9 @@ mod tests {
             changed: tokio::sync::Notify::new(),
             cancelled: AtomicBool::new(false),
             clients: AtomicUsize::new(0),
+            ever_had_client: AtomicBool::new(false),
+            client_epoch: AtomicU64::new(0),
+            disconnect_deadline: Mutex::new(None),
             cacheable: true,
             started: Instant::now(),
         });
@@ -1800,6 +1931,9 @@ mod tests {
             changed: tokio::sync::Notify::new(),
             cancelled: AtomicBool::new(false),
             clients: AtomicUsize::new(0),
+            ever_had_client: AtomicBool::new(false),
+            client_epoch: AtomicU64::new(0),
+            disconnect_deadline: Mutex::new(None),
             cacheable: true,
             started: Instant::now(),
         });
@@ -2031,6 +2165,108 @@ mod tests {
     }
 
     #[test]
+    fn web_disconnect_grace_allows_reconnect_then_cancels_an_abandoned_job() {
+        let dir = temp_dir("web-reconnect-grace");
+        let app = test_app(&dir, 1);
+        let mut spec = job_spec(
+            &dir,
+            "web-reconnect-grace",
+            vec!["sleep".into(), "30".into()],
+        );
+        spec.job_key = "web:42:reconnect-grace".into();
+        spec.cacheable = false;
+        spec.continue_after_disconnect = false;
+        let retry = spec.clone();
+        let job = attach_for_client(app.clone(), spec).unwrap();
+        job.detach_client(
+            app.clone(),
+            "web:42:reconnect-grace".into(),
+            false,
+            Duration::from_millis(100),
+            Duration::ZERO,
+        );
+        std::thread::sleep(Duration::from_millis(25));
+        let reconnected = attach_for_client(app.clone(), retry).unwrap();
+        assert!(Arc::ptr_eq(&job, &reconnected));
+        std::thread::sleep(Duration::from_millis(125));
+        assert!(!job.cancelled.load(Ordering::Acquire));
+        assert!(!matches!(job.state(), RemuxState::Cancelled));
+
+        job.detach_client(
+            app.clone(),
+            "web:42:reconnect-grace".into(),
+            false,
+            Duration::from_millis(20),
+            Duration::ZERO,
+        );
+        wait_for_terminal_cleanup(&app, &job);
+        assert_eq!(job.state(), RemuxState::Cancelled);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn completed_ephemeral_web_output_survives_a_reconnect_window() {
+        let dir = temp_dir("web-complete-reconnect");
+        let app = test_app(&dir, 1);
+        let dest = dir.join("web-complete-reconnect.mp4");
+        let part = cache_part(&dest);
+        let mut spec = job_spec(
+            &dir,
+            "web-complete-reconnect",
+            vec![
+                "cp".into(),
+                dir.join("source.mkv").display().to_string(),
+                part.display().to_string(),
+            ],
+        );
+        spec.job_key = "web:42:complete-reconnect".into();
+        spec.dest = dest.clone();
+        spec.cacheable = false;
+        spec.continue_after_disconnect = false;
+        let retry = spec.clone();
+        let job = attach_for_client(app.clone(), spec).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (!matches!(job.state(), RemuxState::Complete) || app.jobs.in_use() != 0)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(job.state(), RemuxState::Complete);
+        assert!(dest.is_file());
+        assert_eq!(app.jobs.in_use(), 0);
+
+        job.detach_client(
+            app.clone(),
+            "web:42:complete-reconnect".into(),
+            false,
+            Duration::ZERO,
+            Duration::from_millis(100),
+        );
+        std::thread::sleep(Duration::from_millis(25));
+        let reconnected = attach_for_client(app.clone(), retry).unwrap();
+        assert!(Arc::ptr_eq(&job, &reconnected));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(dest.is_file(), "an active reconnect must retain the completed output");
+
+        reconnected.detach_client(
+            app.clone(),
+            "web:42:complete-reconnect".into(),
+            false,
+            Duration::ZERO,
+            Duration::from_millis(20),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (dest.exists() || !app.remuxes.lock().unwrap().is_empty())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!dest.exists());
+        assert!(app.remuxes.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn completed_web_status_is_scoped_to_the_source_request_id() {
         let dir = temp_dir("web-status-request");
         let app = test_app(&dir, 1);
@@ -2136,7 +2372,7 @@ mod tests {
         assert!(matches!(job.state(), RemuxState::Failed(_)));
         assert!(started.elapsed() < Duration::from_secs(3));
 
-        let idle = RemuxJob {
+        let idle = Arc::new(RemuxJob {
             detail_id: 44,
             web_request_ids: Mutex::new(HashSet::new()),
             web: false,
@@ -2148,12 +2384,35 @@ mod tests {
             changed: tokio::sync::Notify::new(),
             cancelled: AtomicBool::new(false),
             clients: AtomicUsize::new(0),
+            ever_had_client: AtomicBool::new(false),
+            client_epoch: AtomicU64::new(0),
+            disconnect_deadline: Mutex::new(None),
             cacheable: true,
             started: Instant::now(),
-        };
+        });
         idle.attach_client();
-        idle.detach_client(&app, false);
-        assert!(idle.cancelled.load(Ordering::Acquire));
+        idle.detach_client(
+            app.clone(),
+            "idle".into(),
+            false,
+            Duration::from_millis(80),
+            Duration::ZERO,
+        );
+        assert!(!idle.reconnect_grace_expired());
+        std::thread::sleep(Duration::from_millis(20));
+        idle.attach_client();
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(!idle.reconnect_grace_expired());
+        assert!(!idle.cancelled.load(Ordering::Acquire));
+        idle.detach_client(
+            app.clone(),
+            "idle".into(),
+            false,
+            Duration::from_millis(20),
+            Duration::ZERO,
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(idle.reconnect_grace_expired());
         let _ = std::fs::remove_dir_all(dir);
     }
 

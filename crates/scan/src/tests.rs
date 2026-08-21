@@ -1410,6 +1410,124 @@ fn monitor_empty_dirty_attaches_new_poster() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[cfg(unix)]
+#[test]
+fn symlink_alias_preserves_and_adopts_the_physical_files_poster() {
+    let tmp = TempPath::new("art-symlink-reconcile");
+    let real_dir = tmp.join("real");
+    let alias_dir = tmp.join("aliases");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    std::fs::create_dir_all(&alias_dir).unwrap();
+    let media = real_dir.join("movie.mkv");
+    let alias = alias_dir.join("movie-link.mkv");
+    let poster = real_dir.join("movie-poster.jpg");
+    write_fake_mkv(&media, 64);
+    std::fs::write(&poster, TINY_JPEG).unwrap();
+    std::os::unix::fs::symlink(&media, &alias).unwrap();
+    let cfg = ScanConfig {
+        media_dirs: vec![tmp.clone()],
+        db_path: Some(tmp.join("cache/files.db")),
+        types: MediaTypes::video_only(),
+        thumbnails: false,
+        ..Default::default()
+    };
+
+    let initial = scan(&cfg).unwrap();
+    let physical_art = |catalog: &Catalog| {
+        catalog
+            .items
+            .values()
+            .filter(|item| item.ref_id.is_none() && (item.path == media || item.path == alias))
+            .map(|item| item.album_art)
+            .collect::<Vec<_>>()
+    };
+    let initial_art = physical_art(&initial);
+    assert_eq!(initial_art.len(), 2);
+    assert!(initial_art.iter().all(|art_id| *art_id > 0));
+    assert!(initial_art.iter().all(|art_id| *art_id == initial_art[0]));
+    assert_eq!(initial.album_art_paths[&initial_art[0]], poster);
+
+    let (reconciled, _) = monitor(&cfg).unwrap();
+    let reconciled = reconciled.unwrap_or(initial);
+    let reconciled_art = physical_art(&reconciled);
+    assert!(reconciled_art
+        .iter()
+        .all(|art_id| *art_id == reconciled_art[0]));
+    assert_eq!(reconciled.album_art_paths[&reconciled_art[0]], poster);
+
+    std::fs::remove_file(&poster).unwrap();
+    let (removed, _) = monitor(&cfg).unwrap();
+    let removed = removed.expect("poster deletion must update aliases");
+    assert!(physical_art(&removed).iter().all(|art_id| *art_id == 0));
+
+    std::fs::write(&poster, TINY_JPEG).unwrap();
+    let (adopted, _) = monitor(&cfg).unwrap();
+    let adopted = adopted.expect("new poster must be adopted");
+    let adopted_art = physical_art(&adopted);
+    assert!(adopted_art.iter().all(|art_id| *art_id > 0));
+    assert!(adopted_art.iter().all(|art_id| *art_id == adopted_art[0]));
+    assert_eq!(adopted.album_art_paths[&adopted_art[0]], poster);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_only_entry_finds_poster_beside_its_target() {
+    let tmp = TempPath::new("art-symlink-only");
+    let real_dir = tmp.join("real");
+    let alias_dir = tmp.join("aliases");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    std::fs::create_dir_all(&alias_dir).unwrap();
+    let media = real_dir.join("gladiator.mkv");
+    let poster = real_dir.join("gladiator-poster.jpg");
+    let alias = alias_dir.join("action-movie.mkv");
+    write_fake_mkv(&media, 64);
+    std::fs::write(&poster, TINY_JPEG).unwrap();
+    std::os::unix::fs::symlink(&media, &alias).unwrap();
+    let cfg = ScanConfig {
+        media_dirs: vec![tmp.clone()],
+        exclude_dirs: vec!["real".into()],
+        db_path: Some(tmp.join("cache/files.db")),
+        types: MediaTypes::video_only(),
+        thumbnails: false,
+        ..Default::default()
+    };
+
+    let catalog = scan(&cfg).unwrap();
+    assert!(!catalog
+        .items
+        .values()
+        .any(|item| item.ref_id.is_none() && item.path == media));
+    let item = catalog
+        .items
+        .values()
+        .find(|item| item.ref_id.is_none() && item.path == alias)
+        .expect("symlink-only media entry");
+    assert!(item.album_art > 0);
+    assert_eq!(catalog.album_art_paths[&item.album_art], poster);
+}
+
+#[test]
+fn artwork_reconcile_recovers_from_one_item_io_failure_but_not_cancellation() {
+    let cfg = ScanConfig::default();
+    let timeout = scan_io(
+        Path::new("movie.mkv"),
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "helper timeout"),
+    );
+    assert!(recoverable_artwork_error(&cfg, &timeout));
+    let interrupted = scan_io(
+        Path::new("movie.mkv"),
+        std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"),
+    );
+    assert!(!recoverable_artwork_error(&cfg, &interrupted));
+    assert!(recoverable_artwork_error(
+        &cfg,
+        &ScanError::HelperAdmission(HelperAdmissionError::TimedOut)
+    ));
+
+    cfg.cancellation.cancel();
+    assert!(!recoverable_artwork_error(&cfg, &timeout));
+}
+
 #[test]
 fn symlink_clones_known_detail_without_second_probe() {
     let tmp = TempPath::new("clone");

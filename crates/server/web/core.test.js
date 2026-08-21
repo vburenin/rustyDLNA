@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  audioDecodingConfiguration,
   audioTrackLabel,
   chooseSource,
   compatibleSegmentStart,
@@ -9,10 +10,12 @@ import {
   durationSeconds,
   navigationFromUrl,
   navigationUrl,
+  negotiateCompatibleStreams,
   queueNeighbor,
   resumePosition,
   seekTarget,
   timelineValueText,
+  videoDecodingConfiguration,
 } from "./core.js";
 import { initialState, Store } from "./store.js";
 
@@ -48,6 +51,111 @@ test("source choice is explicit about forced and unavailable modes", () => {
   assert.deepEqual(chooseSource({ requestedMode: "compat", directSupport: false, transcoding: false }), {
     mode: "direct", reason: "transcoding_disabled",
   });
+});
+
+test("compatible playback negotiates video and audio independently", async () => {
+  const item = {
+    kind: "video",
+    video_content_type: 'video/mp4; codecs="hvc1.1.6.L120.B0"',
+    width: 3840,
+    height: 2160,
+    bitrate: 2_000_000,
+    frame_rate: "24000/1001",
+    hdr: "hdr10",
+    sample_rate: 48_000,
+  };
+  const ac3 = { codec: "ac3", content_type: 'audio/mp4; codecs="ac-3"', channels: 6 };
+  assert.deepEqual(videoDecodingConfiguration(item), {
+    type: "file",
+    video: {
+      contentType: item.video_content_type,
+      width: 3840,
+      height: 2160,
+      bitrate: 16_000_000,
+      framerate: 24000 / 1001,
+      hdrMetadataType: "smpteSt2086",
+      colorGamut: "bt2020",
+      transferFunction: "pq",
+    },
+  });
+  assert.equal(audioDecodingConfiguration(item, ac3).audio.channels, "6");
+
+  const queried = [];
+  const negotiated = await negotiateCompatibleStreams({
+    item,
+    track: ac3,
+    quality: "auto",
+    canPlayType: (contentType) => contentType.includes("ac-3") ? "" : "probably",
+    decodingInfo: async (configuration) => {
+      queried.push(configuration);
+      return { supported: Boolean(configuration.video) };
+    },
+  });
+  assert.deepEqual(negotiated, {
+    video: "copy",
+    audio: "transcode",
+    videoContentType: item.video_content_type,
+    audioContentType: ac3.content_type,
+    videoProbe: { supported: true, canPlayType: "probably", mediaCapabilities: "supported" },
+    audioProbe: { supported: false, canPlayType: "unsupported", mediaCapabilities: "unsupported" },
+  });
+  assert.equal(queried.length, 2);
+
+  const resized = await negotiateCompatibleStreams({
+    item,
+    track: { ...ac3, codec: "aac", content_type: 'audio/mp4; codecs="mp4a.40.2"' },
+    quality: "full_hd",
+    canPlayType: () => "probably",
+  });
+  assert.equal(resized.video, "transcode");
+  assert.equal(resized.audio, "copy");
+
+  const repaired = await negotiateCompatibleStreams({
+    item: { ...item, video_repair_required: true },
+    track: ac3,
+    quality: "auto",
+    canPlayType: () => "probably",
+  });
+  assert.equal(repaired.video, "repair");
+
+  const disagreeingApis = await negotiateCompatibleStreams({
+    item,
+    track: ac3,
+    quality: "auto",
+    canPlayType: (contentType) => contentType.includes("hvc1.") ? "probably" : "",
+    decodingInfo: async () => ({ supported: false }),
+  });
+  assert.equal(disagreeingApis.video, "copy");
+  assert.deepEqual(disagreeingApis.videoProbe, {
+    supported: true,
+    canPlayType: "probably",
+    mediaCapabilities: "unsupported",
+  });
+});
+
+test("compatible audio-only playback copies supported codecs and survives capability API errors", async () => {
+  const item = { kind: "audio", channels: 2, sample_rate: 48_000 };
+  const track = { codec: "aac", content_type: 'audio/mp4; codecs="mp4a.40.2"', channels: 2 };
+  let probes = 0;
+  const negotiated = await negotiateCompatibleStreams({
+    item,
+    track,
+    quality: "auto",
+    canPlayType: (contentType) => contentType === track.content_type ? "probably" : "",
+    decodingInfo: async () => {
+      probes += 1;
+      throw new Error("MediaCapabilities unavailable for this codec");
+    },
+  });
+  assert.deepEqual(negotiated, {
+    video: "transcode",
+    audio: "copy",
+    videoContentType: null,
+    audioContentType: track.content_type,
+    videoProbe: { supported: false, canPlayType: "not tested", mediaCapabilities: "not tested" },
+    audioProbe: { supported: true, canPlayType: "probably", mediaCapabilities: "error" },
+  });
+  assert.equal(probes, 1);
 });
 
 test("queue navigation is stable by item ID", () => {

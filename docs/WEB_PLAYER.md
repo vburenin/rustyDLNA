@@ -52,6 +52,25 @@ quality. A source restart preserves playback intent, global time, rate, volume,
 mute, loop, caption choice, and audio choice. Only selecting a different title
 may scroll the player into view, and reduced-motion preferences are honored.
 
+The player information button shows the original container, video encoding,
+and selected audio track beside the active browser output. Compatible playback
+asks the browser about video and audio independently with Media Capabilities
+and `canPlayType`; either positive result permits stream copy because deployed
+browsers can disagree for HEVC. The information dialog shows the exact codec
+candidate and both probe results. In Auto, supported H.264 or HEVC video and
+supported AAC, AC-3, E-AC-3, or MP3 audio are copied unchanged into fragmented
+MP4. Only unsupported streams are re-encoded. Explicit 1080p or Data saver
+quality still re-encodes video to apply the requested output envelope.
+
+The scanner also samples presentation and decode timestamps before approving
+H.264/HEVC stream copy. Some malformed MP4 files contain reordered frames but
+store every presentation timestamp in decode order; copying those packets
+causes a visible forward/back cadence even though decoding reports no error.
+Compatible Auto marks those files for frame-order repair. An HEVC-capable
+browser receives an HEVC Main 10 repair encode through `hevc_nvenc`, preserving
+HDR10 and mastering metadata; otherwise the portable H.264 path is used. The
+information dialog states that a repair encode is active and why it is needed.
+
 When available, Media Session receives title, artist, album, artwork, duration,
 position, and transport handlers. Fullscreen video requests Screen Wake Lock
 while playing and releases it on pause, end, error, visibility loss, or exit;
@@ -78,16 +97,23 @@ their normal page-scrolling behavior outside editable controls.
 ## Stream modes and quality
 
 - **Auto** asks the browser about the indexed MIME and RFC 6381 codec string.
-  It starts Original when supported and retries once with Compatible if the
-  media element still fails.
+  It starts Original when the complete source is supported and retries once
+  with Compatible if the media element still fails. Compatible then negotiates
+  the exact MP4 video and selected audio candidates independently.
 - **Original** serves the jailed source file with byte-range support. It keeps
   source quality and consumes no encoder slot, but success depends on that
   browser and platform's container, video, and audio codecs.
-- **Compatible** produces a growing fragmented MP4: H.264/AAC for video or
-  AAC-in-MP4 for audio. It may start more slowly and uses server CPU or GPU.
+- **Compatible** produces a growing fragmented MP4. Each browser-supported
+  stream is copied; unsupported video becomes H.264 and unsupported audio
+  becomes AAC. Copied AAC is normalized for MP4 with `aac_adtstoasc` without
+  re-encoding it. Malformed reordered timestamps force a video repair encode;
+  this is the one case where a browser-supported video codec is deliberately
+  not copied. A failed negotiated copy automatically retries with portable
+  H.264/AAC. It may start more slowly and uses an encoder slot while remuxing
+  or transcoding.
 
-Compatible profiles are advertised by the API rather than hard-coded in the
-UI:
+When a stream must be encoded, compatible profiles are advertised by the API
+rather than hard-coded in the UI:
 
 | Profile | Video | Audio | Approximate peak bandwidth |
 |---|---|---|---|
@@ -98,9 +124,10 @@ UI:
 Scaling never enlarges the source. Auto therefore keeps a 3840×2160 source at
 4K, keeps lower-resolution sources at their original dimensions, and limits
 larger sources to 4K. The explicit 1080p and Data saver profiles reduce encoder
-load and bandwidth when desired. HDR10 and Dolby Vision compatibility output is
-tone-mapped to BT.709 SDR with `libplacebo`; multichannel audio is downmixed to
-stereo. The technical/operator logs record the selected mode, fallback
+load and bandwidth when desired. Supported HDR10 and Dolby Vision profile 8
+video can be copied unchanged; video that must be transcoded is tone-mapped to
+BT.709 SDR with `libplacebo`. Multichannel audio is downmixed to stereo. The
+technical/operator logs record the selected mode, fallback
 reason, quality, encoder, source HDR state, tone mapping, audio index, start
 offset, cache reuse, cancellation, failures, and startup-to-first-playable
 latency without putting source filesystem paths in browser responses.
@@ -109,10 +136,12 @@ Compatibility jobs reuse the existing bounded helper/job gate, runtime
 deadline, cache-size and age limits, cancellation, process reaping, and
 finished-file verification. Concurrent equivalent requests share a job. A
 zero-offset completed stream can be reused from cache. Seek restarts are
-session artifacts: the player coalesces rapid scrubs, the server cancels an
-unfinished producer after its last reader disconnects, and completed
-nonzero-offset output is removed after its final reader so repeated exact seeks
-cannot retain movie-length cache tails.
+session artifacts: the player coalesces rapid scrubs, and a dropped browser
+connection gets a 30-second reconnect window before its unfinished producer is
+cancelled. Reopening the same source attaches to that producer. Completed
+nonzero-offset output remains reconnectable for 30 seconds after its final
+reader and is then removed, so repeated exact seeks cannot retain movie-length
+cache tails.
 
 For NVIDIA acceleration, set `web.encoder = "h264_nvenc"` and expose the GPU.
 An NVIDIA Container Toolkit Compose override can include:
@@ -187,7 +216,7 @@ validated strictly.
 | `/api/web/item/{id}` | One item; `enrich=1` explicitly probes legacy stream metadata |
 | `/api/web/transcode/{id}?request={request_id}` | Request-scoped `queued`, `starting`, `producing`, `complete`, `cancelled`, or `failed` state |
 | `/web/media/{id}.mp4?mode=direct` | Original jailed media with byte ranges |
-| `/web/media/{id}.mp4?...` | Compatible stream with validated audio, start, quality, reason, and request parameters |
+| `/web/media/{id}.mp4?...` | Compatible stream with validated audio track, start, quality, negotiated `video_mode`/`audio_mode`, reason, and request parameters |
 | `/Captions/{id}/{index}...?format=webvtt` | Jailed browser caption conversion |
 | `/status` and `/api/status` | Operator status and metrics |
 

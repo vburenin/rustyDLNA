@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#0b0d0f">
   <title>rustyDLNA</title>
+  <link rel="icon" href="/favicon.ico" type="image/png">
   <link rel="stylesheet" href="/web/app.css">
   <script type="module" src="/web/app.js"></script>
 </head>
@@ -63,6 +64,7 @@
               <div class="timeline-times" aria-label="Playback time"><span id="timeline-current">0:00</span><span aria-hidden="true">/</span><span id="timeline-duration">0:00</span></div>
             </div>
             <div class="toggle-controls" aria-label="Player settings">
+              <button type="button" id="stream-info-button" aria-label="Stream information" aria-haspopup="dialog" aria-controls="stream-info-dialog">Info</button>
               <button type="button" id="captions-button" aria-label="Captions" aria-expanded="false" aria-controls="caption-menu">CC</button>
               <button type="button" id="pip-button" aria-pressed="false" aria-label="Enter picture in picture">PiP</button>
               <button type="button" class="advanced-playback-button" id="advanced-playback-button" aria-label="Playback settings" aria-haspopup="dialog" aria-controls="advanced-playback-dialog">Settings</button>
@@ -90,6 +92,17 @@
               <label for="caption-background-control">Caption background<select id="caption-background-control"><option value="translucent">Translucent</option><option value="solid">Solid</option></select></label>
             </div>
             <label class="autoplay-option"><input id="autoplay-control" type="checkbox"> Automatically play the next queue item</label>
+          </form>
+        </dialog>
+
+        <dialog class="stream-info-dialog" id="stream-info-dialog" aria-labelledby="stream-info-title">
+          <form method="dialog">
+            <div class="dialog-heading"><h2 id="stream-info-title">Stream information</h2><button value="close" aria-label="Close stream information">Done</button></div>
+            <p id="stream-info-summary"></p>
+            <div class="stream-info-columns">
+              <section aria-labelledby="source-stream-title"><h3 id="source-stream-title">Original source</h3><dl id="source-stream-facts"></dl></section>
+              <section aria-labelledby="output-stream-title"><h3 id="output-stream-title">Current playback</h3><dl id="output-stream-facts"></dl></section>
+            </div>
           </form>
         </dialog>
 

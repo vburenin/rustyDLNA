@@ -37,6 +37,7 @@ export function initialState(navigation, preferences) {
       selectedAudio: 0,
       audioTracks: [],
       audioTracksStatus: "idle",
+      streamNegotiation: null,
       chapters: [],
       selectedCaption: preferences.caption,
       pip: false,
@@ -156,6 +157,7 @@ function reduce(state, action) {
           selectedAudio: action.item.default_audio_index || 0,
           audioTracks: action.item.audio_tracks || [],
           audioTracksStatus: "idle",
+          streamNegotiation: null,
           chapters: action.item.chapters || [],
           selectedCaption: state.preferences.caption,
         },
@@ -174,6 +176,7 @@ function reduce(state, action) {
           segmentOffset: action.segmentOffset,
           currentTime: action.start,
           previewTime: null,
+          streamNegotiation: null,
           message: action.message || null,
           error: null,
         },
@@ -211,7 +214,16 @@ function reduce(state, action) {
       return { ...state, playback: { ...state.playback, audioTracksStatus: "loading" } };
     case "AUDIO_TRACKS_SUCCESS":
       if (action.sessionId !== state.playback.sessionId) return state;
-      return { ...state, playback: { ...state.playback, audioTracks: action.tracks, chapters: action.chapters || state.playback.chapters, audioTracksStatus: "ready" } };
+      return {
+        ...state,
+        playback: {
+          ...state.playback,
+          item: action.item ? { ...state.playback.item, ...action.item } : state.playback.item,
+          audioTracks: action.tracks,
+          chapters: action.chapters || state.playback.chapters,
+          audioTracksStatus: "ready",
+        },
+      };
     case "AUDIO_TRACKS_ERROR":
       if (action.sessionId !== state.playback.sessionId) return state;
       return { ...state, playback: { ...state.playback, audioTracksStatus: "error" } };

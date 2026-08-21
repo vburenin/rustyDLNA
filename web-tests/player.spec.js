@@ -23,6 +23,19 @@ async function openVideoView(page) {
 
 async function selectTaggedVideo(page) {
   await openVideoView(page);
+  const poster = page.locator(".media-card.video .art", { has: page.locator("img") }).first();
+  await expect(poster).toBeVisible();
+  const posterLayout = await poster.evaluate((art) => {
+    const bounds = art.getBoundingClientRect();
+    return {
+      objectFit: getComputedStyle(art.querySelector("img")).objectFit,
+      width: bounds.width,
+      ratio: bounds.height / bounds.width,
+    };
+  });
+  expect(posterLayout.objectFit).toBe("contain");
+  expect(posterLayout.width).toBeGreaterThan(100);
+  expect(posterLayout.ratio).toBeGreaterThan(1.45);
   await page.getByRole("button", { name: /^Play tagged\b/ }).click();
   await expect(page.locator("#now-playing-title")).toHaveText("tagged");
 }
@@ -64,7 +77,7 @@ test("library tabs, player scoping, and overlay controls work", async ({ page })
   await page.getByRole("button", { name: /^Play tagged\b/ }).click();
 
   const stage = page.locator("#player-stage");
-  for (const selector of ["#timeline", "#volume-control", "#captions-button", "#audio-track-controls", "#fullscreen-button"]) {
+  for (const selector of ["#timeline", "#volume-control", "#stream-info-button", "#captions-button", "#audio-track-controls", "#fullscreen-button"]) {
     await expect(stage.locator(selector)).toHaveCount(1);
   }
   await expect(page.locator(".topbar #now-playing-title")).toHaveText("tagged");
@@ -268,6 +281,186 @@ test("forced Original and Compatible modes select the requested typed source", a
   expect(compatible?.searchParams.get("request")).toMatch(/^\d+$/);
   await page.locator("#quality-control").selectOption("full_hd");
   await expect.poll(() => requests.some((url) => url.searchParams.get("quality") === "full_hd")).toBe(true);
+});
+
+test("compatible startup status is not duplicated and stream info explains an audio-only transcode", async ({ page }) => {
+  await usePreference(page, "stream", "compat");
+  await page.addInitScript(() => {
+    const original = HTMLMediaElement.prototype.canPlayType;
+    HTMLMediaElement.prototype.canPlayType = function negotiatedCanPlayType(contentType) {
+      if (String(contentType).includes("ac-3")) return "";
+      if (String(contentType).includes("hvc1.")) return "probably";
+      return original.call(this, contentType);
+    };
+    Object.defineProperty(navigator, "mediaCapabilities", {
+      configurable: true,
+      value: {
+        decodingInfo: async (configuration) => ({
+          supported: Boolean(configuration.video),
+          smooth: true,
+          powerEfficient: true,
+        }),
+      },
+    });
+  });
+  const fixture = await readFile(compatibleFixture);
+  let compatibleRequest = null;
+  await page.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    for (const entry of payload.entries || []) {
+      if (entry.entry_type !== "media" || entry.kind !== "video") continue;
+      entry.video_codec = "hevc";
+      entry.codec_string = "hvc1.1.6.L120.B0,ac-3";
+      entry.video_content_type = 'video/mp4; codecs="hvc1.1.6.L120.B0"';
+      entry.video_profile = "Main 10";
+      entry.video_level = 120;
+      entry.pixel_format = "yuv420p10le";
+      entry.bit_depth = 10;
+      entry.audio_codec = "ac3";
+      entry.audio_tracks = [{ index: 0, codec: "ac3", content_type: 'audio/mp4; codecs="ac-3"', channels: 6, language: "eng", title: "Main", default: true }];
+      entry.stream_metadata_complete = true;
+      entry.compatible_video_encoder = "libx264";
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  await page.route("**/api/web/transcode/*", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ schema_version: 1, item_id: 9, request_id: 1, state: "starting", retry_after_seconds: 1 }),
+  }));
+  await page.route("**/web/media/*.mp4?**", async (route) => {
+    compatibleRequest = new URL(route.request().url());
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    await route.fulfill({ status: 200, contentType: "video/mp4", body: fixture });
+  });
+
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  await expect(page.locator("#stage-progress-label")).toHaveText("Starting compatible playback…");
+  await expect(page.locator("#player-message")).toBeHidden();
+  await expect(page.getByText("Starting compatible playback…", { exact: true })).toHaveCount(1);
+  expect(compatibleRequest?.searchParams.get("video_mode")).toBe("copy");
+  expect(compatibleRequest?.searchParams.get("audio_mode")).toBe("transcode");
+
+  await showPlayerControls(page);
+  await page.locator("#stream-info-button").click();
+  await expect(page.locator("#stream-info-dialog")).toBeVisible();
+  await expect(page.locator("#source-stream-facts")).toContainText("HEVC");
+  await expect(page.locator("#source-stream-facts")).toContainText("AC-3");
+  await expect(page.locator("#stream-info-summary")).toContainText("video bitstream is copied unchanged");
+  await expect(page.locator("#output-stream-facts")).toContainText("no video re-encode");
+  await expect(page.locator("#output-stream-facts")).toContainText("AAC");
+  await expect(page.locator("#output-stream-facts")).toContainText("canPlayType: probably");
+  await expect(page.locator("#output-stream-facts")).toContainText("MediaCapabilities: supported");
+});
+
+test("malformed HEVC timing selects HDR-preserving frame-order repair", async ({ page }) => {
+  await usePreference(page, "stream", "compat");
+  await page.addInitScript(() => {
+    const original = HTMLMediaElement.prototype.canPlayType;
+    HTMLMediaElement.prototype.canPlayType = function repairCanPlayType(contentType) {
+      if (String(contentType).includes("hvc1.")) return "probably";
+      return original.call(this, contentType);
+    };
+  });
+  let compatibleRequest = null;
+  await page.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    for (const entry of payload.entries || []) {
+      if (entry.entry_type !== "media" || entry.kind !== "video") continue;
+      entry.video_codec = "hevc";
+      entry.codec_string = "hvc1.2.4.H153.90,mp4a.40.2";
+      entry.video_content_type = 'video/mp4; codecs="hvc1.2.4.H153.90"';
+      entry.video_profile = "Main 10";
+      entry.video_level = 153;
+      entry.pixel_format = "yuv420p10le";
+      entry.bit_depth = 10;
+      entry.hdr = "hdr10";
+      entry.video_timestamp_mode = "broken-reordered";
+      entry.video_repair_required = true;
+      entry.repair_video_encoder = "hevc_nvenc";
+      entry.audio_codec = "aac";
+      entry.audio_tracks = [{ index: 0, codec: "aac", content_type: 'audio/mp4; codecs="mp4a.40.2"', channels: 2, default: true }];
+      entry.stream_metadata_complete = true;
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  await page.route("**/api/web/transcode/*", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ schema_version: 1, item_id: 9, request_id: 1, state: "starting", retry_after_seconds: 1 }),
+  }));
+  await serveFixtureMedia(page, (url) => { compatibleRequest = url; });
+
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  expect(compatibleRequest?.searchParams.get("video_mode")).toBe("repair");
+  expect(compatibleRequest?.searchParams.get("audio_mode")).toBe("copy");
+
+  await showPlayerControls(page);
+  await page.locator("#stream-info-button").click();
+  await expect(page.locator("#source-stream-facts")).toContainText("Malformed display-order timestamps detected");
+  await expect(page.locator("#stream-info-summary")).toContainText("restore stable frame order while preserving HEVC and HDR10");
+  await expect(page.locator("#output-stream-facts")).toContainText("HEVC (hevc_nvenc)");
+  await expect(page.locator("#output-stream-facts")).toContainText("frame order repaired");
+});
+
+test("a copied codec decode error retries once with portable H.264 and AAC", async ({ page }) => {
+  await usePreference(page, "stream", "compat");
+  await page.addInitScript(() => {
+    const original = HTMLMediaElement.prototype.canPlayType;
+    HTMLMediaElement.prototype.canPlayType = function negotiatedCanPlayType(contentType) {
+      if (String(contentType).includes("hvc1.")) return "probably";
+      if (String(contentType).includes("ac-3")) return "probably";
+      return original.call(this, contentType);
+    };
+  });
+  await page.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    for (const entry of payload.entries || []) {
+      if (entry.entry_type !== "media" || entry.kind !== "video") continue;
+      entry.video_codec = "hevc";
+      entry.codec_string = "hvc1.2.4.L150.90,ac-3";
+      entry.video_content_type = 'video/mp4; codecs="hvc1.2.4.L150.90"';
+      entry.audio_codec = "ac3";
+      entry.audio_tracks = [{ index: 0, codec: "ac3", content_type: 'audio/mp4; codecs="ac-3"', channels: 6, default: true }];
+      entry.stream_metadata_complete = true;
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  await page.route("**/api/web/transcode/*", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ schema_version: 1, item_id: 9, request_id: 1, state: "producing", retry_after_seconds: 1 }),
+  }));
+  const fixture = await readFile(compatibleFixture);
+  const requests = [];
+  await page.route("**/web/media/*.mp4?**", async (route) => {
+    requests.push(new URL(route.request().url()));
+    if (requests.length > 1) await new Promise((resolve) => setTimeout(resolve, 750));
+    await route.fulfill({ status: 200, contentType: "video/mp4", body: fixture });
+  });
+
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  await expect.poll(() => requests.length).toBe(1);
+  expect(requests[0].searchParams.get("video_mode")).toBe("copy");
+  expect(requests[0].searchParams.get("audio_mode")).toBe("copy");
+  await page.locator("#video-player").evaluate((video) => {
+    Object.defineProperty(video, "error", { configurable: true, value: { code: 3 } });
+    video.dispatchEvent(new Event("error"));
+  });
+
+  await expect.poll(() => requests.length).toBe(2);
+  expect(requests[1].searchParams.get("video_mode")).toBe("transcode");
+  expect(requests[1].searchParams.get("audio_mode")).toBe("transcode");
+  await showPlayerControls(page);
+  await page.locator("#stream-info-button").click();
+  await expect(page.locator("#stream-info-summary")).toContainText("H.264 video and AAC audio");
+  await expect(page.locator("#player-message[role=alert]")).toBeHidden();
 });
 
 test("disabled, busy, and failed compatible playback have distinct recovery copy", async ({ page }) => {
@@ -555,6 +748,11 @@ test("legacy stream metadata exposes loading and retryable enrichment", async ({
 test("queue snapshot crosses pagination, auto-advances, and survives navigation", async ({ page }) => {
   await usePreference(page, "autoplay", "true");
   await serveFixtureMedia(page);
+  await page.route("**/api/web/transcode/*", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ schema_version: 1, item_id: 7, request_id: 1, state: "complete", retry_after_seconds: null }),
+  }));
   let firstPayload = null;
   await page.route("**/api/web/library?**", async (route) => {
     const url = new URL(route.request().url());
@@ -716,6 +914,12 @@ test("fullscreen controls remain reachable and Escape exits", async ({ page, bro
   await page.locator("#fullscreen-button").click();
   await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id || null)).toBe("player-stage");
   await expect(page.locator("#fullscreen-button")).toBeVisible();
+  await expect(page.locator("#stream-info-button")).toBeVisible();
+  await stage.dispatchEvent("pointermove");
+  await page.locator("#stream-info-button").click();
+  await expect(page.locator("#stream-info-dialog")).toBeVisible();
+  await page.locator('#stream-info-dialog button[value="close"]').click();
+  await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id || null)).toBe("player-stage");
   await stage.dispatchEvent("pointermove");
   await expect(page.locator("#timeline")).toBeVisible();
   await expect(stage).not.toHaveClass(/controls-visible/, { timeout: 4_000 });
@@ -727,6 +931,7 @@ test("fullscreen controls remain reachable and Escape exits", async ({ page, bro
   await page.locator('input[name="stream-mode"][value="compat"]').check();
   await expect(page.locator("#mode-label")).toHaveText("Compatible playback");
   await page.locator('#advanced-playback-dialog button[value="close"]').click();
+  await showPlayerControls(page);
   await page.locator("#fullscreen-button").click();
   await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id || null)).toBe("player-stage");
   await expect(page.locator("#captions-button")).toBeVisible();

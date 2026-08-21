@@ -19,6 +19,10 @@ pub struct SourceProbe {
     pub pixel_format: String,
     pub bit_depth: u32,
     pub frame_rate: String,
+    /// Result of checking compressed video packet timestamps. `valid` means
+    /// stream copy is safe from the known decode-order timestamp defect;
+    /// `broken-reordered` requires a video re-encode to restore display order.
+    pub video_timestamp_mode: String,
     pub audio_layout: String,
     pub codec_string: String,
     pub width: u32,
@@ -49,6 +53,7 @@ pub fn parse_probe_toml(text: &str) -> SourceProbe {
             "pixel_format" => p.pixel_format = v.to_string(),
             "bit_depth" => p.bit_depth = v.parse().unwrap_or(0),
             "frame_rate" => p.frame_rate = v.to_string(),
+            "video_timestamp_mode" => p.video_timestamp_mode = v.to_string(),
             "audio_layout" => p.audio_layout = v.to_string(),
             "codec_string" => p.codec_string = v.to_string(),
             "width" => p.width = v.parse().unwrap_or(0),
