@@ -177,7 +177,7 @@ jobs:
             --tag "$IMAGE:sha-$REVISION" \
             "$IMAGE@$DIGEST"
       - name: Create a draft source-and-image release
-        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
           draft: true
           generate_release_notes: true
