@@ -331,8 +331,7 @@ pub fn emit_didl_object(o: &DidlObject, bits: &FilterBits) -> String {
             xml_escape(&o.title),
             o.class
         ));
-        // The dialect always emits this for storageFolder (upnpsoap.c
-        // `strcmp(class+10, "storageFolder")`). Windows UPnP / VLC use it
+        // rustyDLNA always emits this for storageFolder. Windows UPnP / VLC use it
         // with `<container>` + childCount as the folder expand marker.
         if o.class.contains("storageFolder") {
             s.push_str("<upnp:storageUsed>-1</upnp:storageUsed>");
@@ -805,7 +804,7 @@ pub fn extra_ci1_protocol_infos(
     out
 }
 
-/// dialect `X_SetBookmark`: CONVERT_MS divides by 1000; values < 30 store as 0.
+/// `X_SetBookmark`: CONVERT_MS divides by 1000; values below 30 store as zero.
 pub fn bookmark_seconds(pos: i64, convert_ms: bool) -> i64 {
     let sec = if convert_ms { pos / 1000 } else { pos };
     if sec < 30 {
@@ -855,7 +854,7 @@ enum UpdateTag {
 
 /// Parse the two tag lists used by ContentDirectory `UpdateObject`.
 ///
-/// The service supports Kodi/MiniDLNA's escaped XML fragments and the legacy
+/// The service supports Kodi-compatible escaped XML fragments and the legacy
 /// `name=value` spelling. Every requested tag must be writable and must have a
 /// valid integer/duration value. An empty current list represents the absence
 /// of the advertised bookmark fields, whose database value is zero.
@@ -907,7 +906,7 @@ fn unescape_xml_light(s: &str) -> String {
 /// Remove Kodi's opaque player-state extension before parsing the remaining
 /// DIDL property fragments. Kodi escapes an application-defined state blob
 /// into this element. Treating that blob as another XML document is both
-/// unnecessary and incompatible with values accepted by Platinum/MiniDLNA.
+/// unnecessary and incompatible with values accepted by Platinum renderers.
 fn strip_kodi_player_state(input: &str) -> Result<std::borrow::Cow<'_, str>, TagListError> {
     const OPEN: &str = "<xbmc:lastPlayerState>";
     const CLOSE: &str = "</xbmc:lastPlayerState>";
@@ -1003,7 +1002,7 @@ fn parse_update_tag_list(input: &str, allow_empty: bool) -> Result<ParsedUpdateT
     // `xml_fields` has already decoded the SOAP argument's outer entity
     // layer. Do not decode it again: xbmc:lastPlayerState contains escaped,
     // opaque XML and a second pass turns that text into nested elements.
-    // Direct callers/tests may still provide the once-escaped MiniDLNA form.
+    // Direct callers/tests may still provide the once-escaped wire form.
     let decoded_storage;
     let decoded = if input.contains('<') {
         input
@@ -1108,7 +1107,7 @@ pub fn feature_list_xml(ids: [impl AsRef<str>; 3]) -> String {
     )
 }
 
-/// MiniDLNA `RESOURCE_PROTOCOL_INFO_VALUES` (`upnpglobalvars.h`).
+/// rustyDLNA's canonical protocol-info source values.
 pub const PROTOCOL_INFO_SOURCE: &str = concat!(
     "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_TN,",
     "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_SM,",
@@ -1206,7 +1205,7 @@ pub const PROTOCOL_INFO_SOURCE: &str = concat!(
     "http-get:*:video/webm:*"
 );
 
-/// MiniDLNA's profiled list plus wildcard entries generated from the canonical
+/// Profiled entries plus wildcard entries generated from the canonical
 /// extension/MIME map. This prevents the scanner from serving a format that
 /// ConnectionManager does not advertise.
 pub fn protocol_info_source() -> String {
@@ -1460,7 +1459,7 @@ mod tests {
         assert!(xml.contains("&lt;DIDL-Lite"));
         assert!(
             xml.contains("&lt;container id=\"0\"/&gt;"),
-            "The dialect leaves attribute quotes raw in Result: {xml}"
+            "rustyDLNA leaves attribute quotes raw in Result: {xml}"
         );
         assert!(xml.contains("xmlns:dc=\"http://purl.org/dc/elements/1.1/\""));
         assert!(xml.contains("<NumberReturned>1</NumberReturned>"));
@@ -1477,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn soap_faults_match_inherited_shape_and_codes() {
+    fn soap_faults_match_contract_shape_and_codes() {
         for (code, description) in [
             (401, "Invalid Action"),
             (402, "Invalid Args"),
@@ -1511,8 +1510,8 @@ mod tests {
     fn protocol_info_source_is_a_well_formed_entry_list() {
         let source = protocol_info_source();
         let entries = source.split(',').collect::<Vec<_>>();
-        // Keep this in lockstep with RESOURCE_PROTOCOL_INFO_VALUES in the
-        // reference upnpglobalvars.h: 94 adjacent string literals.
+        // Keep this in lockstep with `PROTOCOL_INFO_SOURCE`, whose profiled
+        // section contains 94 adjacent entries.
         assert!(entries.len() >= 94, "unexpected protocol-info entry count");
         assert!(entries.iter().all(|entry| !entry.is_empty()));
         for entry in &entries {

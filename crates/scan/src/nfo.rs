@@ -1,11 +1,11 @@
-//! Structured NFO parse (MiniDLNA / Kodi tags) and `tvshow.nfo` inherit.
+//! Structured Kodi-style NFO parsing and `tvshow.nfo` metadata application.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use rusty_dlna_protocol::w3c_normalize_date;
 
-/// Skip sidecars larger than MiniDLNA's 64 KiB cap.
+/// Skip sidecars larger than rustyDLNA's 64 KiB cap.
 pub const NFO_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -47,7 +47,7 @@ impl NfoMeta {
     }
 }
 
-/// Split MiniDLNA-style joined genres (`Drama / Crime`).
+/// Split slash-joined genres (`Drama / Crime`).
 pub fn split_genres(genre: &str) -> Vec<String> {
     genre
         .split(" / ")

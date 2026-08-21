@@ -176,7 +176,7 @@ pub fn minimal_scpd() -> &'static str {
     scpd_content_directory()
 }
 
-/// dialect `genServiceDesc` for ContentDirectory. Kodi/Platinum
+/// rustyDLNA service description for ContentDirectory. Kodi/Platinum
 /// `FindAction("Browse")` requires these actions in the SCPD.
 pub fn scpd_content_directory() -> &'static str {
     concat!(
@@ -491,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn root_desc_and_scpd_match_inherited_contract() {
+    fn root_desc_and_scpd_match_protocol_contract() {
         let root = gen_root_desc(&RootDescOpts::default());
         for literal in [
             "urn:schemas-upnp-org:device:MediaServer:1",

@@ -38,7 +38,7 @@ impl Drop for TempPath {
 }
 
 #[test]
-fn seeded_virtual_views_match_minidlna_contract() {
+fn seeded_virtual_views_match_rustydlna_contract() {
     let catalog = Catalog::new();
 
     for (id, title) in [

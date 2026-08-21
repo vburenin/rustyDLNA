@@ -22,7 +22,7 @@ pub const STATUS_PATH: &str = "/status";
 pub const HEALTH_PATH: &str = "/health";
 pub const API_STATUS_PATH: &str = "/api/status";
 
-/// dialect `strtoll(object, NULL, 10)` — leading integer, ignore any suffix
+/// Parse a leading integer and ignore any suffix
 /// (so `/MediaItems/{id}.{ext}` treats `{ext}` as decorative).
 pub fn strtoll_prefix(s: &str) -> Option<i64> {
     let s = s.trim();

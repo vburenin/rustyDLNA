@@ -67,7 +67,7 @@ pub enum ClientKind {
     Tivo,
     StandardDlna150,
     StandardUpnp,
-    /// New: Google Cast / Streamer / Chromecast (not in the dialect).
+    /// Google Cast / Streamer / Chromecast renderer family.
     GoogleCast,
 }
 
@@ -444,7 +444,7 @@ pub fn identify_friendly_name(name: &str) -> Option<&'static ClientProfile> {
     first_match(MatchKind::FriendlyName, name)
 }
 
-/// MiniDLNA `SearchClientCache` / table walk: first row whose *own*
+/// Renderer-profile table walk: the first row whose *own*
 /// header matches wins. A generic `DLNADOC/1.50` UA must not hide Sony
 /// BDP `X-AV-Client-Info: mv="2.0"` sitting above it.
 pub fn identify_request(

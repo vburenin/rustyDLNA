@@ -1,4 +1,4 @@
-//! `Range: bytes=` as the dialect understands it.
+//! rustyDLNA handling for `Range: bytes=`.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteRange {

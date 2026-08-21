@@ -1,4 +1,4 @@
-//! Self-contained locks for the inherited MiniDLNA wire and object-ID contract.
+//! Self-contained locks for rustyDLNA's wire and object-ID contract.
 
 use std::collections::HashSet;
 
@@ -24,7 +24,7 @@ use crate::soap::{
 use crate::w3c_normalize_date;
 
 #[test]
-fn inherited_paths_remain_exact_and_unique() {
+fn contract_paths_remain_exact_and_unique() {
     let actual = [
         ROOTDESC_PATH,
         CONTENTDIRECTORY_PATH,
@@ -59,7 +59,7 @@ fn inherited_paths_remain_exact_and_unique() {
 }
 
 #[test]
-fn inherited_object_ids_remain_exact_and_unique() {
+fn contract_object_ids_remain_exact_and_unique() {
     let actual = [
         ROOT_ID,
         BROWSEDIR_ID,
@@ -128,7 +128,7 @@ fn soap_and_namespace_contract_is_complete() {
 }
 
 #[test]
-fn inherited_date_shapes_are_normalized() {
+fn contract_date_shapes_are_normalized() {
     assert_eq!(
         w3c_normalize_date("2024-03-15T14:30:00"),
         "2024-03-15T14:30:00Z"

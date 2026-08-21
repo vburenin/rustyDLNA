@@ -2118,7 +2118,7 @@ impl App {
 }
 
 /// HTTP/1.1 requires a dotted-IPv4 Host on every method (SOAP / GENA included).
-/// Any present Host must pass the dialect rebinding check.
+/// Any present Host must pass rustyDLNA's rebinding check.
 fn host_rebinding_reject(req: &HttpRequest) -> Option<HttpResponse> {
     let http11 = req.version.eq_ignore_ascii_case("HTTP/1.1");
     match req.header("Host") {

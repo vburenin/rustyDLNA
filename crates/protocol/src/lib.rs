@@ -1,8 +1,8 @@
-//! rustyDLNA on-the-wire protocol dialect.
+//! rustyDLNA on-the-wire protocol contract.
 //!
-//! Constants and helpers here are the executable MiniDLNA compatibility
-//! contract. A rewrite that changes these without a client reason will break
-//! TVs that already work.
+//! Constants and helpers here define executable compatibility behavior. A
+//! rewrite that changes them without a renderer reason can break TVs that
+//! already work.
 
 pub mod client_cache;
 pub mod clients;

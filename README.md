@@ -5,9 +5,8 @@ video, music, and pictures on the LAN so TVs, Kodi, game consoles, and
 phones can browse and play them. There is no account, no cloud, and no
 companion app.
 
-The browse tree, object IDs, and client quirks match MiniDLNA, so a
-ReadyMedia library should look familiar after a switch. rustyDLNA is
-GPLv2.
+The browse tree, object IDs, and renderer behavior form rustyDLNA's stable,
+regression-tested compatibility contract. rustyDLNA is GPLv2.
 
 ## Capabilities
 

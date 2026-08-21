@@ -1,7 +1,7 @@
 //! rustyDLNA-compatible SQLite store (`scanner_sqlite.h`).
 //!
 //! Tables: OBJECTS, DETAILS, ALBUM_ART, CAPTIONS, BOOKMARKS, PLAYLISTS,
-//! SETTINGS. WAL. On-disk file is `{db_dir}/files.db` (same name The dialect uses).
+//! SETTINGS. WAL. The on-disk file has the stable name `{db_dir}/files.db`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1000,7 +1000,7 @@ impl LibraryDb {
         Ok(())
     }
 
-    /// dialect `find_detail_by_inode` + TIMESTAMP so aliases can reuse
+    /// Find a current inode/timestamp source so aliases can reuse
     /// metadata without re-probing when the original is still current.
     pub fn find_inode_source(
         &self,
@@ -1031,7 +1031,7 @@ impl LibraryDb {
             .optional()
     }
 
-    /// dialect `clone_detail_for_path`: new DETAILS row, copied codec/date
+    /// Clone metadata for an alias path: new DETAILS row, copied codec/date
     /// columns, new PATH/SIZE/TIMESTAMP/DEVICE/INODE.
     pub fn clone_detail_for_path(
         &self,

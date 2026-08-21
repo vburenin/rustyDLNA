@@ -586,8 +586,8 @@ fn check_database_integrity(pool: &DbPool) -> DbIntegrityResult {
     }
 }
 
-/// MiniDLNA refuses to grow a SOAP response past roughly two MiB.  Keep the
-/// candidate page finite too: `RequestedCount=0` means "as many as possible",
+/// rustyDLNA caps a SOAP response at roughly two MiB. Keep the candidate page
+/// finite too: `RequestedCount=0` means "as many as possible",
 /// not permission to materialize an entire library before applying the byte
 /// ceiling.
 const MAX_SOAP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -642,7 +642,7 @@ enum CatalogChildRef<'a> {
 }
 
 /// Kodi's Platinum UPnP stack URI-encodes `$` in `UpdateObject` IDs and
-/// appends a slash. MiniDLNA normalizes that wire form before catalog lookup.
+/// appends a slash. Normalize that wire form before catalog lookup.
 fn normalize_soap_object_id(raw: &str) -> Option<String> {
     if raw.len() > 1024 {
         return None;

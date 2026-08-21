@@ -1,7 +1,7 @@
 //! Canonical media extension, MIME, UPnP class, and protocol-capability map.
 //!
 //! Keep admission and representation derived from this table. Containers that
-//! MiniDLNA accepts as either audio or video expose both MIME types and are
+//! rustyDLNA accepts as either audio or video expose both MIME types and are
 //! resolved from the streams found by the scanner.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn advertised_wildcards_cover_inherited_protocol_info_core() {
+    fn advertised_wildcards_cover_protocol_info_core() {
         let generated = wildcard_protocol_info_entries();
         for mime in [
             "image/jpeg",

@@ -117,7 +117,7 @@ pub struct MediaItem {
     pub watch_count: i64,
 }
 
-/// dialect `duration_str` (`H:MM:SS.mmm` from milliseconds).
+/// Format milliseconds as rustyDLNA's `H:MM:SS.mmm` duration.
 pub fn duration_str(msec: i64) -> String {
     let msec = msec.max(0);
     format!(
@@ -163,7 +163,7 @@ pub struct EmbeddedTags {
     pub rotation: Option<i64>,
 }
 
-/// dialect `GetVideoMetadata` / lav: duration, bitrate/8, WxH, audio.
+/// Probe duration, bitrate/8, dimensions, and audio stream metadata.
 pub fn probe_av_meta(path: &Path) -> Option<AvMeta> {
     let mut command = std::process::Command::new("ffprobe");
     command

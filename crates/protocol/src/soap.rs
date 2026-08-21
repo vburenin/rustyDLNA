@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn prefix_match_is_strncmp() {
-        // The dialect uses strncmp; BrowseDirectChildren would hit Browse.
+        // Prefix matching means BrowseDirectChildren hits Browse.
         assert_eq!(
             soap_action_method("urn:x#BrowseDirectChildren"),
             Some("Browse")

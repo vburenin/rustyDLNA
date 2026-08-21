@@ -2,7 +2,6 @@
 
 Audit date: 2026-08-18
 Audited rustyDLNA base commit: `ff5397a` plus the current remediation worktree
-Reference: `/home/vlad/workspace/minidlna` (MiniDLNA 1.3.3-derived tree)
 
 This is an evidence-based implementation inventory and release plan, not a list
 of aspirations. Checked items were found in code and/or exercised during this
@@ -26,11 +25,11 @@ item should be checked only after every acceptance checkbox below it is checked.
 
 ## Audit evidence
 
-- [x] Read the current compatibility, distribution, inherited-behavior,
+- [x] Read the current compatibility, distribution, protocol-contract,
   transcode, test, container, CI, release, and soak material.
-- [x] Compared the Rust subsystems with the reference modules for configuration,
-  discovery, HTTP, SOAP, eventing, scanning, metadata, playlists, monitoring,
-  image handling, client quirks, and database/container generation.
+- [x] Audited the Rust subsystems for configuration, discovery, HTTP, SOAP,
+  eventing, scanning, metadata, playlists, monitoring, image handling, renderer
+  behavior, and database/container generation.
 - [x] Ran `./scripts/check.sh` non-interactively: all checks passed.
 - [x] Ran `cargo audit --deny warnings`: 137 dependencies scanned with no known
   vulnerability finding.
@@ -78,10 +77,9 @@ item should be checked only after every acceptance checkbox below it is checked.
   version and OCI revision labels, while a mismatched `v0.1.1` is rejected.
 - [x] The privileged two-namespace SSDP test passes with reply source and
   `LOCATION` matching each receiving interface.
-- [x] Deleted reference documents—including `replica.md`, `docs/replica.md`, the
-  old architecture/checklist files, copied oracle sources, and local specification
-  PDFs—are not silently restored. Broken test/build references were replaced with
-  self-contained executable compatibility contracts.
+- [x] Deleted obsolete design and checklist documents, copied sources, and local
+  specification PDFs are not silently restored. Broken test/build references were replaced
+  with self-contained executable compatibility contracts.
 
 ## Implemented functionality
 
@@ -90,7 +88,7 @@ item should be checked only after every acceptance checkbox below it is checked.
 - [x] The code is separated into seven workspace crates: protocol, SSDP, SOAP,
   HTTP, scan/database, transcode policy, and the server binary.
 - [x] One Tokio-based daemon owns HTTP, SSDP, GENA, scanner/watch workers, remux
-  jobs, signals, and orderly shutdown instead of relying on MiniDLNA's fork model.
+  jobs, signals, and orderly shutdown instead of using a fork-per-request model.
 - [x] TOML configuration uses strict unknown-field rejection, validation, and
   config-file-relative path resolution.
 - [x] `--config`, `--check`, `--print-effective-config`, `rescan`, `database
@@ -113,7 +111,7 @@ item should be checked only after every acceptance checkbox below it is checked.
   and malformed-packet rejection are tested.
 - [x] Multi-interface sockets join and announce on each selected address and reply
   from the subnet-facing source with a matching HTTP `LOCATION`.
-- [x] Renderer profiles inherit MiniDLNA-derived behavior for Kodi, Samsung,
+- [x] Renderer profiles define behavior for Kodi, Samsung,
   Xbox, Sony, Toshiba, Cast, and generic clients.
 - [x] Client identity combines HTTP headers, SSDP data, address specificity, ARP
   information, TTL expiry, and cached renderer descriptions.
@@ -127,13 +125,13 @@ item should be checked only after every acceptance checkbox below it is checked.
 - [x] Malformed request lines/headers, conflicting content lengths, unsupported
   transfer encodings, and request-smuggling forms are rejected.
 - [x] Leftover pipelined bytes are retained between requests.
-- [x] The MiniDLNA dotted-IPv4 `Host` policy and port validation are implemented.
+- [x] The dotted-IPv4 `Host` policy and port validation are implemented.
 - [x] Root/device descriptions and all three SCPDs are generated, XML-escaped,
   parse-tested, and served with real PNG/JPEG icons.
 - [x] Original media supports GET, HEAD, full-body delivery, single byte ranges,
-  206/416 semantics, large-file streaming, and MiniDLNA/DLNA response headers.
-- [x] Media and transcode resources intentionally close the connection, matching
-  the reference behavior for `/MediaItems/`.
+  206/416 semantics, large-file streaming, and DLNA response headers.
+- [x] Media and transcode resources intentionally close the connection according
+  to the rustyDLNA contract for `/MediaItems/`.
 - [x] Album art, captions, thumbnails/resized JPEGs, presentation/status HTML,
   `/api/status`, and `/health` routes exist.
 - [x] DLNA request checks cover time-seek/play-speed without ranges, transfer mode,
@@ -152,7 +150,7 @@ item should be checked only after every acceptance checkbox below it is checked.
 - [x] DIDL includes client-specific class/MIME quirks, protocolInfo, dates,
   metadata, reference IDs, subtitles, artwork, resource dimensions/duration, and
   XML-safe escaping.
-- [x] Stable MiniDLNA-compatible object IDs and virtual views exist for music,
+- [x] Stable rustyDLNA object IDs and virtual views exist for music,
   video, pictures, folders, playlists, recent items, artists, albums, genres,
   composers, contributors, ratings, cameras, series, seasons, and actors.
 - [x] GENA subscription/renewal/unsubscription, UUID SIDs, bounded timeouts,
@@ -212,7 +210,7 @@ item should be checked only after every acceptance checkbox below it is checked.
   multi-architecture image, scans it, signs its digest, and creates a draft release.
 - [x] Fixtures and oracle material are checksum-locked, and fuzz targets cover
   HTTP, ranges, SSDP, SOAP XML, NFO, URL IDs, and sidecars.
-- [x] Inherited behavior, supported scope, deployment, distribution, and
+- [x] Protocol behavior, supported scope, deployment, distribution, and
   transcode limitations are documented in the remaining project files.
 
 ## P0 — must fix before a public release
@@ -278,8 +276,8 @@ item should be checked only after every acceptance checkbox below it is checked.
 - [x] Stop treating `HttpRoute::Soap` like media in `persist_for_route` and the
   server's response post-processing. Successful SOAP should follow the HTTP/1.0
   and HTTP/1.1 persist rule, the 100-request cap, `Connection` tokens, and the
-  inherited chunked-request close rule.
-- [x] Determine fault persistence from MiniDLNA behavior and encode it explicitly;
+  defined chunked-request close rule.
+- [x] Determine fault persistence from rustyDLNA's protocol contract and encode it explicitly;
   do not let the current unconditional SOAP close hide whether individual fault
   constructors have the right behavior.
 - [x] Add one-socket tests with two pipelined/sequential SOAP requests, HTTP/1.0
@@ -469,7 +467,7 @@ should remain unchecked until deliberately accepted, designed, and tested.
   integration tests before accepting IPv6 configuration.
 - [ ] **TiVo support:** implement beacon/discovery, TiVo HTTP/query behavior, schema
   fields, capability advertisement, and real-client tests, or continue rejecting
-  the MiniDLNA keys explicitly.
+  the unsupported keys explicitly.
 - [ ] **Avahi/mDNS:** add only if a concrete non-SSDP consumer requires it; keep it
   optional and prove it cannot advertise inconsistent identities/addresses.
 - [ ] **MiniSSDPd integration:** define ownership/failure semantics and test both
@@ -479,18 +477,18 @@ should remain unchecked until deliberately accepted, designed, and tested.
 - [ ] **Time-based seek/trick play:** implement DLNA time-seek/play-speed only with
   precise range mapping, codec/container support rules, and real renderer tests;
   the current explicit 406 behavior is safer than partial support.
-- [ ] **Upload/import:** remains outside both the current product and reference
-  contract. If ever added, require authentication, quotas, atomic writes, filename
+- [ ] **Upload/import:** remains outside the current product contract. If ever
+  added, require authentication, quotas, atomic writes, filename
   policy, malware/content validation, and rescan integration as a separate design.
 
 ## Explicitly accepted current scope
 
 - [x] Linux + IPv4 SSDP/HTTP is the current deployment target; unsupported address
   configuration is rejected instead of partially working.
-- [x] JPEG is the supported picture-library parity target; PNG/WebP/HEIF are not
+- [x] JPEG is the supported picture-library format; PNG/WebP/HEIF are not
   silently admitted by extension.
-- [x] TiVo, Avahi/mDNS, and MiniSSDPd features from the reference tree are omitted
-  and their configuration keys/capabilities are not falsely advertised.
+- [x] TiVo, Avahi/mDNS, and MiniSSDPd features are omitted and their configuration
+  keys/capabilities are not falsely advertised.
 - [x] Media roots are read-only inputs; filesystem upload/import is out of scope.
 - [x] Privilege selection belongs to the container/service manager; the daemon does
   not start privileged and then implement its own user switch.
@@ -507,8 +505,8 @@ should remain unchecked until deliberately accepted, designed, and tested.
 - [ ] A clean-machine user can install the advertised artifact, run `--version`,
   scan the representative library, discover it, Browse/Search it, stream/range a
   file, restart it without identity loss, and follow documented recovery steps.
-- [ ] The differential suite has no unexplained MiniDLNA drift, and every deliberate
-  difference is in the compatibility contract.
+- [ ] The differential suite has no unexplained wire-contract regressions, and
+  every deliberate difference is in the compatibility contract.
 - [ ] A 24-hour long-lived-daemon soak and a separate restart/recovery soak pass with
   bounded resources on the exact release commit.
 - [ ] Release artifacts are version-consistent, reproducible enough to audit,

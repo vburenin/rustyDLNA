@@ -13,7 +13,7 @@ struct Args {
     /// Config file (TOML). Living-room paths belong in a gitignored local file.
     #[arg(short, long)]
     config: Option<PathBuf>,
-    /// Print dialect / self-check and exit.
+    /// Print the protocol/configuration self-check and exit.
     #[arg(long)]
     check: bool,
     /// Print the resolved, secret-free configuration and exit.

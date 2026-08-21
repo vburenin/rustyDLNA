@@ -1,7 +1,7 @@
-# Inherited product behavior
+# Protocol and product behavior
 
-A replica that only copies generic UPnP 1.0 will still fail real clients. Keep
-these behaviors when `scan` / SOAP land.
+A generic UPnP 1.0 implementation will still fail real clients. These behaviors
+are part of rustyDLNA's protocol contract.
 
 ## Dates (Kodi 1905)
 
@@ -28,7 +28,7 @@ NFO wins when present: `<premiered>`, then `<aired>`, then `<year>`
 - PNG converted to JPEG for DLNA.
 - Optional video thumbnails only when no sidecar/embedded art.
 - Video Series (`2$E`) and Genre (`2$9`) from NFO `showtitle` / `<genre>`.
-- `tvshow.nfo` inherited by episodes.
+- `tvshow.nfo` metadata applied to episodes.
 
 ## Symlink aliases
 
@@ -51,7 +51,7 @@ without Range → 406.
 
 rustyDLNA reports `rustyDLNA/{version}` with `DLNADOC/1.50 UPnP/1.0` tokens.
 
-## Not inherited as architecture
+## Architectural boundaries
 
-Fork-per-GET, `MAP_SHARED` stream cache, lying `CI=1` extra `<res>`
-that still serve the remux, empty client entry for Cast.
+Do not use fork-per-GET, a `MAP_SHARED` stream cache, a misleading `CI=1` extra
+`<res>` that still serves the remux, or an empty renderer entry for Cast.

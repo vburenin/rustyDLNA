@@ -151,7 +151,7 @@ pub fn is_junk_dir(name: &str) -> bool {
 }
 
 /// Built-in sample/trailer skip is case-sensitive on the directory name
-/// (`sample/` not `Sample/`) — dialect `is_sample` path.
+/// (`sample/` not `Sample/`).
 pub fn is_sample_or_trailer_dir(name: &str) -> bool {
     name == "sample" || name == "trailer"
 }
@@ -249,24 +249,24 @@ pub fn caption_http_mime(ext: &str) -> &'static str {
     }
 }
 
-/// dialect `ends_with` is `strcasecmp` on the suffix (`src/utils.c`).
+/// Compare a suffix with ASCII case-insensitive semantics.
 fn ends_with_ci(name: &str, suffix: &str) -> bool {
     let nb = name.as_bytes();
     let sb = suffix.as_bytes();
     nb.len() >= sb.len() && nb[nb.len() - sb.len()..].eq_ignore_ascii_case(sb)
 }
 
-/// dialect `is_video` (`scanner skip rules`).
+/// Return whether rustyDLNA classifies the name as video.
 pub fn is_video(name: &str) -> bool {
     media_format_for_name(name).is_some_and(|format| format.video_mime.is_some())
 }
 
-/// dialect `is_audio`.
+/// Return whether rustyDLNA classifies the name as audio.
 pub fn is_audio(name: &str) -> bool {
     media_format_for_name(name).is_some_and(|format| format.audio_mime.is_some())
 }
 
-/// dialect `is_image` — JPEG only (not PNG).
+/// Return whether rustyDLNA classifies the name as an image (JPEG only).
 pub fn is_image(name: &str) -> bool {
     media_format_for_name(name).is_some_and(|format| format.image_mime.is_some())
 }
@@ -314,7 +314,7 @@ pub fn is_jpeg_bytes(bytes: &[u8]) -> bool {
 }
 
 /// First matching sidecar next to `video_path`. Stem poster, then fanart,
-/// then folder poster/folder/cover (MiniDLNA case variants).
+/// then configured folder poster/folder/cover name variants.
 const FOLDER_ART_NAMES: &[&str] = &[
     "poster.jpg",
     "Poster.jpg",
@@ -1499,7 +1499,7 @@ fn attach_album_art_in_dir(
     Ok(any)
 }
 
-/// Which media classes a `media_dir=` root accepts (dialect `V,` / `A,` / `P,`).
+/// Which media classes a `media_dir=` root accepts (`V,` / `A,` / `P,`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MediaTypes {
     pub video: bool,
@@ -1556,7 +1556,7 @@ impl Default for MediaTypes {
     }
 }
 
-/// Parse dialect `media_dir=V,/path` or a bare path. Default types = AVP.
+/// Parse `media_dir=V,/path` or a bare path. Default types are AVP.
 pub fn parse_media_dir(spec: &str) -> (MediaTypes, PathBuf) {
     if let Some((prefix, rest)) = spec.split_once(',') {
         let p = prefix.trim();
@@ -1583,7 +1583,7 @@ pub fn parse_media_dir(spec: &str) -> (MediaTypes, PathBuf) {
     (MediaTypes::all(), PathBuf::from(spec))
 }
 
-/// Combine dialect `media_dir=` specs. Each prefix is parsed; the
+/// Combine rustyDLNA `media_dir=` specs. Each prefix is parsed; the
 /// returned `MediaTypes` is the **union** so a later `A,` cannot wipe an
 /// earlier `V,`. Empty list → all types (AVP), no dirs.
 pub fn collect_media_dirs<I, S>(specs: I) -> (Vec<PathBuf>, MediaTypes)
@@ -1714,7 +1714,7 @@ where
     Ok(roots)
 }
 
-/// dialect `GetVideoMetadata`: reject non-media. Strong container magic
+/// Reject non-media before probing. Strong container magic
 /// (EBML/ftyp/RIFF/…) is proof the file is a real bitstream, not text.
 /// Ambiguous headers (TS/MPEG/MP3) get a short `ffprobe`.
 pub fn file_is_viable(path: &Path) -> bool {
@@ -2039,8 +2039,8 @@ pub struct ScanConfig {
     pub media_dirs: Vec<PathBuf>,
     pub exclude_dirs: Vec<String>,
     pub exclude_files: Vec<String>,
-    /// Include dot-prefixed files and directories. Default false matches the
-    /// reference's privacy-oriented scan policy.
+    /// Include dot-prefixed files and directories. Defaults to false as a
+    /// privacy-oriented scan policy.
     pub include_hidden: bool,
     /// Extra folder-art basenames. `{stem}` and `%s` expand to the media stem.
     pub album_art_names: Vec<String>,
@@ -2065,9 +2065,9 @@ pub struct ScanConfig {
     /// Keep Kodi resume positions and play counts for this many 24-hour days
     /// since their last update. Zero means indefinite retention.
     pub bookmark_retention_days: u32,
-    /// dialect `media_dir=V,…` filter. Default = all (AVP).
+    /// `media_dir=V,…` filter. Default is all media classes (AVP).
     pub types: MediaTypes,
-    /// dialect `files.db`. None = in-memory SQLite (tests).
+    /// rustyDLNA `files.db`. None selects in-memory SQLite for tests.
     pub db_path: Option<PathBuf>,
     /// Follow directory/file symlinks whose canonical target is outside every
     /// configured media root. This is intentionally false by default because
@@ -3041,7 +3041,7 @@ pub(crate) fn path_excluded(path: &Path, name: &str, cfg: &ScanConfig) -> bool {
     false
 }
 
-/// MiniDLNA `exclude_file` matching: basename only, ASCII case-insensitive,
+/// rustyDLNA `exclude_file` matching: basename only, ASCII case-insensitive,
 /// with `*` (zero or more bytes) and `?` (one byte).
 pub fn basename_glob_matches(pattern: &str, name: &str) -> bool {
     fn matches(pattern: &[u8], name: &[u8]) -> bool {
@@ -3067,7 +3067,7 @@ pub fn basename_glob_matches(pattern: &str, name: &str) -> bool {
     matches(pattern.as_bytes(), name.as_bytes())
 }
 
-/// dialect `exclude_dir`: a path component (`incomplete`) or a suffix
+/// rustyDLNA `exclude_dir`: a path component (`incomplete`) or a suffix
 /// (`video/incomplete`). Never walk or index those trees.
 fn dir_exclude_matches(path: &Path, name: &str, rule: &str) -> bool {
     let rule = rule.trim_matches('/');
@@ -3241,7 +3241,7 @@ pub fn parse_resolution(s: Option<&str>) -> (u32, u32) {
     (w.trim().parse().unwrap_or(0), h.trim().parse().unwrap_or(0))
 }
 
-/// DLNA PN from stored stream identity. Matroska stays empty (dialect).
+/// DLNA PN from stored stream identity. Matroska deliberately stays empty.
 pub fn dlna_pn_from_probe(
     container: &str,
     video: &str,

@@ -5610,7 +5610,7 @@ fn music_and_image_virtuals_browse_ok() {
 }
 
 #[test]
-fn checked_fixtures_match_minidlna_scan_didl_and_get_contract() {
+fn checked_fixtures_match_scan_didl_and_get_contract() {
     let app = testdata_app();
     let expected = [
         (

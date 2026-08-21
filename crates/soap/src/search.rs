@@ -1,6 +1,6 @@
 //! `SearchCriteria` parsing and matching.
 
-/// A single dialect clause. Unknown properties match nothing.
+/// A single rustyDLNA search clause. Unknown properties match nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SearchClause {
     Contains {
@@ -33,7 +33,7 @@ pub enum SearchClause {
         prop: SearchProp,
         prefix: String,
     },
-    /// MiniDLNA `exists true/false` → IS NOT NULL / IS NULL.
+    /// `exists true/false` maps to IS NOT NULL / IS NULL.
     Exists {
         prop: SearchProp,
         want: bool,
@@ -85,7 +85,7 @@ pub struct SearchRow<'a> {
     pub is_container: bool,
 }
 
-/// Parse MiniDLNA-style SearchCriteria. `and` / `or` with SQL precedence
+/// Parse rustyDLNA `SearchCriteria`. `and` / `or` use SQL precedence
 /// (`and` tighter). Empty/`*`/`1=1` → one `All` group.
 pub fn parse_search_criteria(raw: Option<&str>) -> SearchQuery {
     try_parse_search_criteria(raw).unwrap_or(SearchQuery {

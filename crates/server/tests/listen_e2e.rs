@@ -6,7 +6,7 @@
 //!   cargo test -p rusty-dlna --test listen_e2e -- --test-threads=1
 //! ```
 //! Tests offset from those ports so they can run together:
-//! `one_run` +0, byebye +1, series/remux +2, body-cap +3, dialect +4,
+//! `one_run` +0, byebye +1, series/remux +2, body-cap +3, protocol +4,
 //! remaining +5, kodi-platinum +6. Never bind live 8200/1900 (`isolation`).
 //!
 //! Unset env → skip for ordinary unit runs. `RUSTY_DLNA_REQUIRE_E2E=1`
@@ -1068,9 +1068,9 @@ fn series_genre_and_remux_e2e() {
 }
 
 #[test]
-fn replica_dialect_e2e() {
+fn protocol_contract_e2e() {
     let Some((http, ssdp)) = env_ports() else {
-        eprintln!("skip dialect e2e (RUSTY_DLNA_HTTP_PORT unset)");
+        eprintln!("skip protocol contract e2e (RUSTY_DLNA_HTTP_PORT unset)");
         return;
     };
     // +4: beside twice (base), byebye (+1), series/remux (+2), body-cap (+3).
@@ -1494,9 +1494,9 @@ fn replica_dialect_e2e() {
 }
 
 #[test]
-fn remaining_dialect_e2e() {
+fn remaining_protocol_contract_e2e() {
     let Some((http, ssdp)) = env_ports() else {
-        eprintln!("skip remaining dialect e2e (RUSTY_DLNA_HTTP_PORT unset)");
+        eprintln!("skip remaining protocol contract e2e (RUSTY_DLNA_HTTP_PORT unset)");
         return;
     };
     let http = http.saturating_add(5);

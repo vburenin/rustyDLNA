@@ -742,7 +742,7 @@ fn bind_udp_reuse(addr: SocketAddrV4) -> std::io::Result<socket2::Socket> {
         Some(socket2::Protocol::UDP),
     )?;
     sock.set_reuse_address(true)?;
-    // The dialect uses SO_REUSEADDR only. SO_REUSEPORT lets the kernel hash
+    // rustyDLNA uses SO_REUSEADDR only. SO_REUSEPORT lets the kernel hash
     // multicast M-SEARCH to Home Assistant's :1900 socket instead of us.
     sock.bind(&socket2::SockAddr::from(std::net::SocketAddr::V4(addr)))?;
     sock.set_nonblocking(true)?;

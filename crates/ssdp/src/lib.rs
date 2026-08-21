@@ -1,4 +1,4 @@
-//! SSDP packet builders. Sockets come later; the dialect is here.
+//! rustyDLNA SSDP packet builders. Socket ownership lives in the server crate.
 
 use rusty_dlna_protocol::paths::ROOTDESC_PATH;
 use rusty_dlna_protocol::ssdp::{
@@ -13,7 +13,7 @@ fn usn(uuid: &str, st: &str, index: usize) -> String {
     }
 }
 
-/// Unsolicited NOTIFY (The dialect uses no space after `HOST:`, `NT:`, …).
+/// Unsolicited NOTIFY (rustyDLNA uses no space after `HOST:`, `NT:`, …).
 pub fn notify_alive(
     uuid: &str,
     host: &str,
@@ -91,7 +91,7 @@ pub fn man_is_discover(man: &str) -> bool {
     man.trim() == rusty_dlna_protocol::ssdp::MAN_DISCOVER
 }
 
-/// Parsed M-SEARCH. The dialect requires HTTP/1.1, a non-empty ST, MAN exactly
+/// Parsed M-SEARCH. rustyDLNA requires HTTP/1.1, a non-empty ST, MAN exactly
 /// `"ssdp:discover"`, and MX as an integer >= 0.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MSearch {
@@ -198,7 +198,7 @@ pub fn msearch_replies(
         .collect()
 }
 
-/// Second NOTIFY-alive pass waits 150–250 ms per the inherited behavior.
+/// The second NOTIFY-alive pass waits 150–250 ms per the protocol contract.
 pub const ALIVE_DUP_DELAY_MS: std::ops::RangeInclusive<u64> = 150..=250;
 
 /// M-SEARCH reply jitter: 13–30 ms for `ssdp:all`, 13–20 ms for a specific ST.
@@ -332,11 +332,11 @@ mod tests {
     }
 
     #[test]
-    fn all_ssdp_wire_variants_match_inherited_shapes() {
+    fn all_ssdp_wire_variants_match_contract_shapes() {
         let uuid = "uuid:00000000-0000-4000-8000-000000000001";
         let types = rusty_dlna_protocol::ssdp::known_service_types(uuid);
         assert_eq!(types.len(), 6);
-        let alive = notify_alive(uuid, "192.0.2.10", 8200, 895, "reference-server");
+        let alive = notify_alive(uuid, "192.0.2.10", 8200, 895, "rustydlna-test");
         let byebye = notify_byebye(uuid);
         let search = (0..types.len())
             .map(|index| {
@@ -346,7 +346,7 @@ mod tests {
                     "192.0.2.10",
                     8200,
                     895,
-                    "reference-server",
+                    "rustydlna-test",
                     "Tue, 18 Aug 2026 00:00:00 GMT",
                 )
             })
@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn jitter_ranges_match_inherited_contract() {
+    fn jitter_ranges_match_protocol_contract() {
         assert_eq!(*ALIVE_DUP_DELAY_MS.start(), 150);
         assert_eq!(*ALIVE_DUP_DELAY_MS.end(), 250);
         assert_eq!(msearch_jitter_ms_range(true), 13..=30);

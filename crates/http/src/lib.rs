@@ -54,7 +54,7 @@ pub enum HttpRoute {
 
 pub fn route(method: &str, path: &str) -> HttpRoute {
     if method.eq_ignore_ascii_case("POST") {
-        // The dialect ignores the POST target and keys only off SOAPAction.
+        // rustyDLNA ignores the POST target and keys only off SOAPAction.
         return HttpRoute::Soap;
     }
     if method.eq_ignore_ascii_case("SUBSCRIBE") || method.eq_ignore_ascii_case("UNSUBSCRIBE") {
@@ -103,7 +103,7 @@ pub fn route(method: &str, path: &str) -> HttpRoute {
     }
 }
 
-/// Media GET never persists (the dialect forks + Connection: close).
+/// Media GET never persists; streamed responses use `Connection: close`.
 pub fn persist_for_route(
     route: HttpRoute,
     httpver: Option<&str>,
@@ -127,7 +127,7 @@ pub fn http_body_too_large(len: usize) -> bool {
     len > MAX_HTTP_BODY
 }
 
-/// Host must be dotted IPv4 (dialect DNS-rebinding check).
+/// Host must be dotted IPv4 (rustyDLNA DNS-rebinding check).
 pub fn valid_host_header(host: &str) -> bool {
     let (name, port) = match host.split_once(':') {
         Some((h, p)) => (h, Some(p)),

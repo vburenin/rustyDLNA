@@ -1,4 +1,4 @@
-//! 25-slot IPv4 client cache matching MiniDLNA's SearchClientCache/AddClientCache behavior.
+//! rustyDLNA's 25-slot IPv4 renderer cache and address-matching behavior.
 
 use std::net::Ipv4Addr;
 
