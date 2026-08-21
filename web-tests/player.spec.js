@@ -80,6 +80,38 @@ test("library tabs, player scoping, and overlay controls work", async ({ page })
   for (const selector of ["#timeline", "#volume-control", "#stream-info-button", "#captions-button", "#audio-track-controls", "#fullscreen-button"]) {
     await expect(stage.locator(selector)).toHaveCount(1);
   }
+  await expect(stage.locator("[data-seek]")).toHaveCount(0);
+  const iconOffsets = await stage.locator("button:has(.button-icon)").evaluateAll((buttons) => buttons.map((button) => {
+    const control = button.getBoundingClientRect();
+    const icon = button.querySelector(".button-icon").getBoundingClientRect();
+    return {
+      x: Math.abs(icon.left + icon.width / 2 - (control.left + control.width / 2)),
+      y: Math.abs(icon.top + icon.height / 2 - (control.top + control.height / 2)),
+    };
+  }));
+  expect(iconOffsets.length).toBeGreaterThan(0);
+  expect(iconOffsets.every(({ x, y }) => x <= 0.5 && y <= 0.5)).toBe(true);
+  const volumeControl = page.locator(".volume-control");
+  if (await volumeControl.isVisible()) {
+    const volumeWidth = await volumeControl.evaluate((control) => control.getBoundingClientRect().width);
+    const speakerGap = await page.evaluate(() => {
+      const speaker = document.querySelector("#mute-button").getBoundingClientRect();
+      const volume = document.querySelector(".volume-control").getBoundingClientRect();
+      return volume.left - speaker.right;
+    });
+    expect(speakerGap).toBeGreaterThan(0);
+    await showPlayerControls(page);
+    await volumeControl.hover({ force: true });
+    expect(await volumeControl.evaluate((control) => control.getBoundingClientRect().width)).toBe(volumeWidth);
+  }
+  await showPlayerControls(page);
+  await page.locator("#play-button").hover({ force: true });
+  const playHoverStyle = await page.locator("#play-button").evaluate((button) => {
+    const style = getComputedStyle(button);
+    return { backgroundColor: style.backgroundColor, color: style.color };
+  });
+  expect(playHoverStyle.color).toBe("rgb(255, 255, 255)");
+  expect(playHoverStyle.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
   await expect(page.locator(".topbar #now-playing-title")).toHaveText("tagged");
   const layout = await page.evaluate(() => {
     const media = document.querySelector(".media-viewport").getBoundingClientRect();
@@ -247,7 +279,7 @@ test("autoplay rejection leaves a clear Play affordance", async ({ page }) => {
   });
   await openLibrary(page);
   await selectTaggedVideo(page);
-  await expect(page.locator("#play-button")).toHaveText("Play");
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
   await expect(page.locator("#player-message-text")).toContainText("Press Play");
   await showPlayerControls(page);
   await page.locator("#play-button").click();
@@ -463,7 +495,7 @@ test("a copied codec decode error retries once with portable H.264 and AAC", asy
   await expect(page.locator("#player-message[role=alert]")).toBeHidden();
 });
 
-test("disabled, busy, and failed compatible playback have distinct recovery copy", async ({ page }) => {
+test("disabled, busy, and failed compatible playback recover appropriately", async ({ page }) => {
   await usePreference(page, "stream", "compat");
   let transcoding = false;
   await page.route("**/api/web/library?**", async (route) => {
@@ -484,14 +516,23 @@ test("disabled, busy, and failed compatible playback have distinct recovery copy
     contentType: "application/json",
     body: JSON.stringify({ schema_version: 1, item_id: 9, request_id: 1, state: status, retry_after_seconds: status === "queued" ? 1 : null }),
   }));
-  await page.route("**/web/media/*.mp4?**", (route) => route.abort("failed"));
+  const fixture = await readFile(compatibleFixture);
+  let mediaRequests = 0;
+  await page.route("**/web/media/*.mp4?**", (route) => {
+    mediaRequests += 1;
+    return status === "queued" && mediaRequests > 1
+      ? route.fulfill({ status: 200, contentType: "video/mp4", body: fixture })
+      : route.abort("failed");
+  });
   await page.reload();
   await page.getByRole("button", { name: /^Play tagged\b/ }).click();
-  await expect(page.locator("#player-message-text")).toContainText("preparing other media");
-  await expect(page.locator("#player-retry")).toBeVisible();
+  await expect.poll(() => mediaRequests).toBeGreaterThan(1);
+  await expect(page.locator("#player-message[role=alert]")).toBeHidden();
 
   status = "failed";
-  await page.locator("#player-retry").click();
+  mediaRequests = 0;
+  await page.reload();
+  await page.getByRole("button", { name: /^Play tagged\b/ }).click();
   await expect(page.locator("#player-message-text")).toContainText("could not prepare this title");
   await expect(page.locator("#play-original")).toBeVisible();
 });
@@ -540,6 +581,12 @@ test("rapid item switching suppresses an older media failure", async ({ page }) 
 test("repeated compatible seeks coalesce and audio switching preserves global time", async ({ page }) => {
   await usePreference(page, "stream", "compat");
   const requests = [];
+  const cancellations = [];
+  page.on("request", (request) => {
+    if (request.method() === "DELETE" && request.url().includes("/api/web/transcode/")) {
+      cancellations.push(new URL(request.url()));
+    }
+  });
   await serveFixtureMedia(page, (url) => requests.push(url));
   await page.route("**/api/web/library?**", async (route) => {
     const response = await route.fetch();
@@ -576,6 +623,8 @@ test("repeated compatible seeks coalesce and audio switching preserves global ti
     }, value);
   }
   await expect.poll(() => requests.filter((url) => url.searchParams.get("start") !== "0").length).toBe(1);
+  await expect.poll(() => cancellations.length).toBeGreaterThan(0);
+  expect(cancellations[0].searchParams.get("request")).toMatch(/^\d+$/);
   expect(requests.findLast((url) => url.searchParams.get("start") !== "0")?.searchParams.get("start")).toBe("20");
   await openAdvancedPlayback(page);
   await page.locator("#audio-track-controls").selectOption("1");
@@ -583,6 +632,42 @@ test("repeated compatible seeks coalesce and audio switching preserves global ti
   expect(await page.locator("#audio-track-controls").evaluate((select) => select.getBoundingClientRect().width)).toBeLessThanOrEqual(145);
   await page.locator('#advanced-playback-dialog button[value="close"]').click();
   await expect(page.locator("#mode-label")).toHaveText("Compatible playback");
+});
+
+test("repeated compatible keyboard seeks preserve playing intent", async ({ page }) => {
+  await usePreference(page, "stream", "compat");
+  await page.addInitScript(() => {
+    window.__playCalls = 0;
+    HTMLMediaElement.prototype.play = function play() {
+      window.__playCalls += 1;
+      this.dispatchEvent(new Event("playing"));
+      return Promise.resolve();
+    };
+  });
+  const requests = [];
+  await serveFixtureMedia(page, (url) => requests.push(url));
+  await page.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    for (const entry of payload.entries || []) {
+      if (entry.entry_type !== "media") continue;
+      entry.duration_seconds = 600;
+      entry.duration = "0:10:00.000";
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  await expect.poll(() => page.evaluate(() => window.__playCalls)).toBeGreaterThan(0);
+  const initialPlayCalls = await page.evaluate(() => window.__playCalls);
+  await page.locator("#player-stage").focus();
+  await page.evaluate(() => {
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+  });
+  await expect.poll(() => requests.findLast((url) => url.searchParams.get("start") !== "0")?.searchParams.get("start")).toBe("20");
+  await expect.poll(() => page.evaluate(() => window.__playCalls)).toBeGreaterThan(initialPlayCalls);
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Pause");
 });
 
 test("captions convert to WebVTT and survive a compatible source restart", async ({ page }) => {
@@ -842,12 +927,12 @@ test("end state keeps the real duration and Replay starts from zero", async ({ p
   await selectTaggedVideo(page);
   const duration = await page.locator("#timeline").getAttribute("max");
   await page.locator("#video-player").dispatchEvent("ended");
-  await expect(page.locator("#play-button")).toHaveText("Replay");
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Replay");
   await expect(page.locator("#timeline")).toHaveValue(duration);
   await showPlayerControls(page);
   await page.locator("#play-button").click();
   await expect(page.locator("#timeline")).toHaveValue("0");
-  await expect(page.locator("#play-button")).not.toHaveText("Replay");
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
 });
 
 test("reduced motion, 200% zoom, and focus restoration remain usable", async ({ page }) => {
@@ -894,6 +979,7 @@ test("compatible seek while paused clears its busy description on metadata", asy
   await openVideoView(page);
   await page.getByRole("button", { name: /^Play dvp7\b/ }).first().click();
   await expect(page.locator("#timeline")).toHaveAttribute("max", "10");
+  await showPlayerControls(page);
   await page.locator("#play-button").click();
   await page.locator("#timeline").evaluate((timeline) => {
     timeline.value = "5";

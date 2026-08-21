@@ -43,7 +43,6 @@ const dom = {
   chapterMarkers: required("chapter-markers"),
   previousButton: required("previous-button"),
   nextButton: required("next-button"),
-  seekButtons: [...document.querySelectorAll("[data-seek]")],
   playButton: required("play-button"),
   muteButton: required("mute-button"),
   captionsButton: required("captions-button"),
@@ -105,7 +104,7 @@ const dom = {
   loadMore: required("load-more"),
 };
 
-if (!dom.playerPanel || dom.tabs.length !== 5 || dom.seekButtons.length !== 2) {
+if (!dom.playerPanel || dom.tabs.length !== 5) {
   throw new Error("The embedded player document is incomplete");
 }
 

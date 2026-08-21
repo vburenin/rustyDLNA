@@ -54,21 +54,19 @@
           </div>
           <div class="control-row player-toolbar">
             <div class="transport-controls" aria-label="Playback controls">
-              <button type="button" class="primary-control" id="play-button" aria-label="Play">Play</button>
-              <button type="button" id="previous-button" aria-label="Previous item">Previous</button>
-              <button type="button" data-seek="-10" aria-label="Go back 10 seconds">−10s</button>
-              <button type="button" data-seek="30" aria-label="Go forward 30 seconds">+30s</button>
-              <button type="button" id="next-button" aria-label="Next item">Next</button>
-              <button type="button" id="mute-button" aria-pressed="false" aria-label="Mute">Mute</button>
+              <button type="button" class="primary-control" id="play-button" aria-label="Play"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path class="icon-play" d="M8 5v14l11-7Z" fill="currentColor" stroke="none"></path><g class="icon-pause" fill="currentColor" stroke="none"><rect x="7" y="5" width="4" height="14" rx=".75"></rect><rect x="14" y="5" width="4" height="14" rx=".75"></rect></g><path class="icon-replay" d="M18 8a7 7 0 1 0 1 7M18 4v4h-4"></path></svg></button>
+              <button type="button" id="previous-button" aria-label="Previous item"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7 5v14"></path><path d="m18 6-8 6 8 6Z" fill="currentColor" stroke="none"></path></svg></button>
+              <button type="button" id="next-button" aria-label="Next item"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M17 5v14"></path><path d="m6 6 8 6-8 6Z" fill="currentColor" stroke="none"></path></svg></button>
+              <button type="button" id="mute-button" aria-pressed="false" aria-label="Mute"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 9v6h4l5 4V5L9 9Z"></path><g class="icon-sound-waves"><path d="M17 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12"></path></g><path class="icon-mute-slash" d="m4 4 16 16"></path></svg></button>
               <label class="range-control volume-control" for="volume-control"><span class="sr-only">Volume</span><input id="volume-control" type="range" min="0" max="100" value="100" step="1" aria-describedby="volume-value"><output class="sr-only" id="volume-value" for="volume-control">100%</output></label>
               <div class="timeline-times" aria-label="Playback time"><span id="timeline-current">0:00</span><span aria-hidden="true">/</span><span id="timeline-duration">0:00</span></div>
             </div>
             <div class="toggle-controls" aria-label="Player settings">
-              <button type="button" id="stream-info-button" aria-label="Stream information" aria-haspopup="dialog" aria-controls="stream-info-dialog">Info</button>
-              <button type="button" id="captions-button" aria-label="Captions" aria-expanded="false" aria-controls="caption-menu">CC</button>
-              <button type="button" id="pip-button" aria-pressed="false" aria-label="Enter picture in picture">PiP</button>
-              <button type="button" class="advanced-playback-button" id="advanced-playback-button" aria-label="Playback settings" aria-haspopup="dialog" aria-controls="advanced-playback-dialog">Settings</button>
-              <button type="button" id="fullscreen-button" aria-pressed="false" aria-label="Enter full screen">Full</button>
+              <button type="button" id="stream-info-button" aria-label="Stream information" aria-haspopup="dialog" aria-controls="stream-info-dialog"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v6"></path><path d="M12 7h.01"></path></svg></button>
+              <button type="button" id="captions-button" aria-label="Captions" aria-expanded="false" aria-controls="caption-menu"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="M10 10H8a2 2 0 0 0-2 2 2 2 0 0 0 2 2h2M18 10h-2a2 2 0 0 0-2 2 2 2 0 0 0 2 2h2"></path></svg></button>
+              <button type="button" id="pip-button" aria-pressed="false" aria-label="Enter picture in picture"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3" y="5" width="18" height="14" rx="2"></rect><rect x="12" y="11" width="7" height="5" rx="1" fill="currentColor" stroke="none"></rect></svg></button>
+              <button type="button" class="advanced-playback-button" id="advanced-playback-button" aria-label="Playback settings" aria-haspopup="dialog" aria-controls="advanced-playback-dialog"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.09a2 2 0 0 1 1 1.73v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.73l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z"></path><circle cx="12" cy="12" r="3"></circle></svg></button>
+              <button type="button" id="fullscreen-button" aria-pressed="false" aria-label="Enter full screen"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5"></path></svg></button>
             </div>
           </div>
         </div>

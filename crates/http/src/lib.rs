@@ -551,6 +551,10 @@ mod tests {
             route("GET", "/api/web/transcode/3"),
             HttpRoute::WebTranscodeStatus
         );
+        assert_eq!(
+            route("DELETE", "/api/web/transcode/3"),
+            HttpRoute::WebTranscodeStatus
+        );
         assert_eq!(route("GET", "/web/app.js"), HttpRoute::WebAsset);
         assert_eq!(route("GET", "/favicon.ico"), HttpRoute::WebAsset);
         assert_eq!(route("GET", "/web/media/3.mp4"), HttpRoute::WebMedia);

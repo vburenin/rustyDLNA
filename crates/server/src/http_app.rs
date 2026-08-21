@@ -300,7 +300,9 @@ impl App {
             || method.eq_ignore_ascii_case("HEAD")
             || method.eq_ignore_ascii_case("POST")
             || method.eq_ignore_ascii_case("SUBSCRIBE")
-            || method.eq_ignore_ascii_case("UNSUBSCRIBE"))
+            || method.eq_ignore_ascii_case("UNSUBSCRIBE")
+            || (method.eq_ignore_ascii_case("DELETE")
+                && req.path.starts_with("/api/web/transcode/")))
         {
             return HttpResponse::html(501, "Not Implemented", "unsupported method");
         }

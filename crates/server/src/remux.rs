@@ -186,6 +186,7 @@ pub struct RemuxJob {
     pub(crate) state: Mutex<RemuxState>,
     pub(crate) changed: tokio::sync::Notify,
     cancelled: AtomicBool,
+    cancel_when_idle: AtomicBool,
     clients: AtomicUsize,
     ever_had_client: AtomicBool,
     client_epoch: AtomicU64,
@@ -250,6 +251,7 @@ impl RemuxJob {
 
     fn attach_client(&self) {
         let mut deadline = crate::lock_recover(&self.disconnect_deadline);
+        self.cancel_when_idle.store(false, Ordering::Release);
         self.clients.fetch_add(1, Ordering::Relaxed);
         self.ever_had_client.store(true, Ordering::Release);
         self.client_epoch.fetch_add(1, Ordering::AcqRel);
@@ -267,6 +269,12 @@ impl RemuxJob {
         let mut deadline = crate::lock_recover(&self.disconnect_deadline);
         let previous = self.clients.fetch_sub(1, Ordering::AcqRel);
         self.client_epoch.fetch_add(1, Ordering::AcqRel);
+        if previous <= 1 && self.cancel_when_idle.swap(false, Ordering::AcqRel) {
+            *deadline = None;
+            drop(deadline);
+            self.cancel();
+            return;
+        }
         if previous <= 1 && !continue_after_disconnect {
             match self.state() {
                 RemuxState::Starting | RemuxState::Preprocessing | RemuxState::Growing => {
@@ -915,6 +923,7 @@ fn attach_job(
             state: Mutex::new(RemuxState::Complete),
             changed: tokio::sync::Notify::new(),
             cancelled: AtomicBool::new(false),
+            cancel_when_idle: AtomicBool::new(false),
             clients: AtomicUsize::new(0),
             ever_had_client: AtomicBool::new(false),
             client_epoch: AtomicU64::new(0),
@@ -1004,6 +1013,7 @@ fn attach_job(
         state: Mutex::new(RemuxState::Starting),
         changed: tokio::sync::Notify::new(),
         cancelled: AtomicBool::new(false),
+        cancel_when_idle: AtomicBool::new(false),
         clients: AtomicUsize::new(0),
         ever_had_client: AtomicBool::new(false),
         client_epoch: AtomicU64::new(0),
@@ -1064,6 +1074,30 @@ pub(crate) fn web_job_state(
     } else {
         ("idle", None)
     }
+}
+
+/// Cancel an explicitly superseded browser request without disturbing a
+/// coalesced job that is also serving a different playback request.
+pub(crate) fn cancel_web_request(app: &App, detail_id: i64, request_id: u64) -> bool {
+    let job = app.remuxes.lock().ok().and_then(|jobs| {
+        jobs.values()
+            .find(|job| {
+                if !job.web || job.detail_id != detail_id {
+                    return false;
+                }
+                let request_ids = crate::lock_recover(&job.web_request_ids);
+                request_ids.len() == 1 && request_ids.contains(&request_id)
+            })
+            .cloned()
+    });
+    let Some(job) = job else {
+        return false;
+    };
+    job.cancel_when_idle.store(true, Ordering::Release);
+    if job.clients.load(Ordering::Acquire) == 0 {
+        job.cancel();
+    }
+    true
 }
 
 fn generated_cache_mp4(path: &Path) -> bool {
@@ -1845,6 +1879,7 @@ mod tests {
             state: Mutex::new(RemuxState::Preprocessing),
             changed: tokio::sync::Notify::new(),
             cancelled: AtomicBool::new(false),
+            cancel_when_idle: AtomicBool::new(false),
             clients: AtomicUsize::new(0),
             ever_had_client: AtomicBool::new(false),
             client_epoch: AtomicU64::new(0),
@@ -1930,6 +1965,7 @@ mod tests {
             state: Mutex::new(RemuxState::Growing),
             changed: tokio::sync::Notify::new(),
             cancelled: AtomicBool::new(false),
+            cancel_when_idle: AtomicBool::new(false),
             clients: AtomicUsize::new(0),
             ever_had_client: AtomicBool::new(false),
             client_epoch: AtomicU64::new(0),
@@ -2205,6 +2241,68 @@ mod tests {
     }
 
     #[test]
+    fn superseded_web_request_cancels_as_soon_as_its_reader_detaches() {
+        let dir = temp_dir("web-explicit-cancel");
+        let app = test_app(&dir, 1);
+        let mut spec = job_spec(
+            &dir,
+            "web-explicit-cancel",
+            vec!["sleep".into(), "30".into()],
+        );
+        spec.job_key = "web:42:explicit-cancel".into();
+        spec.web_request_id = Some(77);
+        spec.cacheable = false;
+        spec.continue_after_disconnect = false;
+        let job = attach_for_client(app.clone(), spec).unwrap();
+
+        assert!(cancel_web_request(&app, 42, 77));
+        assert!(!job.cancelled.load(Ordering::Acquire));
+        job.detach_client(
+            app.clone(),
+            "web:42:explicit-cancel".into(),
+            false,
+            WEB_RECONNECT_GRACE,
+            Duration::ZERO,
+        );
+        wait_for_terminal_cleanup(&app, &job);
+        assert_eq!(job.state(), RemuxState::Cancelled);
+    }
+
+    #[test]
+    fn cancelling_one_request_does_not_kill_a_shared_web_job() {
+        let dir = temp_dir("web-shared-cancel");
+        let app = test_app(&dir, 1);
+        let mut first = job_spec(
+            &dir,
+            "web-shared-cancel",
+            vec!["sleep".into(), "30".into()],
+        );
+        first.job_key = "web:42:shared-cancel".into();
+        first.web_request_id = Some(77);
+        first.cacheable = false;
+        first.continue_after_disconnect = false;
+        let mut second = first.clone();
+        second.web_request_id = Some(88);
+        let job = attach_for_client(app.clone(), first).unwrap();
+        let shared = attach_for_client(app.clone(), second).unwrap();
+        assert!(Arc::ptr_eq(&job, &shared));
+
+        assert!(!cancel_web_request(&app, 42, 77));
+        assert!(!job.cancelled.load(Ordering::Acquire));
+        for attached in [job.clone(), shared] {
+            attached.detach_client(
+                app.clone(),
+                "web:42:shared-cancel".into(),
+                false,
+                Duration::from_millis(20),
+                Duration::ZERO,
+            );
+        }
+        wait_for_terminal_cleanup(&app, &job);
+        assert_eq!(job.state(), RemuxState::Cancelled);
+    }
+
+    #[test]
     fn completed_ephemeral_web_output_survives_a_reconnect_window() {
         let dir = temp_dir("web-complete-reconnect");
         let app = test_app(&dir, 1);
@@ -2383,6 +2481,7 @@ mod tests {
             state: Mutex::new(RemuxState::Starting),
             changed: tokio::sync::Notify::new(),
             cancelled: AtomicBool::new(false),
+            cancel_when_idle: AtomicBool::new(false),
             clients: AtomicUsize::new(0),
             ever_had_client: AtomicBool::new(false),
             client_epoch: AtomicU64::new(0),

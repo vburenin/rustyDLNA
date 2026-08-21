@@ -92,4 +92,14 @@ export class WebApi {
     });
     return responseJson(response);
   }
+
+  async cancelTranscode(id, requestId) {
+    const query = `?request=${encodeURIComponent(String(requestId))}`;
+    const response = await fetch(`/api/web/transcode/${encodeURIComponent(String(id))}${query}`, {
+      method: "DELETE",
+      headers: { Accept: "application/json" },
+      keepalive: true,
+    });
+    return responseJson(response);
+  }
 }

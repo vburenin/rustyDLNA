@@ -1300,6 +1300,19 @@ pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
     if !app.cfg.web.enable {
         return not_found();
     }
+    let cancel_request = req.method.eq_ignore_ascii_case("DELETE");
+    if !cancel_request
+        && !req.method.eq_ignore_ascii_case("GET")
+        && !req.method.eq_ignore_ascii_case("HEAD")
+    {
+        return api_error(
+            405,
+            "method_not_allowed",
+            "This transcode operation is not supported.",
+            false,
+            None,
+        );
+    }
     let params = QueryParams::parse(&req.query);
     if params.has_unknown(&["request"]) {
         return api_error(
@@ -1350,7 +1363,22 @@ pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
             Some("return_to_library"),
         );
     }
-    let (state, retry_after_seconds) = crate::remux::web_job_state(app, id, request_id);
+    if cancel_request && request_id.is_none() {
+        return api_error(
+            400,
+            "invalid_request",
+            "A playback request ID is required for cancellation.",
+            false,
+            None,
+        );
+    }
+    let cancelled = cancel_request
+        && crate::remux::cancel_web_request(app, id, request_id.unwrap_or_default());
+    let (state, retry_after_seconds) = if cancelled {
+        ("cancelled", None)
+    } else {
+        crate::remux::web_job_state(app, id, request_id)
+    };
     let mut response = json_response(&WebTranscodeStatus {
         schema_version: WEB_SCHEMA_VERSION,
         item_id: id,

@@ -23,6 +23,14 @@ import {
 } from "./preferences.js";
 
 const CONTROLS_IDLE_MS = 3000;
+const MAX_AUTOMATIC_TRANSCODE_RETRIES = 3;
+
+function playbackSessionSeed() {
+  if (globalThis.crypto?.getRandomValues) {
+    return (globalThis.crypto.getRandomValues(new Uint32Array(1))[0] + 1) * 1_048_576;
+  }
+  return Date.now() * 1_024 + Math.floor(Math.random() * 1_024);
+}
 
 function codecLabel(value) {
   const codec = String(value || "unknown").split(",")[0].trim().toLowerCase();
@@ -81,12 +89,14 @@ export class PlaybackController {
   #audioRenderKey = "";
   #chapterRenderKey = "";
   #capabilityCache = new Map();
+  #automaticTranscodeRetries = 0;
   #progressWriter;
 
   constructor({ store, api, dom }) {
     this.#store = store;
     this.#api = api;
     this.#dom = dom;
+    this.#session = playbackSessionSeed();
     this.#progressWriter = createProgressWriter(() => this.#writeProgress());
     this.#bindControls();
     this.#applyInitialPreferences();
@@ -95,6 +105,7 @@ export class PlaybackController {
   }
 
   async select(item, { preserveQueue = false, startAt = 0 } = {}) {
+    this.#automaticTranscodeRetries = 0;
     if (!preserveQueue) {
       this.#store.dispatch({ type: "QUEUE_SUCCESS", entries: [item], generation: null });
     }
@@ -140,6 +151,7 @@ export class PlaybackController {
     const playback = this.#store.getState().playback;
     const player = this.activePlayer();
     const local = Number.isFinite(player?.currentTime) ? player.currentTime : 0;
+    if (playback.sourceMode === "compatible" && playback.status === "seeking") return playback.currentTime;
     return playback.sourceMode === "compatible" ? playback.segmentOffset + local : local;
   }
 
@@ -166,6 +178,7 @@ export class PlaybackController {
     const { playback } = state;
     if (!playback.item || !(playback.duration > 0)) return;
     const target = seekTarget(value, playback.duration);
+    this.#automaticTranscodeRetries = 0;
     if (target >= playback.duration) {
       this.#cancelSeekTimer();
       this.activePlayer().pause();
@@ -186,11 +199,18 @@ export class PlaybackController {
       return;
     }
     this.#cancelSeekTimer();
-    const intent = this.activePlayer().paused ? "paused" : "playing";
-    this.#cancelSource({ keepElement: false });
+    const intent = playback.intent;
+    this.#store.dispatch({
+      type: "PLAYBACK_TIME", sessionId: playback.sessionId,
+      currentTime: target, duration: playback.duration,
+    });
     this.#store.dispatch({
       type: "PLAYBACK_STATUS", sessionId: playback.sessionId, status: "seeking", intent,
       message: `Starting at ${clockLabel(target)}…`,
+    });
+    this.#cancelSource({
+      keepElement: false,
+      cancelTranscode: compatibleSegmentStart(target) !== playback.segmentOffset,
     });
     this.#seekTimer = window.setTimeout(() => {
       this.#seekTimer = null;
@@ -277,9 +297,7 @@ export class PlaybackController {
     }[playback.status] || "Loading media";
 
     const playing = playback.status === "playing";
-    this.#dom.playButton.textContent = playing ? "Pause" : playback.status === "ended" ? "Replay" : "Play";
     this.#dom.playButton.setAttribute("aria-label", playing ? "Pause" : playback.status === "ended" ? "Replay" : "Play");
-    this.#dom.muteButton.textContent = preferences.muted ? "Unmute" : "Mute";
     this.#dom.muteButton.setAttribute("aria-label", preferences.muted ? "Unmute" : "Mute");
     this.#dom.muteButton.setAttribute("aria-pressed", String(preferences.muted));
     this.#dom.loopButton.setAttribute("aria-pressed", String(preferences.loop));
@@ -292,7 +310,6 @@ export class PlaybackController {
     this.#dom.pipButton.setAttribute("aria-pressed", String(playback.pip));
     this.#dom.pipButton.setAttribute("aria-label", playback.pip ? "Exit picture in picture" : "Enter picture in picture");
     this.#dom.fullscreenButton.setAttribute("aria-pressed", String(playback.fullscreen));
-    this.#dom.fullscreenButton.textContent = playback.fullscreen ? "Exit" : "Full";
     this.#dom.fullscreenButton.setAttribute("aria-label", playback.fullscreen ? "Exit full screen" : "Enter full screen");
 
     this.#dom.volumeControl.value = String(preferences.volume);
@@ -447,6 +464,7 @@ export class PlaybackController {
       if (intent === "playing") await this.#attemptPlay(sessionId, player);
     });
     listen("playing", () => {
+      this.#automaticTranscodeRetries = 0;
       status("playing", { intent: "playing", message: null });
       this.#announce("Playing");
       this.#updateWakeLock();
@@ -539,6 +557,15 @@ export class PlaybackController {
           this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId, error: playbackError("transcode_failed", "The transcode producer failed.") });
           return;
         } else if (payload.state === "cancelled") {
+          const playback = this.#store.getState().playback;
+          if (this.#scheduleCompatibleRetry({
+            sessionId,
+            item: playback.item,
+            start: playback.currentTime,
+            intent: playback.intent,
+            streamNegotiation: playback.streamNegotiation,
+            retryAfterSeconds: payload.retry_after_seconds,
+          })) return;
           this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId, error: playbackError("transcode_cancelled") });
           return;
         }
@@ -553,6 +580,36 @@ export class PlaybackController {
       this.#statusTimer = window.setTimeout(poll, 500);
     };
     poll();
+  }
+
+  #scheduleCompatibleRetry({ sessionId, item, start, intent, streamNegotiation, retryAfterSeconds = 1 }) {
+    if (!item || sessionId !== this.#store.getState().playback.sessionId) return false;
+    if (this.#automaticTranscodeRetries >= MAX_AUTOMATIC_TRANSCODE_RETRIES) return false;
+    this.#automaticTranscodeRetries += 1;
+    const target = this.#store.getState().playback.currentTime || start;
+    const delay = Math.max(250, Math.min(2_000, Number(retryAfterSeconds || 1) * 1_000));
+    this.#cancelSource({ keepElement: false });
+    this.#store.dispatch({
+      type: "PLAYBACK_STATUS",
+      sessionId,
+      status: "loading",
+      intent,
+      message: "The previous stream was abandoned. Retrying compatible playback…",
+      error: null,
+    });
+    this.#statusTimer = window.setTimeout(() => {
+      this.#statusTimer = null;
+      if (sessionId !== this.#store.getState().playback.sessionId) return;
+      this.#loadSource(item, {
+        start: target,
+        intent,
+        forceSourceMode: "compatible",
+        forceStreamNegotiation: streamNegotiation,
+        message: "Retrying compatible playback…",
+        messageKind: "retry",
+      });
+    }, delay);
+    return true;
   }
 
   async #attemptPlay(sessionId, player) {
@@ -585,9 +642,44 @@ export class PlaybackController {
       });
       return;
     }
+    const sourceReason = this.#store.getState().playback.sourceReason;
+    let code = sourceMode === "direct"
+      ? (!capabilities.transcoding && sourceReason === "transcoding_disabled" ? "transcode_disabled" : "unsupported_direct")
+      : "transcode_failed";
+    // navigator.onLine is only a hint and WebKit can leave it false after an
+    // intentionally aborted request. Ask the typed API for the real cause.
+    if (sourceMode === "compatible") {
+      try {
+        const payload = await this.#api.transcodeStatus(item.id, sessionId);
+        if (sessionId !== this.#store.getState().playback.sessionId) return;
+        if (["queued", "cancelled", "idle"].includes(payload.state)) {
+          if (this.#scheduleCompatibleRetry({
+            sessionId,
+            item,
+            start,
+            intent,
+            streamNegotiation,
+            retryAfterSeconds: payload.retry_after_seconds,
+          })) return;
+          code = payload.state === "queued" ? "transcode_busy" : "transcode_cancelled";
+        } else if (payload.state === "failed") code = "transcode_failed";
+      } catch (error) {
+        if (sessionId !== this.#store.getState().playback.sessionId) return;
+        const category = apiErrorCategory(error);
+        if (category !== "unknown") code = category;
+      }
+    } else if (sourceMode === "direct") {
+      try {
+        await this.#api.item(item.id);
+      } catch (error) {
+        if (sessionId !== this.#store.getState().playback.sessionId) return;
+        const category = apiErrorCategory(error);
+        if (["media_missing", "offline", "network"].includes(category)) code = category;
+      }
+    }
     // Capability APIs are advisory. If a copied HEVC or audio stream reaches
-    // the browser but fails decoding, retry once with the portable H.264/AAC
-    // path before presenting a terminal MediaError.
+    // a live producer but fails decoding, retry once with portable H.264/AAC
+    // before presenting a terminal MediaError.
     if (sourceMode === "compatible"
       && mediaCode === 3
       && (streamNegotiation?.video === "copy" || streamNegotiation?.audio === "copy")) {
@@ -606,33 +698,6 @@ export class PlaybackController {
         messageKind: "fallback",
       });
       return;
-    }
-    const sourceReason = this.#store.getState().playback.sourceReason;
-    let code = sourceMode === "direct"
-      ? (!capabilities.transcoding && sourceReason === "transcoding_disabled" ? "transcode_disabled" : "unsupported_direct")
-      : "transcode_failed";
-    // navigator.onLine is only a hint and WebKit can leave it false after an
-    // intentionally aborted request. Ask the typed API for the real cause.
-    if (sourceMode === "compatible") {
-      try {
-        const payload = await this.#api.transcodeStatus(item.id, sessionId);
-        if (sessionId !== this.#store.getState().playback.sessionId) return;
-        if (payload.state === "queued") code = "transcode_busy";
-        else if (payload.state === "cancelled") code = "transcode_cancelled";
-        else if (payload.state === "failed") code = "transcode_failed";
-      } catch (error) {
-        if (sessionId !== this.#store.getState().playback.sessionId) return;
-        const category = apiErrorCategory(error);
-        if (category !== "unknown") code = category;
-      }
-    } else if (sourceMode === "direct") {
-      try {
-        await this.#api.item(item.id);
-      } catch (error) {
-        if (sessionId !== this.#store.getState().playback.sessionId) return;
-        const category = apiErrorCategory(error);
-        if (["media_missing", "offline", "network"].includes(category)) code = category;
-      }
     }
     if (sessionId !== this.#store.getState().playback.sessionId) return;
     this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId, error: playbackError(code, mediaCode ? `MediaError code ${mediaCode}` : "Media element error") });
@@ -940,9 +1005,6 @@ export class PlaybackController {
     });
     this.#dom.previousButton.addEventListener("click", () => this.playRelative(-1));
     this.#dom.nextButton.addEventListener("click", () => this.playRelative(1));
-    for (const button of this.#dom.seekButtons) {
-      button.addEventListener("click", () => this.seekTo(this.globalTime() + Number(button.dataset.seek)));
-    }
     this.#dom.timeline.addEventListener("input", () => {
       this.#store.dispatch({ type: "PLAYBACK_PREVIEW", value: Number(this.#dom.timeline.value) });
     });
@@ -1143,7 +1205,14 @@ export class PlaybackController {
     this.#seekTimer = null;
   }
 
-  #cancelSource({ keepElement = true } = {}) {
+  #cancelSource({ keepElement = true, cancelTranscode = true } = {}) {
+    const playback = this.#store.getState().playback;
+    const abandonedRequest = cancelTranscode
+      && this.#sourceController
+      && playback.sourceMode === "compatible"
+      && playback.item
+      ? { itemId: playback.item.id, requestId: playback.sessionId }
+      : null;
     this.#progressWriter.flush();
     this.#sourceController?.abort();
     this.#sourceController = null;
@@ -1154,6 +1223,9 @@ export class PlaybackController {
     if (this.#announceTimer !== null) window.clearTimeout(this.#announceTimer);
     this.#announceTimer = null;
     if (!keepElement) this.#resetMediaElement(this.activePlayer());
+    if (abandonedRequest) {
+      this.#api.cancelTranscode(abandonedRequest.itemId, abandonedRequest.requestId).catch(() => {});
+    }
   }
 
   #resetMediaElement(player) {

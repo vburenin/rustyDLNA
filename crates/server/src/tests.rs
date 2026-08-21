@@ -3914,6 +3914,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     assert!(!root_html.contains("?v="), "{root_html}");
     assert!(root_html.contains("id=\"timeline-status\""), "{root_html}");
     assert!(root_html.contains("id=\"volume-control\""), "{root_html}");
+    assert!(!root_html.contains("data-seek="), "{root_html}");
     assert!(
         root_html.contains("class=\"library-results\""),
         "{root_html}"
@@ -4638,6 +4639,18 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     )));
     let scoped_status: serde_json::Value = serde_json::from_slice(&scoped_status.body).unwrap();
     assert_eq!(scoped_status["request_id"], 77);
+    let cancel_status = app.handle(&req(&format!(
+        "DELETE /api/web/transcode/{}?request=77 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\n\r\n",
+        dvp7.detail_id
+    )));
+    assert_eq!(cancel_status.status, 200);
+    let cancel_status: serde_json::Value = serde_json::from_slice(&cancel_status.body).unwrap();
+    assert_eq!(cancel_status["request_id"], 77);
+    let unscoped_cancel = app.handle(&req(&format!(
+        "DELETE /api/web/transcode/{} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\n\r\n",
+        dvp7.detail_id
+    )));
+    assert_eq!(unscoped_cancel.status, 400);
     for invalid in [
         format!("/web/media/{}.mp4?mode=maybe", dvp7.detail_id),
         format!("/web/media/{}.mp4?request=-1", dvp7.detail_id),

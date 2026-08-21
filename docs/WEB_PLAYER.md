@@ -45,8 +45,8 @@ focus styles and touch-sized targets, account for mobile safe-area insets, and
 remain reachable if the Advanced section makes the fullscreen surface taller
 than the screen.
 
-Supported controls include play/pause, previous/next, 10-second back,
-30-second forward, mute and volume, speed, loop, fit/fill, picture-in-picture,
+Supported controls include play/pause, previous/next, mute and volume, speed,
+loop, fit/fill, picture-in-picture,
 fullscreen, captions, audio tracks, chapters, stream mode, and compatible
 quality. A source restart preserves playback intent, global time, rate, volume,
 mute, loop, caption choice, and audio choice. Only selecting a different title
@@ -136,9 +136,10 @@ Compatibility jobs reuse the existing bounded helper/job gate, runtime
 deadline, cache-size and age limits, cancellation, process reaping, and
 finished-file verification. Concurrent equivalent requests share a job. A
 zero-offset completed stream can be reused from cache. Seek restarts are
-session artifacts: the player coalesces rapid scrubs, and a dropped browser
-connection gets a 30-second reconnect window before its unfinished producer is
-cancelled. Reopening the same source attaches to that producer. Completed
+session artifacts: the player coalesces rapid scrubs and explicitly cancels a
+producer when a new seek supersedes it. An unintentional dropped connection
+still gets a 30-second reconnect window, and reopening the same source attaches
+to that producer. Completed
 nonzero-offset output remains reconnectable for 30 seconds after its final
 reader and is then removed, so repeated exact seeks cannot retain movie-length
 cache tails. When only one stream is copied, nonzero-offset jobs preserve the
@@ -197,7 +198,8 @@ polls, or errors from an older session are ignored.
 
 User-facing failures distinguish missing media, unsupported Original playback,
 disabled Compatible playback, a busy transcode queue, cancelled/failed
-transcoding, network/offline failure, and browser autoplay policy. Depending on
+transcoding, network/offline failure, and browser autoplay policy. Busy or
+cancelled replacement streams retry automatically up to three times. Depending on
 the category, recovery offers Retry, Try compatible, Play original, or Return
 to library. Raw helper output is never primary copy; limited technical details
 remain in a disclosure.
@@ -216,7 +218,7 @@ validated strictly.
 | `/web/{app,api,core,library,player,preferences,store}.js` | Embedded ES modules |
 | `/api/web/library` | Versioned folder or flat-library page, server root, capabilities, generation, and item DTOs |
 | `/api/web/item/{id}` | One item; `enrich=1` explicitly probes legacy stream metadata |
-| `/api/web/transcode/{id}?request={request_id}` | Request-scoped `queued`, `starting`, `producing`, `complete`, `cancelled`, or `failed` state |
+| `/api/web/transcode/{id}?request={request_id}` | GET returns request-scoped `queued`, `starting`, `producing`, `complete`, `cancelled`, or `failed` state; DELETE cancels an exclusively owned, superseded request |
 | `/web/media/{id}.mp4?mode=direct` | Original jailed media with byte ranges |
 | `/web/media/{id}.mp4?...` | Compatible stream with validated audio track, start, quality, negotiated `video_mode`/`audio_mode`, reason, and request parameters |
 | `/Captions/{id}/{index}...?format=webvtt` | Jailed browser caption conversion |

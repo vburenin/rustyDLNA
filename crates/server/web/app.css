@@ -77,16 +77,8 @@ main { width: min(1700px, 100%); margin: 0 auto; padding: clamp(.75rem, 2vw, 1.5
 .timeline-times { display: flex; justify-content: space-between; color: #e0e5e8; font-size: .78rem; font-variant-numeric: tabular-nums; }
 .control-row { min-width: 0; display: grid; gap: .55rem; }
 .transport-controls, .toggle-controls { min-width: 0; display: grid; gap: .35rem; }
-.transport-controls { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.transport-controls { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .control-surface .transport-controls button { font-size: 0; }
-.transport-controls button::after { font-size: 1rem; line-height: 1; overflow-wrap: normal; white-space: nowrap; }
-#previous-button::after { content: "⏮"; }
-.transport-controls button[data-seek="-10"]::after { content: "−10"; font-size: .82rem; }
-#play-button::after { content: "▶"; }
-#play-button[aria-label="Pause"]::after { content: "Ⅱ"; }
-#play-button[aria-label="Replay"]::after { content: "↻"; }
-.transport-controls button[data-seek="30"]::after { content: "+30"; font-size: .82rem; }
-#next-button::after { content: "⏭"; }
 .toggle-controls { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .control-surface button { min-width: 0; min-height: 44px; padding: .45rem .35rem; overflow-wrap: anywhere; background: #20252a; font-size: .78rem; }
 .control-surface .primary-control { background: var(--accent); }
@@ -215,7 +207,7 @@ dialog dd { margin: 0; color: var(--muted); }
   .player-stage:fullscreen { min-height: 0; grid-template-rows: minmax(0, 1fr) auto; }
   .player-stage:fullscreen .control-surface { max-height: 46svh; }
   .control-surface { max-height: none; padding: .65rem; border-top: 1px solid var(--line); border-left: 0; }
-  .transport-controls, .toggle-controls { display: grid; grid-template-columns: repeat(5, minmax(44px, 1fr)); }
+  .transport-controls, .toggle-controls { display: grid; grid-template-columns: repeat(4, minmax(44px, 1fr)); }
   .toggle-controls { grid-template-columns: repeat(4, minmax(44px, 1fr)); }
   .control-surface button { padding-inline: .35rem; font-size: .8rem; }
   .library-heading-row { grid-template-columns: 1fr auto; }
@@ -232,7 +224,7 @@ dialog dd { margin: 0; color: var(--muted); }
   .server-state { font-size: .8rem; }
   .now-playing .eyebrow { display: none; }
   .media-viewport { aspect-ratio: 4 / 3; }
-  .transport-controls { grid-template-columns: repeat(5, 1fr); }
+  .transport-controls { grid-template-columns: repeat(4, 1fr); }
   .toggle-controls { grid-template-columns: repeat(4, 1fr); }
   .media-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .card-title { font-size: .9rem; }
@@ -363,45 +355,42 @@ dialog dd { margin: 0; color: var(--muted); }
 .control-surface button:hover:not(:disabled) { border: 0; background: rgba(255, 255, 255, .14); }
 .control-surface button:active:not(:disabled) { background: rgba(255, 255, 255, .22); }
 .control-surface button:disabled { background: transparent; opacity: .4; }
-.control-surface button::after {
+.control-surface .button-icon {
+  width: 24px;
+  height: 24px;
   display: block;
-  color: currentColor;
-  font-family: Arial, sans-serif;
-  font-size: 21px;
-  font-weight: 600;
-  line-height: 1;
-  white-space: nowrap;
+  overflow: visible;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
 }
 
-#play-button { width: 46px; height: 46px; border-radius: 50%; background: transparent; }
-#play-button::after { content: ""; width: 18px; height: 20px; margin-left: 2px; background: #fff; clip-path: polygon(8% 0, 100% 50%, 8% 100%); }
-#play-button[aria-label="Pause"]::after { margin-left: 0; background: linear-gradient(to right, #fff 0 36%, transparent 36% 64%, #fff 64%); clip-path: none; }
-#play-button[aria-label="Replay"]::after { content: "↻"; width: auto; height: auto; margin: 0; background: none; clip-path: none; font-size: 27px; }
-#previous-button::after { content: "⏮︎"; font-size: 20px; }
-#next-button::after { content: "⏭︎"; font-size: 20px; }
-.transport-controls button[data-seek="-10"]::after { content: "−10"; font-size: 13px; }
-.transport-controls button[data-seek="30"]::after { content: "+30"; font-size: 13px; }
-#mute-button::after { content: "🔊︎"; font-size: 20px; }
-#mute-button[aria-label="Unmute"]::after { content: "🔇︎"; }
-#stream-info-button::after { content: "i"; width: 17px; height: 17px; display: grid; place-items: center; border: 2px solid currentColor; border-radius: 50%; font: 700 13px/1 Georgia, serif; }
-#captions-button::after { content: "CC"; padding: 1px 2px 0; border: 2px solid currentColor; border-radius: 2px; font-size: 10px; font-weight: 800; letter-spacing: .02em; }
+#play-button { width: 46px; height: 46px; color: #fff; border-radius: 50%; background: transparent; }
+#play-button:hover:not(:disabled) { color: #fff; background: rgba(255, 255, 255, .14); }
+#play-button .button-icon { width: 27px; height: 27px; }
+#play-button .icon-pause, #play-button .icon-replay { display: none; }
+#play-button[aria-label="Pause"] .icon-play { display: none; }
+#play-button[aria-label="Pause"] .icon-pause { display: initial; }
+#play-button[aria-label="Replay"] .icon-play { display: none; }
+#play-button[aria-label="Replay"] .icon-replay { display: initial; }
+#mute-button .icon-mute-slash { display: none; }
+#mute-button[aria-label="Unmute"] .icon-sound-waves { display: none; }
+#mute-button[aria-label="Unmute"] .icon-mute-slash { display: initial; }
 #captions-button[aria-pressed="true"]::before { content: ""; position: absolute; right: 9px; bottom: 7px; left: 9px; height: 2px; background: var(--player-red); }
-#pip-button::after { content: "▣"; font-size: 24px; font-weight: 400; }
 #advanced-playback-button { width: 44px; padding: 0; color: #fff; }
-#advanced-playback-button::after { content: "⚙︎"; font-size: 23px; font-weight: 400; }
-#fullscreen-button::after { content: "⛶"; font-size: 26px; font-weight: 400; }
 
 .volume-control {
-  width: 62px;
+  width: 84px;
   min-width: 44px;
   min-height: 44px;
-  margin: 0 .25rem 0 -.2rem;
+  margin: 0 .25rem;
   display: flex;
   align-items: center;
   flex: 0 0 auto;
-  transition: width .15s ease;
 }
-.volume-control:is(:hover, :focus-within) { width: 84px; }
 #volume-control {
   --volume-level: 100%;
   width: 100%;
@@ -481,7 +470,7 @@ dialog dd { margin: 0; color: var(--muted); }
   }
   .timeline-control { margin-inline: .35rem; }
   .player-toolbar { gap: 0; }
-  .transport-controls button[data-seek], .volume-control, #pip-button { display: none; }
+  .volume-control, #pip-button { display: none; }
   .player-stage:fullscreen #previous-button { display: none; }
   .player-stage:fullscreen .volume-control { width: 44px; margin-inline: 0; display: flex; }
   .timeline-times { padding-inline: .15rem; }
