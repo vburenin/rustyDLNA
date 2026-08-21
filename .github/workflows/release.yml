@@ -17,7 +17,7 @@ jobs:
       date: ${{ steps.release.outputs.date }}
       image: ${{ steps.release.outputs.image }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavformat-dev ffmpeg curl
       - name: Pinned latest stable Rust
@@ -59,7 +59,7 @@ jobs:
           - platform: linux/arm64
             suffix: arm64
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a
       - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
       - name: Build the architecture image locally
@@ -92,7 +92,7 @@ jobs:
       id-token: write
       packages: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a
       - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
       - name: Log in to GHCR
