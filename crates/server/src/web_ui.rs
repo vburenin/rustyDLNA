@@ -26,7 +26,7 @@ const WEB_TRANSCODE_STATUS_PREFIX: &str = "/api/web/transcode/";
 const DEFAULT_PAGE_SIZE: usize = 60;
 const MAX_PAGE_SIZE: usize = 200;
 const SDR_TONEMAP_CACHE_REVISION: &str = "sdr-tonemap-libplacebo-v1";
-const BROWSER_TIMELINE_CACHE_REVISION: &str = "timeline-zero-v1";
+const BROWSER_TIMELINE_CACHE_REVISION: &str = "aligned-seek-v2";
 const WEB_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Serialize)]
@@ -1791,6 +1791,33 @@ fn apply_browser_sdr_tonemap(
     );
 }
 
+fn apply_browser_input_seek(
+    args: &mut Vec<OsString>,
+    start_seconds: usize,
+    preserve_preroll: bool,
+) {
+    if start_seconds == 0 {
+        return;
+    }
+    let input = args
+        .iter()
+        .position(|argument| argument == "-i")
+        .expect("ffmpeg browser command must include an input");
+    let mut seek = Vec::with_capacity(usize::from(preserve_preroll) + 2);
+    if preserve_preroll {
+        // With input-side seeking, FFmpeg retains the preceding keyframe for a
+        // copied stream but normally discards that same preroll from a stream
+        // it encodes. Preserve both sides of a mixed copy/encode job so video
+        // cannot begin several seconds before its audio (or vice versa).
+        seek.push(OsString::from("-noaccurate_seek"));
+    }
+    seek.extend([
+        OsString::from("-ss"),
+        OsString::from(start_seconds.to_string()),
+    ]);
+    args.splice(input..input, seek);
+}
+
 pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpResponse {
     if !app.cfg.web.enable {
         return not_found();
@@ -2201,19 +2228,13 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
                 [OsString::from("-tag:v"), OsString::from("hvc1")],
             );
         }
-        if start_seconds > 0 {
-            let input = args
-                .iter()
-                .position(|argument| argument == "-i")
-                .expect("ffmpeg browser command must include an input");
-            args.splice(
-                input..input,
-                [
-                    OsString::from("-ss"),
-                    OsString::from(start_seconds.to_string()),
-                ],
-            );
-        }
+        let video_is_copied = is_video && selected_plan.video_encoder == "copy";
+        let audio_is_copied = matches!(selected_plan.audio, AudioAction::Copy);
+        apply_browser_input_seek(
+            &mut args,
+            start_seconds,
+            is_video && video_is_copied != audio_is_copied,
+        );
         args
     };
     let args = transcode_args(&plan);

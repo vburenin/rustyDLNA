@@ -4264,9 +4264,27 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .fallback_args
         .as_ref()
         .is_some_and(|args| args.iter().any(|arg| arg == "libx264")));
+    let aligned_audio_seek = app.handle(&req(&get(
+        &format!(
+            "/web/media/{}.mp4?start=30&quality=auto&video_mode=copy&audio_mode=transcode",
+            h264_audio_fallback.detail_id
+        ),
+        "Browser/1.0",
+    )));
+    let aligned_audio_seek = aligned_audio_seek
+        .remux_job
+        .expect("mixed copied-video/transcoded-audio seek job");
+    assert!(aligned_audio_seek
+        .args
+        .windows(3)
+        .any(|args| args == ["-noaccurate_seek", "-ss", "30"]));
+    assert!(aligned_audio_seek
+        .fallback_args
+        .as_ref()
+        .is_some_and(|args| !args.iter().any(|arg| arg == "-noaccurate_seek")));
     let resized_compat = app.handle(&req(&get(
         &format!(
-            "/web/media/{}.mp4?quality=full_hd&video_mode=transcode&audio_mode=copy",
+            "/web/media/{}.mp4?start=30&quality=full_hd&video_mode=transcode&audio_mode=copy",
             h264_audio_fallback.detail_id
         ),
         "Browser/1.0",
@@ -4283,6 +4301,10 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .args
         .windows(2)
         .any(|pair| pair == ["-c:v", "copy"]));
+    assert!(resized_spec
+        .args
+        .windows(3)
+        .any(|args| args == ["-noaccurate_seek", "-ss", "30"]));
 
     {
         let mut catalog = app.catalog.write().unwrap();
@@ -4317,7 +4339,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     let copied_spec = copied_compat
         .remux_job
         .expect("fully copied HEVC/AAC browser job");
-    assert!(copied_spec.cache_key.contains("timeline-zero-v1"));
+    assert!(copied_spec.cache_key.contains("aligned-seek-v2"));
     assert!(copied_spec
         .args
         .windows(2)
@@ -4557,6 +4579,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         selected_args.windows(2).any(|pair| pair == ["-ss", "120"]),
         "{selected_args:?}"
     );
+    assert!(!selected_args.iter().any(|arg| arg == "-noaccurate_seek"));
     assert!(
         selected_args.iter().any(|arg| arg == "0:a:1?"),
         "{selected_args:?}"

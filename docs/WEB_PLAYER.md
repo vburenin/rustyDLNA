@@ -141,7 +141,9 @@ connection gets a 30-second reconnect window before its unfinished producer is
 cancelled. Reopening the same source attaches to that producer. Completed
 nonzero-offset output remains reconnectable for 30 seconds after its final
 reader and is then removed, so repeated exact seeks cannot retain movie-length
-cache tails.
+cache tails. When only one stream is copied, nonzero-offset jobs preserve the
+same keyframe preroll for both streams so a seek does not begin with silent
+video or audio over a blank frame.
 
 For NVIDIA acceleration, set `web.encoder = "h264_nvenc"` and expose the GPU.
 An NVIDIA Container Toolkit Compose override can include:
