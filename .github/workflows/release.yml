@@ -184,7 +184,7 @@ jobs:
           exit-code: "1"
           version: v0.70.0
       - name: Attest the tested image digest
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-name: ${{ needs.validate.outputs.image }}
           subject-digest: ${{ steps.image.outputs.digest }}
