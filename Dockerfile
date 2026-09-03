@@ -2,7 +2,7 @@
 # (see docker-compose.yaml). This file must not request host network —
 # docker-compose.test.yaml stays on a bridge with no published 8200/1900.
 
-FROM rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS build
+FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS build
 
 # Build and run against the same FFmpeg 8 ABI. The official Rust toolchain is
 # copied into the Ubuntu builder so ffmpeg-sys-next links to libavformat 62,
