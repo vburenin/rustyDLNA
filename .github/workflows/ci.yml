@@ -18,7 +18,7 @@ jobs:
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavformat-dev ffmpeg curl
       - name: Pinned Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 22.19.0
       - name: Pinned Rust toolchain
@@ -35,7 +35,7 @@ jobs:
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavformat-dev ffmpeg
       - name: Pinned Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 22.19.0
           cache: npm
