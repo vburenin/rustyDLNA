@@ -7,7 +7,7 @@ FROM rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019b
 # Build and run against the same FFmpeg 8 ABI. The official Rust toolchain is
 # copied into the Ubuntu builder so ffmpeg-sys-next links to libavformat 62,
 # rather than to Debian bookworm's incompatible libavformat 59.
-FROM ubuntu:resolute-20260724.1@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03 AS app-build
+FROM ubuntu:resolute-20260811.1@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b AS app-build
 
 COPY --from=build /usr/local/cargo /usr/local/cargo
 COPY --from=build /usr/local/rustup /usr/local/rustup
@@ -80,7 +80,7 @@ RUN --mount=type=cache,id=rusty-dlna-dovi-tool,target=/var/cache/dovi-tool,shari
 # Byte-for-byte fixture reproduction uses the same FFmpeg decoder/encoder as
 # production and the exact muxer that created the checked-in Matroska file.
 # Deterministic mkvmerge output is stable only within one muxer version.
-FROM ubuntu:resolute-20260724.1@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03 AS fixture-tools
+FROM ubuntu:resolute-20260811.1@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b AS fixture-tools
 
 ARG FIXTURE_FFMPEG_VERSION=7:8.0.1-3ubuntu2
 ARG FIXTURE_MKVTOOLNIX_VERSION=97.0-1build1
@@ -96,7 +96,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=app-build /opt/dovi/bin/dovi_tool /usr/local/bin/dovi_tool
 
-FROM ubuntu:resolute-20260724.1@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03
+FROM ubuntu:resolute-20260811.1@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b
 
 ARG FFMPEG_VERSION=7:8.0.1-3ubuntu2
 ARG BUILD_VERSION=dev
