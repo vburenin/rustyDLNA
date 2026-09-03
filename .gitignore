@@ -1,0 +1,31 @@
+/target
+/.docker-cache/dovi-tool/*
+!/.docker-cache/dovi-tool/.gitkeep
+**/*.rs.bk
+.idea
+.vscode
+*.swp
+.env
+.env.local
+contrib/library/.env
+.rusty-library/
+*.log
+*.cdx.json
+soak-report.tsv
+perf.data
+perf.data.old
+/cache
+testdata/cache/
+/data
+/media
+# host-only deploy settings (paths, uuid, advertise_ip)
+rusty-dlna.local.toml
+rusty-dlna.live.toml
+docker-compose.override.yaml
+# local experiments (converters, generated mappings)
+/dev/
+# Local web-test dependencies and reports
+node_modules/
+test-results/
+playwright-report/
+__pycache__/

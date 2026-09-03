@@ -1,0 +1,5634 @@
+//! rustyDLNA-compatible SQLite store (`scanner_sqlite.h`).
+//!
+//! Tables: OBJECTS, DETAILS, ALBUM_ART, CAPTIONS, BOOKMARKS, PLAYLISTS,
+//! SETTINGS. WAL. The on-disk file has the stable name `{db_dir}/files.db`.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use rusqlite::{params, params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension};
+use rusty_dlna_protocol::object_id::{
+    BROWSEDIR_ID, IMAGE_ALBUM_ID, IMAGE_ALL_ID, IMAGE_CAMERA_ID, IMAGE_DATE_ID, IMAGE_DIR_ID,
+    IMAGE_ID, IMAGE_PLIST_ID, IMAGE_RATING_ID, IMAGE_RECENT_ID, MUSIC_ALBUM_ARTIST_ID,
+    MUSIC_ALBUM_ID, MUSIC_ALL_ID, MUSIC_ARTIST_ID, MUSIC_COMPOSER_ID, MUSIC_CONTRIB_ARTIST_ID,
+    MUSIC_DIR_ID, MUSIC_GENRE_ID, MUSIC_ID, MUSIC_PLIST_ID, MUSIC_RATING_ID, MUSIC_RECENT_ID,
+    ROOT_ID, SAMSUNG_AUDIO, SAMSUNG_IMAGE, SAMSUNG_VIDEO, VIDEO_ACTOR_ID, VIDEO_ALL_ID,
+    VIDEO_DIR_ID, VIDEO_GENRE_ID, VIDEO_ID, VIDEO_PLIST_ID, VIDEO_RATING_ID, VIDEO_RECENT_ID,
+    VIDEO_SERIES_ID,
+};
+
+use crate::{
+    path_from_db, path_is_live_file, path_is_unwanted, Caption, Catalog, CatalogPatch, Container,
+    EmbeddedTags, MediaItem, NfoMeta, ScanConfig,
+};
+
+pub(crate) const STREAM_PROBE_REVISION: i64 = 5;
+pub(crate) const SCAN_CATALOG_EPOCH_KEY: &str = "scan_catalog_epoch";
+
+fn parse_scan_catalog_epoch(value: Option<String>, column: usize) -> rusqlite::Result<u64> {
+    match value {
+        None => Ok(0),
+        Some(value) => value.parse::<u64>().map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        }),
+    }
+}
+
+fn page_start_at_or_past_total(start: usize, total: i64) -> bool {
+    if total <= 0 {
+        return true;
+    }
+    usize::try_from(total).is_ok_and(|total| start >= total)
+}
+
+fn sqlite_page_value(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+static FAIL_NEXT_SCAN_STAGE_DETACH: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+#[cfg(test)]
+static FAIL_NEXT_SCAN_STAGE_ATTACH: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+#[cfg(test)]
+static BACKUP_STEP_PROBES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::atomic::AtomicUsize>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+#[cfg(test)]
+static BACKUP_CANCEL_AFTER_STEP: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, crate::CancellationToken>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[derive(Clone, Debug)]
+pub struct ObjectSnap {
+    pub object_id: String,
+    pub parent_id: String,
+    pub class: String,
+    pub detail_id: Option<i64>,
+    pub name: Option<String>,
+    pub ref_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DetailTags {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album_artist: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub composer: Option<String>,
+    pub contributor: Option<String>,
+    pub creator: Option<String>,
+    pub date: Option<String>,
+    pub rating: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetailPresentation {
+    pub title: Option<String>,
+    pub creator: Option<String>,
+    pub artist: Option<String>,
+    pub album_artist: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub composer: Option<String>,
+    pub contributor: Option<String>,
+    pub outline: Option<String>,
+    pub plot: Option<String>,
+    pub comment: Option<String>,
+    pub disc: Option<i64>,
+    pub track: Option<i64>,
+    pub date: Option<String>,
+    pub rating: Option<i64>,
+    pub rotation: Option<i64>,
+    pub album_art: i64,
+    pub captions: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaylistDbRow {
+    pub id: i64,
+    pub name: String,
+    pub path: String,
+    pub timestamp: i64,
+    pub device: i64,
+    pub inode: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetailStat {
+    pub path: String,
+    pub id: i64,
+    pub size: i64,
+    pub timestamp: i64,
+    pub device: i64,
+    pub inode: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamProbeCandidate {
+    pub id: i64,
+    pub path: String,
+    pub device: i64,
+    pub inode: i64,
+}
+
+fn media_item_from_catalog_row(
+    row: &rusqlite::Row<'_>,
+    captions: &HashMap<i64, Vec<Caption>>,
+) -> rusqlite::Result<MediaItem> {
+    let object_id: String = row.get(0)?;
+    let parent_id: String = row.get(1)?;
+    let class: String = row.get(2)?;
+    let object_name: Option<String> = row.get(3)?;
+    let detail_id: i64 = row.get(4)?;
+    if detail_id <= 0 || detail_id == i64::MAX {
+        return Err(rusqlite::Error::IntegralValueOutOfRange(4, detail_id));
+    }
+    let ref_id: Option<String> = row.get(5)?;
+    let path = path_from_db(&row.get::<_, Option<String>>(6)?.unwrap_or_default());
+    let mime = row
+        .get::<_, Option<String>>(10)?
+        .unwrap_or_else(|| "video/x-matroska".into());
+    let ext = mime_to_ext(&mime);
+    let nonempty = |value: Option<String>| value.filter(|value| !value.is_empty());
+    let detail_title: Option<String> = row.get(25)?;
+    let under_series_or_genre = parent_id == VIDEO_SERIES_ID
+        || parent_id.starts_with(&format!("{VIDEO_SERIES_ID}$"))
+        || parent_id == VIDEO_GENRE_ID
+        || parent_id.starts_with(&format!("{VIDEO_GENRE_ID}$"));
+    let title = if under_series_or_genre {
+        nonempty(object_name.clone()).or_else(|| nonempty(detail_title.clone()))
+    } else {
+        nonempty(detail_title).or_else(|| nonempty(object_name))
+    }
+    .unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("item")
+            .to_string()
+    });
+    let container: Option<String> = row.get(19)?;
+    let video: Option<String> = row.get(20)?;
+    let audio: Option<String> = row.get(21)?;
+    let audio_streams: Option<String> = row.get(22)?;
+    let hdr: Option<String> = row.get(23)?;
+    let resolution: Option<String> = row.get(16)?;
+    let stored_size = row.get::<_, Option<i64>>(7)?.unwrap_or(0);
+    let size = u64::try_from(stored_size)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(7, stored_size))?;
+    let probe = crate::probe_from_stored(
+        ext,
+        container.as_deref(),
+        video.as_deref(),
+        audio.as_deref(),
+        audio_streams.as_deref(),
+        hdr.as_deref(),
+        resolution.as_deref(),
+    );
+    let dlna_pn = row
+        .get::<_, Option<String>>(11)?
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            crate::dlna_pn_from_probe(
+                &probe.container,
+                &probe.video,
+                &probe.audio,
+                &probe.hdr,
+                probe.width,
+                probe.height,
+            )
+        });
+    let is_video = mime.starts_with("video/");
+    let stored_comment = nonempty(row.get(30)?);
+    let stored_plot = nonempty(row.get(39)?);
+    Ok(MediaItem {
+        object_id,
+        parent_id,
+        detail_id,
+        title,
+        class,
+        date: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+        path,
+        mime,
+        ext: ext.into(),
+        size,
+        mtime: row.get::<_, Option<i64>>(8)?.unwrap_or(0),
+        captions: captions.get(&detail_id).cloned().unwrap_or_default(),
+        probe,
+        dlna_pn,
+        ref_id,
+        device: crate::u64_from_sqlite_i64_bits(row.get::<_, Option<i64>>(12)?.unwrap_or(0)),
+        inode: crate::u64_from_sqlite_i64_bits(row.get::<_, Option<i64>>(13)?.unwrap_or(0)),
+        duration: row
+            .get::<_, Option<String>>(14)?
+            .filter(|value| !value.is_empty()),
+        bitrate: row.get(15)?,
+        resolution: resolution.filter(|value| !value.is_empty()),
+        channels: row.get(17)?,
+        samplerate: row.get(18)?,
+        album_art: row.get::<_, Option<i64>>(24)?.unwrap_or(0),
+        creator: nonempty(row.get(26)?),
+        about: if is_video {
+            nonempty(row.get(38)?)
+        } else {
+            stored_comment.clone()
+        },
+        plot: if is_video {
+            stored_plot.or(stored_comment)
+        } else {
+            None
+        },
+        artist: nonempty(row.get(27)?),
+        album_artist: nonempty(row.get(33)?),
+        composer: nonempty(row.get(34)?),
+        contributor: nonempty(row.get(35)?),
+        album: nonempty(row.get(28)?),
+        genre: nonempty(row.get(29)?),
+        disc: row.get(31)?,
+        track: row.get(32)?,
+        rating: row.get(36)?,
+        rotation: row.get(37)?,
+        bookmark_sec: 0,
+        watch_count: 0,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VideoDetailTitle {
+    pub id: i64,
+    pub path: String,
+    pub title: String,
+    pub device: i64,
+    pub inode: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExistingDetail {
+    pub id: i64,
+    pub size: i64,
+    pub timestamp: i64,
+    pub device: i64,
+    pub inode: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InodeSource {
+    pub id: i64,
+    pub size: i64,
+    pub timestamp: i64,
+    pub path: String,
+    pub mime: String,
+    pub stream_probe_rev: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NewDetail<'a> {
+    pub path: &'a str,
+    pub size: i64,
+    pub timestamp: i64,
+    pub title: &'a str,
+    pub date: &'a str,
+    pub mime: &'a str,
+    pub device: i64,
+    pub inode: i64,
+    pub dlna_pn: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DetailStreamUpdate<'a> {
+    pub duration: Option<&'a str>,
+    pub bitrate: Option<i64>,
+    pub resolution: Option<&'a str>,
+    pub channels: Option<i64>,
+    pub samplerate: Option<i64>,
+    pub container: Option<&'a str>,
+    pub video: Option<&'a str>,
+    pub audio: Option<&'a str>,
+    pub hdr: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetailGroupFields {
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub disc: Option<i64>,
+    pub track: Option<i64>,
+    pub title: Option<String>,
+    pub device: i64,
+    pub inode: i64,
+}
+
+/// rustyDLNA schema from `SQLite schema`.
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS OBJECTS (
+  ID INTEGER PRIMARY KEY AUTOINCREMENT,
+  OBJECT_ID TEXT UNIQUE NOT NULL,
+  PARENT_ID TEXT NOT NULL,
+  REF_ID TEXT DEFAULT NULL,
+  CLASS TEXT NOT NULL,
+  DETAIL_ID INTEGER DEFAULT NULL REFERENCES DETAILS(ID) ON DELETE CASCADE,
+  NAME TEXT DEFAULT NULL
+);
+CREATE TABLE IF NOT EXISTS DETAILS (
+  ID INTEGER PRIMARY KEY AUTOINCREMENT,
+  PATH TEXT DEFAULT NULL,
+  SIZE INTEGER,
+  TIMESTAMP INTEGER,
+  TITLE TEXT COLLATE NOCASE,
+  DURATION TEXT,
+  BITRATE INTEGER,
+  SAMPLERATE INTEGER,
+  CREATOR TEXT COLLATE NOCASE,
+  ARTIST TEXT COLLATE NOCASE,
+  ALBUM_ARTIST TEXT COLLATE NOCASE,
+  COMPOSER TEXT COLLATE NOCASE,
+  CONTRIBUTOR TEXT COLLATE NOCASE,
+  ALBUM TEXT COLLATE NOCASE,
+  GENRE TEXT COLLATE NOCASE,
+  OUTLINE TEXT,
+  PLOT TEXT,
+  COMMENT TEXT,
+  CHANNELS INTEGER,
+  DISC INTEGER,
+  TRACK INTEGER,
+  RATING INTEGER,
+  DATE DATE,
+  RESOLUTION TEXT,
+  THUMBNAIL BOOL DEFAULT 0,
+  ALBUM_ART INTEGER DEFAULT NULL REFERENCES ALBUM_ART(ID) ON DELETE SET NULL,
+  ROTATION INTEGER,
+  DLNA_PN TEXT,
+  MIME TEXT,
+  DEVICE INTEGER,
+  INODE INTEGER,
+  STREAM_PROBE_REV INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS ALBUM_ART (
+  ID INTEGER PRIMARY KEY AUTOINCREMENT,
+  PATH TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS CAPTIONS (
+  ID INTEGER NOT NULL REFERENCES DETAILS(ID) ON DELETE CASCADE,
+  PATH TEXT NOT NULL,
+  PRIMARY KEY (ID, PATH)
+);
+CREATE TABLE IF NOT EXISTS BOOKMARKS (
+  ID INTEGER PRIMARY KEY REFERENCES DETAILS(ID) ON DELETE CASCADE,
+  SEC INTEGER,
+  WATCH_COUNT INTEGER,
+  UPDATED_AT INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS PLAYLISTS (
+  ID INTEGER PRIMARY KEY AUTOINCREMENT,
+  NAME TEXT NOT NULL,
+  PATH TEXT NOT NULL,
+  ITEMS INTEGER DEFAULT 0,
+  FOUND INTEGER DEFAULT 0,
+  TIMESTAMP INTEGER DEFAULT 0,
+  DEVICE INTEGER DEFAULT 0,
+  INODE INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS PLAYLIST_ITEMS (
+  PLAYLIST_ID INTEGER NOT NULL REFERENCES PLAYLISTS(ID) ON DELETE CASCADE,
+  DETAIL_ID INTEGER NOT NULL REFERENCES DETAILS(ID) ON DELETE CASCADE,
+  POSITION INTEGER NOT NULL,
+  PRIMARY KEY (PLAYLIST_ID, POSITION)
+);
+CREATE TABLE IF NOT EXISTS SETTINGS (
+  KEY TEXT NOT NULL UNIQUE,
+  VALUE TEXT
+);
+CREATE INDEX IF NOT EXISTS IDX_DETAILS_INODE ON DETAILS(DEVICE, INODE);
+CREATE INDEX IF NOT EXISTS IDX_DETAILS_PATH ON DETAILS(PATH);
+CREATE INDEX IF NOT EXISTS IDX_OBJECTS_PARENT ON OBJECTS(PARENT_ID, NAME, OBJECT_ID);
+CREATE INDEX IF NOT EXISTS IDX_OBJECTS_DETAIL ON OBJECTS(DETAIL_ID);
+CREATE INDEX IF NOT EXISTS IDX_OBJECTS_CLASS ON OBJECTS(CLASS, OBJECT_ID);
+CREATE INDEX IF NOT EXISTS IDX_DETAILS_TITLE ON DETAILS(TITLE, ID);
+CREATE INDEX IF NOT EXISTS IDX_DETAILS_DATE ON DETAILS(DATE, ID);
+CREATE INDEX IF NOT EXISTS IDX_DETAILS_ALBUM ON DETAILS(ALBUM, ID);
+CREATE INDEX IF NOT EXISTS IDX_DETAILS_TRACK ON DETAILS(TRACK, ID);
+"#;
+
+pub(crate) const STREAM_PROBE_NULLABLE_BATCH_SQL: &str =
+    "SELECT ID, PATH, COALESCE(DEVICE, 0), COALESCE(INODE, 0)
+     FROM DETAILS
+     WHERE MIME IS NOT NULL AND PATH IS NOT NULL
+       AND (STREAM_PROBE_REV < ?1 OR PROBE_SIDECAR_FINGERPRINT IS NULL)
+       AND (DEVICE IS NULL OR INODE IS NULL) AND ID > ?4
+     ORDER BY ID LIMIT ?5";
+
+pub(crate) const STREAM_PROBE_NONNULL_BATCH_SQL: &str = "SELECT ID, PATH, DEVICE, INODE
+     FROM DETAILS INDEXED BY IDX_DETAILS_INODE
+     WHERE MIME IS NOT NULL AND PATH IS NOT NULL
+       AND (STREAM_PROBE_REV < ?1 OR PROBE_SIDECAR_FINGERPRINT IS NULL)
+       AND DEVICE IS NOT NULL AND INODE IS NOT NULL
+       AND (DEVICE > ?2 OR (DEVICE = ?2 AND INODE > ?3)
+         OR (DEVICE = ?2 AND INODE = ?3 AND ID > ?4))
+     ORDER BY DEVICE, INODE, ID LIMIT ?5";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogQueryField {
+    Title,
+    Creator,
+    Date,
+    Class,
+    Artist,
+    Genre,
+    Album,
+    Actor,
+    Id,
+    ParentId,
+    RefId,
+    Track,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CatalogQueryOp {
+    Contains(String),
+    DoesNotContain(String),
+    Equals(String),
+    NotEquals(String),
+    LessThan { value: String, inclusive: bool },
+    GreaterThan { value: String, inclusive: bool },
+    DerivedFrom(String),
+    Exists(bool),
+    Never,
+    All,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogQueryClause {
+    pub field: CatalogQueryField,
+    pub op: CatalogQueryOp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogQuerySort {
+    pub field: CatalogQueryField,
+    pub descending: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogDefaultOrder {
+    FoldersFirst,
+    ClassTitle,
+    ClassDiscTrackTitle,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogQuery {
+    /// OR of AND groups, matching the ContentDirectory search grammar.
+    pub groups: Vec<Vec<CatalogQueryClause>>,
+    pub sort: Vec<CatalogQuerySort>,
+    pub default_order: CatalogDefaultOrder,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogQueryPage {
+    pub object_ids: Vec<String>,
+    pub total: u32,
+    /// Total searchable OBJECTS rows, used to detect a catalog/DB generation
+    /// mismatch before publishing a mixed response.
+    pub population: u32,
+}
+
+/// Media-kind filter for the embedded web player's detail-deduplicated query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebMediaKind {
+    /// Audio and video.
+    All,
+    /// Video only.
+    Video,
+    /// Audio only.
+    Audio,
+}
+
+/// Stable sort choices exposed by the embedded web player.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebMediaSort {
+    /// Metadata title, then detail identity.
+    Title,
+    /// Metadata date newest first, then title and identity.
+    DateDescending,
+    /// Album/show, disc/season, track/episode, then title and identity.
+    EpisodeTrack,
+}
+
+const QUERY_TITLE: &str = "CASE \
+    WHEN o.PARENT_ID = '2$E' OR o.PARENT_ID LIKE '2$E$%' \
+      OR o.PARENT_ID = '2$9' OR o.PARENT_ID LIKE '2$9$%' \
+    THEN COALESCE(NULLIF(o.NAME, ''), NULLIF(d.TITLE, ''), '') \
+    ELSE COALESCE(NULLIF(d.TITLE, ''), NULLIF(o.NAME, ''), '') END";
+
+const CATALOG_ITEM_SELECT: &str =
+    "SELECT o.OBJECT_ID, o.PARENT_ID, o.CLASS, o.NAME, o.DETAIL_ID, o.REF_ID,
+            d.PATH, d.SIZE, d.TIMESTAMP, d.DATE, d.MIME, d.DLNA_PN,
+            d.DEVICE, d.INODE, d.DURATION, d.BITRATE, d.RESOLUTION,
+            d.CHANNELS, d.SAMPLERATE, d.CONTAINER, d.VIDEO, d.AUDIO,
+            d.AUDIO_STREAMS, d.HDR,
+            d.ALBUM_ART, d.TITLE, d.CREATOR, d.ARTIST, d.ALBUM, d.GENRE,
+            d.COMMENT, d.DISC, d.TRACK, d.ALBUM_ARTIST, d.COMPOSER,
+            d.CONTRIBUTOR, d.RATING, d.ROTATION, d.OUTLINE, d.PLOT
+     FROM OBJECTS o JOIN DETAILS d ON o.DETAIL_ID = d.ID";
+
+fn catalog_field_sql(field: CatalogQueryField) -> &'static str {
+    match field {
+        CatalogQueryField::Title => QUERY_TITLE,
+        CatalogQueryField::Creator => "COALESCE(d.CREATOR, '')",
+        CatalogQueryField::Date => "COALESCE(d.DATE, '')",
+        CatalogQueryField::Class => "COALESCE(o.CLASS, '')",
+        CatalogQueryField::Artist => "COALESCE(d.ARTIST, '')",
+        CatalogQueryField::Genre => "COALESCE(d.GENRE, '')",
+        CatalogQueryField::Album => "COALESCE(d.ALBUM, '')",
+        // Actor metadata is not currently persisted in DETAILS, matching the
+        // empty field exposed by the in-memory search row.
+        CatalogQueryField::Actor => "''",
+        CatalogQueryField::Id => "o.OBJECT_ID",
+        CatalogQueryField::ParentId => "o.PARENT_ID",
+        CatalogQueryField::RefId => "COALESCE(o.REF_ID, '')",
+        CatalogQueryField::Track => "COALESCE(d.TRACK, 0)",
+    }
+}
+
+fn full_class_sql() -> &'static str {
+    "CASE WHEN o.CLASS LIKE 'object.%' THEN o.CLASS ELSE 'object.' || o.CLASS END"
+}
+
+fn catalog_clause_sql(clause: &CatalogQueryClause, values: &mut Vec<Value>) -> String {
+    let field = catalog_field_sql(clause.field);
+    match &clause.op {
+        CatalogQueryOp::Contains(value) => {
+            values.push(Value::Text(value.to_ascii_lowercase()));
+            let field = if clause.field == CatalogQueryField::Class {
+                full_class_sql()
+            } else {
+                field
+            };
+            format!("instr(lower({field}), ?) > 0")
+        }
+        CatalogQueryOp::DoesNotContain(value) => {
+            values.push(Value::Text(value.to_ascii_lowercase()));
+            format!("instr(lower({field}), ?) = 0")
+        }
+        CatalogQueryOp::Equals(value) => {
+            values.push(Value::Text(value.clone()));
+            format!("{field} = ? COLLATE NOCASE")
+        }
+        CatalogQueryOp::NotEquals(value) => {
+            values.push(Value::Text(value.clone()));
+            format!("{field} <> ? COLLATE NOCASE")
+        }
+        CatalogQueryOp::LessThan { value, inclusive } => {
+            values.push(Value::Text(value.clone()));
+            format!(
+                "{field} {} ? COLLATE NOCASE",
+                if *inclusive { "<=" } else { "<" }
+            )
+        }
+        CatalogQueryOp::GreaterThan { value, inclusive } => {
+            values.push(Value::Text(value.clone()));
+            format!(
+                "{field} {} ? COLLATE NOCASE",
+                if *inclusive { ">=" } else { ">" }
+            )
+        }
+        CatalogQueryOp::DerivedFrom(value) => {
+            let value = if value.starts_with("object.") {
+                value.clone()
+            } else {
+                format!("object.{value}")
+            };
+            values.push(Value::Text(value.clone()));
+            values.push(Value::Text(value));
+            let field = if clause.field == CatalogQueryField::Class {
+                full_class_sql()
+            } else {
+                field
+            };
+            format!("(lower({field}) = lower(?) OR instr(lower({field}), lower(?) || '.') = 1)")
+        }
+        CatalogQueryOp::Exists(want) => {
+            if *want {
+                format!("{field} <> ''")
+            } else {
+                format!("{field} = ''")
+            }
+        }
+        CatalogQueryOp::Never => "0".to_string(),
+        CatalogQueryOp::All => "1".to_string(),
+    }
+}
+
+fn catalog_order_sql(sort: &[CatalogQuerySort], default_order: CatalogDefaultOrder) -> String {
+    let mut parts = Vec::new();
+    if sort.is_empty() {
+        match default_order {
+            CatalogDefaultOrder::FoldersFirst => {
+                parts.push("(o.DETAIL_ID IS NULL) DESC".to_string());
+                parts.push(format!("{QUERY_TITLE} COLLATE NOCASE ASC"));
+            }
+            CatalogDefaultOrder::ClassTitle => {
+                parts.push("o.CLASS COLLATE NOCASE ASC".to_string());
+                parts.push(format!("{QUERY_TITLE} COLLATE NOCASE ASC"));
+            }
+            CatalogDefaultOrder::ClassDiscTrackTitle => {
+                parts.push("o.CLASS COLLATE NOCASE ASC".to_string());
+                parts.push("COALESCE(d.DISC, 0) ASC".to_string());
+                parts.push("COALESCE(d.TRACK, 0) ASC".to_string());
+                parts.push(format!("{QUERY_TITLE} COLLATE NOCASE ASC"));
+            }
+        }
+    } else {
+        for spec in sort {
+            let direction = if spec.descending { "DESC" } else { "ASC" };
+            parts.push(format!(
+                "{} COLLATE NOCASE {direction}",
+                catalog_field_sql(spec.field)
+            ));
+        }
+    }
+    // HashMap iteration previously made ties nondeterministic. Stable object
+    // IDs make page boundaries repeatable across requests and restarts.
+    parts.push("o.OBJECT_ID ASC".to_string());
+    parts.join(", ")
+}
+
+pub struct LibraryDb {
+    conn: Connection,
+    pub path: PathBuf,
+}
+
+struct BackupProgressDeadline {
+    previous_remaining: Option<i32>,
+    deadline: std::time::Instant,
+    timeout: std::time::Duration,
+}
+
+impl BackupProgressDeadline {
+    fn new(now: std::time::Instant, timeout: std::time::Duration) -> Self {
+        Self {
+            previous_remaining: None,
+            deadline: now + timeout,
+            timeout,
+        }
+    }
+
+    fn observe(&mut self, now: std::time::Instant, remaining: i32) -> bool {
+        if self
+            .previous_remaining
+            .is_none_or(|previous| remaining < previous)
+        {
+            self.deadline = now + self.timeout;
+        }
+        self.previous_remaining = Some(remaining);
+        now < self.deadline
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackupStepKind {
+    Done,
+    More,
+    Busy,
+    Locked,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackupLoopStop {
+    Cancelled,
+    NoProgress,
+}
+
+struct BackupLoopControl {
+    progress: BackupProgressDeadline,
+}
+
+impl BackupLoopControl {
+    fn new(now: std::time::Instant, timeout: std::time::Duration) -> Self {
+        Self {
+            progress: BackupProgressDeadline::new(now, timeout),
+        }
+    }
+
+    fn before_step(&self, cancelled: bool) -> Result<(), BackupLoopStop> {
+        if cancelled {
+            Err(BackupLoopStop::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn after_step(
+        &mut self,
+        now: std::time::Instant,
+        remaining: i32,
+        step: BackupStepKind,
+    ) -> Result<Option<std::time::Duration>, BackupLoopStop> {
+        if step == BackupStepKind::Done {
+            return Ok(None);
+        }
+        if !self.progress.observe(now, remaining) {
+            return Err(BackupLoopStop::NoProgress);
+        }
+        let delay = match step {
+            BackupStepKind::Busy | BackupStepKind::Locked => std::time::Duration::from_millis(10),
+            BackupStepKind::More | BackupStepKind::Other => std::time::Duration::from_millis(1),
+            BackupStepKind::Done => return Ok(None),
+        };
+        Ok(Some(delay))
+    }
+}
+
+impl LibraryDb {
+    /// Make long SQLite statements and lock admission observe daemon
+    /// cancellation. The short busy window bounds a blocked publication;
+    /// normal reconciles retry on the next watcher/periodic pass.
+    pub fn install_cancellation(
+        &self,
+        cancellation: crate::CancellationToken,
+    ) -> rusqlite::Result<()> {
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(250))?;
+        self.conn
+            .progress_handler(1_000, Some(move || cancellation.is_cancelled()));
+        Ok(())
+    }
+
+    /// Capture the exact catalog rows touched by the next scanner transaction.
+    /// TEMP triggers keep the journal connection-local and transactional.
+    pub fn begin_catalog_change_capture(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS catalog_object_changes (
+                 OBJECT_ID TEXT PRIMARY KEY
+             );
+             CREATE TEMP TABLE IF NOT EXISTS catalog_detail_changes (
+                 DETAIL_ID INTEGER PRIMARY KEY
+             );
+             CREATE TEMP TABLE IF NOT EXISTS catalog_album_art_changes (
+                 ALBUM_ART_ID INTEGER PRIMARY KEY
+             );
+             DELETE FROM catalog_object_changes;
+             DELETE FROM catalog_detail_changes;
+             DELETE FROM catalog_album_art_changes;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_object_insert
+             AFTER INSERT ON main.OBJECTS BEGIN
+                 INSERT INTO catalog_object_changes VALUES (NEW.OBJECT_ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_object_update
+             AFTER UPDATE ON main.OBJECTS BEGIN
+                 INSERT INTO catalog_object_changes VALUES (OLD.OBJECT_ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO catalog_object_changes VALUES (NEW.OBJECT_ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_object_delete
+             AFTER DELETE ON main.OBJECTS BEGIN
+                 INSERT INTO catalog_object_changes VALUES (OLD.OBJECT_ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_detail_insert
+             AFTER INSERT ON main.DETAILS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_detail_update
+             AFTER UPDATE ON main.DETAILS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO catalog_detail_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_detail_delete
+             AFTER DELETE ON main.DETAILS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_caption_insert
+             AFTER INSERT ON main.CAPTIONS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_caption_delete
+             AFTER DELETE ON main.CAPTIONS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_caption_update
+             AFTER UPDATE ON main.CAPTIONS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO catalog_detail_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_bookmark_insert
+             AFTER INSERT ON main.BOOKMARKS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_bookmark_update
+             AFTER UPDATE ON main.BOOKMARKS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_bookmark_delete
+             AFTER DELETE ON main.BOOKMARKS BEGIN
+                 INSERT INTO catalog_detail_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_album_art_insert
+             AFTER INSERT ON main.ALBUM_ART BEGIN
+                 INSERT INTO catalog_album_art_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_album_art_update
+             AFTER UPDATE ON main.ALBUM_ART BEGIN
+                 INSERT INTO catalog_album_art_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO catalog_album_art_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_album_art_delete
+             AFTER DELETE ON main.ALBUM_ART BEGIN
+                 INSERT INTO catalog_album_art_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+             END;",
+        )
+    }
+
+    pub(crate) fn end_catalog_change_capture(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(
+            "DROP TRIGGER IF EXISTS temp.capture_object_insert;
+             DROP TRIGGER IF EXISTS temp.capture_object_update;
+             DROP TRIGGER IF EXISTS temp.capture_object_delete;
+             DROP TRIGGER IF EXISTS temp.capture_detail_insert;
+             DROP TRIGGER IF EXISTS temp.capture_detail_update;
+             DROP TRIGGER IF EXISTS temp.capture_detail_delete;
+             DROP TRIGGER IF EXISTS temp.capture_caption_insert;
+             DROP TRIGGER IF EXISTS temp.capture_caption_update;
+             DROP TRIGGER IF EXISTS temp.capture_caption_delete;
+             DROP TRIGGER IF EXISTS temp.capture_bookmark_insert;
+             DROP TRIGGER IF EXISTS temp.capture_bookmark_update;
+             DROP TRIGGER IF EXISTS temp.capture_bookmark_delete;
+             DROP TRIGGER IF EXISTS temp.capture_album_art_insert;
+             DROP TRIGGER IF EXISTS temp.capture_album_art_update;
+             DROP TRIGGER IF EXISTS temp.capture_album_art_delete;
+             DROP TABLE IF EXISTS temp.catalog_object_changes;
+             DROP TABLE IF EXISTS temp.catalog_detail_changes;
+             DROP TABLE IF EXISTS temp.catalog_album_art_changes;",
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_change_counts(&self) -> rusqlite::Result<(i64, i64, i64)> {
+        let count = |table: &str| {
+            let exists = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_temp_schema WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Ok(0);
+            }
+            self.conn
+                .query_row(&format!("SELECT count(*) FROM temp.{table}"), [], |row| {
+                    row.get(0)
+                })
+        };
+        Ok((
+            count("catalog_object_changes")?,
+            count("catalog_detail_changes")?,
+            count("catalog_album_art_changes")?,
+        ))
+    }
+
+    /// Create a persistent, key-only journal for scanner-owned catalog rows.
+    /// The tables live in the staging database so a large change set is disk
+    /// bounded. Connection-local triggers keep the journal machinery out of
+    /// the live catalog copied by a later backup.
+    pub(crate) fn begin_scan_change_capture(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _scan_detail_changes (
+                 ID INTEGER PRIMARY KEY
+             );
+             CREATE TABLE IF NOT EXISTS _scan_object_changes (
+                 OBJECT_ID TEXT PRIMARY KEY
+             );
+             CREATE TABLE IF NOT EXISTS _scan_album_art_changes (
+                 ID INTEGER PRIMARY KEY
+             );
+             CREATE TABLE IF NOT EXISTS _scan_caption_changes (
+                 ID INTEGER PRIMARY KEY
+             );
+             CREATE TABLE IF NOT EXISTS _scan_playlist_changes (
+                 ID INTEGER PRIMARY KEY
+             );
+             CREATE TABLE IF NOT EXISTS _scan_setting_changes (
+                 KEY TEXT PRIMARY KEY
+             );
+             DELETE FROM _scan_detail_changes;
+             DELETE FROM _scan_object_changes;
+             DELETE FROM _scan_album_art_changes;
+             DELETE FROM _scan_caption_changes;
+             DELETE FROM _scan_playlist_changes;
+             DELETE FROM _scan_setting_changes;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_detail_insert
+             AFTER INSERT ON main.DETAILS BEGIN
+                 INSERT INTO _scan_detail_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_detail_update
+             AFTER UPDATE ON main.DETAILS BEGIN
+                 INSERT INTO _scan_detail_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO _scan_detail_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_detail_delete
+             AFTER DELETE ON main.DETAILS BEGIN
+                 INSERT INTO _scan_detail_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_object_insert
+             AFTER INSERT ON main.OBJECTS BEGIN
+                 INSERT INTO _scan_object_changes VALUES (NEW.OBJECT_ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_object_update
+             AFTER UPDATE ON main.OBJECTS BEGIN
+                 INSERT INTO _scan_object_changes VALUES (OLD.OBJECT_ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO _scan_object_changes VALUES (NEW.OBJECT_ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_object_delete
+             AFTER DELETE ON main.OBJECTS BEGIN
+                 INSERT INTO _scan_object_changes VALUES (OLD.OBJECT_ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_album_art_insert
+             AFTER INSERT ON main.ALBUM_ART BEGIN
+                 INSERT INTO _scan_album_art_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_album_art_update
+             AFTER UPDATE ON main.ALBUM_ART BEGIN
+                 INSERT INTO _scan_album_art_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO _scan_album_art_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_album_art_delete
+             AFTER DELETE ON main.ALBUM_ART BEGIN
+                 INSERT INTO _scan_album_art_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_caption_insert
+             AFTER INSERT ON main.CAPTIONS BEGIN
+                 INSERT INTO _scan_caption_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_caption_delete
+             AFTER DELETE ON main.CAPTIONS BEGIN
+                 INSERT INTO _scan_caption_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_caption_update
+             AFTER UPDATE ON main.CAPTIONS BEGIN
+                 INSERT INTO _scan_caption_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO _scan_caption_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_playlist_insert
+             AFTER INSERT ON main.PLAYLISTS BEGIN
+                 INSERT INTO _scan_playlist_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_playlist_update
+             AFTER UPDATE ON main.PLAYLISTS BEGIN
+                 INSERT INTO _scan_playlist_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO _scan_playlist_changes VALUES (NEW.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_playlist_delete
+             AFTER DELETE ON main.PLAYLISTS BEGIN
+                 INSERT INTO _scan_playlist_changes VALUES (OLD.ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_playlist_item_insert
+             AFTER INSERT ON main.PLAYLIST_ITEMS BEGIN
+                 INSERT INTO _scan_playlist_changes VALUES (NEW.PLAYLIST_ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_playlist_item_delete
+             AFTER DELETE ON main.PLAYLIST_ITEMS BEGIN
+                 INSERT INTO _scan_playlist_changes VALUES (OLD.PLAYLIST_ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_playlist_item_update
+             AFTER UPDATE ON main.PLAYLIST_ITEMS BEGIN
+                 INSERT INTO _scan_playlist_changes VALUES (OLD.PLAYLIST_ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO _scan_playlist_changes VALUES (NEW.PLAYLIST_ID) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_setting_insert
+             AFTER INSERT ON main.SETTINGS
+             WHEN NEW.KEY NOT IN ('updateID', 'scan_catalog_epoch') BEGIN
+                 INSERT INTO _scan_setting_changes VALUES (NEW.KEY) ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_setting_update
+             AFTER UPDATE ON main.SETTINGS
+             WHEN OLD.KEY NOT IN ('updateID', 'scan_catalog_epoch')
+               OR NEW.KEY NOT IN ('updateID', 'scan_catalog_epoch') BEGIN
+                 INSERT INTO _scan_setting_changes
+                 SELECT OLD.KEY WHERE OLD.KEY NOT IN ('updateID', 'scan_catalog_epoch')
+                 ON CONFLICT DO NOTHING;
+                 INSERT INTO _scan_setting_changes
+                 SELECT NEW.KEY WHERE NEW.KEY NOT IN ('updateID', 'scan_catalog_epoch')
+                 ON CONFLICT DO NOTHING;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS capture_scan_setting_delete
+             AFTER DELETE ON main.SETTINGS
+             WHEN OLD.KEY NOT IN ('updateID', 'scan_catalog_epoch') BEGIN
+                 INSERT INTO _scan_setting_changes VALUES (OLD.KEY) ON CONFLICT DO NOTHING;
+             END;",
+        )
+    }
+
+    pub(crate) fn clear_scan_change_capture(&self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM _scan_detail_changes;
+             DELETE FROM _scan_object_changes;
+             DELETE FROM _scan_album_art_changes;
+             DELETE FROM _scan_caption_changes;
+             DELETE FROM _scan_playlist_changes;
+             DELETE FROM _scan_setting_changes;",
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scan_change_counts(&self) -> rusqlite::Result<[i64; 6]> {
+        self.conn.query_row(
+            "SELECT
+               (SELECT count(*) FROM _scan_detail_changes),
+               (SELECT count(*) FROM _scan_object_changes),
+               (SELECT count(*) FROM _scan_album_art_changes),
+               (SELECT count(*) FROM _scan_caption_changes),
+               (SELECT count(*) FROM _scan_playlist_changes),
+               (SELECT count(*) FROM _scan_setting_changes)",
+            [],
+            |row| {
+                Ok([
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ])
+            },
+        )
+    }
+
+    pub(crate) fn attach_scan_stage(&self, path: &Path) -> rusqlite::Result<()> {
+        #[cfg(test)]
+        if FAIL_NEXT_SCAN_STAGE_ATTACH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.path)
+        {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some("injected scan-stage attach failure".into()),
+            ));
+        }
+        let already_attached = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_database_list WHERE name = 'scan_stage')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if already_attached {
+            self.conn.execute_batch("DETACH DATABASE scan_stage")?;
+        }
+        self.conn.execute(
+            "ATTACH DATABASE CAST(?1 AS TEXT) AS scan_stage",
+            [path.as_os_str().as_encoded_bytes()],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_scan_stage_attach(&self) {
+        FAIL_NEXT_SCAN_STAGE_ATTACH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(self.path.clone());
+    }
+
+    pub(crate) fn detach_scan_stage(&self) -> rusqlite::Result<()> {
+        #[cfg(test)]
+        if FAIL_NEXT_SCAN_STAGE_DETACH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.path)
+        {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some("injected scan-stage detach failure".into()),
+            ));
+        }
+        self.conn.execute_batch("DETACH DATABASE scan_stage")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_scan_stage_detach(&self) {
+        FAIL_NEXT_SCAN_STAGE_DETACH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(self.path.clone());
+    }
+
+    pub(crate) fn attached_scan_epochs(&self) -> rusqlite::Result<(u64, u64)> {
+        let values = self.conn.query_row(
+            "SELECT
+                 (SELECT VALUE FROM SETTINGS WHERE KEY = 'scan_catalog_epoch'),
+                 (SELECT VALUE FROM scan_stage.SETTINGS WHERE KEY = 'scan_catalog_epoch')",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )?;
+        Ok((
+            parse_scan_catalog_epoch(values.0, 0)?,
+            parse_scan_catalog_epoch(values.1, 1)?,
+        ))
+    }
+
+    pub(crate) fn scan_catalog_epoch(&self) -> rusqlite::Result<u64> {
+        parse_scan_catalog_epoch(self.setting(SCAN_CATALOG_EPOCH_KEY)?, 0)
+    }
+
+    pub(crate) fn set_scan_catalog_epoch(&self, epoch: u64) -> rusqlite::Result<()> {
+        self.set_setting(SCAN_CATALOG_EPOCH_KEY, &epoch.to_string())
+    }
+
+    /// Merge only journaled scanner rows from the attached stage. Explicit
+    /// IDs are retained and BOOKMARKS/updateID are deliberately absent.
+    pub(crate) fn merge_attached_scan_stage(
+        &self,
+        bookmark_expiry_cutoff: Option<i64>,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM OBJECTS
+             WHERE OBJECT_ID IN (SELECT OBJECT_ID FROM scan_stage._scan_object_changes)
+               AND NOT EXISTS (
+                 SELECT 1 FROM scan_stage.OBJECTS staged
+                 WHERE staged.OBJECT_ID = OBJECTS.OBJECT_ID
+               );
+             DELETE FROM PLAYLISTS
+             WHERE ID IN (SELECT ID FROM scan_stage._scan_playlist_changes)
+               AND NOT EXISTS (
+                 SELECT 1 FROM scan_stage.PLAYLISTS staged
+                 WHERE staged.ID = PLAYLISTS.ID
+               );
+             DELETE FROM DETAILS
+             WHERE ID IN (SELECT ID FROM scan_stage._scan_detail_changes)
+               AND NOT EXISTS (
+                 SELECT 1 FROM scan_stage.DETAILS staged
+                 WHERE staged.ID = DETAILS.ID
+               );
+
+             INSERT INTO ALBUM_ART (ID, PATH)
+             SELECT staged.ID, staged.PATH
+             FROM scan_stage.ALBUM_ART staged
+             JOIN scan_stage._scan_album_art_changes changed ON changed.ID = staged.ID
+             WHERE true
+             ON CONFLICT(ID) DO UPDATE SET PATH = excluded.PATH
+             WHERE ALBUM_ART.PATH COLLATE BINARY IS NOT excluded.PATH COLLATE BINARY;
+
+             INSERT INTO DETAILS (
+                 ID, PATH, SIZE, TIMESTAMP, TITLE, DURATION, BITRATE, SAMPLERATE,
+                 CREATOR, ARTIST, ALBUM_ARTIST, COMPOSER, CONTRIBUTOR, ALBUM,
+                 GENRE, OUTLINE, PLOT, COMMENT, CHANNELS, DISC, TRACK, RATING, DATE, RESOLUTION,
+                 THUMBNAIL, ALBUM_ART, ROTATION, DLNA_PN, MIME, DEVICE, INODE,
+                 CONTAINER, VIDEO, AUDIO, AUDIO_STREAMS, HDR, STREAM_PROBE_REV,
+                 PROBE_SIDECAR_FINGERPRINT
+             )
+             SELECT staged.ID, staged.PATH, staged.SIZE, staged.TIMESTAMP,
+                 staged.TITLE, staged.DURATION, staged.BITRATE, staged.SAMPLERATE,
+                 staged.CREATOR, staged.ARTIST, staged.ALBUM_ARTIST,
+                 staged.COMPOSER, staged.CONTRIBUTOR, staged.ALBUM, staged.GENRE,
+                 staged.OUTLINE, staged.PLOT, staged.COMMENT, staged.CHANNELS, staged.DISC, staged.TRACK,
+                 staged.RATING, staged.DATE, staged.RESOLUTION, staged.THUMBNAIL,
+                 staged.ALBUM_ART, staged.ROTATION, staged.DLNA_PN, staged.MIME,
+                 staged.DEVICE, staged.INODE, staged.CONTAINER,
+                 staged.VIDEO, staged.AUDIO,
+                 staged.AUDIO_STREAMS, staged.HDR, staged.STREAM_PROBE_REV,
+                 staged.PROBE_SIDECAR_FINGERPRINT
+             FROM scan_stage.DETAILS staged
+             JOIN scan_stage._scan_detail_changes changed ON changed.ID = staged.ID
+             WHERE true
+             ON CONFLICT(ID) DO UPDATE SET
+                 PATH=excluded.PATH, SIZE=excluded.SIZE, TIMESTAMP=excluded.TIMESTAMP,
+                 TITLE=excluded.TITLE, DURATION=excluded.DURATION,
+                 BITRATE=excluded.BITRATE, SAMPLERATE=excluded.SAMPLERATE,
+                 CREATOR=excluded.CREATOR, ARTIST=excluded.ARTIST,
+                 ALBUM_ARTIST=excluded.ALBUM_ARTIST, COMPOSER=excluded.COMPOSER,
+                 CONTRIBUTOR=excluded.CONTRIBUTOR, ALBUM=excluded.ALBUM,
+                 GENRE=excluded.GENRE, OUTLINE=excluded.OUTLINE,
+                 PLOT=excluded.PLOT, COMMENT=excluded.COMMENT,
+                 CHANNELS=excluded.CHANNELS, DISC=excluded.DISC,
+                 TRACK=excluded.TRACK, RATING=excluded.RATING, DATE=excluded.DATE,
+                 RESOLUTION=excluded.RESOLUTION, THUMBNAIL=excluded.THUMBNAIL,
+                 ALBUM_ART=excluded.ALBUM_ART, ROTATION=excluded.ROTATION,
+                 DLNA_PN=excluded.DLNA_PN, MIME=excluded.MIME,
+                 DEVICE=excluded.DEVICE, INODE=excluded.INODE,
+                 CONTAINER=excluded.CONTAINER, VIDEO=excluded.VIDEO,
+                 AUDIO=excluded.AUDIO, AUDIO_STREAMS=excluded.AUDIO_STREAMS,
+                 HDR=excluded.HDR,
+                 STREAM_PROBE_REV=excluded.STREAM_PROBE_REV,
+                 PROBE_SIDECAR_FINGERPRINT=excluded.PROBE_SIDECAR_FINGERPRINT
+             WHERE DETAILS.PATH COLLATE BINARY IS NOT excluded.PATH COLLATE BINARY
+                OR DETAILS.SIZE IS NOT excluded.SIZE
+                OR DETAILS.TIMESTAMP IS NOT excluded.TIMESTAMP
+                OR DETAILS.TITLE COLLATE BINARY IS NOT excluded.TITLE COLLATE BINARY
+                OR DETAILS.DURATION COLLATE BINARY IS NOT excluded.DURATION COLLATE BINARY
+                OR DETAILS.BITRATE IS NOT excluded.BITRATE
+                OR DETAILS.SAMPLERATE IS NOT excluded.SAMPLERATE
+                OR DETAILS.CREATOR COLLATE BINARY IS NOT excluded.CREATOR COLLATE BINARY
+                OR DETAILS.ARTIST COLLATE BINARY IS NOT excluded.ARTIST COLLATE BINARY
+                OR DETAILS.ALBUM_ARTIST COLLATE BINARY IS NOT excluded.ALBUM_ARTIST COLLATE BINARY
+                OR DETAILS.COMPOSER COLLATE BINARY IS NOT excluded.COMPOSER COLLATE BINARY
+                OR DETAILS.CONTRIBUTOR COLLATE BINARY IS NOT excluded.CONTRIBUTOR COLLATE BINARY
+                OR DETAILS.ALBUM COLLATE BINARY IS NOT excluded.ALBUM COLLATE BINARY
+                OR DETAILS.GENRE COLLATE BINARY IS NOT excluded.GENRE COLLATE BINARY
+                OR DETAILS.OUTLINE COLLATE BINARY IS NOT excluded.OUTLINE COLLATE BINARY
+                OR DETAILS.PLOT COLLATE BINARY IS NOT excluded.PLOT COLLATE BINARY
+                OR DETAILS.COMMENT COLLATE BINARY IS NOT excluded.COMMENT COLLATE BINARY
+                OR DETAILS.CHANNELS IS NOT excluded.CHANNELS
+                OR DETAILS.DISC IS NOT excluded.DISC
+                OR DETAILS.TRACK IS NOT excluded.TRACK
+                OR DETAILS.RATING IS NOT excluded.RATING
+                OR DETAILS.DATE COLLATE BINARY IS NOT excluded.DATE COLLATE BINARY
+                OR DETAILS.RESOLUTION COLLATE BINARY IS NOT excluded.RESOLUTION COLLATE BINARY
+                OR DETAILS.THUMBNAIL IS NOT excluded.THUMBNAIL
+                OR DETAILS.ALBUM_ART IS NOT excluded.ALBUM_ART
+                OR DETAILS.ROTATION IS NOT excluded.ROTATION
+                OR DETAILS.DLNA_PN COLLATE BINARY IS NOT excluded.DLNA_PN COLLATE BINARY
+                OR DETAILS.MIME COLLATE BINARY IS NOT excluded.MIME COLLATE BINARY
+                OR DETAILS.DEVICE IS NOT excluded.DEVICE
+                OR DETAILS.INODE IS NOT excluded.INODE
+                OR DETAILS.CONTAINER COLLATE BINARY IS NOT excluded.CONTAINER COLLATE BINARY
+                OR DETAILS.VIDEO COLLATE BINARY IS NOT excluded.VIDEO COLLATE BINARY
+                OR DETAILS.AUDIO COLLATE BINARY IS NOT excluded.AUDIO COLLATE BINARY
+                OR DETAILS.AUDIO_STREAMS COLLATE BINARY IS NOT excluded.AUDIO_STREAMS COLLATE BINARY
+                OR DETAILS.HDR COLLATE BINARY IS NOT excluded.HDR COLLATE BINARY
+                OR DETAILS.STREAM_PROBE_REV IS NOT excluded.STREAM_PROBE_REV
+                OR DETAILS.PROBE_SIDECAR_FINGERPRINT COLLATE BINARY
+                   IS NOT excluded.PROBE_SIDECAR_FINGERPRINT COLLATE BINARY;
+
+             INSERT INTO PLAYLISTS (ID, NAME, PATH, ITEMS, FOUND, TIMESTAMP, DEVICE, INODE)
+             SELECT staged.ID, staged.NAME, staged.PATH, staged.ITEMS, staged.FOUND,
+                    staged.TIMESTAMP, staged.DEVICE, staged.INODE
+             FROM scan_stage.PLAYLISTS staged
+             JOIN scan_stage._scan_playlist_changes changed ON changed.ID = staged.ID
+             WHERE true
+             ON CONFLICT(ID) DO UPDATE SET
+                 NAME=excluded.NAME, PATH=excluded.PATH, ITEMS=excluded.ITEMS,
+                 FOUND=excluded.FOUND, TIMESTAMP=excluded.TIMESTAMP,
+                 DEVICE=excluded.DEVICE, INODE=excluded.INODE
+             WHERE PLAYLISTS.NAME COLLATE BINARY IS NOT excluded.NAME COLLATE BINARY
+                OR PLAYLISTS.PATH COLLATE BINARY IS NOT excluded.PATH COLLATE BINARY
+                OR PLAYLISTS.ITEMS IS NOT excluded.ITEMS
+                OR PLAYLISTS.FOUND IS NOT excluded.FOUND
+                OR PLAYLISTS.TIMESTAMP IS NOT excluded.TIMESTAMP
+                OR PLAYLISTS.DEVICE IS NOT excluded.DEVICE
+                OR PLAYLISTS.INODE IS NOT excluded.INODE;
+
+             DELETE FROM CAPTIONS
+             WHERE ID IN (SELECT ID FROM scan_stage._scan_caption_changes)
+               AND (
+                 EXISTS (
+                   SELECT live.PATH FROM CAPTIONS live WHERE live.ID = CAPTIONS.ID
+                   EXCEPT
+                   SELECT staged.PATH FROM scan_stage.CAPTIONS staged
+                   WHERE staged.ID = CAPTIONS.ID
+                 )
+                 OR EXISTS (
+                   SELECT staged.PATH FROM scan_stage.CAPTIONS staged
+                   WHERE staged.ID = CAPTIONS.ID
+                   EXCEPT
+                   SELECT live.PATH FROM CAPTIONS live WHERE live.ID = CAPTIONS.ID
+                 )
+               );
+             INSERT OR IGNORE INTO CAPTIONS (ID, PATH)
+             SELECT staged.ID, staged.PATH
+             FROM scan_stage.CAPTIONS staged
+             JOIN scan_stage._scan_caption_changes changed ON changed.ID = staged.ID;
+
+             DELETE FROM PLAYLIST_ITEMS
+             WHERE PLAYLIST_ID IN (SELECT ID FROM scan_stage._scan_playlist_changes)
+               AND (
+                 EXISTS (
+                   SELECT live.DETAIL_ID, live.POSITION
+                   FROM PLAYLIST_ITEMS live
+                   WHERE live.PLAYLIST_ID = PLAYLIST_ITEMS.PLAYLIST_ID
+                   EXCEPT
+                   SELECT staged.DETAIL_ID, staged.POSITION
+                   FROM scan_stage.PLAYLIST_ITEMS staged
+                   WHERE staged.PLAYLIST_ID = PLAYLIST_ITEMS.PLAYLIST_ID
+                 )
+                 OR EXISTS (
+                   SELECT staged.DETAIL_ID, staged.POSITION
+                   FROM scan_stage.PLAYLIST_ITEMS staged
+                   WHERE staged.PLAYLIST_ID = PLAYLIST_ITEMS.PLAYLIST_ID
+                   EXCEPT
+                   SELECT live.DETAIL_ID, live.POSITION
+                   FROM PLAYLIST_ITEMS live
+                   WHERE live.PLAYLIST_ID = PLAYLIST_ITEMS.PLAYLIST_ID
+                 )
+               );
+             INSERT OR IGNORE INTO PLAYLIST_ITEMS (PLAYLIST_ID, DETAIL_ID, POSITION)
+             SELECT staged.PLAYLIST_ID, staged.DETAIL_ID, staged.POSITION
+             FROM scan_stage.PLAYLIST_ITEMS staged
+             JOIN scan_stage._scan_playlist_changes changed
+               ON changed.ID = staged.PLAYLIST_ID;
+
+             INSERT INTO OBJECTS (ID, OBJECT_ID, PARENT_ID, REF_ID, CLASS, DETAIL_ID, NAME)
+             SELECT staged.ID, staged.OBJECT_ID, staged.PARENT_ID, staged.REF_ID,
+                    staged.CLASS, staged.DETAIL_ID, staged.NAME
+             FROM scan_stage.OBJECTS staged
+             JOIN scan_stage._scan_object_changes changed
+               ON changed.OBJECT_ID = staged.OBJECT_ID
+             WHERE true
+             ON CONFLICT(OBJECT_ID) DO UPDATE SET
+                 ID=excluded.ID, PARENT_ID=excluded.PARENT_ID,
+                 REF_ID=excluded.REF_ID, CLASS=excluded.CLASS,
+                 DETAIL_ID=excluded.DETAIL_ID, NAME=excluded.NAME
+             WHERE OBJECTS.ID IS NOT excluded.ID
+                OR OBJECTS.PARENT_ID COLLATE BINARY IS NOT excluded.PARENT_ID COLLATE BINARY
+                OR OBJECTS.REF_ID COLLATE BINARY IS NOT excluded.REF_ID COLLATE BINARY
+                OR OBJECTS.CLASS COLLATE BINARY IS NOT excluded.CLASS COLLATE BINARY
+                OR OBJECTS.DETAIL_ID IS NOT excluded.DETAIL_ID
+                OR OBJECTS.NAME COLLATE BINARY IS NOT excluded.NAME COLLATE BINARY;
+
+             DELETE FROM SETTINGS
+             WHERE KEY IN (SELECT KEY FROM scan_stage._scan_setting_changes)
+               AND KEY NOT IN ('updateID', 'scan_catalog_epoch')
+               AND NOT EXISTS (
+                 SELECT 1 FROM scan_stage.SETTINGS staged
+                 WHERE staged.KEY = SETTINGS.KEY
+               );
+             INSERT INTO SETTINGS (KEY, VALUE)
+             SELECT staged.KEY, staged.VALUE
+             FROM scan_stage.SETTINGS staged
+             JOIN scan_stage._scan_setting_changes changed ON changed.KEY = staged.KEY
+             WHERE staged.KEY NOT IN ('updateID', 'scan_catalog_epoch')
+             ON CONFLICT(KEY) DO UPDATE SET VALUE=excluded.VALUE
+             WHERE SETTINGS.VALUE COLLATE BINARY IS NOT excluded.VALUE COLLATE BINARY;
+
+             DELETE FROM ALBUM_ART
+             WHERE ID IN (SELECT ID FROM scan_stage._scan_album_art_changes)
+               AND NOT EXISTS (
+                 SELECT 1 FROM scan_stage.ALBUM_ART staged
+                 WHERE staged.ID = ALBUM_ART.ID
+               );",
+        )?;
+        if let Some(cutoff) = bookmark_expiry_cutoff {
+            self.conn.execute(
+                "DELETE FROM BOOKMARKS WHERE UPDATED_AT > 0 AND UPDATED_AT < ?1",
+                [cutoff],
+            )?;
+        }
+        for table in ["OBJECTS", "DETAILS", "ALBUM_ART", "PLAYLISTS"] {
+            self.conn.execute(
+                "UPDATE sqlite_sequence
+                 SET seq = MAX(seq, (SELECT seq FROM scan_stage.sqlite_sequence WHERE name = ?1))
+                 WHERE name = ?1
+                   AND EXISTS (SELECT 1 FROM scan_stage.sqlite_sequence WHERE name = ?1)",
+                [table],
+            )?;
+            self.conn.execute(
+                "INSERT INTO sqlite_sequence(name, seq)
+                 SELECT name, seq FROM scan_stage.sqlite_sequence staged
+                 WHERE staged.name = ?1
+                   AND NOT EXISTS (SELECT 1 FROM sqlite_sequence live WHERE live.name = ?1)",
+                [table],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn quick_check(&self) -> rusqlite::Result<String> {
+        self.conn
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+    }
+    pub fn open(path: &Path) -> rusqlite::Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        }
+        Self::open_with_control(path, std::time::Duration::from_secs(15), None)
+    }
+
+    pub fn open_with_cancellation(
+        path: &Path,
+        cancellation: crate::CancellationToken,
+    ) -> rusqlite::Result<Self> {
+        if cancellation.is_cancelled() {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+                Some("database open cancelled".into()),
+            ));
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        }
+        Self::open_with_control(
+            path,
+            std::time::Duration::from_millis(250),
+            Some(cancellation),
+        )
+    }
+
+    #[cfg(test)]
+    fn open_with_busy_timeout(
+        path: &Path,
+        busy_timeout: std::time::Duration,
+    ) -> rusqlite::Result<Self> {
+        Self::open_with_control(path, busy_timeout, None)
+    }
+
+    fn open_with_control(
+        path: &Path,
+        busy_timeout: std::time::Duration,
+        cancellation: Option<crate::CancellationToken>,
+    ) -> rusqlite::Result<Self> {
+        let mut conn = Connection::open(path)?;
+        conn.busy_timeout(busy_timeout)?;
+        if let Some(cancellation) = cancellation {
+            conn.progress_handler(1_000, Some(move || cancellation.is_cancelled()));
+        }
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+        )?;
+        conn.execute_batch(SCHEMA)?;
+        migrate_schema(&mut conn)?;
+        verify_integrity(&conn)?;
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub fn open_memory() -> rusqlite::Result<Self> {
+        let mut conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(SCHEMA)?;
+        migrate_schema(&mut conn)?;
+        Ok(Self {
+            conn,
+            path: PathBuf::from(":memory:"),
+        })
+    }
+
+    /// Open an already-initialized catalog for bounded request-time queries.
+    /// This deliberately performs no migrations or write pragmas.
+    pub fn open_read_only(path: &Path) -> rusqlite::Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub(crate) fn backup_to_path_cancelled(
+        &self,
+        path: &Path,
+        cancellation: &crate::CancellationToken,
+    ) -> crate::ScanResult<()> {
+        use rusqlite::backup::{Backup, StepResult};
+
+        let mut destination = Connection::open(path)?;
+        let backup = Backup::new(&self.conn, &mut destination)?;
+        let mut control =
+            BackupLoopControl::new(std::time::Instant::now(), std::time::Duration::from_secs(5));
+        loop {
+            control
+                .before_step(cancellation.is_cancelled())
+                .map_err(|_| crate::ScanError::Cancelled)?;
+            let step = backup.step(128)?;
+            let step = match step {
+                StepResult::Done => BackupStepKind::Done,
+                StepResult::More => BackupStepKind::More,
+                StepResult::Busy => BackupStepKind::Busy,
+                StepResult::Locked => BackupStepKind::Locked,
+                _ => BackupStepKind::Other,
+            };
+            #[cfg(test)]
+            if let Some(probe) = BACKUP_STEP_PROBES
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&self.path)
+                .cloned()
+            {
+                probe.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            #[cfg(test)]
+            if step == BackupStepKind::More {
+                if let Some(cancel) = BACKUP_CANCEL_AFTER_STEP
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&self.path)
+                {
+                    cancel.cancel();
+                }
+            }
+            let delay = control
+                .after_step(std::time::Instant::now(), backup.progress().remaining, step)
+                .map_err(|stop| match stop {
+                    BackupLoopStop::Cancelled => crate::ScanError::Cancelled,
+                    BackupLoopStop::NoProgress => {
+                        crate::ScanError::Database(rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                            Some("scan staging backup made no progress before its deadline".into()),
+                        ))
+                    }
+                })?;
+            let Some(delay) = delay else {
+                break;
+            };
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn query_children_page(
+        &self,
+        parent_id: &str,
+        sort: &[CatalogQuerySort],
+        default_order: CatalogDefaultOrder,
+        start: usize,
+        take: usize,
+    ) -> rusqlite::Result<CatalogQueryPage> {
+        let from = " FROM OBJECTS o LEFT JOIN DETAILS d ON o.DETAIL_ID = d.ID ";
+        let where_sql = " WHERE o.PARENT_ID = ? ";
+        let params = vec![Value::Text(parent_id.to_string())];
+        self.run_catalog_page(
+            from,
+            where_sql,
+            "",
+            &params,
+            sort,
+            default_order,
+            start,
+            take,
+        )
+    }
+
+    pub fn query_search_page(
+        &self,
+        root_id: &str,
+        query: &CatalogQuery,
+        start: usize,
+        take: usize,
+    ) -> rusqlite::Result<CatalogQueryPage> {
+        let all = root_id.is_empty() || root_id == ROOT_ID;
+        let cte = if all {
+            String::new()
+        } else {
+            "WITH RECURSIVE scope(OBJECT_ID) AS (\
+             SELECT ? UNION SELECT child.OBJECT_ID FROM OBJECTS child \
+             JOIN scope parent ON child.PARENT_ID = parent.OBJECT_ID) "
+                .to_string()
+        };
+        let mut values = Vec::new();
+        if !all {
+            values.push(Value::Text(root_id.to_string()));
+        }
+        let mut predicates = Vec::new();
+        for group in &query.groups {
+            let clauses: Vec<String> = group
+                .iter()
+                .map(|clause| catalog_clause_sql(clause, &mut values))
+                .collect();
+            predicates.push(format!("({})", clauses.join(" AND ")));
+        }
+        let criteria = if predicates.is_empty() {
+            "1".to_string()
+        } else {
+            format!("({})", predicates.join(" OR "))
+        };
+        let scope = if all {
+            "1".to_string()
+        } else {
+            "(o.OBJECT_ID IN (SELECT OBJECT_ID FROM scope) \
+              OR o.PARENT_ID IN (SELECT OBJECT_ID FROM scope) \
+              OR o.REF_ID IN (SELECT OBJECT_ID FROM scope))"
+                .to_string()
+        };
+        let where_sql = format!(
+            " WHERE o.OBJECT_ID <> '{}' AND {scope} AND {criteria} ",
+            ROOT_ID.replace('\'', "''")
+        );
+        let from = " FROM OBJECTS o LEFT JOIN DETAILS d ON o.DETAIL_ID = d.ID ";
+        self.run_catalog_page(
+            from,
+            &where_sql,
+            &cte,
+            &values,
+            &query.sort,
+            query.default_order,
+            start,
+            take,
+        )
+    }
+
+    /// Query one stable web-player page directly from `DETAILS`, selecting one
+    /// representative object per physical file. Virtual aliases therefore do
+    /// not multiply results, and later pages do not materialize or sort the
+    /// complete catalog in memory.
+    pub fn query_web_media_page(
+        &self,
+        kind: WebMediaKind,
+        query: &str,
+        sort: WebMediaSort,
+        start: usize,
+        take: usize,
+    ) -> rusqlite::Result<CatalogQueryPage> {
+        let mime = match kind {
+            WebMediaKind::All => "(d.MIME LIKE 'video/%' OR d.MIME LIKE 'audio/%')",
+            WebMediaKind::Video => "d.MIME LIKE 'video/%'",
+            WebMediaKind::Audio => "d.MIME LIKE 'audio/%'",
+        };
+        let order = match sort {
+            WebMediaSort::Title => "LOWER(COALESCE(NULLIF(d.TITLE, ''), d.PATH)), d.ID",
+            WebMediaSort::DateDescending => {
+                "COALESCE(d.DATE, '') DESC, LOWER(COALESCE(NULLIF(d.TITLE, ''), d.PATH)), d.ID"
+            }
+            WebMediaSort::EpisodeTrack => {
+                "LOWER(COALESCE(d.ALBUM, '')), COALESCE(d.DISC, 0), COALESCE(d.TRACK, 0), \
+                 LOWER(COALESCE(NULLIF(d.TITLE, ''), d.PATH)), d.ID"
+            }
+        };
+        let escaped = query
+            .to_lowercase()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let needle = format!("%{escaped}%");
+        let cte = format!(
+            "WITH matching AS (\
+               SELECT MIN(d.ID) AS detail_id \
+               FROM DETAILS d \
+               WHERE {mime} AND (\
+                 LOWER(COALESCE(d.TITLE, '')) LIKE ?1 ESCAPE '\\' OR \
+                 LOWER(COALESCE(d.ARTIST, '')) LIKE ?1 ESCAPE '\\' OR \
+                 LOWER(COALESCE(d.ALBUM_ARTIST, '')) LIKE ?1 ESCAPE '\\' OR \
+                 LOWER(COALESCE(d.ALBUM, '')) LIKE ?1 ESCAPE '\\' OR \
+                 LOWER(COALESCE(d.PATH, '')) LIKE ?1 ESCAPE '\\'\
+               ) \
+               GROUP BY CASE WHEN COALESCE(d.INODE, 0) = 0 \
+                 THEN 'id:' || d.ID ELSE d.DEVICE || ':' || d.INODE END\
+             ), representatives AS (\
+               SELECT m.detail_id, COALESCE(\
+                 MIN(CASE WHEN o.REF_ID IS NULL THEN o.OBJECT_ID END), \
+                 MIN(o.OBJECT_ID)\
+               ) AS object_id \
+               FROM matching m JOIN OBJECTS o ON o.DETAIL_ID = m.detail_id \
+               GROUP BY m.detail_id\
+             ) "
+        );
+        let population_i64: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM OBJECTS WHERE OBJECT_ID <> ?1",
+            [ROOT_ID],
+            |row| row.get(0),
+        )?;
+        let total_i64: i64 = self
+            .conn
+            .prepare_cached(&format!("{cte}SELECT COUNT(*) FROM representatives"))?
+            .query_row([&needle], |row| row.get(0))?;
+        let total = u32::try_from(total_i64.max(0)).unwrap_or(u32::MAX);
+        let population = u32::try_from(population_i64.max(0)).unwrap_or(u32::MAX);
+        if take == 0 || page_start_at_or_past_total(start, total_i64) {
+            return Ok(CatalogQueryPage {
+                object_ids: Vec::new(),
+                total,
+                population,
+            });
+        }
+        let sql = format!(
+            "{cte}SELECT r.object_id FROM representatives r \
+             JOIN DETAILS d ON d.ID = r.detail_id \
+             ORDER BY {order} LIMIT {} OFFSET {}",
+            sqlite_page_value(take),
+            sqlite_page_value(start)
+        );
+        let mut statement = self.conn.prepare_cached(&sql)?;
+        let object_ids = statement
+            .query_map([&needle], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(CatalogQueryPage {
+            object_ids,
+            total,
+            population,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_catalog_page(
+        &self,
+        from: &str,
+        where_sql: &str,
+        cte: &str,
+        values: &[Value],
+        sort: &[CatalogQuerySort],
+        default_order: CatalogDefaultOrder,
+        start: usize,
+        take: usize,
+    ) -> rusqlite::Result<CatalogQueryPage> {
+        let population_i64: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM OBJECTS WHERE OBJECT_ID <> ?1",
+            [ROOT_ID],
+            |row| row.get(0),
+        )?;
+        let count_sql = format!("{cte}SELECT COUNT(*){from}{where_sql}");
+        let total_i64: i64 = self
+            .conn
+            .prepare_cached(&count_sql)?
+            .query_row(params_from_iter(values.iter()), |row| row.get(0))?;
+        let total = u32::try_from(total_i64.max(0)).unwrap_or(u32::MAX);
+        let population = u32::try_from(population_i64.max(0)).unwrap_or(u32::MAX);
+        if take == 0 || page_start_at_or_past_total(start, total_i64) {
+            return Ok(CatalogQueryPage {
+                object_ids: Vec::new(),
+                total,
+                population,
+            });
+        }
+        let order = catalog_order_sql(sort, default_order);
+        let page_sql = format!(
+            "{cte}SELECT o.OBJECT_ID{from}{where_sql} ORDER BY {order} LIMIT {} OFFSET {}",
+            sqlite_page_value(take),
+            sqlite_page_value(start)
+        );
+        let mut stmt = self.conn.prepare_cached(&page_sql)?;
+        let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        let object_ids = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(CatalogQueryPage {
+            object_ids,
+            total,
+            population,
+        })
+    }
+
+    pub fn transaction(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        self.conn.unchecked_transaction()
+    }
+
+    pub(crate) fn immediate_transaction(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+    pub fn find_detail_by_inode(&self, device: i64, inode: i64) -> rusqlite::Result<Option<i64>> {
+        Ok(self
+            .find_inode_source(device, inode)?
+            .map(|source| source.id))
+    }
+
+    pub fn remove_detail_id(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM OBJECTS WHERE DETAIL_ID = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM CAPTIONS WHERE ID = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM BOOKMARKS WHERE ID = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM DETAILS WHERE ID = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Find a current inode/timestamp source so aliases can reuse
+    /// metadata without re-probing when the original is still current.
+    pub fn find_inode_source(
+        &self,
+        device: i64,
+        inode: i64,
+    ) -> rusqlite::Result<Option<InodeSource>> {
+        self.find_inode_source_inner(device, inode, None)
+    }
+
+    pub(crate) fn find_inode_source_with_probe_sidecar(
+        &self,
+        device: i64,
+        inode: i64,
+        fingerprint: &str,
+    ) -> rusqlite::Result<Option<InodeSource>> {
+        self.find_inode_source_inner(device, inode, Some(fingerprint))
+    }
+
+    fn find_inode_source_inner(
+        &self,
+        device: i64,
+        inode: i64,
+        fingerprint: Option<&str>,
+    ) -> rusqlite::Result<Option<InodeSource>> {
+        if inode == 0 {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT ID, SIZE, TIMESTAMP, PATH, MIME, STREAM_PROBE_REV FROM DETAILS
+                 WHERE DEVICE = ?1 AND INODE = ?2 AND MIME IS NOT NULL
+                   AND (?3 IS NULL OR PROBE_SIDECAR_FINGERPRINT COLLATE BINARY = ?3)
+                 ORDER BY STREAM_PROBE_REV DESC, ID
+                 LIMIT 1",
+                params![device, inode, fingerprint],
+                |r| {
+                    Ok(InodeSource {
+                        id: r.get(0)?,
+                        size: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                        timestamp: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        path: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        mime: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        stream_probe_rev: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Clone metadata for an alias path: new DETAILS row, copied codec/date
+    /// columns, new PATH/SIZE/TIMESTAMP/DEVICE/INODE.
+    pub fn clone_detail_for_path(
+        &self,
+        src_id: i64,
+        path: &str,
+        size: i64,
+        mtime: i64,
+        device: i64,
+        inode: i64,
+    ) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO DETAILS
+               (PATH, SIZE, TIMESTAMP, TITLE, DURATION, BITRATE, SAMPLERATE,
+                CREATOR, ARTIST, ALBUM_ARTIST, COMPOSER, CONTRIBUTOR,
+                ALBUM, GENRE, OUTLINE, PLOT, COMMENT, CHANNELS, DISC, TRACK, RATING,
+                DATE, RESOLUTION, THUMBNAIL, ALBUM_ART, ROTATION, DLNA_PN, MIME,
+                DEVICE, INODE, CONTAINER, VIDEO, AUDIO, AUDIO_STREAMS, HDR,
+                STREAM_PROBE_REV, PROBE_SIDECAR_FINGERPRINT)
+             SELECT ?1, ?2, ?3, TITLE, DURATION, BITRATE, SAMPLERATE,
+                CREATOR, ARTIST, ALBUM_ARTIST, COMPOSER, CONTRIBUTOR,
+                ALBUM, GENRE, OUTLINE, PLOT, COMMENT, CHANNELS, DISC, TRACK, RATING,
+                DATE, RESOLUTION, THUMBNAIL, ALBUM_ART, ROTATION, DLNA_PN, MIME,
+                ?4, ?5, CONTAINER, VIDEO, AUDIO, AUDIO_STREAMS, HDR,
+                STREAM_PROBE_REV, PROBE_SIDECAR_FINGERPRINT
+             FROM DETAILS WHERE ID = ?6",
+            params![path, size, mtime, device, inode, src_id],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        let n: i64 =
+            self.conn
+                .query_row("SELECT count(*) FROM CAPTIONS WHERE ID = ?1", [id], |r| {
+                    r.get(0)
+                })?;
+        if n == 0 {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO CAPTIONS (ID, PATH)
+                 SELECT ?1, PATH FROM CAPTIONS WHERE ID = ?2",
+                params![id, src_id],
+            )?;
+        }
+        Ok(id)
+    }
+
+    pub fn all_detail_stats(&self) -> rusqlite::Result<Vec<DetailStat>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT PATH, ID, SIZE, TIMESTAMP, DEVICE, INODE FROM DETAILS WHERE PATH IS NOT NULL AND MIME IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(DetailStat {
+                path: r.get(0)?,
+                id: r.get(1)?,
+                size: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                timestamp: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                device: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                inode: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn detail_stats_for_paths(&self, paths: &[String]) -> rusqlite::Result<Vec<DetailStat>> {
+        let mut statement = self.conn.prepare(
+            "SELECT PATH, ID, SIZE, TIMESTAMP, DEVICE, INODE
+             FROM DETAILS
+             WHERE PATH = ?1 AND MIME IS NOT NULL",
+        )?;
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for path in paths {
+            if !seen.insert(path) {
+                continue;
+            }
+            let row = statement
+                .query_row([path], |row| {
+                    Ok(DetailStat {
+                        path: row.get(0)?,
+                        id: row.get(1)?,
+                        size: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                        timestamp: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                        device: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                        inode: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                    })
+                })
+                .optional()?;
+            if let Some(row) = row {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn video_detail_titles(&self) -> rusqlite::Result<Vec<VideoDetailTitle>> {
+        let mut statement = self.conn.prepare(
+            "SELECT ID, PATH, COALESCE(TITLE, ''), COALESCE(DEVICE, 0), COALESCE(INODE, 0)
+             FROM DETAILS
+             WHERE PATH IS NOT NULL AND MIME LIKE 'video/%'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(VideoDetailTitle {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                title: row.get(2)?,
+                device: row.get(3)?,
+                inode: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn update_detail_title(&self, id: i64, title: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET TITLE = ?1 WHERE ID = ?2",
+            params![title, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn find_detail_by_path(&self, path: &str) -> rusqlite::Result<Option<ExistingDetail>> {
+        self.conn
+            .query_row(
+                "SELECT ID, SIZE, TIMESTAMP,
+                        COALESCE(DEVICE, 0), COALESCE(INODE, 0)
+                 FROM DETAILS WHERE PATH = ?1 LIMIT 1",
+                [path],
+                |r| {
+                    Ok(ExistingDetail {
+                        id: r.get(0)?,
+                        size: r.get(1)?,
+                        timestamp: r.get(2)?,
+                        device: r.get(3)?,
+                        inode: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    pub fn details_with_inode(
+        &self,
+        device: i64,
+        inode: i64,
+    ) -> rusqlite::Result<Vec<(i64, String)>> {
+        if inode == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT ID, PATH FROM DETAILS
+             WHERE DEVICE = ?1 AND INODE = ?2 AND MIME IS NOT NULL AND PATH IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![device, inode], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn find_inode_probe_source(
+        &self,
+        device: i64,
+        inode: i64,
+        not_id: i64,
+    ) -> rusqlite::Result<Option<i64>> {
+        self.find_inode_probe_source_inner(device, inode, not_id, None)
+    }
+
+    pub(crate) fn find_inode_probe_source_with_sidecar(
+        &self,
+        device: i64,
+        inode: i64,
+        not_id: i64,
+        fingerprint: &str,
+    ) -> rusqlite::Result<Option<i64>> {
+        self.find_inode_probe_source_inner(device, inode, not_id, Some(fingerprint))
+    }
+
+    fn find_inode_probe_source_inner(
+        &self,
+        device: i64,
+        inode: i64,
+        not_id: i64,
+        fingerprint: Option<&str>,
+    ) -> rusqlite::Result<Option<i64>> {
+        if inode == 0 {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT ID FROM DETAILS
+                 WHERE DEVICE = ?1 AND INODE = ?2 AND ID != ?3
+                   AND MIME IS NOT NULL
+                   AND STREAM_PROBE_REV >= ?4
+                   AND SIZE = (SELECT SIZE FROM DETAILS WHERE ID = ?3)
+                   AND TIMESTAMP = (SELECT TIMESTAMP FROM DETAILS WHERE ID = ?3)
+                   AND (?5 IS NULL OR PROBE_SIDECAR_FINGERPRINT COLLATE BINARY = ?5)
+                 LIMIT 1",
+                params![device, inode, not_id, STREAM_PROBE_REVISION, fingerprint],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+    }
+
+    pub fn copy_stream_from(&self, src: i64, dest: i64) -> rusqlite::Result<()> {
+        self.copy_stream_from_inner(src, dest, false)
+    }
+
+    pub(crate) fn copy_stream_from_matching_probe_sidecar(
+        &self,
+        src: i64,
+        dest: i64,
+    ) -> rusqlite::Result<()> {
+        self.copy_stream_from_inner(src, dest, true)
+    }
+
+    fn copy_stream_from_inner(
+        &self,
+        src: i64,
+        dest: i64,
+        require_matching_probe_sidecar: bool,
+    ) -> rusqlite::Result<()> {
+        if src == dest {
+            return Ok(());
+        }
+        self.conn.execute(
+            "UPDATE DETAILS SET
+                 DURATION = (SELECT DURATION FROM DETAILS WHERE ID = ?1),
+                 BITRATE = (SELECT BITRATE FROM DETAILS WHERE ID = ?1),
+                 RESOLUTION = (SELECT RESOLUTION FROM DETAILS WHERE ID = ?1),
+                 CHANNELS = (SELECT CHANNELS FROM DETAILS WHERE ID = ?1),
+                 SAMPLERATE = (SELECT SAMPLERATE FROM DETAILS WHERE ID = ?1),
+                 CONTAINER = (SELECT CONTAINER FROM DETAILS WHERE ID = ?1),
+                 VIDEO = (SELECT VIDEO FROM DETAILS WHERE ID = ?1),
+                 AUDIO = (SELECT AUDIO FROM DETAILS WHERE ID = ?1),
+                 HDR = (SELECT HDR FROM DETAILS WHERE ID = ?1),
+                 AUDIO_STREAMS = (SELECT AUDIO_STREAMS FROM DETAILS WHERE ID = ?1),
+                 DLNA_PN = (SELECT DLNA_PN FROM DETAILS WHERE ID = ?1),
+                 STREAM_PROBE_REV = (SELECT STREAM_PROBE_REV FROM DETAILS WHERE ID = ?1)
+             WHERE ID = ?2
+               AND (?3 = 0 OR PROBE_SIDECAR_FINGERPRINT COLLATE BINARY IS
+                   (SELECT PROBE_SIDECAR_FINGERPRINT COLLATE BINARY
+                    FROM DETAILS WHERE ID = ?1))",
+            params![src, dest, require_matching_probe_sidecar],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_album_art(&self, path: &str) -> rusqlite::Result<i64> {
+        if let Some(id) = self
+            .conn
+            .query_row("SELECT ID FROM ALBUM_ART WHERE PATH = ?1", [path], |r| {
+                r.get(0)
+            })
+            .optional()?
+        {
+            return Ok(id);
+        }
+        self.conn
+            .execute("INSERT INTO ALBUM_ART (PATH) VALUES (?1)", [path])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn set_detail_album_art(&self, id: i64, art_id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET ALBUM_ART = ?1 WHERE ID = ?2",
+            params![art_id, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_detail_album_art(&self, id: i64) -> rusqlite::Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE DETAILS SET ALBUM_ART = NULL
+             WHERE ID = ?1 AND COALESCE(ALBUM_ART, 0) != 0",
+            [id],
+        )? > 0;
+        if changed {
+            self.copy_album_art_to_inode_aliases(id)?;
+        }
+        Ok(changed)
+    }
+
+    /// Remove database rows no longer referenced by any detail and return the
+    /// backing paths. The caller may delete only paths it owns (cache files),
+    /// never user-provided artwork.
+    pub fn prune_unreferenced_album_art(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.PATH FROM ALBUM_ART a
+             WHERE NOT EXISTS (
+               SELECT 1 FROM DETAILS d WHERE COALESCE(d.ALBUM_ART, 0) = a.ID
+             )",
+        )?;
+        let paths = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        self.conn.execute(
+            "DELETE FROM ALBUM_ART
+             WHERE NOT EXISTS (
+               SELECT 1 FROM DETAILS d WHERE COALESCE(d.ALBUM_ART, 0) = ALBUM_ART.ID
+             )",
+            [],
+        )?;
+        Ok(paths)
+    }
+
+    pub fn detail_album_art(&self, id: i64) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "SELECT COALESCE(ALBUM_ART, 0) FROM DETAILS WHERE ID = ?1",
+            [id],
+            |r| r.get(0),
+        )
+    }
+
+    pub fn album_art_path(&self, id: i64) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row("SELECT PATH FROM ALBUM_ART WHERE ID = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()
+    }
+
+    pub fn copy_album_art_to_inode_aliases(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET
+                 ALBUM_ART = (SELECT ALBUM_ART FROM DETAILS WHERE ID = ?1)
+             WHERE DEVICE = (SELECT DEVICE FROM DETAILS WHERE ID = ?1)
+               AND INODE = (SELECT INODE FROM DETAILS WHERE ID = ?1)
+               AND INODE != 0
+               AND ID != ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_detail_creator_if_empty(&self, id: i64, creator: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET CREATOR = ?1
+             WHERE ID = ?2 AND (CREATOR IS NULL OR CREATOR = '')",
+            params![creator, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_detail_nfo(&self, id: i64, nfo: &NfoMeta) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET
+                 TITLE = COALESCE(?1, TITLE),
+                 CREATOR = COALESCE(?2, CREATOR),
+                 ARTIST = COALESCE(?3, ARTIST),
+                 ALBUM = COALESCE(?4, ALBUM),
+                 GENRE = COALESCE(?5, GENRE),
+                 OUTLINE = ?6,
+                 PLOT = ?7,
+                 DISC = COALESCE(?8, DISC),
+                 TRACK = COALESCE(?9, TRACK),
+                 DATE = COALESCE(?10, DATE)
+             WHERE ID = ?11",
+            params![
+                nfo.title,
+                nfo.creator,
+                nfo.artist,
+                nfo.showtitle,
+                nfo.genre,
+                nfo.about,
+                nfo.plot,
+                nfo.disc,
+                nfo.track,
+                nfo.date,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_detail_nfo_descriptions(&self, id: i64) -> rusqlite::Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE DETAILS SET OUTLINE = NULL, PLOT = NULL
+             WHERE ID = ?1 AND (OUTLINE IS NOT NULL OR PLOT IS NOT NULL)",
+            [id],
+        )? > 0)
+    }
+
+    pub fn update_detail_embedded_tags(
+        &self,
+        id: i64,
+        tags: &EmbeddedTags,
+    ) -> rusqlite::Result<()> {
+        let date = tags
+            .date
+            .as_deref()
+            .map(rusty_dlna_protocol::w3c_normalize_date);
+        let camera = match (
+            tags.camera_make
+                .as_deref()
+                .filter(|value| !value.is_empty()),
+            tags.camera_model
+                .as_deref()
+                .filter(|value| !value.is_empty()),
+        ) {
+            (Some(make), Some(model)) if !model.starts_with(make) => {
+                Some(format!("{make} {model}"))
+            }
+            (Some(make), _) => Some(make.to_string()),
+            (_, Some(model)) => Some(model.to_string()),
+            _ => None,
+        };
+        self.conn.execute(
+            "UPDATE DETAILS SET
+                 TITLE = CASE WHEN COALESCE(MIME, '') LIKE 'video/%'
+                     THEN TITLE ELSE COALESCE(NULLIF(?1, ''), TITLE) END,
+                 ARTIST = COALESCE(NULLIF(?2, ''), ARTIST),
+                 ALBUM_ARTIST = COALESCE(NULLIF(?3, ''), ALBUM_ARTIST),
+                 ALBUM = COALESCE(NULLIF(?4, ''), ALBUM),
+                 GENRE = COALESCE(NULLIF(?5, ''), GENRE),
+                 COMPOSER = COALESCE(NULLIF(?6, ''), COMPOSER),
+                 CONTRIBUTOR = COALESCE(NULLIF(?7, ''), CONTRIBUTOR),
+                 DATE = COALESCE(NULLIF(?8, ''), DATE),
+                 COMMENT = COALESCE(NULLIF(?9, ''), COMMENT),
+                 DISC = COALESCE(?10, DISC),
+                 TRACK = COALESCE(?11, TRACK),
+                 RATING = COALESCE(?12, RATING),
+                 CREATOR = COALESCE(NULLIF(?13, ''), CREATOR),
+                 ROTATION = COALESCE(?14, ROTATION)
+             WHERE ID = ?15",
+            params![
+                tags.title,
+                tags.artist,
+                tags.album_artist,
+                tags.album,
+                tags.genre,
+                tags.composer,
+                tags.contributor,
+                date,
+                tags.comment,
+                tags.disc,
+                tags.track,
+                tags.rating,
+                camera,
+                tags.rotation,
+                id,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn reset_detail_tags_to_file_defaults(
+        &self,
+        id: i64,
+        title: &str,
+        date: &str,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET TITLE = ?1, DATE = ?2, CREATOR = NULL,
+                 ARTIST = NULL, ALBUM_ARTIST = NULL, ALBUM = NULL, GENRE = NULL,
+                 COMPOSER = NULL, CONTRIBUTOR = NULL, OUTLINE = NULL, PLOT = NULL,
+                 COMMENT = NULL,
+                 DISC = NULL, TRACK = NULL, RATING = NULL, ROTATION = NULL
+             WHERE ID = ?3",
+            params![title, date, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn copy_embedded_tags_to_inode_aliases(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET
+                 TITLE = CASE WHEN COALESCE(MIME, '') LIKE 'video/%'
+                     THEN TITLE ELSE (SELECT TITLE FROM DETAILS WHERE ID = ?1) END,
+                 ARTIST = (SELECT ARTIST FROM DETAILS WHERE ID = ?1),
+                 ALBUM_ARTIST = (SELECT ALBUM_ARTIST FROM DETAILS WHERE ID = ?1),
+                 ALBUM = (SELECT ALBUM FROM DETAILS WHERE ID = ?1),
+                 GENRE = (SELECT GENRE FROM DETAILS WHERE ID = ?1),
+                 COMPOSER = (SELECT COMPOSER FROM DETAILS WHERE ID = ?1),
+                 CONTRIBUTOR = (SELECT CONTRIBUTOR FROM DETAILS WHERE ID = ?1),
+                 DATE = (SELECT DATE FROM DETAILS WHERE ID = ?1),
+                 OUTLINE = (SELECT OUTLINE FROM DETAILS WHERE ID = ?1),
+                 PLOT = (SELECT PLOT FROM DETAILS WHERE ID = ?1),
+                 COMMENT = (SELECT COMMENT FROM DETAILS WHERE ID = ?1),
+                 DISC = (SELECT DISC FROM DETAILS WHERE ID = ?1),
+                 TRACK = (SELECT TRACK FROM DETAILS WHERE ID = ?1),
+                 RATING = (SELECT RATING FROM DETAILS WHERE ID = ?1),
+                 CREATOR = (SELECT CREATOR FROM DETAILS WHERE ID = ?1),
+                 ROTATION = (SELECT ROTATION FROM DETAILS WHERE ID = ?1)
+             WHERE DEVICE = (SELECT DEVICE FROM DETAILS WHERE ID = ?1)
+               AND INODE = (SELECT INODE FROM DETAILS WHERE ID = ?1)
+               AND INODE != 0 AND ID != ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn copy_nfo_to_inode_aliases(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET
+                 TITLE = (SELECT TITLE FROM DETAILS WHERE ID = ?1),
+                 CREATOR = (SELECT CREATOR FROM DETAILS WHERE ID = ?1),
+                 ARTIST = (SELECT ARTIST FROM DETAILS WHERE ID = ?1),
+                 ALBUM = (SELECT ALBUM FROM DETAILS WHERE ID = ?1),
+                 GENRE = (SELECT GENRE FROM DETAILS WHERE ID = ?1),
+                 OUTLINE = (SELECT OUTLINE FROM DETAILS WHERE ID = ?1),
+                 PLOT = (SELECT PLOT FROM DETAILS WHERE ID = ?1),
+                 DISC = (SELECT DISC FROM DETAILS WHERE ID = ?1),
+                 TRACK = (SELECT TRACK FROM DETAILS WHERE ID = ?1),
+                 DATE = (SELECT DATE FROM DETAILS WHERE ID = ?1)
+             WHERE DEVICE = (SELECT DEVICE FROM DETAILS WHERE ID = ?1)
+               AND INODE = (SELECT INODE FROM DETAILS WHERE ID = ?1)
+               AND INODE != 0
+               AND ID != ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_detail(&self, detail: NewDetail<'_>) -> rusqlite::Result<i64> {
+        let NewDetail {
+            path,
+            size,
+            timestamp,
+            title,
+            date,
+            mime,
+            device,
+            inode,
+            dlna_pn,
+        } = detail;
+        self.conn.execute(
+            "INSERT INTO DETAILS (PATH, SIZE, TIMESTAMP, TITLE, DATE, MIME, DEVICE, INODE, DLNA_PN)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![path, size, timestamp, title, date, mime, device, inode, dlna_pn],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn update_detail_av_meta(
+        &self,
+        id: i64,
+        duration: Option<&str>,
+        bitrate: Option<i64>,
+        resolution: Option<&str>,
+        channels: Option<i64>,
+        samplerate: Option<i64>,
+    ) -> rusqlite::Result<()> {
+        self.update_detail_stream(
+            id,
+            DetailStreamUpdate {
+                duration,
+                bitrate,
+                resolution,
+                channels,
+                samplerate,
+                ..DetailStreamUpdate::default()
+            },
+        )
+    }
+
+    pub fn update_detail_stream(
+        &self,
+        id: i64,
+        stream: DetailStreamUpdate<'_>,
+    ) -> rusqlite::Result<()> {
+        let DetailStreamUpdate {
+            duration,
+            bitrate,
+            resolution,
+            channels,
+            samplerate,
+            container,
+            video,
+            audio,
+            hdr,
+        } = stream;
+        self.conn.execute(
+            "UPDATE DETAILS SET DURATION = COALESCE(?1, DURATION),
+                 BITRATE = COALESCE(?2, BITRATE),
+                 RESOLUTION = COALESCE(?3, RESOLUTION),
+                 CHANNELS = COALESCE(?4, CHANNELS),
+                 SAMPLERATE = COALESCE(?5, SAMPLERATE),
+                 CONTAINER = COALESCE(?6, CONTAINER),
+                 VIDEO = COALESCE(?7, VIDEO),
+                 AUDIO = COALESCE(?8, AUDIO),
+                 HDR = COALESCE(?9, HDR)
+             WHERE ID = ?10",
+            params![
+                duration, bitrate, resolution, channels, samplerate, container, video, audio, hdr,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn replace_detail_stream(
+        &self,
+        id: i64,
+        stream: DetailStreamUpdate<'_>,
+    ) -> rusqlite::Result<()> {
+        let DetailStreamUpdate {
+            duration,
+            bitrate,
+            resolution,
+            channels,
+            samplerate,
+            container,
+            video,
+            audio,
+            hdr,
+        } = stream;
+        self.conn.execute(
+            "UPDATE DETAILS SET DURATION = ?1, BITRATE = ?2, RESOLUTION = ?3,
+                 CHANNELS = ?4, SAMPLERATE = ?5, CONTAINER = ?6, VIDEO = ?7,
+                 AUDIO = ?8, HDR = ?9
+             WHERE ID = ?10
+               AND (DURATION COLLATE BINARY IS NOT ?1 COLLATE BINARY
+                 OR BITRATE IS NOT ?2
+                 OR RESOLUTION COLLATE BINARY IS NOT ?3 COLLATE BINARY
+                 OR CHANNELS IS NOT ?4
+                 OR SAMPLERATE IS NOT ?5
+                 OR CONTAINER COLLATE BINARY IS NOT ?6 COLLATE BINARY
+                 OR VIDEO COLLATE BINARY IS NOT ?7 COLLATE BINARY
+                 OR AUDIO COLLATE BINARY IS NOT ?8 COLLATE BINARY
+                 OR HDR COLLATE BINARY IS NOT ?9 COLLATE BINARY)",
+            params![
+                duration, bitrate, resolution, channels, samplerate, container, video, audio, hdr,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn detail_probe_sidecar_fingerprint(
+        &self,
+        id: i64,
+    ) -> rusqlite::Result<Option<String>> {
+        Ok(self.detail_probe_state(id)?.0)
+    }
+
+    pub(crate) fn detail_probe_state(&self, id: i64) -> rusqlite::Result<(Option<String>, i64)> {
+        self.conn.query_row(
+            "SELECT PROBE_SIDECAR_FINGERPRINT, COALESCE(STREAM_PROBE_REV, 0)
+             FROM DETAILS WHERE ID = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+    }
+
+    pub(crate) fn set_detail_probe_sidecar_fingerprint(
+        &self,
+        id: i64,
+        fingerprint: &str,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET PROBE_SIDECAR_FINGERPRINT = ?1
+             WHERE ID = ?2
+               AND PROBE_SIDECAR_FINGERPRINT COLLATE BINARY IS NOT ?1 COLLATE BINARY",
+            params![fingerprint, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_detail_audio_streams(
+        &self,
+        id: i64,
+        audio_streams: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        let audio_streams = audio_streams.filter(|value| !value.is_empty());
+        self.conn.execute(
+            "UPDATE DETAILS SET AUDIO_STREAMS = ?1
+             WHERE ID = ?2
+               AND AUDIO_STREAMS COLLATE BINARY IS NOT ?1 COLLATE BINARY",
+            params![audio_streams, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn copy_stream_to_inode_aliases(&self, id: i64) -> rusqlite::Result<()> {
+        self.copy_stream_to_inode_aliases_inner(id, false)
+    }
+
+    pub(crate) fn copy_stream_to_matching_probe_sidecar_aliases(
+        &self,
+        id: i64,
+    ) -> rusqlite::Result<()> {
+        self.copy_stream_to_inode_aliases_inner(id, true)
+    }
+
+    fn copy_stream_to_inode_aliases_inner(
+        &self,
+        id: i64,
+        require_matching_probe_sidecar: bool,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET
+                 DURATION = (SELECT DURATION FROM DETAILS WHERE ID = ?1),
+                 BITRATE = (SELECT BITRATE FROM DETAILS WHERE ID = ?1),
+                 RESOLUTION = (SELECT RESOLUTION FROM DETAILS WHERE ID = ?1),
+                 CHANNELS = (SELECT CHANNELS FROM DETAILS WHERE ID = ?1),
+                 SAMPLERATE = (SELECT SAMPLERATE FROM DETAILS WHERE ID = ?1),
+                 CONTAINER = (SELECT CONTAINER FROM DETAILS WHERE ID = ?1),
+                 VIDEO = (SELECT VIDEO FROM DETAILS WHERE ID = ?1),
+                 AUDIO = (SELECT AUDIO FROM DETAILS WHERE ID = ?1),
+                 HDR = (SELECT HDR FROM DETAILS WHERE ID = ?1),
+                 AUDIO_STREAMS = (SELECT AUDIO_STREAMS FROM DETAILS WHERE ID = ?1),
+                 DLNA_PN = (SELECT DLNA_PN FROM DETAILS WHERE ID = ?1),
+                 STREAM_PROBE_REV = (SELECT STREAM_PROBE_REV FROM DETAILS WHERE ID = ?1)
+             WHERE DEVICE = (SELECT DEVICE FROM DETAILS WHERE ID = ?1)
+               AND INODE = (SELECT INODE FROM DETAILS WHERE ID = ?1)
+               AND INODE != 0
+               AND ID != ?1
+               AND (?2 = 0 OR PROBE_SIDECAR_FINGERPRINT COLLATE BINARY IS
+                   (SELECT PROBE_SIDECAR_FINGERPRINT COLLATE BINARY
+                    FROM DETAILS WHERE ID = ?1))",
+            params![id, require_matching_probe_sidecar],
+        )?;
+        Ok(())
+    }
+
+    pub fn details_missing_stream_meta(&self) -> rusqlite::Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ID, PATH FROM DETAILS
+             WHERE ID IN (
+               SELECT MIN(ID) FROM DETAILS
+               WHERE MIME IS NOT NULL AND PATH IS NOT NULL
+                 AND (STREAM_PROBE_REV < ?1 OR PROBE_SIDECAR_FINGERPRINT IS NULL)
+               GROUP BY DEVICE, INODE,
+                        CASE WHEN COALESCE(INODE, 0) = 0 THEN ID ELSE 0 END
+             )
+             ORDER BY ID",
+        )?;
+        let rows = stmt.query_map([STREAM_PROBE_REVISION], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn stream_probe_candidate_batch(
+        &self,
+        nullable_identity: bool,
+        after: (i64, i64, i64),
+        limit: usize,
+    ) -> rusqlite::Result<Vec<StreamProbeCandidate>> {
+        let sql = if nullable_identity {
+            STREAM_PROBE_NULLABLE_BATCH_SQL
+        } else {
+            STREAM_PROBE_NONNULL_BATCH_SQL
+        };
+        let (after_device, after_inode, after_id) = after;
+        let mut statement = self.conn.prepare(sql)?;
+        let rows = statement.query_map(
+            params![
+                STREAM_PROBE_REVISION,
+                after_device,
+                after_inode,
+                after_id,
+                limit
+            ],
+            |row| {
+                Ok(StreamProbeCandidate {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    device: row.get(2)?,
+                    inode: row.get(3)?,
+                })
+            },
+        )?;
+        rows.collect()
+    }
+
+    /// Inodes whose current revision has never been attempted. Empty optional
+    /// metadata is not a retry signal: failed and unusual streams are marked
+    /// attempted and retried only after their file stat changes.
+    pub fn inodes_needing_stream_probe(&self) -> rusqlite::Result<Vec<(i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT DEVICE, INODE FROM DETAILS
+             WHERE MIME IS NOT NULL AND INODE != 0
+               AND (STREAM_PROBE_REV < ?1 OR PROBE_SIDECAR_FINGERPRINT IS NULL)
+             ORDER BY DEVICE, INODE",
+        )?;
+        let rows = stmt.query_map([STREAM_PROBE_REVISION], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn clear_detail_stream(&self, id: i64) -> rusqlite::Result<()> {
+        self.clear_detail_stream_inner(id, false)
+    }
+
+    pub(crate) fn clear_detail_stream_matching_probe_sidecar(
+        &self,
+        id: i64,
+    ) -> rusqlite::Result<()> {
+        self.clear_detail_stream_inner(id, true)
+    }
+
+    fn clear_detail_stream_inner(
+        &self,
+        id: i64,
+        require_matching_probe_sidecar: bool,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET DURATION = NULL, BITRATE = NULL, RESOLUTION = NULL,
+                 CHANNELS = NULL, SAMPLERATE = NULL,
+                 CONTAINER = NULL, VIDEO = NULL, AUDIO = NULL, AUDIO_STREAMS = NULL, HDR = NULL,
+                 DLNA_PN = NULL, STREAM_PROBE_REV = ?2
+             WHERE ID = ?1
+               AND (DURATION IS NOT NULL OR BITRATE IS NOT NULL OR RESOLUTION IS NOT NULL
+                 OR CHANNELS IS NOT NULL OR SAMPLERATE IS NOT NULL
+                 OR CONTAINER IS NOT NULL OR VIDEO IS NOT NULL OR AUDIO IS NOT NULL
+                 OR AUDIO_STREAMS IS NOT NULL OR HDR IS NOT NULL OR DLNA_PN IS NOT NULL
+                 OR STREAM_PROBE_REV IS NOT ?2)",
+            params![id, STREAM_PROBE_REVISION],
+        )?;
+        self.copy_stream_to_inode_aliases_inner(id, require_matching_probe_sidecar)?;
+        Ok(())
+    }
+
+    pub fn details_missing_av_meta(&self) -> rusqlite::Result<Vec<(i64, String)>> {
+        self.details_missing_stream_meta()
+    }
+
+    pub fn mark_detail_stream_probed(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET STREAM_PROBE_REV = ?2
+             WHERE ID = ?1 AND STREAM_PROBE_REV IS NOT ?2",
+            params![id, STREAM_PROBE_REVISION],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_detail_dlna_pn(&self, id: i64, pn: Option<&str>) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET DLNA_PN = ?1
+             WHERE ID = ?2 AND DLNA_PN COLLATE BINARY IS NOT ?1 COLLATE BINARY",
+            params![pn, id],
+        )?;
+        Ok(())
+    }
+
+    /// Derive DLNA_PN and rewrite leftover `VIDEO=other` AVI rows from
+    /// already-stored stream columns. No libav.
+    pub fn backfill_derived_stream_fields(&self) -> rusqlite::Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ID, PATH, MIME, CONTAINER, VIDEO, AUDIO, AUDIO_STREAMS, HDR, RESOLUTION, DLNA_PN
+             FROM DETAILS WHERE MIME IS NOT NULL AND PATH IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+            ))
+        })?;
+        let mut pending = Vec::new();
+        for row in rows {
+            pending.push(row?);
+        }
+        drop(stmt);
+        let mut n = 0usize;
+        for (id, path, mime, container, video, audio, audio_streams, hdr, resolution, pn) in pending
+        {
+            let ext = mime_to_ext(&mime);
+            let decoded_path = crate::path_from_db(&path);
+            let ext = if ext == "dat" {
+                decoded_path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(ext)
+            } else {
+                ext
+            };
+            let probe = crate::probe_from_stored(
+                ext,
+                container.as_deref(),
+                video.as_deref(),
+                audio.as_deref(),
+                audio_streams.as_deref(),
+                hdr.as_deref(),
+                resolution.as_deref(),
+            );
+            if probe.video != video.as_deref().unwrap_or("") && !probe.video.is_empty() {
+                self.conn.execute(
+                    "UPDATE DETAILS SET VIDEO = ?1 WHERE ID = ?2",
+                    params![probe.video.as_str(), id],
+                )?;
+                n += 1;
+            }
+            if probe.hdr.is_empty() && probe.video.is_empty() {
+                continue;
+            }
+            let want = crate::dlna_pn_from_probe(
+                &probe.container,
+                &probe.video,
+                &probe.audio,
+                &probe.hdr,
+                probe.width,
+                probe.height,
+            );
+            let have = pn.filter(|s| !s.is_empty());
+            if have.as_deref() != want.as_deref() {
+                self.update_detail_dlna_pn(id, want.as_deref())?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    pub fn update_detail_stat(
+        &self,
+        id: i64,
+        size: i64,
+        timestamp: i64,
+        device: i64,
+        inode: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET SIZE = ?1, TIMESTAMP = ?2, DEVICE = ?3, INODE = ?4,
+                 STREAM_PROBE_REV = 0, PROBE_SIDECAR_FINGERPRINT = NULL
+             WHERE ID = ?5",
+            params![size, timestamp, device, inode, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_object(
+        &self,
+        object_id: &str,
+        parent_id: &str,
+        class: &str,
+        detail_id: Option<i64>,
+        name: &str,
+        ref_id: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE OBJECTS SET
+               PARENT_ID = ?2, REF_ID = ?3, CLASS = ?4, DETAIL_ID = ?5, NAME = ?6
+             WHERE OBJECT_ID = ?1
+               AND (OBJECTS.PARENT_ID COLLATE BINARY IS NOT ?2 COLLATE BINARY
+                    OR OBJECTS.REF_ID COLLATE BINARY IS NOT ?3 COLLATE BINARY
+                    OR OBJECTS.CLASS COLLATE BINARY IS NOT ?4 COLLATE BINARY
+                    OR OBJECTS.DETAIL_ID IS NOT ?5
+                    OR OBJECTS.NAME COLLATE BINARY IS NOT ?6 COLLATE BINARY)",
+            params![object_id, parent_id, ref_id, class, detail_id, name],
+        )?;
+        // An implicit-rowid INSERT that reaches ON CONFLICT consumes an
+        // AUTOINCREMENT value even when its update predicate is false. Select
+        // only genuinely absent keys so repeated object reconciliation leaves
+        // sqlite_sequence stable.
+        self.conn.execute(
+            "INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, REF_ID, CLASS, DETAIL_ID, NAME)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6
+             WHERE NOT EXISTS (
+               SELECT 1 FROM OBJECTS WHERE OBJECT_ID = ?1
+             )",
+            params![object_id, parent_id, ref_id, class, detail_id, name],
+        )?;
+        Ok(())
+    }
+
+    pub fn replace_captions(&self, detail_id: i64, caps: &[Caption]) -> rusqlite::Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT PATH FROM CAPTIONS WHERE ID = ?1 ORDER BY PATH")?;
+        let current = stmt
+            .query_map([detail_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut desired: Vec<String> = caps
+            .iter()
+            .map(|caption| crate::path_to_db(&caption.path))
+            .collect();
+        desired.sort();
+        if current == desired {
+            return Ok(false);
+        }
+        drop(stmt);
+        self.conn
+            .execute("DELETE FROM CAPTIONS WHERE ID = ?1", [detail_id])?;
+        for c in caps {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO CAPTIONS (ID, PATH) VALUES (?1, ?2)",
+                params![detail_id, crate::path_to_db(&c.path)],
+            )?;
+        }
+        Ok(true)
+    }
+
+    pub fn detail_presentation(&self, id: i64) -> rusqlite::Result<DetailPresentation> {
+        let mut presentation = self.conn.query_row(
+            "SELECT TITLE, CREATOR, ARTIST, ALBUM_ARTIST, ALBUM, GENRE,
+                    COMPOSER, CONTRIBUTOR, OUTLINE, PLOT, COMMENT, DISC, TRACK, DATE, RATING,
+                    ROTATION, COALESCE(ALBUM_ART, 0)
+             FROM DETAILS WHERE ID = ?1",
+            [id],
+            |row| {
+                Ok(DetailPresentation {
+                    title: row.get(0)?,
+                    creator: row.get(1)?,
+                    artist: row.get(2)?,
+                    album_artist: row.get(3)?,
+                    album: row.get(4)?,
+                    genre: row.get(5)?,
+                    composer: row.get(6)?,
+                    contributor: row.get(7)?,
+                    outline: row.get(8)?,
+                    plot: row.get(9)?,
+                    comment: row.get(10)?,
+                    disc: row.get(11)?,
+                    track: row.get(12)?,
+                    date: row.get(13)?,
+                    rating: row.get(14)?,
+                    rotation: row.get(15)?,
+                    album_art: row.get(16)?,
+                    captions: Vec::new(),
+                })
+            },
+        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT PATH FROM CAPTIONS WHERE ID = ?1 ORDER BY PATH")?;
+        presentation.captions = stmt
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(presentation)
+    }
+
+    pub fn all_video_has_inode(&self, device: i64, inode: i64) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM OBJECTS o JOIN DETAILS d ON o.DETAIL_ID = d.ID
+             WHERE o.PARENT_ID = ?1 AND d.DEVICE = ?2 AND d.INODE = ?3",
+            params![VIDEO_ALL_ID, device, inode],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Next `$HEX` suffix for a new child of `parent`. Uses the max existing
+    /// suffix, not `count(*)+1`, so deleting a sibling cannot reuse an id
+    /// and `upsert` cannot rename another folder onto leftover children.
+    pub fn next_child_seq(&self, parent: &str) -> rusqlite::Result<i64> {
+        let prefix = format!("{parent}$");
+        let mut stmt = self
+            .conn
+            .prepare("SELECT OBJECT_ID FROM OBJECTS WHERE PARENT_ID = ?1")?;
+        let rows = stmt.query_map([parent], |r| r.get::<_, String>(0))?;
+        let mut max = 0i64;
+        for id in rows {
+            let id = id?;
+            let Some(rest) = id.strip_prefix(&prefix) else {
+                continue;
+            };
+            let suffix = rest.split('$').next().unwrap_or(rest);
+            if let Ok(n) = i64::from_str_radix(suffix, 16) {
+                max = max.max(n);
+            }
+        }
+        max.checked_add(1)
+            .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, max))
+    }
+
+    pub fn object_exists(&self, object_id: &str) -> rusqlite::Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM OBJECTS WHERE OBJECT_ID = ?1",
+                [object_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+    }
+
+    /// All OBJECTS rows except virtual roots. Used so `rebuild_objects`
+    /// can put the same IDs back — Infuse/libupnp caches ObjectID.
+    pub fn snapshot_objects(&self) -> rusqlite::Result<Vec<ObjectSnap>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID, NAME, REF_ID FROM OBJECTS")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ObjectSnap {
+                object_id: r.get(0)?,
+                parent_id: r.get(1)?,
+                class: r.get(2)?,
+                detail_id: r.get(3)?,
+                name: r.get(4)?,
+                ref_id: r.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let row = row?;
+            if is_virtual_container(&row.object_id) {
+                continue;
+            }
+            out.push(row);
+        }
+        Ok(out)
+    }
+
+    pub fn restore_object(&self, row: &ObjectSnap) -> rusqlite::Result<()> {
+        self.upsert_object(
+            &row.object_id,
+            &row.parent_id,
+            &row.class,
+            row.detail_id,
+            row.name.as_deref().unwrap_or(""),
+            row.ref_id.as_deref(),
+        )
+    }
+
+    /// Fields used to hang Series/Genre aliases and deduplicate physical files.
+    pub fn detail_group_fields(&self, id: i64) -> rusqlite::Result<DetailGroupFields> {
+        self.conn.query_row(
+            "SELECT ALBUM, GENRE, DISC, TRACK, TITLE,
+                    COALESCE(DEVICE, 0), COALESCE(INODE, 0)
+             FROM DETAILS WHERE ID = ?1",
+            [id],
+            |r| {
+                Ok(DetailGroupFields {
+                    album: r.get(0)?,
+                    genre: r.get(1)?,
+                    disc: r.get(2)?,
+                    track: r.get(3)?,
+                    title: r.get(4)?,
+                    device: r.get(5)?,
+                    inode: r.get(6)?,
+                })
+            },
+        )
+    }
+
+    pub fn detail_tag_fields(&self, id: i64) -> rusqlite::Result<DetailTags> {
+        self.conn.query_row(
+            "SELECT TITLE, ARTIST, ALBUM_ARTIST, ALBUM, GENRE, COMPOSER,
+                    CONTRIBUTOR, CREATOR, DATE, RATING
+             FROM DETAILS WHERE ID = ?1",
+            [id],
+            |r| {
+                Ok(DetailTags {
+                    title: r.get(0)?,
+                    artist: r.get(1)?,
+                    album_artist: r.get(2)?,
+                    album: r.get(3)?,
+                    genre: r.get(4)?,
+                    composer: r.get(5)?,
+                    contributor: r.get(6)?,
+                    creator: r.get(7)?,
+                    date: r.get(8)?,
+                    rating: r.get(9)?,
+                })
+            },
+        )
+    }
+
+    /// Browse Folders object for this detail (no `REF_ID`).
+    pub fn browse_object_for_detail(&self, detail: i64) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT OBJECT_ID FROM OBJECTS
+                 WHERE DETAIL_ID = ?1 AND REF_ID IS NULL
+                 ORDER BY length(OBJECT_ID) ASC LIMIT 1",
+                [detail],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    /// Drop Series/Genre item aliases for this detail so a re-NFO can move them.
+    pub fn delete_detail_under_root(&self, detail: i64, root: &str) -> rusqlite::Result<usize> {
+        let like = format!("{root}$%");
+        self.conn.execute(
+            "DELETE FROM OBJECTS WHERE DETAIL_ID = ?1 AND (
+                 PARENT_ID = ?2 OR PARENT_ID LIKE ?3 OR OBJECT_ID LIKE ?3
+             )",
+            params![detail, root, like],
+        )
+    }
+
+    /// Refresh the presentation name of an item's aliases under a virtual
+    /// root without disturbing its stable ObjectIDs.
+    pub fn update_detail_names_under_root(
+        &self,
+        detail: i64,
+        root: &str,
+        name: &str,
+    ) -> rusqlite::Result<usize> {
+        let like = format!("{root}$%");
+        self.conn.execute(
+            "UPDATE OBJECTS SET NAME = ?1
+             WHERE DETAIL_ID = ?2 AND (PARENT_ID = ?3 OR PARENT_ID LIKE ?4)
+               AND COALESCE(NAME, '') <> ?1",
+            params![name, detail, root, like],
+        )
+    }
+
+    pub fn object_detail_id(&self, object_id: &str) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT DETAIL_ID FROM OBJECTS WHERE OBJECT_ID = ?1",
+                [object_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+    }
+
+    /// Delete this path. Also drop other DETAILS rows for the same inode
+    /// whose files are gone (dangling symlink aliases). Live hardlinks and
+    /// live symlinks that still resolve — e.g. a genre tree retargeted at
+    /// the file's new location — are kept.
+    pub fn remove_path_and_symlink_aliases(&self, path: &str) -> rusqlite::Result<usize> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT ID, DEVICE, INODE FROM DETAILS WHERE PATH = ?1 LIMIT 1",
+                [path],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((_, device, inode)) = row else {
+            return Ok(0);
+        };
+        let mut victims: Vec<(i64, String)> = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT ID, PATH FROM DETAILS WHERE DEVICE = ?1 AND INODE = ?2")?;
+            let rows = stmt.query_map(params![device, inode], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                victims.push(r?);
+            }
+        }
+        let mut n = 0usize;
+        for (id, p) in victims {
+            let gone = p == path || !path_is_live_file(&path_from_db(&p));
+            if !gone {
+                continue;
+            }
+            self.conn
+                .execute("DELETE FROM OBJECTS WHERE DETAIL_ID = ?1", [id])?;
+            self.conn
+                .execute("DELETE FROM CAPTIONS WHERE ID = ?1", [id])?;
+            self.conn
+                .execute("DELETE FROM BOOKMARKS WHERE ID = ?1", [id])?;
+            self.conn
+                .execute("DELETE FROM DETAILS WHERE ID = ?1", [id])?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    pub fn prune_missing_files(&self) -> rusqlite::Result<usize> {
+        let mut paths: Vec<String> = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT PATH FROM DETAILS WHERE PATH IS NOT NULL AND MIME IS NOT NULL")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                paths.push(r?);
+            }
+        }
+        let mut n = 0;
+        for p in paths {
+            if !path_is_live_file(&path_from_db(&p)) {
+                n += self.remove_path_and_symlink_aliases(&p)?;
+            }
+        }
+        Ok(n)
+    }
+
+    pub fn prune_excluded_paths(&self, cfg: &ScanConfig) -> rusqlite::Result<usize> {
+        let mut paths: Vec<String> = Vec::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT PATH FROM DETAILS WHERE PATH IS NOT NULL AND MIME IS NOT NULL")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                paths.push(r?);
+            }
+        }
+        let mut n = 0;
+        for p in paths {
+            if path_is_unwanted(&path_from_db(&p), cfg) {
+                n += self.remove_path_and_symlink_aliases(&p)?;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Drop folder OBJECTS that have no remaining children. Virtual
+    /// containers (root, Browse Folders, All Video, …) stay even if empty.
+    pub fn prune_empty_folders(&self) -> rusqlite::Result<usize> {
+        let mut n = 0usize;
+        loop {
+            let empty: Vec<String> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT o.OBJECT_ID FROM OBJECTS o
+                     WHERE o.DETAIL_ID IS NULL
+                       AND NOT EXISTS (
+                         SELECT 1 FROM OBJECTS c WHERE c.PARENT_ID = o.OBJECT_ID
+                       )",
+                )?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                let mut ids = Vec::new();
+                for r in rows {
+                    let id = r?;
+                    if !is_virtual_container(&id) {
+                        ids.push(id);
+                    }
+                }
+                ids
+            };
+            if empty.is_empty() {
+                break;
+            }
+            for id in empty {
+                n += self
+                    .conn
+                    .execute("DELETE FROM OBJECTS WHERE OBJECT_ID = ?1", [id])?;
+            }
+        }
+        Ok(n)
+    }
+
+    pub fn object_item_count(&self) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "SELECT count(*) FROM OBJECTS WHERE DETAIL_ID IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+    }
+
+    pub fn details_missing_objects(&self) -> rusqlite::Result<i64> {
+        // A hardlink/symlink clone may leave an older DETAILS row without
+        // OBJECTS while the same inode is already attached. Those are not
+        // missing library entries — do not trigger a full tree repair.
+        self.conn.query_row(
+            "SELECT count(*) FROM DETAILS d
+             WHERE d.MIME IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM OBJECTS o WHERE o.DETAIL_ID = d.ID)
+               AND NOT EXISTS (
+                 SELECT 1 FROM DETAILS d2
+                 JOIN OBJECTS o2 ON o2.DETAIL_ID = d2.ID
+                 WHERE d2.DEVICE = d.DEVICE AND d2.INODE = d.INODE
+               )",
+            [],
+            |r| r.get(0),
+        )
+    }
+
+    pub fn detail_has_object(&self, detail_id: i64) -> rusqlite::Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM OBJECTS WHERE DETAIL_ID = ?1",
+                [detail_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+    }
+
+    pub fn detail_count(&self) -> rusqlite::Result<i64> {
+        self.conn.query_row(
+            "SELECT count(*) FROM DETAILS WHERE MIME IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+    }
+
+    pub fn get_update_id(&self) -> rusqlite::Result<u32> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT VALUE FROM SETTINGS WHERE KEY = 'updateID' LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        match value {
+            None => Ok(1),
+            Some(value) => value.parse::<u32>().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            }),
+        }
+    }
+
+    pub fn set_update_id(&self, id: u32) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO SETTINGS (KEY, VALUE) VALUES ('updateID', ?1)
+             ON CONFLICT(KEY) DO UPDATE SET VALUE = excluded.VALUE",
+            [id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn setting(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT VALUE FROM SETTINGS WHERE KEY = ?1 ORDER BY rowid DESC LIMIT 1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO SETTINGS (KEY, VALUE) VALUES (?1, ?2)
+             ON CONFLICT(KEY) DO UPDATE SET VALUE = excluded.VALUE
+             WHERE SETTINGS.VALUE COLLATE BINARY IS NOT excluded.VALUE COLLATE BINARY",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn transaction_settings_with_prefix(
+        transaction: &rusqlite::Transaction<'_>,
+        prefix: &str,
+    ) -> rusqlite::Result<Vec<(String, String)>> {
+        let mut statement = transaction.prepare(
+            "SELECT KEY, VALUE FROM SETTINGS
+             WHERE substr(KEY, 1, length(?1)) = ?1
+             ORDER BY KEY COLLATE BINARY",
+        )?;
+        let rows = statement.query_map([prefix], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    pub(crate) fn transaction_settings_prefix_size(
+        transaction: &rusqlite::Transaction<'_>,
+        prefix: &str,
+    ) -> rusqlite::Result<(u64, u64)> {
+        transaction.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(length(CAST(KEY AS BLOB)) +
+                                           length(CAST(VALUE AS BLOB))), 0)
+             FROM SETTINGS WHERE substr(KEY, 1, length(?1)) = ?1",
+            [prefix],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+    }
+
+    pub(crate) fn set_transaction_setting(
+        transaction: &rusqlite::Transaction<'_>,
+        key: &str,
+        value: &str,
+    ) -> rusqlite::Result<()> {
+        transaction.execute(
+            "INSERT INTO SETTINGS (KEY, VALUE) VALUES (?1, ?2)
+             ON CONFLICT(KEY) DO UPDATE SET VALUE = excluded.VALUE
+             WHERE SETTINGS.VALUE COLLATE BINARY IS NOT excluded.VALUE COLLATE BINARY",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_transaction_setting(
+        transaction: &rusqlite::Transaction<'_>,
+        key: &str,
+    ) -> rusqlite::Result<()> {
+        transaction.execute("DELETE FROM SETTINGS WHERE KEY = ?1", [key])?;
+        Ok(())
+    }
+
+    pub fn playlists(&self) -> rusqlite::Result<Vec<PlaylistDbRow>> {
+        let mut statement = self.conn.prepare(
+            "SELECT ID, NAME, PATH, COALESCE(TIMESTAMP, 0),
+                    COALESCE(DEVICE, 0), COALESCE(INODE, 0)
+             FROM PLAYLISTS ORDER BY ID",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(PlaylistDbRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    timestamp: row.get(3)?,
+                    device: row.get(4)?,
+                    inode: row.get(5)?,
+                })
+            })?
+            .collect();
+        rows
+    }
+
+    pub fn upsert_playlist(
+        &self,
+        existing_id: Option<i64>,
+        name: &str,
+        path: &str,
+        timestamp: i64,
+        device: i64,
+        inode: i64,
+    ) -> rusqlite::Result<i64> {
+        if let Some(id) = existing_id {
+            self.conn.execute(
+                "UPDATE PLAYLISTS SET NAME=?1, PATH=?2, TIMESTAMP=?3,
+                     DEVICE=?4, INODE=?5, FOUND=1
+                 WHERE ID=?6
+                   AND (NAME COLLATE BINARY IS NOT ?1 COLLATE BINARY
+                        OR PATH COLLATE BINARY IS NOT ?2 COLLATE BINARY
+                        OR TIMESTAMP IS NOT ?3
+                        OR DEVICE IS NOT ?4 OR INODE IS NOT ?5 OR FOUND IS NOT 1)",
+                params![name, path, timestamp, device, inode, id],
+            )?;
+            return Ok(id);
+        }
+        self.conn.execute(
+            "INSERT INTO PLAYLISTS (NAME, PATH, TIMESTAMP, DEVICE, INODE, FOUND)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+            params![name, path, timestamp, device, inode],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn playlist_detail_ids(&self, playlist_id: i64) -> rusqlite::Result<Vec<i64>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DETAIL_ID FROM PLAYLIST_ITEMS
+             WHERE PLAYLIST_ID=?1 ORDER BY POSITION",
+        )?;
+        let rows = statement
+            .query_map([playlist_id], |row| row.get(0))?
+            .collect();
+        rows
+    }
+
+    pub fn replace_playlist_items(
+        &self,
+        playlist_id: i64,
+        detail_ids: &[i64],
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM PLAYLIST_ITEMS WHERE PLAYLIST_ID=?1",
+            [playlist_id],
+        )?;
+        let mut statement = self.conn.prepare(
+            "INSERT INTO PLAYLIST_ITEMS (PLAYLIST_ID, DETAIL_ID, POSITION)
+             VALUES (?1, ?2, ?3)",
+        )?;
+        for (position, detail_id) in detail_ids.iter().enumerate() {
+            let position = i64::try_from(position)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            statement.execute(params![playlist_id, detail_id, position])?;
+        }
+        let item_count = i64::try_from(detail_ids.len())
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        self.conn.execute(
+            "UPDATE PLAYLISTS SET ITEMS=?1 WHERE ID=?2",
+            params![item_count, playlist_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn reset_playlist_found(&self) -> rusqlite::Result<()> {
+        self.conn
+            .execute("UPDATE PLAYLISTS SET FOUND=0 WHERE FOUND IS NOT 0", [])?;
+        Ok(())
+    }
+
+    pub fn delete_missing_playlists(&self) -> rusqlite::Result<usize> {
+        self.conn.execute("DELETE FROM PLAYLISTS WHERE FOUND=0", [])
+    }
+
+    pub fn delete_missing_playlist_objects(
+        &self,
+        desired: &HashSet<String>,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS desired_playlist_objects (
+                 OBJECT_ID TEXT PRIMARY KEY
+             ) WITHOUT ROWID;
+             DELETE FROM temp.desired_playlist_objects;",
+        )?;
+        {
+            let mut insert = self
+                .conn
+                .prepare("INSERT INTO temp.desired_playlist_objects (OBJECT_ID) VALUES (?1)")?;
+            for object_id in desired {
+                insert.execute([object_id])?;
+            }
+        }
+        self.conn.execute(
+            "DELETE FROM OBJECTS
+             WHERE (OBJECT_ID LIKE ?1 ESCAPE '\\'
+                    OR OBJECT_ID LIKE ?2 ESCAPE '\\'
+                    OR OBJECT_ID LIKE ?3 ESCAPE '\\')
+               AND NOT EXISTS (
+                 SELECT 1 FROM temp.desired_playlist_objects desired
+                 WHERE desired.OBJECT_ID = OBJECTS.OBJECT_ID
+               )",
+            params![
+                format!(
+                    "{}$%",
+                    MUSIC_PLIST_ID.replace('%', "\\%").replace('_', "\\_")
+                ),
+                format!(
+                    "{}$%",
+                    VIDEO_PLIST_ID.replace('%', "\\%").replace('_', "\\_")
+                ),
+                format!(
+                    "{}$%",
+                    IMAGE_PLIST_ID.replace('%', "\\%").replace('_', "\\_")
+                ),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn playlist_object_source(
+        &self,
+        detail_id: i64,
+    ) -> rusqlite::Result<Option<(String, String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT OBJECT_ID, CLASS, COALESCE(NULLIF(d.TITLE, ''), NULLIF(o.NAME, ''), 'item')
+                 FROM OBJECTS o JOIN DETAILS d ON d.ID=o.DETAIL_ID
+                 WHERE o.DETAIL_ID=?1 AND o.REF_ID IS NULL
+                 ORDER BY length(o.OBJECT_ID), o.OBJECT_ID LIMIT 1",
+                [detail_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+    }
+
+    pub fn bump_update_id(&self) -> rusqlite::Result<u32> {
+        let n = rusty_dlna_protocol::soap::next_system_update_id(self.get_update_id()?);
+        self.set_update_id(n)?;
+        Ok(n)
+    }
+
+    /// Atomically update one or both Kodi state fields and refresh their
+    /// retention timestamp. `None` leaves that field unchanged.
+    pub fn update_bookmark(
+        &self,
+        detail_id: i64,
+        sec: Option<i64>,
+        watch_count: Option<i64>,
+    ) -> rusqlite::Result<()> {
+        if sec.is_none() && watch_count.is_none() {
+            return Ok(());
+        }
+        let updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT INTO BOOKMARKS (ID, SEC, WATCH_COUNT, UPDATED_AT)
+               VALUES (?1, COALESCE(?2, 0), COALESCE(?3, 0), ?4)
+             ON CONFLICT(ID) DO UPDATE SET
+               SEC = COALESCE(?2, BOOKMARKS.SEC),
+               WATCH_COUNT = COALESCE(?3, BOOKMARKS.WATCH_COUNT),
+               UPDATED_AT = ?4",
+            params![detail_id, sec, watch_count, updated_at],
+        )?;
+        Ok(())
+    }
+
+    /// `BOOKMARKS` is keyed by DETAILS.ID. `sec < 30` is stored as 0 by the SOAP helper.
+    pub fn set_bookmark(&self, detail_id: i64, sec: i64) -> rusqlite::Result<()> {
+        self.update_bookmark(detail_id, Some(sec), None)
+    }
+
+    pub fn set_watch_count(&self, detail_id: i64, count: i64) -> rusqlite::Result<()> {
+        self.update_bookmark(detail_id, None, Some(count))
+    }
+
+    pub fn get_bookmark(&self, detail_id: i64) -> rusqlite::Result<Option<(i64, i64)>> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(SEC, 0), COALESCE(WATCH_COUNT, 0) FROM BOOKMARKS WHERE ID = ?1",
+                [detail_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+    }
+
+    /// Replace every request-time bookmark field with the database's current
+    /// value. Missing rows deliberately become zero so retention deletions are
+    /// not resurrected from an older catalog snapshot.
+    pub fn hydrate_catalog_bookmarks(&self, catalog: &mut Catalog) -> rusqlite::Result<()> {
+        let bookmarks = self.catalog_bookmark_snapshot()?;
+        Self::apply_catalog_bookmark_snapshot(catalog, &bookmarks);
+        Ok(())
+    }
+
+    /// Read the canonical bookmark rows without walking catalog aliases.
+    pub(crate) fn catalog_bookmark_snapshot(&self) -> rusqlite::Result<HashMap<i64, (i64, i64)>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT ID, COALESCE(SEC, 0), COALESCE(WATCH_COUNT, 0) FROM BOOKMARKS")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        rows.map(|row| row.map(|(id, seconds, watches)| (id, (seconds, watches))))
+            .collect::<rusqlite::Result<HashMap<_, _>>>()
+    }
+
+    /// Apply a canonical bookmark snapshot to every in-memory alias.
+    pub(crate) fn apply_catalog_bookmark_snapshot(
+        catalog: &mut Catalog,
+        bookmarks: &HashMap<i64, (i64, i64)>,
+    ) {
+        for item in catalog.items.values_mut() {
+            let (seconds, watches) = bookmarks.get(&item.detail_id).copied().unwrap_or((0, 0));
+            item.bookmark_sec = seconds;
+            item.watch_count = watches;
+        }
+    }
+
+    /// Refresh bookmark fields for only the details carried by an incremental
+    /// catalog patch. Queries are chunked below SQLite's conservative bind
+    /// limit and missing rows reset to zero, including retention deletions.
+    pub fn hydrate_catalog_patch_bookmarks(
+        &self,
+        patch: &mut CatalogPatch,
+    ) -> rusqlite::Result<()> {
+        let detail_ids = patch
+            .items
+            .iter()
+            .map(|item| item.detail_id)
+            .collect::<HashSet<_>>();
+        let mut bookmarks = HashMap::new();
+        let mut detail_ids = detail_ids.into_iter().collect::<Vec<_>>();
+        detail_ids.sort_unstable();
+        for chunk in detail_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT ID, COALESCE(SEC, 0), COALESCE(WATCH_COUNT, 0)
+                 FROM BOOKMARKS WHERE ID IN ({placeholders})"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map(params_from_iter(chunk), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, seconds, watches) = row?;
+                bookmarks.insert(id, (seconds, watches));
+            }
+        }
+        for item in &mut patch.items {
+            let (seconds, watches) = bookmarks.get(&item.detail_id).copied().unwrap_or((0, 0));
+            item.bookmark_sec = seconds;
+            item.watch_count = watches;
+        }
+        Ok(())
+    }
+
+    /// Remove resume/play-count rows older than the configured number of
+    /// 24-hour days. Zero preserves bookmarks indefinitely.
+    pub fn prune_expired_bookmarks(
+        &self,
+        retention_days: u32,
+        now_unix: i64,
+    ) -> rusqlite::Result<usize> {
+        if retention_days == 0 {
+            return Ok(0);
+        }
+        let retention_secs = i64::from(retention_days).saturating_mul(86_400);
+        let cutoff = now_unix.saturating_sub(retention_secs);
+        self.conn.execute(
+            "DELETE FROM BOOKMARKS WHERE UPDATED_AT > 0 AND UPDATED_AT < ?1",
+            [cutoff],
+        )
+    }
+
+    pub fn clear_objects(&self) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM OBJECTS", [])?;
+        Ok(())
+    }
+
+    pub fn seed_virtual_containers(&self) -> rusqlite::Result<()> {
+        let rows = [
+            (ROOT_ID, "-1", "container.storageFolder", "root"),
+            (
+                BROWSEDIR_ID,
+                ROOT_ID,
+                "container.storageFolder",
+                "Browse Folders",
+            ),
+            (MUSIC_ID, ROOT_ID, "container.storageFolder", "Music"),
+            (VIDEO_ID, ROOT_ID, "container.storageFolder", "Video"),
+            (IMAGE_ID, ROOT_ID, "container.storageFolder", "Pictures"),
+            (
+                VIDEO_ALL_ID,
+                VIDEO_ID,
+                "container.storageFolder",
+                "All Video",
+            ),
+            (VIDEO_DIR_ID, VIDEO_ID, "container.storageFolder", "Folders"),
+            (
+                VIDEO_RECENT_ID,
+                VIDEO_ID,
+                "container.storageFolder",
+                "Recently Added",
+            ),
+            (
+                VIDEO_SERIES_ID,
+                VIDEO_ID,
+                "container.storageFolder",
+                "Series",
+            ),
+            (VIDEO_GENRE_ID, VIDEO_ID, "container.storageFolder", "Genre"),
+            (VIDEO_ACTOR_ID, VIDEO_ID, "container.storageFolder", "Actor"),
+            (
+                VIDEO_PLIST_ID,
+                VIDEO_ID,
+                "container.storageFolder",
+                "Playlists",
+            ),
+            (
+                VIDEO_RATING_ID,
+                VIDEO_ID,
+                "container.storageFolder",
+                "Rating",
+            ),
+            (
+                MUSIC_ALL_ID,
+                MUSIC_ID,
+                "container.storageFolder",
+                "All Music",
+            ),
+            (MUSIC_GENRE_ID, MUSIC_ID, "container.storageFolder", "Genre"),
+            (
+                MUSIC_ARTIST_ID,
+                MUSIC_ID,
+                "container.storageFolder",
+                "Artist",
+            ),
+            (MUSIC_ALBUM_ID, MUSIC_ID, "container.storageFolder", "Album"),
+            (MUSIC_DIR_ID, MUSIC_ID, "container.storageFolder", "Folders"),
+            (
+                MUSIC_PLIST_ID,
+                MUSIC_ID,
+                "container.storageFolder",
+                "Playlists",
+            ),
+            (
+                MUSIC_CONTRIB_ARTIST_ID,
+                MUSIC_ID,
+                "container.storageFolder",
+                "Contributing Artists",
+            ),
+            (
+                MUSIC_ALBUM_ARTIST_ID,
+                MUSIC_ID,
+                "container.storageFolder",
+                "Album Artist",
+            ),
+            (
+                MUSIC_COMPOSER_ID,
+                MUSIC_ID,
+                "container.storageFolder",
+                "Composer",
+            ),
+            (
+                MUSIC_RATING_ID,
+                MUSIC_ID,
+                "container.storageFolder",
+                "Rating",
+            ),
+            (
+                MUSIC_RECENT_ID,
+                MUSIC_ID,
+                "container.storageFolder",
+                "Recently Added",
+            ),
+            (
+                IMAGE_ALL_ID,
+                IMAGE_ID,
+                "container.storageFolder",
+                "All Pictures",
+            ),
+            (
+                IMAGE_DATE_ID,
+                IMAGE_ID,
+                "container.storageFolder",
+                "Date Taken",
+            ),
+            (IMAGE_ALBUM_ID, IMAGE_ID, "container.storageFolder", "Album"),
+            (
+                IMAGE_CAMERA_ID,
+                IMAGE_ID,
+                "container.storageFolder",
+                "Camera",
+            ),
+            (IMAGE_DIR_ID, IMAGE_ID, "container.storageFolder", "Folders"),
+            (
+                IMAGE_PLIST_ID,
+                IMAGE_ID,
+                "container.storageFolder",
+                "Playlists",
+            ),
+            (
+                IMAGE_RATING_ID,
+                IMAGE_ID,
+                "container.storageFolder",
+                "Rating",
+            ),
+            (
+                IMAGE_RECENT_ID,
+                IMAGE_ID,
+                "container.storageFolder",
+                "Recently Added",
+            ),
+        ];
+        for (id, parent, class, name) in rows {
+            self.upsert_object(id, parent, class, None, name, None)?;
+        }
+        Ok(())
+    }
+
+    /// True when this folder already lists `name` for this inode (a
+    /// directory-symlink alias of the same file).
+    pub fn folder_has_inode_named(
+        &self,
+        parent_id: &str,
+        device: i64,
+        inode: i64,
+        name: &str,
+    ) -> rusqlite::Result<bool> {
+        if inode == 0 {
+            return Ok(false);
+        }
+        self.conn
+            .query_row(
+                "SELECT count(*) FROM OBJECTS o
+                 JOIN DETAILS d ON d.ID = o.DETAIL_ID
+                 WHERE o.PARENT_ID = ?1 AND d.DEVICE = ?2 AND d.INODE = ?3
+                   AND o.NAME = ?4",
+                params![parent_id, device, inode, name],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+    }
+
+    /// True when a virtual folder already contains this physical file. Its
+    /// symlink aliases may have different DETAILS IDs, but should only occur
+    /// once in Series/Genre/Actor views.
+    pub fn folder_has_inode(
+        &self,
+        parent_id: &str,
+        device: i64,
+        inode: i64,
+    ) -> rusqlite::Result<bool> {
+        if inode == 0 {
+            return Ok(false);
+        }
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM OBJECTS o
+                   JOIN DETAILS d ON d.ID = o.DETAIL_ID
+                   WHERE o.PARENT_ID = ?1 AND d.DEVICE = ?2 AND d.INODE = ?3
+                 )",
+                params![parent_id, device, inode],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|value| value != 0)
+    }
+
+    /// Same inode+title listed more than once in one folder.
+    pub fn folders_have_duplicate_inodes(&self) -> rusqlite::Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM OBJECTS o
+                   JOIN DETAILS d ON d.ID = o.DETAIL_ID
+                   WHERE o.DETAIL_ID IS NOT NULL AND d.INODE != 0
+                   GROUP BY o.PARENT_ID, d.DEVICE, d.INODE, o.NAME
+                   HAVING COUNT(*) > 1
+                 )",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|value| value != 0)
+    }
+
+    /// Keep the oldest stable ObjectID when an older scanner attached several
+    /// DETAILS aliases for one inode under the same virtual folder.
+    pub fn prune_duplicate_folder_inodes(&self) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "DELETE FROM OBJECTS WHERE ID IN (
+               SELECT item.ID
+               FROM OBJECTS item
+               JOIN DETAILS detail ON detail.ID = item.DETAIL_ID
+               JOIN (
+                 SELECT o.PARENT_ID AS parent_id, d.DEVICE AS device,
+                        d.INODE AS inode, o.NAME AS name, MIN(o.ID) AS keep_id
+                 FROM OBJECTS o
+                 JOIN DETAILS d ON d.ID = o.DETAIL_ID
+                 WHERE d.INODE != 0
+                 GROUP BY o.PARENT_ID, d.DEVICE, d.INODE, o.NAME
+                 HAVING COUNT(*) > 1
+               ) duplicate
+                 ON duplicate.parent_id = item.PARENT_ID
+                AND duplicate.device = detail.DEVICE
+                AND duplicate.inode = detail.INODE
+                AND duplicate.name IS item.NAME
+               WHERE item.ID != duplicate.keep_id
+             )",
+            [],
+        )
+    }
+
+    pub fn find_child_object(
+        &self,
+        parent_id: &str,
+        name: &str,
+    ) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT OBJECT_ID FROM OBJECTS WHERE PARENT_ID = ?1 AND NAME = ?2 LIMIT 1",
+                params![parent_id, name],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    pub fn object_name(&self, object_id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT NAME FROM OBJECTS WHERE OBJECT_ID = ?1",
+                [object_id],
+                |r| r.get(0),
+            )
+            .optional()
+    }
+
+    pub fn load_catalog_patch(&self) -> rusqlite::Result<CatalogPatch> {
+        let mut patch = CatalogPatch::default();
+        {
+            let mut statement = self
+                .conn
+                .prepare("SELECT OBJECT_ID FROM temp.catalog_object_changes ORDER BY OBJECT_ID")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                patch.changed_object_ids.push(row?);
+            }
+        }
+        {
+            let mut statement = self
+                .conn
+                .prepare("SELECT DETAIL_ID FROM temp.catalog_detail_changes ORDER BY DETAIL_ID")?;
+            let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+            for row in rows {
+                patch.changed_detail_ids.push(row?);
+            }
+        }
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT ALBUM_ART_ID FROM temp.catalog_album_art_changes ORDER BY ALBUM_ART_ID",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+            for row in rows {
+                patch.changed_album_art_ids.push(row?);
+            }
+        }
+
+        let affected_details = "SELECT DETAIL_ID FROM temp.catalog_detail_changes
+             UNION
+             SELECT DETAIL_ID FROM OBJECTS
+             WHERE OBJECT_ID IN (SELECT OBJECT_ID FROM temp.catalog_object_changes)
+               AND DETAIL_ID IS NOT NULL";
+        let mut captions: HashMap<i64, Vec<Caption>> = HashMap::new();
+        {
+            let sql = format!(
+                "SELECT ID, PATH FROM CAPTIONS WHERE ID IN ({affected_details}) ORDER BY PATH"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (detail_id, stored) = row?;
+                let path = path_from_db(&stored);
+                let ext = crate::caption_extension_for_path(&path).to_string();
+                let entries = captions.entry(detail_id).or_default();
+                entries.push(Caption {
+                    index: entries.len() as u32,
+                    path,
+                    ext,
+                });
+            }
+        }
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT OBJECT_ID, PARENT_ID, CLASS, NAME
+                 FROM OBJECTS
+                 WHERE DETAIL_ID IS NULL
+                   AND OBJECT_ID IN (SELECT OBJECT_ID FROM temp.catalog_object_changes)
+                 ORDER BY OBJECT_ID",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let object_id: String = row.get(0)?;
+                Ok(Container {
+                    parent_id: row.get(1)?,
+                    class: row.get(2)?,
+                    title: row
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| object_id.clone()),
+                    object_id,
+                    children: Vec::new(),
+                    searchable: true,
+                })
+            })?;
+            for row in rows {
+                patch.containers.push(row?);
+            }
+        }
+        {
+            let sql = format!(
+                "{CATALOG_ITEM_SELECT}
+                 WHERE o.OBJECT_ID IN (SELECT OBJECT_ID FROM temp.catalog_object_changes)
+                    OR o.DETAIL_ID IN (SELECT DETAIL_ID FROM temp.catalog_detail_changes)
+                 ORDER BY o.OBJECT_ID"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let rows =
+                statement.query_map([], |row| media_item_from_catalog_row(row, &captions))?;
+            for row in rows {
+                patch.items.push(row?);
+            }
+        }
+        self.hydrate_catalog_patch_bookmarks(&mut patch)?;
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT ID, PATH FROM ALBUM_ART
+                 WHERE ID IN (SELECT ALBUM_ART_ID FROM temp.catalog_album_art_changes)",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (album_art_id, stored) = row?;
+                patch
+                    .album_art_paths
+                    .insert(album_art_id, path_from_db(&stored));
+            }
+        }
+        Ok(patch)
+    }
+
+    pub fn load_catalog(&self) -> rusqlite::Result<Catalog> {
+        let mut cat = Catalog::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT OBJECT_ID, PARENT_ID, CLASS, NAME FROM OBJECTS WHERE DETAIL_ID IS NULL",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, parent, class, name) = row?;
+                if id == ROOT_ID {
+                    continue;
+                }
+                cat.containers
+                    .entry(id.clone())
+                    .or_insert_with(|| Container {
+                        object_id: id.clone(),
+                        parent_id: parent.clone(),
+                        title: name.unwrap_or_else(|| id.clone()),
+                        class,
+                        children: Vec::new(),
+                        searchable: true,
+                    });
+                if let Some(p) = cat.containers.get_mut(&parent) {
+                    if !p.children.iter().any(|c| c == &id) {
+                        p.children.push(id);
+                    }
+                }
+            }
+        }
+        let mut caps_by: HashMap<i64, Vec<Caption>> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT ID, PATH FROM CAPTIONS ORDER BY PATH")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (id, p) = row?;
+                let decoded = crate::path_from_db(&p);
+                let ext = crate::caption_extension_for_path(&decoded).to_string();
+                let e = caps_by.entry(id).or_default();
+                let index = e.len() as u32;
+                e.push(Caption {
+                    index,
+                    path: decoded,
+                    ext,
+                });
+            }
+        }
+        {
+            let sql = format!("{CATALOG_ITEM_SELECT} WHERE o.DETAIL_ID IS NOT NULL");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map([], |row| media_item_from_catalog_row(row, &caps_by))?;
+            for row in rows {
+                let item = row?;
+                let oid = item.object_id.clone();
+                let parent = item.parent_id.clone();
+                let did = item.detail_id;
+                cat.by_detail.entry(did).or_insert_with(|| oid.clone());
+                if let Some(p) = cat.containers.get_mut(&parent) {
+                    if !p.children.iter().any(|c| c == &oid) {
+                        p.children.push(oid.clone());
+                    }
+                }
+                let next_detail = did
+                    .checked_add(1)
+                    .ok_or(rusqlite::Error::IntegralValueOutOfRange(4, did))?;
+                cat.next_detail = cat.next_detail.max(next_detail);
+                cat.items.insert(oid, item);
+            }
+        }
+        self.hydrate_catalog_bookmarks(&mut cat)?;
+        {
+            let mut stmt = self.conn.prepare("SELECT ID, PATH FROM ALBUM_ART")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (id, path) = row?;
+                cat.album_art_paths.insert(id, crate::path_from_db(&path));
+            }
+        }
+        cat.ensure_video_folder_mirrors();
+        Ok(cat)
+    }
+}
+
+fn is_virtual_container(id: &str) -> bool {
+    matches!(
+        id,
+        ROOT_ID
+            | BROWSEDIR_ID
+            | MUSIC_ID
+            | MUSIC_ALL_ID
+            | MUSIC_GENRE_ID
+            | MUSIC_ARTIST_ID
+            | MUSIC_ALBUM_ID
+            | MUSIC_PLIST_ID
+            | MUSIC_DIR_ID
+            | MUSIC_CONTRIB_ARTIST_ID
+            | MUSIC_ALBUM_ARTIST_ID
+            | MUSIC_COMPOSER_ID
+            | MUSIC_RATING_ID
+            | MUSIC_RECENT_ID
+            | VIDEO_ID
+            | VIDEO_ALL_ID
+            | VIDEO_GENRE_ID
+            | VIDEO_ACTOR_ID
+            | VIDEO_SERIES_ID
+            | VIDEO_PLIST_ID
+            | VIDEO_DIR_ID
+            | VIDEO_RATING_ID
+            | VIDEO_RECENT_ID
+            | IMAGE_ID
+            | IMAGE_ALL_ID
+            | IMAGE_DATE_ID
+            | IMAGE_ALBUM_ID
+            | IMAGE_CAMERA_ID
+            | IMAGE_PLIST_ID
+            | IMAGE_DIR_ID
+            | IMAGE_RATING_ID
+            | IMAGE_RECENT_ID
+            | SAMSUNG_AUDIO
+            | SAMSUNG_VIDEO
+            | SAMSUNG_IMAGE
+    )
+}
+
+const SCHEMA_VERSION: i64 = 12;
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql)?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name?.eq_ignore_ascii_case(column) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_schema(conn: &mut Connection) -> rusqlite::Result<()> {
+    migrate_schema_inner(conn, None)
+}
+
+fn migration_checkpoint(step: u8, fail_after_step: Option<u8>) -> rusqlite::Result<()> {
+    if fail_after_step == Some(step) {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ABORT),
+            Some(format!("injected migration interruption after step {step}")),
+        ));
+    }
+    Ok(())
+}
+
+fn migrate_schema_inner(
+    conn: &mut Connection,
+    fail_after_step: Option<u8>,
+) -> rusqlite::Result<()> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let tx = conn.transaction()?;
+    if version < 1 {
+        for col in ["CONTAINER", "VIDEO", "AUDIO", "AUDIO_STREAMS", "HDR"] {
+            if !table_has_column(&tx, "DETAILS", col)? {
+                tx.execute(&format!("ALTER TABLE DETAILS ADD COLUMN {col} TEXT"), [])?;
+            }
+        }
+    }
+    migration_checkpoint(1, fail_after_step)?;
+    if version < 2 {
+        tx.execute(
+            "DELETE FROM SETTINGS
+             WHERE rowid NOT IN (SELECT MAX(rowid) FROM SETTINGS GROUP BY KEY)",
+            [],
+        )?;
+        tx.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS IDX_SETTINGS_KEY ON SETTINGS(KEY);
+             UPDATE DETAILS SET ALBUM_ART = COALESCE((
+               SELECT MIN(a2.ID) FROM ALBUM_ART a2
+               WHERE a2.PATH = (SELECT a1.PATH FROM ALBUM_ART a1 WHERE a1.ID = DETAILS.ALBUM_ART)
+             ), ALBUM_ART) WHERE ALBUM_ART > 0;
+             DELETE FROM ALBUM_ART
+             WHERE ID NOT IN (SELECT MIN(ID) FROM ALBUM_ART GROUP BY PATH);
+             CREATE UNIQUE INDEX IF NOT EXISTS IDX_ALBUM_ART_PATH ON ALBUM_ART(PATH);
+             DELETE FROM PLAYLISTS
+             WHERE ID NOT IN (SELECT MIN(ID) FROM PLAYLISTS GROUP BY PATH);
+             CREATE UNIQUE INDEX IF NOT EXISTS IDX_PLAYLISTS_PATH ON PLAYLISTS(PATH);",
+        )?;
+    }
+    migration_checkpoint(2, fail_after_step)?;
+    if version < 3 {
+        tx.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS TR_DETAILS_DELETE
+               AFTER DELETE ON DETAILS BEGIN
+                 DELETE FROM OBJECTS WHERE DETAIL_ID = OLD.ID;
+                 DELETE FROM CAPTIONS WHERE ID = OLD.ID;
+                 DELETE FROM BOOKMARKS WHERE ID = OLD.ID;
+               END;",
+        )?;
+    }
+    migration_checkpoint(3, fail_after_step)?;
+    if version < 5 {
+        for (column, kind) in [
+            ("ALBUM_ARTIST", "TEXT COLLATE NOCASE"),
+            ("COMPOSER", "TEXT COLLATE NOCASE"),
+            ("CONTRIBUTOR", "TEXT COLLATE NOCASE"),
+            ("RATING", "INTEGER"),
+        ] {
+            if !table_has_column(&tx, "DETAILS", column)? {
+                tx.execute(
+                    &format!("ALTER TABLE DETAILS ADD COLUMN {column} {kind}"),
+                    [],
+                )?;
+            }
+        }
+    }
+    if version < 6 {
+        for column in ["DEVICE", "INODE"] {
+            if !table_has_column(&tx, "PLAYLISTS", column)? {
+                tx.execute(
+                    &format!("ALTER TABLE PLAYLISTS ADD COLUMN {column} INTEGER DEFAULT 0"),
+                    [],
+                )?;
+            }
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS PLAYLIST_ITEMS (
+               PLAYLIST_ID INTEGER NOT NULL REFERENCES PLAYLISTS(ID) ON DELETE CASCADE,
+               DETAIL_ID INTEGER NOT NULL REFERENCES DETAILS(ID) ON DELETE CASCADE,
+               POSITION INTEGER NOT NULL,
+               PRIMARY KEY (PLAYLIST_ID, POSITION));
+             CREATE INDEX IF NOT EXISTS IDX_PLAYLIST_ITEMS_DETAIL
+               ON PLAYLIST_ITEMS(DETAIL_ID);
+             DELETE FROM PLAYLISTS WHERE INODE != 0 AND ID NOT IN (
+               SELECT MIN(ID) FROM PLAYLISTS WHERE INODE != 0 GROUP BY DEVICE, INODE
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS IDX_PLAYLISTS_DEVICE_INODE
+               ON PLAYLISTS(DEVICE, INODE) WHERE INODE != 0;",
+        )?;
+    }
+    if version < 7 && !table_has_column(&tx, "DETAILS", "AUDIO_STREAMS")? {
+        tx.execute("ALTER TABLE DETAILS ADD COLUMN AUDIO_STREAMS TEXT", [])?;
+    }
+    if version < 8 && !table_has_column(&tx, "DETAILS", "STREAM_PROBE_REV")? {
+        tx.execute(
+            "ALTER TABLE DETAILS ADD COLUMN STREAM_PROBE_REV INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if version < 9 {
+        if !table_has_column(&tx, "BOOKMARKS", "UPDATED_AT")? {
+            tx.execute(
+                "ALTER TABLE BOOKMARKS ADD COLUMN UPDATED_AT INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        // Give every pre-upgrade bookmark a full retention window. Using the
+        // upgrade time avoids deleting valid Kodi positions merely because
+        // the old schema could not record their last update time.
+        tx.execute(
+            "UPDATE BOOKMARKS SET UPDATED_AT = CAST(strftime('%s', 'now') AS INTEGER)
+             WHERE UPDATED_AT = 0",
+            [],
+        )?;
+    }
+    if version < 10 && !table_has_column(&tx, "DETAILS", "PROBE_SIDECAR_FINGERPRINT")? {
+        // NULL deliberately means "not evaluated by this schema revision".
+        // The next private-stage reconciliation computes the current bounded
+        // semantic fingerprint and performs one correctness-first base probe.
+        tx.execute(
+            "ALTER TABLE DETAILS ADD COLUMN PROBE_SIDECAR_FINGERPRINT TEXT DEFAULT NULL",
+            [],
+        )?;
+    }
+    if version < 12 {
+        if !table_has_column(&tx, "DETAILS", "OUTLINE")? {
+            tx.execute("ALTER TABLE DETAILS ADD COLUMN OUTLINE TEXT", [])?;
+        }
+        if !table_has_column(&tx, "DETAILS", "PLOT")? {
+            tx.execute("ALTER TABLE DETAILS ADD COLUMN PLOT TEXT", [])?;
+        }
+        // COMMENT historically carried both embedded comments and NFO plots.
+        // Preserve the request-facing video behavior while establishing
+        // provenance for future NFO removal and embedded-tag restoration.
+        tx.execute(
+            "UPDATE DETAILS SET PLOT = COMMENT, COMMENT = NULL
+             WHERE MIME LIKE 'video/%' AND PLOT IS NULL AND COMMENT IS NOT NULL",
+            [],
+        )?;
+    }
+    let rev: i64 = tx
+        .query_row(
+            "SELECT VALUE FROM SETTINGS WHERE KEY = 'stream_probe_rev' LIMIT 1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if rev < 3 {
+        // Re-read with libav (rev 3). Earlier revs used a hand-rolled parser.
+        tx.execute(
+            "UPDATE DETAILS SET HDR = NULL, VIDEO = NULL, AUDIO = NULL,
+                 AUDIO_STREAMS = NULL, CONTAINER = NULL, STREAM_PROBE_REV = 0",
+            [],
+        )?;
+    }
+    if rev < 4 {
+        // Revision 4 adds the compact @v capability record needed for exact
+        // RFC 6381 browser negotiation. Preserve already-capable rows and
+        // schedule only legacy rows for the startup probe backfill.
+        tx.execute(
+            "UPDATE DETAILS SET STREAM_PROBE_REV =
+                 CASE WHEN COALESCE(AUDIO_STREAMS, '') LIKE '%@v:%'
+                      THEN 4 ELSE 0 END",
+            [],
+        )?;
+    }
+    if rev < 5 {
+        // Revision 5 samples compressed packet timestamps. Reprobe only MP4
+        // H.264/HEVC sources, where decode-order timestamps are both plausible
+        // and eligible for browser stream copy. Other current rows do not need
+        // the new marker to retain their existing behavior.
+        tx.execute(
+            "UPDATE DETAILS SET STREAM_PROBE_REV =
+                 CASE WHEN COALESCE(AUDIO_STREAMS, '') NOT LIKE '%@v:%' THEN 0
+                      WHEN MIME LIKE 'video/%'
+                       AND CONTAINER IN ('mp4', 'mov')
+                       AND (VIDEO = 'h264' OR VIDEO = 'hevc') THEN 0
+                      ELSE ?1 END",
+            [STREAM_PROBE_REVISION],
+        )?;
+    }
+    if rev < STREAM_PROBE_REVISION {
+        tx.execute(
+            "INSERT INTO SETTINGS (KEY, VALUE) VALUES ('stream_probe_rev', ?1)
+             ON CONFLICT(KEY) DO UPDATE SET VALUE = excluded.VALUE",
+            [STREAM_PROBE_REVISION.to_string()],
+        )?;
+    }
+    migration_checkpoint(4, fail_after_step)?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn verify_integrity(conn: &Connection) -> rusqlite::Result<()> {
+    let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if result == "ok" {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            Some(result),
+        ))
+    }
+}
+
+pub fn mime_to_ext(mime: &str) -> &'static str {
+    rusty_dlna_protocol::MEDIA_FORMATS
+        .iter()
+        .find(|format| {
+            [format.video_mime, format.audio_mime, format.image_mime]
+                .into_iter()
+                .flatten()
+                .any(|candidate| candidate.eq_ignore_ascii_case(mime))
+        })
+        .map(|format| format.extension)
+        .unwrap_or("dat")
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_sqlite_page_counts_do_not_narrow_or_wrap() {
+        assert!(page_start_at_or_past_total(0, -1));
+        assert!(page_start_at_or_past_total(0, 0));
+        assert!(!page_start_at_or_past_total(0, 1));
+        assert!(page_start_at_or_past_total(1, 1));
+        if usize::BITS < 64 {
+            assert!(!page_start_at_or_past_total(usize::MAX, i64::MAX));
+        }
+        assert_eq!(
+            sqlite_page_value(usize::MAX),
+            i64::try_from(usize::MAX).unwrap_or(i64::MAX)
+        );
+    }
+
+    #[test]
+    fn backup_loop_bounds_cancel_busy_locked_and_source_restarts() {
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        let mut control = BackupLoopControl::new(start, timeout);
+        assert_eq!(control.before_step(true), Err(BackupLoopStop::Cancelled));
+        assert_eq!(control.before_step(false), Ok(()));
+        assert_eq!(
+            control.after_step(start, 1_000, BackupStepKind::More),
+            Ok(Some(std::time::Duration::from_millis(1)))
+        );
+        assert_eq!(
+            control.after_step(
+                start + std::time::Duration::from_secs(4),
+                900,
+                BackupStepKind::Busy,
+            ),
+            Ok(Some(std::time::Duration::from_millis(10)))
+        );
+        assert_eq!(
+            control.after_step(
+                start + std::time::Duration::from_secs(8),
+                950,
+                BackupStepKind::Locked,
+            ),
+            Ok(Some(std::time::Duration::from_millis(10))),
+            "a source-write restart may increase remaining pages but must not extend the deadline"
+        );
+        assert_eq!(
+            control.after_step(
+                start + std::time::Duration::from_millis(8_500),
+                925,
+                BackupStepKind::More,
+            ),
+            Ok(Some(std::time::Duration::from_millis(1))),
+            "real descending progress after a restart refreshes the idle deadline"
+        );
+        assert_eq!(
+            control.after_step(
+                start + std::time::Duration::from_millis(13_500),
+                925,
+                BackupStepKind::Busy,
+            ),
+            Err(BackupLoopStop::NoProgress)
+        );
+
+        let mut deadline = BackupProgressDeadline::new(start, timeout);
+        assert!(deadline.observe(start, 1_000));
+        assert!(deadline.observe(start + std::time::Duration::from_secs(4), 900));
+        assert!(deadline.observe(start + std::time::Duration::from_secs(8), 950));
+        assert!(deadline.observe(start + std::time::Duration::from_millis(8_500), 925));
+        assert!(!deadline.observe(start + std::time::Duration::from_millis(13_500), 925));
+
+        let mut progressing = BackupProgressDeadline::new(start, timeout);
+        for step in 0..20 {
+            let now = start + std::time::Duration::from_secs(step * 4);
+            assert!(progressing.observe(now, 1_000 - step as i32));
+        }
+    }
+
+    #[test]
+    fn multi_step_online_backup_observes_cancellation_after_more() {
+        let live_path = TempDb::new("backup-cancel-more");
+        let stage_path = TempDb::new("backup-cancel-more-stage");
+        let source = LibraryDb::open(&live_path).unwrap();
+        source
+            .connection()
+            .execute_batch(
+                "CREATE TABLE backup_padding (id INTEGER PRIMARY KEY, value BLOB);
+                 WITH RECURSIVE n(value) AS (
+                   SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < 4096
+                 )
+                 INSERT INTO backup_padding SELECT value, zeroblob(4096) FROM n;",
+            )
+            .unwrap();
+        let probe = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        BACKUP_STEP_PROBES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert((*live_path).clone(), std::sync::Arc::clone(&probe));
+        let cancellation = crate::CancellationToken::default();
+        BACKUP_CANCEL_AFTER_STEP
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert((*live_path).clone(), cancellation.clone());
+
+        assert!(matches!(
+            source.backup_to_path_cancelled(&stage_path, &cancellation),
+            Err(crate::ScanError::Cancelled)
+        ));
+        assert_eq!(
+            probe.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "the cancellation is injected after the first real SQLite More step"
+        );
+        BACKUP_STEP_PROBES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&*live_path);
+        BACKUP_CANCEL_AFTER_STEP
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&*live_path);
+    }
+
+    #[test]
+    fn multi_step_online_backup_tolerates_source_writer_churn_without_starving_it() {
+        let live_path = TempDb::new("backup-live-writer");
+        let stage_path = TempDb::new("backup-live-writer-stage");
+        let source = LibraryDb::open(&live_path).unwrap();
+        source
+            .connection()
+            .execute_batch(
+                "CREATE TABLE backup_padding (id INTEGER PRIMARY KEY, value BLOB);
+                 WITH RECURSIVE n(value) AS (
+                   SELECT 1 UNION ALL SELECT value + 1 FROM n WHERE value < 4096
+                 )
+                 INSERT INTO backup_padding SELECT value, zeroblob(4096) FROM n;",
+            )
+            .unwrap();
+        let probe = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        BACKUP_STEP_PROBES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert((*live_path).clone(), std::sync::Arc::clone(&probe));
+        let cancellation = crate::CancellationToken::default();
+        let destination = (*stage_path).clone();
+        let worker = std::thread::spawn(move || {
+            source
+                .backup_to_path_cancelled(&destination, &cancellation)
+                .unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while probe.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            assert!(std::time::Instant::now() < deadline, "backup did not start");
+            std::thread::yield_now();
+        }
+        let writer = LibraryDb::open(&live_path).unwrap();
+        let started = std::time::Instant::now();
+        for revision in 0..8 {
+            writer
+                .set_setting("backup_concurrent_writer", &revision.to_string())
+                .unwrap();
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "online backup starved the live writer for {:?}",
+            started.elapsed()
+        );
+        worker.join().unwrap();
+        BACKUP_STEP_PROBES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&*live_path);
+        assert_eq!(
+            writer
+                .setting("backup_concurrent_writer")
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+    }
+
+    #[test]
+    fn scan_stage_epochs_parse_full_u64_text_and_reject_out_of_range_values() {
+        let live_path = TempDb::new("epoch-live");
+        let stage_path = TempDb::new("epoch-stage");
+        let live = LibraryDb::open(&live_path).unwrap();
+        let stage = LibraryDb::open(&stage_path).unwrap();
+        live.set_scan_catalog_epoch(u64::MAX).unwrap();
+        stage.set_scan_catalog_epoch(u64::MAX).unwrap();
+        live.attach_scan_stage(&stage_path).unwrap();
+        assert_eq!(live.attached_scan_epochs().unwrap(), (u64::MAX, u64::MAX));
+        live.detach_scan_stage().unwrap();
+
+        stage
+            .set_setting(SCAN_CATALOG_EPOCH_KEY, "18446744073709551616")
+            .unwrap();
+        live.attach_scan_stage(&stage_path).unwrap();
+        assert!(matches!(
+            live.attached_scan_epochs(),
+            Err(rusqlite::Error::FromSqlConversionFailure(1, _, _))
+        ));
+        live.detach_scan_stage().unwrap();
+    }
+
+    #[test]
+    fn stage_merge_schema_coverage_requires_every_scanner_owned_column() {
+        let db = LibraryDb::open_memory().unwrap();
+        let covered: &[(&str, &[&str])] = &[
+            (
+                "OBJECTS",
+                &[
+                    "ID",
+                    "OBJECT_ID",
+                    "PARENT_ID",
+                    "REF_ID",
+                    "CLASS",
+                    "DETAIL_ID",
+                    "NAME",
+                ],
+            ),
+            (
+                "DETAILS",
+                &[
+                    "ID",
+                    "PATH",
+                    "SIZE",
+                    "TIMESTAMP",
+                    "TITLE",
+                    "DURATION",
+                    "BITRATE",
+                    "SAMPLERATE",
+                    "CREATOR",
+                    "ARTIST",
+                    "ALBUM_ARTIST",
+                    "COMPOSER",
+                    "CONTRIBUTOR",
+                    "ALBUM",
+                    "GENRE",
+                    "OUTLINE",
+                    "PLOT",
+                    "COMMENT",
+                    "CHANNELS",
+                    "DISC",
+                    "TRACK",
+                    "RATING",
+                    "DATE",
+                    "RESOLUTION",
+                    "THUMBNAIL",
+                    "ALBUM_ART",
+                    "ROTATION",
+                    "DLNA_PN",
+                    "MIME",
+                    "DEVICE",
+                    "INODE",
+                    "STREAM_PROBE_REV",
+                    "CONTAINER",
+                    "VIDEO",
+                    "AUDIO",
+                    "AUDIO_STREAMS",
+                    "HDR",
+                    "PROBE_SIDECAR_FINGERPRINT",
+                ],
+            ),
+            ("ALBUM_ART", &["ID", "PATH"]),
+            ("CAPTIONS", &["ID", "PATH"]),
+            (
+                "PLAYLISTS",
+                &[
+                    "ID",
+                    "NAME",
+                    "PATH",
+                    "ITEMS",
+                    "FOUND",
+                    "TIMESTAMP",
+                    "DEVICE",
+                    "INODE",
+                ],
+            ),
+            ("PLAYLIST_ITEMS", &["PLAYLIST_ID", "DETAIL_ID", "POSITION"]),
+            ("SETTINGS", &["KEY", "VALUE"]),
+        ];
+        for (table, expected) in covered {
+            let mut statement = db
+                .connection()
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let actual = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(actual, *expected, "update the stage merge for {table}");
+        }
+        let tables = db
+            .connection()
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(tables.contains(&"BOOKMARKS".to_owned()));
+        let actual_scanner_tables = tables
+            .iter()
+            .filter(|table| table.as_str() != "BOOKMARKS" && table.as_str() != "sqlite_sequence")
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let covered_tables = covered
+            .iter()
+            .map(|(table, _)| *table)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(actual_scanner_tables, covered_tables);
+        // BOOKMARKS are never staged; SETTINGS deliberately excludes only
+        // request-owned updateID and the separately validated catalog epoch.
+    }
+
+    struct TempDb(PathBuf);
+
+    impl TempDb {
+        fn new(name: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "rusty-dlna-db-{name}-{}-{sequence}",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl std::ops::Deref for TempDb {
+        type Target = PathBuf;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TempDb {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = self.0.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(sidecar));
+            }
+        }
+    }
+
+    fn temp_db(name: &str) -> TempDb {
+        TempDb::new(name)
+    }
+
+    fn create_legacy_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE OBJECTS (
+               ID INTEGER PRIMARY KEY AUTOINCREMENT, OBJECT_ID TEXT UNIQUE NOT NULL,
+               PARENT_ID TEXT NOT NULL, REF_ID TEXT, CLASS TEXT NOT NULL,
+               DETAIL_ID INTEGER, NAME TEXT);
+             CREATE TABLE DETAILS (
+               ID INTEGER PRIMARY KEY AUTOINCREMENT, PATH TEXT, SIZE INTEGER,
+               TIMESTAMP INTEGER, TITLE TEXT, DURATION TEXT, BITRATE INTEGER,
+               SAMPLERATE INTEGER, CREATOR TEXT, ARTIST TEXT, ALBUM TEXT,
+               GENRE TEXT, COMMENT TEXT, CHANNELS INTEGER, DISC INTEGER,
+               TRACK INTEGER, DATE DATE, RESOLUTION TEXT, THUMBNAIL BOOL DEFAULT 0,
+               ALBUM_ART INTEGER DEFAULT 0, ROTATION INTEGER, DLNA_PN TEXT,
+               MIME TEXT, DEVICE INTEGER, INODE INTEGER);
+             CREATE TABLE ALBUM_ART (ID INTEGER PRIMARY KEY AUTOINCREMENT, PATH TEXT NOT NULL);
+             CREATE TABLE CAPTIONS (ID INTEGER NOT NULL, PATH TEXT NOT NULL, PRIMARY KEY (ID, PATH));
+             CREATE TABLE BOOKMARKS (ID INTEGER PRIMARY KEY, SEC INTEGER, WATCH_COUNT INTEGER);
+             CREATE TABLE PLAYLISTS (
+               ID INTEGER PRIMARY KEY AUTOINCREMENT, NAME TEXT NOT NULL, PATH TEXT NOT NULL,
+               ITEMS INTEGER DEFAULT 0, FOUND INTEGER DEFAULT 0, TIMESTAMP INTEGER DEFAULT 0);
+             CREATE TABLE SETTINGS (KEY TEXT NOT NULL, VALUE TEXT);
+             PRAGMA user_version=0;",
+        )
+        .unwrap();
+    }
+
+    fn create_v9_schema(conn: &Connection) {
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO SETTINGS (KEY, VALUE) VALUES ('stream_probe_rev', ?1)",
+            [STREAM_PROBE_REVISION.to_string()],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO SETTINGS (KEY, VALUE) VALUES ('migration_sentinel', 'unchanged');
+             INSERT INTO DETAILS
+               (ID, PATH, SIZE, TIMESTAMP, TITLE, COMMENT, MIME, DEVICE, INODE, STREAM_PROBE_REV)
+             VALUES
+               (17, '/media/v9.mkv', 99, 123, 'v9 title', 'v9 plot',
+                'video/x-matroska', 4, 5, 5);
+             PRAGMA user_version=9;",
+        )
+        .unwrap();
+    }
+
+    fn query_fixture() -> LibraryDb {
+        let db = LibraryDb::open_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, NAME) VALUES ('0', '-1', 'container.storageFolder', 'root')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, NAME) VALUES ('2', '0', 'container.storageFolder', 'Video')",
+                [],
+            )
+            .unwrap();
+        for (id, title, track) in [(1, "Zulu", 3), (2, "Alpha", 1), (3, "Middle", 2)] {
+            db.conn
+                .execute(
+                    "INSERT INTO DETAILS (ID, TITLE, DATE, ALBUM, TRACK, CREATOR, MIME) VALUES (?1, ?2, '2024-01-01', 'Album', ?3, 'Creator', 'video/mp4')",
+                    params![id, title, track],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID, NAME) VALUES (?1, '2', 'item.videoItem', ?2, ?3)",
+                    params![format!("2${id}"), id, format!("file-{id}")],
+                )
+                .unwrap();
+        }
+        db
+    }
+
+    fn assert_catalog_items_equal(full: &MediaItem, incremental: &MediaItem) {
+        macro_rules! assert_fields_equal {
+            ($left:expr, $right:expr, $($field:ident),+ $(,)?) => {
+                $(assert_eq!(
+                    &$left.$field,
+                    &$right.$field,
+                    "catalog item field {} differed",
+                    stringify!($field)
+                );)+
+            };
+        }
+
+        assert_fields_equal!(
+            full,
+            incremental,
+            object_id,
+            parent_id,
+            detail_id,
+            title,
+            class,
+            date,
+            path,
+            mime,
+            ext,
+            size,
+            mtime,
+            dlna_pn,
+            ref_id,
+            device,
+            inode,
+            duration,
+            bitrate,
+            resolution,
+            channels,
+            samplerate,
+            album_art,
+            creator,
+            about,
+            plot,
+            artist,
+            album_artist,
+            composer,
+            contributor,
+            album,
+            genre,
+            disc,
+            track,
+            rating,
+            rotation,
+            bookmark_sec,
+            watch_count,
+        );
+        assert_fields_equal!(
+            full.probe,
+            incremental.probe,
+            container,
+            video,
+            hdr,
+            audio,
+            audio_streams,
+            video_profile,
+            video_level,
+            pixel_format,
+            bit_depth,
+            frame_rate,
+            video_timestamp_mode,
+            audio_layout,
+            codec_string,
+            width,
+            height,
+        );
+        assert_eq!(full.captions.len(), incremental.captions.len());
+        for (full_caption, incremental_caption) in full.captions.iter().zip(&incremental.captions) {
+            assert_eq!(full_caption.index, incremental_caption.index);
+            assert_eq!(full_caption.path, incremental_caption.path);
+            assert_eq!(full_caption.ext, incremental_caption.ext);
+        }
+    }
+
+    #[test]
+    fn full_and_incremental_catalog_mappers_match_every_nullable_field() {
+        let db = LibraryDb::open_memory().unwrap();
+        db.begin_catalog_change_capture().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO ALBUM_ART (ID, PATH) VALUES (77, '/art/exhaustive.jpg')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO DETAILS (
+                     ID, PATH, SIZE, TIMESTAMP, TITLE, DURATION, BITRATE, SAMPLERATE,
+                     CREATOR, ARTIST, ALBUM_ARTIST, COMPOSER, CONTRIBUTOR, ALBUM,
+                     GENRE, OUTLINE, PLOT, COMMENT, CHANNELS, DISC, TRACK, RATING, DATE, RESOLUTION,
+                     THUMBNAIL, ALBUM_ART, ROTATION, DLNA_PN, MIME, DEVICE, INODE,
+                     STREAM_PROBE_REV, CONTAINER, VIDEO, AUDIO, AUDIO_STREAMS, HDR
+                 ) VALUES (
+                     42, '/media/exhaustive.mkv', 987654321, 1700000123,
+                     'Detail title', '1:02:03.004', 7654321, 48000,
+                     'Creator value', 'Artist value', 'Album artist value',
+                     'Composer value', 'Contributor value', 'Album value',
+                     'Genre value', 'Spoiler-free outline', 'Full plot value',
+                     'Embedded comment value', 6, 3, 7, 4, '2026-08-20',
+                     '3840x2160', 1, 77, 90, 'EXPLICIT_DLNA_PROFILE',
+                     'video/x-matroska', 123, 456, ?1, 'mkv', 'hevc', 'eac3,aac',
+                     '1:0:eac3:6:eng:Main:1,2:1:aac:2:jpn:Commentary:0,@v:Main%2010:153:yuv420p10le:10:24000/1001:hvc1.2.4.L153.B0:5.1:valid',
+                     'dolby-vision-profile-8,hdr10'
+                 )",
+                [STREAM_PROBE_REVISION],
+            )
+            .unwrap();
+        let genre_parent = format!("{VIDEO_GENRE_ID}$Genre value");
+        let series_parent = format!("{VIDEO_SERIES_ID}$Series value");
+        db.conn
+            .execute(
+                "INSERT INTO OBJECTS
+                     (OBJECT_ID, PARENT_ID, REF_ID, CLASS, DETAIL_ID, NAME)
+                 VALUES ('genre-object', ?1, 'genre-ref', 'item.videoItem', 42,
+                         'Genre object title')",
+                [&genre_parent],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO OBJECTS
+                     (OBJECT_ID, PARENT_ID, REF_ID, CLASS, DETAIL_ID, NAME)
+                 VALUES ('series-object', ?1, 'series-ref', 'item.videoItem', 42,
+                         'Series object title')",
+                [&series_parent],
+            )
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO CAPTIONS (ID, PATH)
+                   VALUES (42, '/media/exhaustive.01.SRT'),
+                          (42, '/media/exhaustive.02.ASS'),
+                          (42, '/media/exhaustive.03.SsA'),
+                          (42, '/media/exhaustive.04.VTT'),
+                          (42, '/media/exhaustive.05.SMI'),
+                          (42, '/media/exhaustive.06.sub'),
+                          (42, '/media/exhaustive.07.unknown');
+                 INSERT INTO BOOKMARKS (ID, SEC, WATCH_COUNT, UPDATED_AT)
+                   VALUES (42, 3723, 9, 1700000999);",
+            )
+            .unwrap();
+
+        let full = db.load_catalog().unwrap();
+        let patch = db.load_catalog_patch().unwrap();
+        assert_eq!(patch.items.len(), 2);
+        assert_eq!(full.items.len(), patch.items.len());
+        for incremental in &patch.items {
+            let full_item = full
+                .items
+                .get(&incremental.object_id)
+                .expect("full catalog item");
+            assert_catalog_items_equal(full_item, incremental);
+        }
+        for item in full.items.values() {
+            assert_eq!(
+                item.captions
+                    .iter()
+                    .map(|caption| caption.ext.as_str())
+                    .collect::<Vec<_>>(),
+                ["srt", "ass", "ssa", "vtt", "smi", "sub", "sub"]
+            );
+        }
+        for item in &patch.items {
+            assert_eq!(
+                item.captions
+                    .iter()
+                    .map(|caption| caption.ext.as_str())
+                    .collect::<Vec<_>>(),
+                ["srt", "ass", "ssa", "vtt", "smi", "sub", "sub"]
+            );
+        }
+        assert_eq!(full.items["genre-object"].title, "Genre object title");
+        assert_eq!(full.items["series-object"].title, "Series object title");
+        assert_eq!(
+            full.album_art_paths.get(&77),
+            patch.album_art_paths.get(&77)
+        );
+    }
+
+    #[test]
+    fn sqlite_catalog_query_counts_sorts_pages_and_handles_huge_offsets() {
+        let db = query_fixture();
+        let children = db
+            .query_children_page(
+                "2",
+                &[CatalogQuerySort {
+                    field: CatalogQueryField::Title,
+                    descending: false,
+                }],
+                CatalogDefaultOrder::FoldersFirst,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!(children.total, 3);
+        assert_eq!(children.object_ids, ["2$3"]);
+
+        let query = CatalogQuery {
+            groups: vec![vec![CatalogQueryClause {
+                field: CatalogQueryField::Class,
+                op: CatalogQueryOp::DerivedFrom("object.item.videoItem".into()),
+            }]],
+            sort: vec![CatalogQuerySort {
+                field: CatalogQueryField::Track,
+                descending: true,
+            }],
+            default_order: CatalogDefaultOrder::FoldersFirst,
+        };
+        let page = db.query_search_page("0", &query, 0, 2).unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.population, 4);
+        assert_eq!(page.object_ids, ["2$1", "2$3"]);
+
+        let past_end = db
+            .query_search_page("0", &query, i32::MAX as usize, 4096)
+            .unwrap();
+        assert_eq!(past_end.total, 3);
+        assert!(past_end.object_ids.is_empty());
+    }
+
+    #[test]
+    fn web_media_query_deduplicates_aliases_and_physical_files_before_paging() {
+        let db = query_fixture();
+        db.conn
+            .execute(
+                "INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, REF_ID, CLASS, DETAIL_ID, NAME)
+                 VALUES ('alias-zulu', '2', '2$1', 'item.videoItem', 1, 'alias')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute("UPDATE DETAILS SET DEVICE = 9, INODE = 42 WHERE ID = 2", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO DETAILS (ID, PATH, TITLE, DATE, ALBUM, TRACK, MIME, DEVICE, INODE)
+                 VALUES (4, '/alias/alpha.mp4', 'Alpha duplicate', '2024-01-02', 'Album', 4, 'video/mp4', 9, 42)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID, NAME)
+                 VALUES ('2$4', '2', 'item.videoItem', 4, 'duplicate')",
+                [],
+            )
+            .unwrap();
+
+        let page = db
+            .query_web_media_page(WebMediaKind::Video, "", WebMediaSort::Title, 0, 2)
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.object_ids, ["2$2", "2$3"]);
+        let second = db
+            .query_web_media_page(WebMediaKind::Video, "", WebMediaSort::Title, 2, 2)
+            .unwrap();
+        assert_eq!(second.total, 3);
+        assert_eq!(second.object_ids, ["2$1"]);
+
+        let searched = db
+            .query_web_media_page(WebMediaKind::All, "zulu", WebMediaSort::Title, 0, 10)
+            .unwrap();
+        assert_eq!(searched.total, 1);
+        assert_eq!(searched.object_ids, ["2$1"]);
+    }
+
+    #[test]
+    #[ignore = "50k-row latency benchmark; run explicitly in release mode"]
+    fn web_media_50k_page_benchmark_stays_in_sqlite() {
+        let mut db = LibraryDb::open_memory().unwrap();
+        let transaction = db.conn.transaction().unwrap();
+        {
+            let mut detail = transaction
+                .prepare("INSERT INTO DETAILS (ID, PATH, TITLE, MIME, DEVICE, INODE, DATE) VALUES (?1, ?2, ?3, 'video/mp4', 1, ?1, '2026-01-01')")
+                .unwrap();
+            let mut object = transaction
+                .prepare("INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID, NAME) VALUES (?1, '64', 'item.videoItem', ?2, ?3)")
+                .unwrap();
+            for id in 1i64..=50_000 {
+                let title = format!("Title {id:05}");
+                detail
+                    .execute(params![id, format!("/media/{id}.mp4"), title])
+                    .unwrap();
+                object
+                    .execute(params![format!("64${id}"), id, format!("{id}.mp4")])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+
+        for offset in [0, 25_000, 49_800] {
+            let started = std::time::Instant::now();
+            let page = db
+                .query_web_media_page(WebMediaKind::Video, "", WebMediaSort::Title, offset, 200)
+                .unwrap();
+            assert_eq!(page.total, 50_000);
+            assert_eq!(page.object_ids.len(), 200);
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(750),
+                "50k page at offset {offset} exceeded the 750ms release target: {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_catalog_query_preserves_or_and_exists_semantics() {
+        let db = query_fixture();
+        let query = CatalogQuery {
+            groups: vec![
+                vec![CatalogQueryClause {
+                    field: CatalogQueryField::Title,
+                    op: CatalogQueryOp::Contains("alpha".into()),
+                }],
+                vec![
+                    CatalogQueryClause {
+                        field: CatalogQueryField::Title,
+                        op: CatalogQueryOp::Equals("Zulu".into()),
+                    },
+                    CatalogQueryClause {
+                        field: CatalogQueryField::RefId,
+                        op: CatalogQueryOp::Exists(false),
+                    },
+                ],
+            ],
+            sort: vec![CatalogQuerySort {
+                field: CatalogQueryField::Title,
+                descending: false,
+            }],
+            default_order: CatalogDefaultOrder::FoldersFirst,
+        };
+        let page = db.query_search_page("2", &query, 0, 10).unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.object_ids, ["2$2", "2$1"]);
+    }
+
+    #[test]
+    fn sqlite_catalog_query_implements_negative_and_relational_operators() {
+        let db = query_fixture();
+        let cases = [
+            (
+                CatalogQueryOp::DoesNotContain("u".into()),
+                vec!["2$2", "2$3"],
+            ),
+            (
+                CatalogQueryOp::NotEquals("Middle".into()),
+                vec!["2$2", "2$1"],
+            ),
+            (
+                CatalogQueryOp::LessThan {
+                    value: "Middle".into(),
+                    inclusive: true,
+                },
+                vec!["2$2", "2$3"],
+            ),
+            (
+                CatalogQueryOp::GreaterThan {
+                    value: "Middle".into(),
+                    inclusive: false,
+                },
+                vec!["2$1"],
+            ),
+        ];
+        for (op, expected) in cases {
+            let query = CatalogQuery {
+                groups: vec![vec![
+                    CatalogQueryClause {
+                        field: CatalogQueryField::Class,
+                        op: CatalogQueryOp::Equals("item.videoItem".into()),
+                    },
+                    CatalogQueryClause {
+                        field: CatalogQueryField::Title,
+                        op,
+                    },
+                ]],
+                sort: vec![CatalogQuerySort {
+                    field: CatalogQueryField::Title,
+                    descending: false,
+                }],
+                default_order: CatalogDefaultOrder::FoldersFirst,
+            };
+            let page = db.query_search_page("2", &query, 0, 10).unwrap();
+            assert_eq!(page.object_ids, expected);
+        }
+    }
+
+    #[test]
+    fn legacy_schema_migrates_atomically_and_deduplicates_constraints() {
+        let path = temp_db("legacy-migrate");
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_legacy_schema(&conn);
+            conn.execute_batch(
+                "INSERT INTO SETTINGS VALUES ('updateID', '4');
+                 INSERT INTO SETTINGS VALUES ('updateID', '7');
+                 INSERT INTO ALBUM_ART (ID, PATH) VALUES (10, '/art/cover.jpg');
+                 INSERT INTO ALBUM_ART (ID, PATH) VALUES (11, '/art/cover.jpg');
+                 INSERT INTO DETAILS (ID, PATH, TITLE, COMMENT, ALBUM_ART, MIME)
+                   VALUES (1, '/media/a.mkv', 'A', 'legacy plot', 11, 'video/x-matroska');
+                 INSERT INTO BOOKMARKS (ID, SEC, WATCH_COUNT) VALUES (1, 120, 3);
+                 INSERT INTO PLAYLISTS (NAME, PATH) VALUES ('old', '/lists/a.m3u');
+                 INSERT INTO PLAYLISTS (NAME, PATH) VALUES ('new', '/lists/a.m3u');",
+            )
+            .unwrap();
+        }
+
+        let db = LibraryDb::open(&path).unwrap();
+        let version: i64 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(table_has_column(&db.conn, "DETAILS", "HDR").unwrap());
+        assert!(table_has_column(&db.conn, "BOOKMARKS", "UPDATED_AT").unwrap());
+        assert!(table_has_column(&db.conn, "DETAILS", "OUTLINE").unwrap());
+        assert!(table_has_column(&db.conn, "DETAILS", "PLOT").unwrap());
+        let migrated_descriptions: (Option<String>, Option<String>) = db
+            .conn
+            .query_row("SELECT PLOT, COMMENT FROM DETAILS WHERE ID=1", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(migrated_descriptions, (Some("legacy plot".into()), None));
+        let bookmark_updated_at: i64 = db
+            .conn
+            .query_row("SELECT UPDATED_AT FROM BOOKMARKS WHERE ID=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            bookmark_updated_at > 0,
+            "pre-upgrade bookmarks must receive the migration time"
+        );
+        assert_eq!(db.setting("updateID").unwrap().as_deref(), Some("7"));
+        assert_eq!(db.detail_album_art(1).unwrap(), 10);
+        let art_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM ALBUM_ART", [], |row| row.get(0))
+            .unwrap();
+        let playlist_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM PLAYLISTS", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(art_count, 1);
+        assert_eq!(playlist_count, 1);
+        assert!(db
+            .conn
+            .execute("INSERT INTO SETTINGS VALUES ('updateID', '8')", [])
+            .is_err());
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn v11_outline_only_database_migrates_before_catalog_load() {
+        let path = temp_db("v11-outline-only");
+        {
+            let db = LibraryDb::open(&path).unwrap();
+            db.conn
+                .execute_batch(
+                    "INSERT INTO DETAILS (ID, PATH, TITLE, COMMENT, MIME)
+                       VALUES (1, '/media/a.mkv', 'A', 'legacy plot', 'video/x-matroska');
+                     INSERT INTO OBJECTS
+                       (OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID, NAME)
+                       VALUES ('2$1', '2', 'item.videoItem', 1, 'a.mkv');
+                     ALTER TABLE DETAILS DROP COLUMN PLOT;
+                     PRAGMA user_version=11;",
+                )
+                .unwrap();
+        }
+
+        let db = LibraryDb::open(&path).unwrap();
+        assert!(table_has_column(&db.conn, "DETAILS", "PLOT").unwrap());
+        let version: i64 = db
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let item = db
+            .load_catalog()
+            .unwrap()
+            .items
+            .remove("2$1")
+            .expect("the pre-upgrade catalog item must remain available");
+        assert_eq!(item.plot.as_deref(), Some("legacy plot"));
+        assert_eq!(item.about, None);
+    }
+
+    #[test]
+    fn capability_and_timing_revisions_schedule_only_affected_rows() {
+        let mut db = LibraryDb::open_memory().unwrap();
+        db.conn
+            .execute(
+                "UPDATE SETTINGS SET VALUE = '3' WHERE KEY = 'stream_probe_rev'",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO DETAILS
+                    (ID, PATH, MIME, CONTAINER, VIDEO, STREAM_PROBE_REV, AUDIO_STREAMS)
+                 VALUES (1, '/media/legacy.mkv', 'video/x-matroska', 'mkv', 'hevc', 3,
+                         '1:0:eac3:6'),
+                        (2, '/media/current.mkv', 'video/x-matroska', 'mkv', 'hevc', 3,
+                         '1:0:eac3:6,@v:Main%2010:153:yuv420p10le:10:24000/1001:hvc1.2.4.L153.B0:5.1'),
+                        (3, '/media/reordered.mp4', 'video/mp4', 'mp4', 'hevc', 3,
+                         '1:0:eac3:6,@v:Main%2010:153:yuv420p10le:10:24000/1001:hvc1.2.4.L153.B0:5.1')",
+                [],
+            )
+            .unwrap();
+
+        migrate_schema(&mut db.conn).unwrap();
+
+        let legacy_revision: i64 = db
+            .conn
+            .query_row(
+                "SELECT STREAM_PROBE_REV FROM DETAILS WHERE ID = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let current_revision: i64 = db
+            .conn
+            .query_row(
+                "SELECT STREAM_PROBE_REV FROM DETAILS WHERE ID = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let timing_revision: i64 = db
+            .conn
+            .query_row(
+                "SELECT STREAM_PROBE_REV FROM DETAILS WHERE ID = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_revision, 0);
+        assert_eq!(current_revision, STREAM_PROBE_REVISION);
+        assert_eq!(timing_revision, 0);
+        assert_eq!(
+            db.setting("stream_probe_rev").unwrap().as_deref(),
+            Some("5")
+        );
+    }
+
+    #[test]
+    fn interrupted_migration_rolls_back_every_step_and_version() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_legacy_schema(&conn);
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO SETTINGS VALUES ('key', 'old');
+             INSERT INTO SETTINGS VALUES ('key', 'new');",
+        )
+        .unwrap();
+
+        let error = migrate_schema_inner(&mut conn, Some(2)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected migration interruption"));
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 0);
+        assert!(!table_has_column(&conn, "DETAILS", "CONTAINER").unwrap());
+        let duplicates: i64 = conn
+            .query_row("SELECT COUNT(*) FROM SETTINGS WHERE KEY='key'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(duplicates, 2);
+
+        migrate_schema_inner(&mut conn, None).unwrap();
+        assert!(table_has_column(&conn, "DETAILS", "CONTAINER").unwrap());
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn interrupted_v9_to_current_migration_rolls_back_then_retries_atomically() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_v9_schema(&conn);
+
+        let error = migrate_schema_inner(&mut conn, Some(4)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected migration interruption after step 4"));
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+        assert!(!table_has_column(&conn, "DETAILS", "PROBE_SIDECAR_FINGERPRINT").unwrap());
+        let row: (String, i64, String) = conn
+            .query_row(
+                "SELECT PATH, STREAM_PROBE_REV,
+                        (SELECT VALUE FROM SETTINGS WHERE KEY='migration_sentinel')
+                 FROM DETAILS WHERE ID=17",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("/media/v9.mkv".into(), 5, "unchanged".into()));
+        let descriptions: (Option<String>, Option<String>) = conn
+            .query_row("SELECT PLOT, COMMENT FROM DETAILS WHERE ID=17", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(descriptions, (None, Some("v9 plot".into())));
+
+        migrate_schema_inner(&mut conn, None).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(table_has_column(&conn, "DETAILS", "PROBE_SIDECAR_FINGERPRINT").unwrap());
+        let fingerprint: Option<String> = conn
+            .query_row(
+                "SELECT PROBE_SIDECAR_FINGERPRINT FROM DETAILS WHERE ID=17",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fingerprint, None,
+            "legacy rows require one provenance probe"
+        );
+        let descriptions: (Option<String>, Option<String>) = conn
+            .query_row("SELECT PLOT, COMMENT FROM DETAILS WHERE ID=17", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(descriptions, (Some("v9 plot".into()), None));
+    }
+
+    #[test]
+    fn pre_cancelled_v9_open_never_partially_migrates_the_database() {
+        let path = temp_db("v9-pre-cancelled-migration");
+        let conn = Connection::open(&path).unwrap();
+        create_v9_schema(&conn);
+        drop(conn);
+
+        let cancellation = crate::CancellationToken::default();
+        cancellation.cancel();
+        let error = LibraryDb::open_with_cancellation(&path, cancellation)
+            .err()
+            .expect("pre-cancelled open must fail");
+        assert!(error.to_string().contains("database open cancelled"));
+
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+        assert!(!table_has_column(&conn, "DETAILS", "PROBE_SIDECAR_FINGERPRINT").unwrap());
+        let sentinel: String = conn
+            .query_row(
+                "SELECT VALUE FROM SETTINGS WHERE KEY='migration_sentinel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sentinel, "unchanged");
+    }
+
+    #[test]
+    fn foreign_keys_and_delete_relationships_are_enforced() {
+        let db = LibraryDb::open_memory().unwrap();
+        let foreign_keys: i64 = db
+            .conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+        assert!(db
+            .conn
+            .execute(
+                "INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID)
+                 VALUES ('bad', '0', 'item.videoItem', 999)",
+                [],
+            )
+            .is_err());
+        db.conn
+            .execute(
+                "INSERT INTO DETAILS (ID, PATH, MIME) VALUES (1, '/a', 'video/mp4')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID)
+                 VALUES ('ok', '0', 'item.videoItem', 1)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute("INSERT INTO CAPTIONS (ID, PATH) VALUES (1, '/a.srt')", [])
+            .unwrap();
+        db.conn
+            .execute("INSERT INTO BOOKMARKS (ID, SEC) VALUES (1, 12)", [])
+            .unwrap();
+        db.conn
+            .execute("DELETE FROM DETAILS WHERE ID=1", [])
+            .unwrap();
+        for table in ["OBJECTS", "CAPTIONS", "BOOKMARKS"] {
+            let count: i64 = db
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} relationship was not deleted");
+        }
+    }
+
+    #[test]
+    fn busy_and_full_failures_roll_back_coherent_updates() {
+        let path = temp_db("busy-rollback");
+        let primary = LibraryDb::open(&path).unwrap();
+        primary
+            .conn
+            .execute(
+                "INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, NAME)
+                 VALUES ('sentinel', '0', 'container.storageFolder', 'keep')",
+                [],
+            )
+            .unwrap();
+        let contender =
+            LibraryDb::open_with_busy_timeout(&path, std::time::Duration::from_millis(1)).unwrap();
+        primary.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let tx = contender.transaction().unwrap();
+        let busy = contender.clear_objects().unwrap_err();
+        assert!(matches!(
+            busy,
+            rusqlite::Error::SqliteFailure(ref error, _)
+                if error.extended_code & 0xff == rusqlite::ffi::SQLITE_BUSY
+                    || error.extended_code & 0xff == rusqlite::ffi::SQLITE_LOCKED
+        ));
+        drop(tx);
+        primary.conn.execute_batch("ROLLBACK").unwrap();
+        assert!(primary.object_exists("sentinel").unwrap());
+        drop(contender);
+        drop(primary);
+        let _ = std::fs::remove_file(&path);
+
+        let full = LibraryDb::open_memory().unwrap();
+        full.conn
+            .execute(
+                "INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, NAME)
+                 VALUES ('sentinel', '0', 'container.storageFolder', 'keep')",
+                [],
+            )
+            .unwrap();
+        let pages: i64 = full
+            .conn
+            .pragma_query_value(None, "page_count", |row| row.get(0))
+            .unwrap();
+        full.conn
+            .pragma_update(None, "max_page_count", pages + 1)
+            .unwrap();
+        let tx = full.transaction().unwrap();
+        full.clear_objects().unwrap();
+        let no_space = full
+            .conn
+            .execute(
+                "INSERT INTO DETAILS (COMMENT) VALUES (zeroblob(1048576))",
+                [],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            no_space,
+            rusqlite::Error::SqliteFailure(ref error, _)
+                if error.extended_code & 0xff == rusqlite::ffi::SQLITE_FULL
+        ));
+        drop(tx);
+        assert!(full.object_exists("sentinel").unwrap());
+    }
+
+    #[test]
+    fn database_parent_io_error_is_observable() {
+        let parent = temp_db("io-parent");
+        std::fs::write(&parent, b"not a directory").unwrap();
+        let error = match LibraryDb::open(&parent.join("files.db")) {
+            Ok(_) => panic!("database unexpectedly opened below a regular file"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, rusqlite::Error::ToSqlConversionFailure(_)));
+        let _ = std::fs::remove_file(parent);
+    }
+}

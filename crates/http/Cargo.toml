@@ -1,0 +1,13 @@
+[package]
+name = "rusty-dlna-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP media, description, and sidecar serving"
+
+[dependencies]
+rusty-dlna-protocol.workspace = true
+rusty-dlna-transcode.workspace = true
+
+[dev-dependencies]
+roxmltree.workspace = true

@@ -1,0 +1,95 @@
+name: Scheduled fuzzing
+
+on:
+  schedule:
+    - cron: "17 4 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-fuzz
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }} (${{ matrix.sanitizer }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        target: [http_request, http_range, ssdp, soap_xml, nfo, url_ids, sidecars]
+        sanitizer: [address, leak]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+      - name: Pinned fuzz toolchain
+        run: |
+          rustup toolchain install nightly-2026-08-01 --profile minimal --component rust-src
+          cargo +nightly-2026-08-01 install cargo-fuzz --version 0.13.2 --locked
+      - name: Restore evolving corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-${{ matrix.target }}-${{ matrix.sanitizer }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-${{ matrix.target }}-${{ matrix.sanitizer }}-
+      - name: Seed and replay promoted regressions
+        shell: bash
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          mkdir -p "fuzz/corpus/$FUZZ_TARGET"
+          cp -an "fuzz/seeds/$FUZZ_TARGET/." "fuzz/corpus/$FUZZ_TARGET/"
+          if [[ -d "fuzz/regressions/$FUZZ_TARGET" ]]; then
+            for regression in "fuzz/regressions/$FUZZ_TARGET"/*; do
+              [[ -f "$regression" ]] || continue
+              cargo +nightly-2026-08-01 fuzz run --sanitizer "$FUZZ_SANITIZER" \
+                "$FUZZ_TARGET" "$regression" -- -runs=1 -timeout=5
+            done
+          fi
+      - name: Fuzz for ten minutes
+        shell: bash
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          mkdir -p fuzz/logs
+          set -o pipefail
+          cargo +nightly-2026-08-01 fuzz run --sanitizer "$FUZZ_SANITIZER" \
+            "$FUZZ_TARGET" "fuzz/corpus/$FUZZ_TARGET" -- \
+            -max_total_time=600 -timeout=5 2>&1 | tee "fuzz/logs/$FUZZ_TARGET-$FUZZ_SANITIZER.log"
+      - name: Minimize retained crash
+        if: failure()
+        shell: bash
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          mkdir -p "fuzz/artifacts/$FUZZ_TARGET" "fuzz/minimized/$FUZZ_TARGET"
+          marker=$(mktemp)
+          for artifact in "fuzz/artifacts/$FUZZ_TARGET"/*; do
+            [[ -f "$artifact" ]] || continue
+            cargo +nightly-2026-08-01 fuzz tmin --sanitizer "$FUZZ_SANITIZER" \
+              --runs 64 "$FUZZ_TARGET" "$artifact" -- -timeout=5 || true
+          done
+          find "fuzz/artifacts/$FUZZ_TARGET" -maxdepth 1 -type f \
+            -name 'minimized-from-*' -newer "$marker" \
+            -exec cp -t "fuzz/minimized/$FUZZ_TARGET" {} +
+          rm -f "$marker"
+      - name: Retain crashes, minimized cases, and logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: fuzz-${{ matrix.target }}-${{ matrix.sanitizer }}-${{ github.run_id }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}
+            fuzz/minimized/${{ matrix.target }}
+            fuzz/logs/${{ matrix.target }}-${{ matrix.sanitizer }}.log
+          if-no-files-found: warn
+          retention-days: 30

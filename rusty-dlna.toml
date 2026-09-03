@@ -1,0 +1,100 @@
+# Example container rustyDLNA config. Baked into the image at
+# /etc/rusty-dlna.toml. Bind-mount a gitignored local file
+# (rusty-dlna.live.toml) from compose for uuid, advertise_ip, remaps.
+
+friendly_name = "rustyDLNA"
+media_dir = ["V,/storage/video"]
+exclude_dir = ["incomplete"]
+# Basename globs are ASCII case-insensitive; `*` and `?` are supported.
+# exclude_file = ["*-extra.*", "sample?.mkv"]
+include_hidden = false
+# Extra folder art names; `{stem}` or `%s` expands to the media filename stem.
+# album_art_names = ["AlbumArt.jpg", "{stem}-cover.jpg"]
+subtitles = true
+thumbnails = true
+thumbnail_width = 320
+thumbnail_quality = 2
+thumbnail_filmstrip = false
+scan_command_timeout_secs = 30
+# Physical files are probed and have artwork prepared concurrently. Database
+# publication remains ordered and single-writer safe.
+scan_workers = 16
+# One fair process-wide budget covers scan probes, image generation, FFmpeg,
+# FFprobe, and remux. Excess work waits in a bounded FIFO queue.
+helper_max_jobs = 16
+helper_queue_capacity = 64
+helper_queue_timeout_secs = 30
+# Whole-process SIGTERM budget; helpers receive TERM, then KILL/reap within it.
+shutdown_timeout_secs = 15
+# Recently Added uses filesystem mtime, newest first, with inode deduplication.
+recent_limit = 200
+# recent_days = 90 # omitted means no age window
+# Security default: do not follow symlinks whose target leaves media_dir.
+wide_links = false
+root_container = "V"
+listen_ip = "0.0.0.0"
+cache_dir = "/var/cache/rusty-dlna"
+db_dir = "/var/cache/rusty-dlna"
+derived_image_cache_mb = 512
+derived_image_cache_age_days = 30
+# FFmpeg JPEG qscale: larger values trade detail for substantially smaller
+# browser/DLNA resize responses. Scanner thumbnails retain their own setting.
+derived_image_quality = 8
+cache_min_free_mb = 128
+# Kodi resume positions/play counts: 0 = retain indefinitely.
+bookmark_retention_days = 0
+
+# The browser player is compiled into the binary and served at `/`.
+# Set false to remove /web/* and /api/web/* and restore the status page at `/`.
+[web]
+enable = true
+# Use h264_nvenc when an NVIDIA GPU is exposed to the container.
+encoder = "libx264"
+# AI upscaling has a separate producer gate so one model does not make another
+# fall below its measured real-time rate.
+ai_upscale_max_jobs = 1
+# Ordered external libplacebo shaders are optional. See docs/WEB_PLAYER.md for
+# model selection, licensing, calibration, and a complete example.
+# [[web.ai_upscale]]
+# name = "fsrcnnx-16"
+# shader_path = "models/FSRCNNX_x2_16-0-4-1.glsl"
+# max_source_width = 1920
+# max_source_height = 1080
+# max_source_pixels_per_second = 52000000
+#
+# [[web.ai_upscale]]
+# name = "fsrcnnx-8"
+# shader_path = "models/FSRCNNX_x2_8-0-4-1.glsl"
+# max_source_width = 1920
+# max_source_height = 1080
+# max_source_pixels_per_second = 70000000
+
+[transcode]
+# Original browser playback remains available when false; only the browser's
+# Compatible mode and configured DLNA remap jobs are disabled.
+enable = false
+encoder = "libx264"
+max_jobs = 2
+cache_max_mb = 51200
+cache_max_age_days = 30
+
+# Ad-hoc codec remaps, **per software**. Unset fields are wildcards.
+# First match wins. Match codecs + which player asked — not titles.
+# client: UA token ("CrKey", "Kodi"), table name, or alias
+#         (google-cast | streamer | samsung | any).
+# clients = ["CrKey", "BubbleUPnP"]  is the same field as a list.
+# action: original | remux-p8 | hdr10 | audio-ac3
+#
+# [[remap]]
+# name = "streamer-p7"
+# client = "CrKey"
+# hdr = "dv-p7"
+# action = "hdr10"
+# encoder = "hevc_nvenc"
+# audio_out = "to-ac3"
+#
+# [[remap]]
+# name = "kodi-p7-leave"
+# client = "Kodi"
+# hdr = "dv-p7"
+# action = "original"

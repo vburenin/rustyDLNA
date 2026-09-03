@@ -1,0 +1,27 @@
+# Documented operator catalog layout. The Python tools currently read
+# lib/catalog_config.py; keep this file next to the media tree as the human
+# description of that layout. Caches belong in <library>/.rusty-library/.
+
+# Primary movie homes. Secondary genres appear as generated links under genres/.
+# action       -> Action
+# anime        -> Anime, Animation
+# comedy       -> Comedy
+# drama        -> Drama
+# fantasy      -> Fantasy
+# kids/Movies  -> Kids, Family
+# sci-fi       -> Sci-Fi
+
+# Show homes. Year/age views link the whole show directory.
+# shows
+# kids/Shows
+
+# Generated views (do not hand-edit):
+# genres/_genre-index.tsv
+# genres/BY_YEAR/
+# genres/BY_AGE/
+# genres/UNTIL_AGE/
+# genres/BY_RATING/
+
+# Optional reviewed age overrides live at:
+#   <library>/.rusty-library/age-overrides.tsv
+# Copy age-overrides.example.tsv there and replace the sample rows.

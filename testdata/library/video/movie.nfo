@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<movie>
+  <title>Fixture Movie</title>
+  <year>1999</year>
+  <outline>A tiny spoiler-free fixture.</outline>
+  <plot>A full fixture plot in which the ending is revealed.</plot>
+  <genre>Drama</genre>
+  <director>Fixture Director</director>
+  <studio>Fixture Studio</studio>
+</movie>

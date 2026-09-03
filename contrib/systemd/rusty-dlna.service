@@ -1,0 +1,49 @@
+[Unit]
+Description=rustyDLNA media server
+Documentation=https://github.com/vburenin/rustyDLNA
+Wants=network-online.target
+After=network-online.target local-fs.target
+
+[Service]
+Type=exec
+User=rusty-dlna
+Group=rusty-dlna
+UMask=0027
+CacheDirectory=rusty-dlna
+CacheDirectoryMode=0750
+ExecStartPre=/usr/local/bin/rusty-dlna --config /etc/rusty-dlna/rusty-dlna.toml --check
+ExecStart=/usr/local/bin/rusty-dlna --config /etc/rusty-dlna/rusty-dlna.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+KillMode=mixed
+SendSIGKILL=yes
+LimitNOFILE=8192
+TasksMax=512
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/srv/media
+ReadWritePaths=/var/cache/rusty-dlna
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

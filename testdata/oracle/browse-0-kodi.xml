@@ -1,0 +1,14 @@
+HTTP/1.1 200 OK
+Content-Type: text/xml; charset="utf-8"
+Connection: close
+Content-Length: 1430
+Server: 6.8.0-136-generic DLNADOC/1.50 UPnP/1.0 rustyDLNA/0.1.0
+Date: Sun, 16 Aug 2026 02:55:30 GMT
+EXT:
+
+<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:BrowseResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><Result>&lt;DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/"&gt;
+&lt;container id="2$8" parentID="0" restricted="1" searchable="1" childCount="15831"&gt;&lt;dc:title&gt;All Video&lt;/dc:title&gt;&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;upnp:storageUsed&gt;-1&lt;/upnp:storageUsed&gt;&lt;/container&gt;&lt;container id="2$15" parentID="0" restricted="1" searchable="1" childCount="38"&gt;&lt;dc:title&gt;Folders&lt;/dc:title&gt;&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;upnp:storageUsed&gt;-1&lt;/upnp:storageUsed&gt;&lt;/container&gt;&lt;container id="2$FF0" parentID="0" restricted="1" searchable="0" childCount="50"&gt;&lt;dc:title&gt;Recently Added&lt;/dc:title&gt;&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;upnp:storageUsed&gt;-1&lt;/upnp:storageUsed&gt;&lt;/container&gt;&lt;/DIDL-Lite&gt;</Result>
+<NumberReturned>3</NumberReturned>
+<TotalMatches>3</TotalMatches>
+<UpdateID>36</UpdateID></u:BrowseResponse></s:Body></s:Envelope>

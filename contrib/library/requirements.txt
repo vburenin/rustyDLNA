@@ -1,0 +1,14 @@
+# rustyDLNA library-maintenance tools.
+# Python 3.10 or newer. There are no third-party PyPI packages: HTTP, SQLite,
+# XML, gzip, and concurrent work use the standard library.
+#
+# This file installs nothing today. Keep it so the operator setup is
+# explicit and so a future PyPI dependency has a lock-in point. Do not
+# run pip against it on a PEP 668 distro until a real package is listed.
+#
+# Host programs (not pip):
+#   python3 >= 3.10
+#   ffmpeg
+#   ffprobe
+#   curl          (IMDb dataset refresh)
+#   dovi_tool     (optional; Profile 7 recode only)

@@ -1,0 +1,22 @@
+[package]
+name = "rusty-dlna-scan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Library scan, inode reuse, NFO, and object IDs"
+
+[dependencies]
+rusty-dlna-helper.workspace = true
+rusty-dlna-protocol.workspace = true
+thiserror.workspace = true
+rusqlite.workspace = true
+tracing.workspace = true
+inotify = "0.11"
+libc = "0.2"
+ffmpeg-sys-next = { version = "8.1", default-features = false, features = ["avformat"] }
+sha2.workspace = true
+exif = { package = "kamadak-exif", version = "0.6.1" }
+quick-xml.workspace = true
+
+[build-dependencies]
+cc = "1"

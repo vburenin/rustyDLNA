@@ -1,0 +1,23 @@
+# Host-only: real library on isolated ports. Never 8200/1900.
+friendly_name = "rustyDLNA-video"
+media_dir = ["V,/storage/video"]
+exclude_dir = ["incomplete"]
+root_container = "V"
+cache_dir = "cache"
+db_dir = "cache"
+advertise_ip = "127.0.0.1"
+notify_interval = 895
+rescan_secs = 30
+
+[transcode]
+enable = true
+encoder = "libx264"
+max_jobs = 1
+
+[[remap]]
+name = "crkey-dvp7"
+client = "CrKey"
+hdr = "dv-p7"
+action = "remux-p8"
+encoder = "copy"
+audio_out = "to-aac"

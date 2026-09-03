@@ -1,0 +1,13 @@
+[package]
+name = "rusty-dlna-transcode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-client transcode decision and ffmpeg job builder"
+
+[dependencies]
+rusty-dlna-helper.workspace = true
+rusty-dlna-protocol.workspace = true
+serde = { workspace = true }
+toml.workspace = true
+sha2.workspace = true

@@ -1,0 +1,97 @@
+name: Rust toolchain update
+
+on:
+  schedule:
+    - cron: "17 9 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: rust-toolchain-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Detect latest stable Rust
+        id: stable
+        run: |
+          curl --fail --show-error --silent --retry 3 \
+            https://static.rust-lang.org/dist/channel-rust-stable.toml \
+            --output "$RUNNER_TEMP/channel-rust-stable.toml"
+          latest=$(sed -n 's/^version = "\([0-9][0-9.]*\) .*/\1/p' \
+            "$RUNNER_TEMP/channel-rust-stable.toml" | head -n 1)
+          current=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+          test -n "$latest"
+          test -n "$current"
+          case "$latest" in
+            "$current") needed=false ;;
+            *) needed=true ;;
+          esac
+          {
+            echo "current=$current"
+            echo "latest=$latest"
+            echo "needed=$needed"
+          } >> "$GITHUB_OUTPUT"
+      - name: Check for an existing update pull request
+        id: existing
+        if: steps.stable.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.stable.outputs.latest }}
+        run: |
+          count=$(gh pr list --state open --head "automation/rust-${VERSION}" \
+            --json number --jq length)
+          test "$count" -le 1
+          test "$count" -eq 0 && open=false || open=true
+          echo "open=$open" >> "$GITHUB_OUTPUT"
+      - name: Resolve builder digest and update all pins
+        if: steps.stable.outputs.needed == 'true' && steps.existing.outputs.open != 'true'
+        env:
+          VERSION: ${{ steps.stable.outputs.latest }}
+        run: |
+          digest=$(docker buildx imagetools inspect "rust:${VERSION}-bookworm" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')
+          scripts/set-rust-version.sh "$VERSION" "$digest"
+      - name: Install build dependencies and updated toolchain
+        if: steps.stable.outputs.needed == 'true' && steps.existing.outputs.open != 'true'
+        env:
+          VERSION: ${{ steps.stable.outputs.latest }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libavformat-dev ffmpeg curl
+          rustup toolchain install "$VERSION" --profile minimal --component rustfmt,clippy
+      - name: Pinned Node.js
+        if: steps.stable.outputs.needed == 'true' && steps.existing.outputs.open != 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.19.0
+      - name: Verify the complete update
+        if: steps.stable.outputs.needed == 'true' && steps.existing.outputs.open != 'true'
+        run: scripts/check.sh
+      - name: Open one toolchain update pull request
+        if: steps.stable.outputs.needed == 'true' && steps.existing.outputs.open != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.stable.outputs.latest }}
+          CURRENT: ${{ steps.stable.outputs.current }}
+        run: |
+          branch="automation/rust-${VERSION}"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git switch -c "$branch"
+          git add rust-toolchain.toml Cargo.toml Dockerfile \
+            .github/workflows/ci.yml .github/workflows/release.yml \
+            .github/workflows/soak.yml docs/DISTRIBUTION.md
+          git commit -m "Update Rust to ${VERSION}"
+          git push --set-upstream origin "$branch"
+          gh pr create \
+            --title "Update Rust to ${VERSION}" \
+            --body "Updates the exact Rust pin from ${CURRENT} to ${VERSION} across Cargo, Docker, CI/release/soak workflows, and documentation. The scheduled updater passed scripts/check.sh before opening this PR." \
+            --base "$GITHUB_REF_NAME" \
+            --head "$branch"

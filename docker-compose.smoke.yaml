@@ -1,0 +1,31 @@
+# Disposable production-image smoke test. Bridge only; no host ports.
+name: rusty-dlna-smoke
+
+services:
+  rusty-dlna-smoke:
+    build:
+      context: .
+    image: ${RUSTY_DLNA_SMOKE_IMAGE:-rusty-dlna:smoke}
+    init: true
+    environment:
+      RUST_LOG: info
+      RUSTY_DLNA_HTTP_PORT: "18200"
+      RUSTY_DLNA_SSDP_PORT: "11900"
+    volumes:
+      - ${RUSTY_DLNA_SMOKE_MEDIA:?set by scripts/compose-smoke.sh}:/storage/video:ro
+      - ${RUSTY_DLNA_SMOKE_CACHE:?set by scripts/compose-smoke.sh}:/var/cache/rusty-dlna
+      - ${RUSTY_DLNA_SMOKE_CONFIG:?set by scripts/compose-smoke.sh}:/etc/rusty-dlna.toml:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl --fail --silent http://127.0.0.1:18200/health
+          | grep -Eq '"status"[[:space:]]*:[[:space:]]*"(healthy|degraded)"'
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 2s

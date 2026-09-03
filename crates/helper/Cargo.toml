@@ -1,0 +1,10 @@
+[package]
+name = "rusty-dlna-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bounded admission and controlled child execution for rustyDLNA media helpers"
+
+[dependencies]
+thiserror.workspace = true
+libc = "0.2"

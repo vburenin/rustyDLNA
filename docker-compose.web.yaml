@@ -1,0 +1,35 @@
+# Browser-only security boundary for reverse-proxy deployments. The gateway
+# has no media/cache mounts and publishes no SSDP port. It forwards only the
+# browser allowlist to the host-network rusty-dlna service on TCP 8200.
+name: rusty-web
+
+services:
+  rusty-web:
+    container_name: rusty-web
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    image: rusty-web:local
+    restart: unless-stopped
+    init: true
+    read_only: true
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - ${RUSTY_WEB_BIND_IP:-127.0.0.1}:${RUSTY_WEB_PORT:-8201}:8080
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,uid=101,gid=101,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          wget -qO- http://127.0.0.1:8080/health
+          | grep -Eq '"status"[[:space:]]*:[[:space:]]*"(healthy|degraded)"'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

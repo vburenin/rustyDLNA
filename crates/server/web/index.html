@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d0f">
+  <title>rustyDLNA</title>
+  <link rel="icon" href="/favicon.ico" type="image/png">
+  <link rel="stylesheet" href="/web/app.css">
+  <script type="module" src="/web/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Media library home">
+      <span class="brand-mark" aria-hidden="true"><i></i></span>
+      <strong id="server-name">rustyDLNA</strong>
+    </a>
+    <div class="layout-switch" role="group" aria-label="Page layout">
+      <button type="button" id="layout-browse" aria-controls="app-main" aria-pressed="true">Browse</button>
+      <button type="button" id="layout-watch" aria-controls="app-main" aria-pressed="false">Watch</button>
+    </div>
+    <div class="now-playing" id="now-playing" hidden>
+      <div><p class="eyebrow">Now playing</p><h1><button type="button" class="now-playing-title-action" id="show-player" aria-controls="player-panel" aria-label="Show player"><span id="now-playing-title">Nothing selected</span></button></h1><p id="now-playing-meta"></p></div>
+      <div class="now-playing-context"><div class="playback-mode" id="playback-mode" hidden><span aria-hidden="true"></span><b id="mode-label"></b></div><small id="queue-position"></small></div>
+    </div>
+    <div class="top-actions">
+      <span class="server-state" id="server-state" data-state="connecting"><i aria-hidden="true"></i><span id="library-count">Connecting…</span></span>
+      <button type="button" class="text-action" id="library-retry-top" hidden>Retry</button>
+      <a class="status-link" href="/status">Server status</a>
+    </div>
+  </header>
+
+  <main id="app-main" data-layout="browse">
+    <section class="player-panel" id="player-panel" aria-labelledby="now-playing-title" hidden>
+      <div class="player-stage" id="player-stage" tabindex="0" aria-label="Media player">
+        <button type="button" class="close-player" id="close-player-button" hidden aria-label="Close player"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6 6 18"></path></svg></button>
+        <div class="media-viewport">
+          <video id="video-player" playsinline preload="metadata"></video>
+          <canvas class="video-frame-hold" id="video-frame-hold" aria-hidden="true" hidden></canvas>
+          <div class="audio-stage" id="audio-stage" hidden>
+            <div class="disc-wrap"><img id="audio-art" alt="" hidden><span class="disc" aria-hidden="true"></span></div>
+          </div>
+          <audio id="audio-player" preload="metadata"></audio>
+          <div class="player-empty" id="player-empty"><span class="empty-icon" aria-hidden="true"></span><p id="player-empty-text">Choose something from your library</p></div>
+          <div class="stage-progress" id="stage-progress" hidden><span class="spinner" aria-hidden="true"></span><span id="stage-progress-label">Loading media</span></div>
+          <div class="seek-gesture-feedback" id="seek-gesture-feedback" aria-hidden="true" hidden></div>
+
+          <div class="resume-prompt" id="resume-prompt" role="group" aria-labelledby="resume-title" hidden>
+            <strong id="resume-title">Continue watching?</strong><span id="resume-time"></span>
+            <div><button type="button" class="primary-control" id="resume-button">Resume</button><button type="button" id="start-over-button">Start over</button></div>
+          </div>
+        </div>
+
+        <div class="control-surface" id="playback-controls" hidden>
+          <div class="caption-menu" id="caption-menu" hidden><fieldset><legend>Captions</legend><div id="caption-choices"></div></fieldset></div>
+          <div class="timeline-control">
+            <input id="timeline" type="range" min="0" max="0" value="0" step="0.1" list="chapter-markers" aria-label="Media position" aria-describedby="timeline-status">
+            <datalist id="chapter-markers"></datalist>
+            <span class="sr-only" id="timeline-status">No media selected</span>
+          </div>
+          <div class="control-row player-toolbar">
+            <div class="transport-controls" aria-label="Playback controls">
+              <button type="button" class="primary-control" id="play-button" aria-label="Play"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path class="icon-play" d="M8 5v14l11-7Z" fill="currentColor" stroke="none"></path><g class="icon-pause" fill="currentColor" stroke="none"><rect x="7" y="5" width="4" height="14" rx=".75"></rect><rect x="14" y="5" width="4" height="14" rx=".75"></rect></g><path class="icon-replay" d="M18 8a7 7 0 1 0 1 7M18 4v4h-4"></path></svg></button>
+              <button type="button" id="previous-button" aria-label="Previous item"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M7 5v14"></path><path d="m18 6-8 6 8 6Z" fill="currentColor" stroke="none"></path></svg></button>
+              <button type="button" id="next-button" aria-label="Next item"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M17 5v14"></path><path d="m6 6 8 6-8 6Z" fill="currentColor" stroke="none"></path></svg></button>
+              <button type="button" id="mute-button" aria-pressed="false" aria-label="Mute"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 9v6h4l5 4V5L9 9Z"></path><g class="icon-sound-waves"><path d="M17 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12"></path></g><path class="icon-mute-slash" d="m4 4 16 16"></path></svg></button>
+              <label class="range-control volume-control" for="volume-control"><span class="sr-only">Volume</span><input id="volume-control" type="range" min="0" max="100" value="100" step="1" aria-describedby="volume-value"><output class="sr-only" id="volume-value" for="volume-control">100%</output></label>
+              <div class="timeline-times" aria-label="Playback time"><span id="timeline-current">0:00</span><span aria-hidden="true">/</span><span id="timeline-duration">0:00</span></div>
+            </div>
+            <div class="toggle-controls" aria-label="Player settings">
+              <button type="button" id="stream-info-button" aria-label="Stream information" aria-haspopup="dialog" aria-controls="stream-info-dialog"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v6"></path><path d="M12 7h.01"></path></svg></button>
+              <button type="button" id="captions-button" aria-label="Captions" aria-expanded="false" aria-controls="caption-menu"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="M10 10H8a2 2 0 0 0-2 2 2 2 0 0 0 2 2h2M18 10h-2a2 2 0 0 0-2 2 2 2 0 0 0 2 2h2"></path></svg></button>
+              <button type="button" id="quality-menu-button" aria-label="Transcoded quality: Auto" aria-haspopup="dialog" aria-controls="quality-dialog">Auto</button>
+              <button type="button" id="pip-button" aria-pressed="false" aria-label="Enter picture in picture"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="3" y="5" width="18" height="14" rx="2"></rect><rect x="12" y="11" width="7" height="5" rx="1" fill="currentColor" stroke="none"></rect></svg></button>
+              <button type="button" class="advanced-playback-button" id="advanced-playback-button" aria-label="Playback settings" aria-haspopup="dialog" aria-controls="advanced-playback-dialog"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.09a2 2 0 0 1 1 1.73v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.38a2 2 0 0 0-.73-2.73l-.15-.09a2 2 0 0 1-1-1.74v-.51a2 2 0 0 1 1-1.73l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2Z"></path><circle cx="12" cy="12" r="3"></circle></svg></button>
+              <button type="button" id="fullscreen-button" aria-pressed="false" aria-label="Enter full screen"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5"></path></svg></button>
+            </div>
+          </div>
+        </div>
+
+        <dialog class="advanced-playback-dialog" id="advanced-playback-dialog" aria-labelledby="advanced-playback-title">
+          <form method="dialog">
+            <div class="dialog-heading"><h2 id="advanced-playback-title">Playback settings</h2><button class="dialog-close" value="close" aria-label="Close playback settings"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div>
+            <div class="advanced-actions" aria-label="Additional player settings">
+              <button type="button" id="loop-button" aria-pressed="false" aria-label="Turn loop on">Loop</button>
+              <button type="button" id="fit-button" aria-pressed="false" aria-label="Fill video frame">Fill</button>
+              <button type="button" id="shortcut-help-button" aria-label="Keyboard shortcuts">Keys</button>
+            </div>
+            <fieldset id="stream-controls"><legend>Stream mode</legend><div class="stream-options"><label><input type="radio" name="stream-mode" value="auto" checked> Auto</label><label><input type="radio" name="stream-mode" value="direct"> Original · no conversion</label><label><input type="radio" name="stream-mode" value="compat"> Compatible</label></div></fieldset>
+            <div class="advanced-selects">
+              <label for="speed-control">Playback speed<select id="speed-control"><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+              <label id="audio-track-control" for="audio-track-controls" hidden>Audio track<select id="audio-track-controls"></select></label><span id="audio-track-status" role="status" hidden></span>
+              <label id="chapter-control" for="chapter-controls" hidden>Chapter<select id="chapter-controls"></select></label>
+              <button type="button" class="text-action" id="audio-track-retry" hidden>Retry audio tracks</button>
+              <label for="quality-control">Transcoded quality<select id="quality-control"><option value="auto">Auto</option></select></label>
+              <label for="caption-size-control">Caption size<select id="caption-size-control"><option value="normal">Normal</option><option value="large">Large</option><option value="extra_large">Extra large</option></select></label>
+              <label for="caption-background-control">Caption background<select id="caption-background-control"><option value="translucent">Translucent</option><option value="solid">Solid</option></select></label>
+            </div>
+            <label class="autoplay-option"><input id="autoplay-control" type="checkbox"> Automatically play the next queue item</label>
+          </form>
+        </dialog>
+
+        <dialog class="quality-dialog" id="quality-dialog" aria-labelledby="quality-dialog-title">
+          <form method="dialog">
+            <div class="dialog-heading"><h2 id="quality-dialog-title">Transcoded quality</h2><button class="dialog-close" value="close" aria-label="Close transcoded quality"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div>
+            <fieldset><legend class="sr-only">Choose transcoded quality</legend><div class="quality-options" id="quality-choices"></div></fieldset>
+          </form>
+        </dialog>
+
+        <dialog class="stream-info-dialog" id="stream-info-dialog" aria-labelledby="stream-info-title">
+          <form method="dialog">
+            <div class="dialog-heading"><h2 id="stream-info-title">Stream information</h2><button class="dialog-close" value="close" aria-label="Close stream information"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div>
+            <p id="stream-info-summary"></p>
+            <div class="stream-info-columns">
+              <section aria-labelledby="source-stream-title"><h3 id="source-stream-title">Original source</h3><dl id="source-stream-facts"></dl></section>
+              <section aria-labelledby="output-stream-title"><h3 id="output-stream-title">Current playback</h3><dl id="output-stream-facts"></dl></section>
+            </div>
+          </form>
+        </dialog>
+
+        <dialog id="shortcut-dialog" aria-labelledby="shortcut-dialog-title">
+          <form method="dialog">
+            <div class="dialog-heading"><h2 id="shortcut-dialog-title">Keyboard shortcuts</h2><button class="dialog-close" value="close" aria-label="Close keyboard shortcuts"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div>
+            <dl><div><dt>Space or K</dt><dd>Play / pause</dd></div><div><dt>Left / Right</dt><dd>Back / forward 10 seconds</dd></div><div><dt>J / L</dt><dd>Back / forward 10 seconds</dd></div><div><dt>M</dt><dd>Mute / unmute</dd></div><div><dt>F</dt><dd>Enter / exit full screen</dd></div><div><dt>Escape</dt><dd>Exit full screen or close the player</dd></div><div><dt>?</dt><dd>Show this help</dd></div></dl>
+          </form>
+        </dialog>
+      </div>
+
+      <div class="player-message" id="player-message" hidden>
+        <p id="player-message-text"></p>
+        <div id="player-message-actions"><button type="button" id="player-retry" hidden>Retry</button><button type="button" id="try-compatible" hidden>Try compatible</button><button type="button" id="play-original" hidden>Play original</button><button type="button" id="return-library" hidden>Return to library</button></div>
+        <details id="technical-details" hidden><summary>Technical details</summary><pre id="technical-message"></pre></details>
+      </div>
+      <p class="sr-only" id="playback-live" role="status" aria-live="polite" aria-atomic="true"></p>
+    </section>
+
+    <section class="library" aria-labelledby="library-heading">
+      <div class="library-chrome">
+        <div class="library-heading-row">
+          <h2 id="library-heading">Library</h2>
+          <label class="search"><span class="search-icon" aria-hidden="true"></span><span class="sr-only">Search library</span><input id="search-input" type="search" placeholder="Filter this folder…" autocomplete="off"></label>
+          <label class="sort-control" for="sort-control">Sort<select id="sort-control"><option value="title">Title</option><option value="date_desc">Recently added</option><option value="episode">Episode / track</option></select></label>
+        </div>
+        <div class="filters" role="tablist" aria-label="Media view">
+          <button id="tab-folders" class="active" data-view="folders" data-kind="all" role="tab" aria-selected="true" aria-controls="library-panel" tabindex="0">Folders</button>
+          <button id="tab-all" data-view="library" data-kind="all" role="tab" aria-selected="false" aria-controls="library-panel" tabindex="-1">All media</button>
+          <button id="tab-video" data-view="library" data-kind="video" role="tab" aria-selected="false" aria-controls="library-panel" tabindex="-1">Videos</button>
+          <button id="tab-audio" data-view="library" data-kind="audio" role="tab" aria-selected="false" aria-controls="library-panel" tabindex="-1">Audio</button>
+          <button id="tab-continue" data-view="continue" data-kind="all" role="tab" aria-selected="false" aria-controls="library-panel" tabindex="-1">Continue watching</button>
+        </div>
+        <nav class="breadcrumbs" id="breadcrumbs" aria-label="Current folder"></nav>
+        <p class="results-summary" id="results-summary"></p>
+        <p class="sr-only" id="library-live" role="status" aria-live="polite" aria-atomic="true"></p>
+      </div>
+      <div class="library-results" id="library-panel" role="tabpanel" aria-labelledby="tab-folders" tabindex="-1">
+        <div class="media-grid" id="media-grid"></div>
+        <div class="library-empty" id="library-empty" hidden><p id="library-empty-title">No media found</p><small id="library-empty-detail">Try another search.</small><button type="button" id="library-retry" hidden>Retry</button></div>
+        <div class="loading" id="loading" hidden><span class="spinner" aria-hidden="true"></span><span id="loading-label">Loading library…</span></div>
+        <div class="load-more-sentinel" id="load-more-sentinel" aria-hidden="true" hidden></div>
+      </div>
+      <dialog id="item-details-dialog" aria-labelledby="item-details-title">
+        <form method="dialog">
+          <div class="dialog-heading"><h2 id="item-details-title">Item details</h2><button class="dialog-close" value="close" aria-label="Close item details"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div>
+          <section id="item-details-about" hidden>
+            <h3>About</h3>
+            <p id="item-details-summary"></p>
+          </section>
+          <details id="item-details-plot" hidden>
+            <summary>Reveal full plot (spoilers)</summary>
+            <p id="item-details-plot-text"></p>
+          </details>
+          <dl id="item-details-facts"></dl>
+          <a class="dialog-download" id="item-details-download" download hidden>Download original</a>
+        </form>
+      </dialog>
+    </section>
+  </main>
+</body>
+</html>

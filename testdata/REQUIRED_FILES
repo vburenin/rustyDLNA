@@ -1,0 +1,22 @@
+@eaDir/junk.mkv
+exclude_me/secret.mkv
+music/fixture.m3u8
+music/song.flac
+music/song.mp3
+music/song.nfo
+pictures/shot.jpg
+sample/ignored.mkv
+unfinished.mkv.part
+video/Movie.2024.2160p.UHD.BDRemux.HDR.DV.HEVC.mkv
+video/The Show/S01E01.mkv
+video/The Show/S01E01.nfo
+video/The Show/S01E02.mkv
+video/The Show/S01E02.nfo
+video/The Show/tvshow.nfo
+video/dvp7.mkv
+video/movie-poster.jpg
+video/movie.en.srt
+video/movie.mkv
+video/movie.nfo
+video/movie.srt
+video/tagged.mp4

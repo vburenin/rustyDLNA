@@ -1,0 +1,73 @@
+//! Inject a deterministic EXIF APP1 segment into a JPEG fixture.
+//!
+//! This intentionally uses only the Rust standard library so
+//! `scripts/generate-fixtures.sh` does not need a host EXIF editor.
+
+use std::path::Path;
+
+fn jpeg_with_fixture_exif(base_jpeg: &[u8]) -> Result<Vec<u8>, String> {
+    if !base_jpeg.starts_with(&[0xff, 0xd8]) {
+        return Err("input is not a JPEG".into());
+    }
+    let strings = [
+        (0x010f_u16, b"rustyDLNA\0".as_slice()),
+        (0x0110_u16, b"FixtureCam\0".as_slice()),
+        (0x010e_u16, b"Fixture Photo\0".as_slice()),
+        (0x0132_u16, b"2024:03:15 14:30:00\0".as_slice()),
+        (0x010d_u16, b"Fixture Album\0".as_slice()),
+    ];
+    let entry_count = 9_u16;
+    let data_start = 8 + 2 + usize::from(entry_count) * 12 + 4;
+    let mut tiff = Vec::new();
+    tiff.extend_from_slice(b"II");
+    tiff.extend_from_slice(&42_u16.to_le_bytes());
+    tiff.extend_from_slice(&8_u32.to_le_bytes());
+    tiff.extend_from_slice(&entry_count.to_le_bytes());
+    let mut tail = Vec::new();
+    for (tag, value) in strings {
+        tiff.extend_from_slice(&tag.to_le_bytes());
+        tiff.extend_from_slice(&2_u16.to_le_bytes());
+        tiff.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&u32::try_from(data_start + tail.len()).unwrap().to_le_bytes());
+        tail.extend_from_slice(value);
+    }
+    for (tag, value) in [(0x0100_u16, 16_u32), (0x0101_u16, 12_u32)] {
+        tiff.extend_from_slice(&tag.to_le_bytes());
+        tiff.extend_from_slice(&4_u16.to_le_bytes());
+        tiff.extend_from_slice(&1_u32.to_le_bytes());
+        tiff.extend_from_slice(&value.to_le_bytes());
+    }
+    for (tag, value) in [(0x0112_u16, 6_u16), (0x4746_u16, 4_u16)] {
+        tiff.extend_from_slice(&tag.to_le_bytes());
+        tiff.extend_from_slice(&3_u16.to_le_bytes());
+        tiff.extend_from_slice(&1_u32.to_le_bytes());
+        tiff.extend_from_slice(&value.to_le_bytes());
+        tiff.extend_from_slice(&0_u16.to_le_bytes());
+    }
+    tiff.extend_from_slice(&0_u32.to_le_bytes());
+    tiff.extend_from_slice(&tail);
+
+    let mut app1 = b"Exif\0\0".to_vec();
+    app1.extend_from_slice(&tiff);
+    let length = u16::try_from(app1.len() + 2).map_err(|_| "EXIF segment is too large")?;
+    let mut output = Vec::with_capacity(base_jpeg.len() + app1.len() + 4);
+    output.extend_from_slice(&base_jpeg[..2]);
+    output.extend_from_slice(&[0xff, 0xe1]);
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(&app1);
+    output.extend_from_slice(&base_jpeg[2..]);
+    Ok(output)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args_os().skip(1);
+    let input = args.next().ok_or("usage: fixture-exif INPUT OUTPUT")?;
+    let output = args.next().ok_or("usage: fixture-exif INPUT OUTPUT")?;
+    if args.next().is_some() {
+        return Err("usage: fixture-exif INPUT OUTPUT".into());
+    }
+    let bytes = std::fs::read(Path::new(&input))?;
+    let bytes = jpeg_with_fixture_exif(&bytes).map_err(std::io::Error::other)?;
+    std::fs::write(Path::new(&output), bytes)?;
+    Ok(())
+}
