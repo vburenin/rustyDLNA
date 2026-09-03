@@ -175,7 +175,7 @@ jobs:
               scripts/release-contract.sh "$GITHUB_REF_NAME"
           done
       - name: Scan the exact staged image digest
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
           image-ref: ${{ needs.validate.outputs.image }}@${{ steps.image.outputs.digest }}
           format: table
