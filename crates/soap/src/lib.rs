@@ -52,7 +52,7 @@ fn xml_nodes(hay: &str) -> Result<Vec<XmlNode>, SoapXmlError> {
     use quick_xml::events::Event;
 
     let mut reader = quick_xml::Reader::from_str(hay);
-    // Keep segment-boundary whitespace: quick-xml 0.41 emits entity
+    // Keep segment-boundary whitespace: quick-xml emits entity
     // references separately, so trimming each text event would turn
     // `Foo &amp; Bar` into `Foo&Bar`. Trim only the completed element below.
     reader.config_mut().trim_text(false);
@@ -65,8 +65,7 @@ fn xml_nodes(hay: &str) -> Result<Vec<XmlNode>, SoapXmlError> {
                 if stack.len() >= MAX_SOAP_XML_DEPTH {
                     return Err(SoapXmlError("SOAP XML nesting is too deep".into()));
                 }
-                let name =
-                    String::from_utf8_lossy(start.local_name().as_ref()).to_ascii_lowercase();
+                let name = start.local_name().as_ref().to_ascii_lowercase();
                 stack.push(XmlNode {
                     name,
                     value: String::new(),
@@ -75,9 +74,7 @@ fn xml_nodes(hay: &str) -> Result<Vec<XmlNode>, SoapXmlError> {
             }
             Ok(Event::Text(text)) => {
                 if let Some(node) = stack.last_mut() {
-                    let decoded = text
-                        .decode()
-                        .map_err(|error| SoapXmlError(error.to_string()))?;
+                    let decoded = text.into_inner();
                     let unescaped = quick_xml::escape::unescape(&decoded)
                         .map_err(|error| SoapXmlError(error.to_string()))?;
                     node.value.push_str(&unescaped);
@@ -91,9 +88,7 @@ fn xml_nodes(hay: &str) -> Result<Vec<XmlNode>, SoapXmlError> {
                     {
                         node.value.push(character);
                     } else {
-                        let name = reference
-                            .decode()
-                            .map_err(|error| SoapXmlError(error.to_string()))?;
+                        let name = reference.into_inner();
                         let entity =
                             quick_xml::escape::resolve_xml_entity(&name).ok_or_else(|| {
                                 SoapXmlError(format!("unrecognized XML entity '&{name};'"))
@@ -104,16 +99,11 @@ fn xml_nodes(hay: &str) -> Result<Vec<XmlNode>, SoapXmlError> {
             }
             Ok(Event::CData(text)) => {
                 if let Some(node) = stack.last_mut() {
-                    node.value.push_str(
-                        &text
-                            .decode()
-                            .map_err(|error| SoapXmlError(error.to_string()))?,
-                    );
+                    node.value.push_str(&text.into_inner());
                 }
             }
             Ok(Event::End(end)) => {
-                let end_name =
-                    String::from_utf8_lossy(end.local_name().as_ref()).to_ascii_lowercase();
+                let end_name = end.local_name().as_ref().to_ascii_lowercase();
                 let Some(node) = stack.pop() else {
                     return Err(SoapXmlError("unexpected closing element".into()));
                 };

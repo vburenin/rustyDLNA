@@ -173,7 +173,7 @@ fn parse_nfo_parts_bytes(bytes: &[u8]) -> Result<NfoParts, String> {
         bytes
     };
     let mut reader = quick_xml::Reader::from_reader(bytes);
-    // Entity references are separate events in quick-xml 0.41. Preserve the
+    // Entity references are separate events in quick-xml. Preserve the
     // spaces around them, then trim the completed element value.
     reader.config_mut().trim_text(false);
     reader.config_mut().expand_empty_elements = true;
@@ -185,13 +185,12 @@ fn parse_nfo_parts_bytes(bytes: &[u8]) -> Result<NfoParts, String> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(start)) => {
-                let name =
-                    String::from_utf8_lossy(start.local_name().as_ref()).to_ascii_lowercase();
+                let name = start.local_name().as_ref().to_ascii_lowercase();
                 stack.push((name, String::new()));
             }
             Ok(Event::Text(text)) => {
                 if let Some((_, value)) = stack.last_mut() {
-                    let decoded = text.decode().map_err(|error| error.to_string())?;
+                    let decoded = text.into_inner();
                     let unescaped =
                         quick_xml::escape::unescape(&decoded).map_err(|error| error.to_string())?;
                     value.push_str(&unescaped);
@@ -205,7 +204,7 @@ fn parse_nfo_parts_bytes(bytes: &[u8]) -> Result<NfoParts, String> {
                     {
                         value.push(character);
                     } else {
-                        let name = reference.decode().map_err(|error| error.to_string())?;
+                        let name = reference.into_inner();
                         let entity = quick_xml::escape::resolve_xml_entity(&name)
                             .ok_or_else(|| format!("unrecognized XML entity '&{name};'"))?;
                         value.push_str(entity);
@@ -214,12 +213,11 @@ fn parse_nfo_parts_bytes(bytes: &[u8]) -> Result<NfoParts, String> {
             }
             Ok(Event::CData(text)) => {
                 if let Some((_, value)) = stack.last_mut() {
-                    value.push_str(&text.decode().map_err(|error| error.to_string())?);
+                    value.push_str(&text.into_inner());
                 }
             }
             Ok(Event::End(end)) => {
-                let end_name =
-                    String::from_utf8_lossy(end.local_name().as_ref()).to_ascii_lowercase();
+                let end_name = end.local_name().as_ref().to_ascii_lowercase();
                 let Some((name, value)) = stack.pop() else {
                     return Err("unexpected closing element".into());
                 };
