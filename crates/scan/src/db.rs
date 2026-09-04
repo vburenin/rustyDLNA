@@ -757,7 +757,7 @@ impl LibraryDb {
         self.conn
             .busy_timeout(std::time::Duration::from_millis(250))?;
         self.conn
-            .progress_handler(1_000, Some(move || cancellation.is_cancelled()));
+            .progress_handler(1_000, Some(move || cancellation.is_cancelled()))?;
         Ok(())
     }
 
@@ -1438,7 +1438,7 @@ impl LibraryDb {
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(busy_timeout)?;
         if let Some(cancellation) = cancellation {
-            conn.progress_handler(1_000, Some(move || cancellation.is_cancelled()));
+            conn.progress_handler(1_000, Some(move || cancellation.is_cancelled()))?;
         }
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
@@ -2598,6 +2598,7 @@ impl LibraryDb {
             STREAM_PROBE_NONNULL_BATCH_SQL
         };
         let (after_device, after_inode, after_id) = after;
+        let limit = sqlite_page_value(limit);
         let mut statement = self.conn.prepare(sql)?;
         let rows = statement.query_map(
             params![
@@ -3303,13 +3304,28 @@ impl LibraryDb {
         transaction: &rusqlite::Transaction<'_>,
         prefix: &str,
     ) -> rusqlite::Result<(u64, u64)> {
-        transaction.query_row(
+        let (count, bytes): (i64, i64) = transaction.query_row(
             "SELECT COUNT(*), COALESCE(SUM(length(CAST(KEY AS BLOB)) +
                                            length(CAST(VALUE AS BLOB))), 0)
              FROM SETTINGS WHERE substr(KEY, 1, length(?1)) = ?1",
             [prefix],
             |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+        )?;
+        let count = u64::try_from(count).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?;
+        let bytes = u64::try_from(bytes).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?;
+        Ok((count, bytes))
     }
 
     pub(crate) fn set_transaction_setting(

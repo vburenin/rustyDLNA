@@ -15,6 +15,7 @@ allow = [
   "MIT",
   "Unicode-3.0",
   "WTFPL",
+  "Zlib",
 ]
 
 [bans]
@@ -24,7 +25,7 @@ wildcards = "deny"
 # cannot be unified by changing a direct rustyDLNA dependency. Keep the review
 # explicit so a future dependency update can remove each exception.
 skip = [
-  { crate = "hashbrown@0.14.5", reason = "rusqlite/hashlink uses 0.14 while toml/indexmap uses 0.15" },
+  { crate = "hashbrown@0.16.1", reason = "rusqlite/sqlite-wasm-rs uses 0.16 while rusqlite/hashlink and toml/indexmap use 0.17" },
   { crate = "shlex@1.3.0", reason = "ffmpeg-sys bindgen uses 1.x while cc uses 2.x" },
   { crate = "syn@2.0.119", reason = "bindgen/clap/tracing use 2.x while serde/tokio/thiserror/inotify use 3.x" },
 ]
