@@ -1293,7 +1293,12 @@ fn apply_browser_hls_keyframes(args: &mut [OsString], hls: bool) {
     }
 }
 
-fn apply_browser_hls_pacing(args: &mut Vec<OsString>, hls: bool, encoding_stream: bool) {
+fn apply_browser_hls_pacing(
+    args: &mut Vec<OsString>,
+    hls: bool,
+    encoding_stream: bool,
+    readrate_catchup: bool,
+) {
     if !hls || !encoding_stream {
         return;
     }
@@ -1301,31 +1306,30 @@ fn apply_browser_hls_pacing(args: &mut Vec<OsString>, hls: bool, encoding_stream
         .iter()
         .position(|argument| argument == "-i")
         .expect("ffmpeg browser command must include an input");
-    args.splice(
-        input..input,
-        [
-            OsString::from("-readrate"),
-            OsString::from("1"),
-            OsString::from("-readrate_initial_burst"),
-            OsString::from("30"),
-            // FFmpeg 8 defaults catch-up to 1.05x. That turns the nominal
-            // initial burst into real-time decoding, including keyframe
-            // preroll discarded by an accurate input seek. Let startup run
-            // at the pipeline's natural rate; readrate still takes over once
-            // the thirty-second lead is filled.
-            OsString::from("-readrate_catchup"),
-            OsString::from("100"),
-        ],
-    );
+    let mut pacing = vec![
+        OsString::from("-readrate"),
+        OsString::from("1"),
+        OsString::from("-readrate_initial_burst"),
+        OsString::from("30"),
+    ];
+    if readrate_catchup {
+        // FFmpeg 8 defaults catch-up to 1.05x. That turns the nominal initial
+        // burst into real-time decoding, including keyframe preroll discarded
+        // by an accurate input seek. Let startup run at the pipeline's natural
+        // rate; readrate still takes over once the thirty-second lead is
+        // filled. Older FFmpeg releases do not expose this option and retain
+        // their original unbounded catch-up behavior without it.
+        pacing.extend([OsString::from("-readrate_catchup"), OsString::from("100")]);
+    }
+    args.splice(input..input, pacing);
 }
 
-/// Build the complete browser-compatible FFmpeg command without exposing raw
-/// flag mutation to the server orchestration layer.
-pub fn browser_ffmpeg_os_args(
+fn browser_ffmpeg_os_args_with_readrate_catchup(
     src_path: &Path,
     dst_path: &Path,
     plan: &TranscodePlan,
     options: BrowserOutputOptions,
+    readrate_catchup: bool,
 ) -> Vec<OsString> {
     debug_assert_eq!(plan.action, RecodeAction::Browser);
     let policy = browser_output_policy(plan, options);
@@ -1374,9 +1378,43 @@ pub fn browser_ffmpeg_os_args(
         &mut args,
         options.hls,
         plan.video_encoder != "copy" || plan.audio != AudioAction::Copy,
+        readrate_catchup,
     );
     apply_browser_input_seek(&mut args, options.start_seconds, policy.seek);
     args
+}
+
+/// Build the complete browser-compatible FFmpeg command without exposing raw
+/// flag mutation to the server orchestration layer.
+///
+/// Daemon request paths that retain a verified FFmpeg executable should use
+/// [`browser_ffmpeg_os_args_for_verified_ffmpeg`] so older supported releases
+/// do not receive options introduced in FFmpeg 8.
+pub fn browser_ffmpeg_os_args(
+    src_path: &Path,
+    dst_path: &Path,
+    plan: &TranscodePlan,
+    options: BrowserOutputOptions,
+) -> Vec<OsString> {
+    browser_ffmpeg_os_args_with_readrate_catchup(src_path, dst_path, plan, options, true)
+}
+
+/// Build browser arguments for the exact FFmpeg executable retained by a
+/// request-time transcode identity.
+pub fn browser_ffmpeg_os_args_for_verified_ffmpeg(
+    src_path: &Path,
+    dst_path: &Path,
+    plan: &TranscodePlan,
+    options: BrowserOutputOptions,
+    ffmpeg: &VerifiedExecutable,
+) -> Vec<OsString> {
+    browser_ffmpeg_os_args_with_readrate_catchup(
+        src_path,
+        dst_path,
+        plan,
+        options,
+        ffmpeg.supports_readrate_catchup(),
+    )
 }
 
 /// Whether this primary browser plan uses the SDR-tonemap cache revision.
@@ -1670,6 +1708,14 @@ impl VerifiedExecutable {
         &self.fingerprint
     }
 
+    /// Whether this FFmpeg release accepts the input catch-up pacing option.
+    ///
+    /// The option first shipped in FFmpeg 8. Unknown development/vendor
+    /// version formats conservatively omit this optional tuning flag.
+    pub fn supports_readrate_catchup(&self) -> bool {
+        ffmpeg_major_version(&self.fingerprint).is_some_and(|major| major >= 8)
+    }
+
     /// Recheck content-relevant metadata on the retained inode immediately
     /// before it is handed to a child process.
     pub fn verify_for_execution(&self) -> Result<(), String> {
@@ -1709,6 +1755,24 @@ impl VerifiedExecutable {
         }
         Ok(())
     }
+}
+
+fn ffmpeg_major_version(fingerprint: &str) -> Option<u32> {
+    let version = fingerprint
+        .split_once('|')
+        .map_or(fingerprint, |(version, _)| version)
+        .strip_prefix("ffmpeg version ")?
+        .split_whitespace()
+        .next()?
+        .trim_start_matches(['n', 'N']);
+    let digits = version
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    (digits > 0)
+        .then(|| version[..digits].parse().ok())
+        .flatten()
 }
 
 /// Inode-pinned tools used by one Profile-8 cache identity and producer.
@@ -4743,6 +4807,19 @@ action = "audio-ac3"
         assert!(mse_args
             .windows(2)
             .any(|pair| pair == ["-readrate_catchup", "100"]));
+        let legacy_mse_args = browser_ffmpeg_os_args_with_readrate_catchup(
+            Path::new("source.mkv"),
+            Path::new("output.mp4.part"),
+            &plan,
+            mse,
+            false,
+        );
+        assert!(legacy_mse_args
+            .windows(2)
+            .any(|pair| pair == ["-readrate_initial_burst", "30"]));
+        assert!(!legacy_mse_args
+            .iter()
+            .any(|argument| argument == "-readrate_catchup"));
         let mut copy_plan = plan.clone();
         copy_plan.video_encoder = "copy".into();
         let mixed_hls_args = browser_ffmpeg_os_args(
@@ -4776,6 +4853,27 @@ action = "audio-ac3"
                 "browser-nvenc-idr-v1-browser-data-saver-baseline-v1"
             )
         );
+    }
+
+    #[test]
+    fn ffmpeg_readrate_catchup_requires_a_known_version_eight_or_newer() {
+        assert_eq!(
+            ffmpeg_major_version("ffmpeg version 6.1.1-3ubuntu5|identity"),
+            Some(6)
+        );
+        assert_eq!(
+            ffmpeg_major_version("ffmpeg version 8.0.1 Copyright (c) FFmpeg|identity"),
+            Some(8)
+        );
+        assert_eq!(
+            ffmpeg_major_version("ffmpeg version n9.2-static|identity"),
+            Some(9)
+        );
+        assert_eq!(
+            ffmpeg_major_version("ffmpeg version N-119831-gabcdef|identity"),
+            None
+        );
+        assert_eq!(ffmpeg_major_version("vendor wrapper|identity"), None);
     }
 
     #[test]

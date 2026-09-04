@@ -2871,11 +2871,24 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
     if let Some(spec) =
         crate::remux::active_web_job_spec(app, item.detail_id, session_id, request_id)
     {
-        let expected_args = rusty_dlna_transcode::browser_ffmpeg_os_args(
-            std::path::Path::new("/proc/self/fd/3"),
-            &cache_part(&spec.dest),
-            &plan,
-            browser_options,
+        let expected_args = spec.verified_ffmpeg.as_ref().map_or_else(
+            || {
+                rusty_dlna_transcode::browser_ffmpeg_os_args(
+                    std::path::Path::new("/proc/self/fd/3"),
+                    &cache_part(&spec.dest),
+                    &plan,
+                    browser_options,
+                )
+            },
+            |ffmpeg| {
+                rusty_dlna_transcode::browser_ffmpeg_os_args_for_verified_ffmpeg(
+                    std::path::Path::new("/proc/self/fd/3"),
+                    &cache_part(&spec.dest),
+                    &plan,
+                    browser_options,
+                    ffmpeg,
+                )
+            },
         );
         if spec.mime != output_mime
             || spec.args != expected_args
@@ -2993,7 +3006,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         (source_file, opened.resolved_path, cache_identity)
     };
     let cache_key = cache_identity.cache_key().to_owned();
-    let verified_ffmpeg = Some(cache_identity.ffmpeg().clone());
+    let verified_ffmpeg = cache_identity.ffmpeg().clone();
     let destination = cache_dest_for_key(
         &app.cache_dir,
         item.detail_id,
@@ -3002,11 +3015,12 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
     );
     let part = cache_part(&destination);
     let transcode_args = |selected_plan: &TranscodePlan| {
-        rusty_dlna_transcode::browser_ffmpeg_os_args(
+        rusty_dlna_transcode::browser_ffmpeg_os_args_for_verified_ffmpeg(
             std::path::Path::new("/proc/self/fd/3"),
             &part,
             selected_plan,
             browser_options,
+            &verified_ffmpeg,
         )
     };
     let args = transcode_args(&plan);
@@ -3062,7 +3076,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         cacheable: start_seconds == 0,
         hls_all_fragments_independent: all_fragments_independent,
         remux_p8: false,
-        verified_ffmpeg,
+        verified_ffmpeg: Some(verified_ffmpeg),
         profile8_toolchain: None,
         audio_index: plan.audio_index,
         audio: remux_audio,

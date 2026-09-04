@@ -155,9 +155,11 @@ fragment. The rest fills in behind the client.
 HLS/Media Source output that encodes either track runs without input pacing for
 its first 30 seconds of media, then reads at playback rate. This preserves a
 useful startup buffer without racing through the rest of a feature film at full
-CPU/GPU or cache-write utilization. FFmpeg's catch-up rate is raised only while
-filling that lead; otherwise FFmpeg 8's near-realtime default also paces the
-accurate-seek preroll and delays the first fragment by several seconds.
+CPU/GPU or cache-write utilization. On FFmpeg 8 and newer, the catch-up rate is
+raised only while filling that lead; otherwise its near-realtime default also
+paces the accurate-seek preroll and delays the first fragment by several
+seconds. Older FFmpeg releases do not expose that catch-up option and retain
+their legacy initial-burst behavior without it.
 Fragmented remuxes that copy both tracks remain unpaced because they consume
 negligible encoder resources. Playlist,
 fragment, and reconnect requests from one browser generation reuse its initial
