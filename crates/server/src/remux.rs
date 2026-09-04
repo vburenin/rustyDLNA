@@ -3170,6 +3170,25 @@ mod tests {
         }
     }
 
+    fn attach_started_long_running_job(app: Arc<App>, mut spec: RemuxJobSpec) -> Arc<RemuxJob> {
+        let part = cache_part(&spec.dest);
+        let command = format!(
+            "dd if=/dev/zero of=\"$1\" bs={FIRST_BYTES} count=1 2>/dev/null; exec sleep 30"
+        );
+        spec.args = vec![
+            "sh".into(),
+            "-c".into(),
+            command.into(),
+            "rustydlna-job".into(),
+            part.into_os_string(),
+        ];
+        let job = attach_for_client(app, spec).unwrap();
+        wait_until(Duration::from_secs(10), || {
+            matches!(job.state(), RemuxState::Growing)
+        });
+        job
+    }
+
     fn wait_for_terminal_cleanup(app: &App, job: &RemuxJob) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
@@ -5008,7 +5027,7 @@ mod tests {
         first.web_request_id = Some(77);
         first.cacheable = false;
         first.ai_upscale_shader_file = Some(Arc::new(std::fs::File::open(&first.src).unwrap()));
-        let first_job = attach_for_client(app.clone(), first).unwrap();
+        let first_job = attach_started_long_running_job(app.clone(), first);
         assert_eq!(app.jobs.in_use(), 1);
         assert_eq!(app.ai_upscale_jobs.in_use(), 1);
 
@@ -5048,7 +5067,7 @@ mod tests {
         first.web_request_id = Some(77);
         first.cacheable = false;
         first.ai_upscale_shader_file = Some(Arc::new(std::fs::File::open(&first.src).unwrap()));
-        let first_job = attach_for_client(app.clone(), first).unwrap();
+        let first_job = attach_started_long_running_job(app.clone(), first);
 
         assert!(cancel_web_request(&app, 42, Some(9), 77));
         assert!(first_job.cancelled.load(Ordering::Acquire));
