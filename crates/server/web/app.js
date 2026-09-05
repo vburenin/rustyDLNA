@@ -84,6 +84,11 @@ const dom = {
   qualityChoices: required("quality-choices"),
   streamControls: required("stream-controls"),
   qualityControl: required("quality-control"),
+  encodingPresetOption: required("encoding-preset-option"),
+  encodingPresetControl: required("encoding-preset-control"),
+  encodingPresetHint: required("encoding-preset-hint"),
+  hevcHlsOption: required("hevc-hls-option"),
+  hevcHlsControl: required("hevc-hls-control"),
   captionSizeControl: required("caption-size-control"),
   captionBackgroundControl: required("caption-background-control"),
   autoplayControl: required("autoplay-control"),
@@ -115,6 +120,7 @@ const dom = {
   libraryEmptyTitle: required("library-empty-title"),
   libraryEmptyDetail: required("library-empty-detail"),
   libraryRetry: required("library-retry"),
+  libraryClearSearch: required("library-clear-search"),
   loading: required("loading"),
   loadingLabel: required("loading-label"),
   loadMoreSentinel: required("load-more-sentinel"),
@@ -241,6 +247,7 @@ function focusPlayer() {
 }
 
 function closePlaybackToLibrary() {
+  supersedePendingNavigation();
   store.dispatch({ type: "NAVIGATE", navigation: { itemId: null, start: 0 } });
   library?.markCurrent(null);
   if (!setLayout(LAYOUT_MODES.BROWSE)) {
@@ -301,6 +308,22 @@ library = new LibraryController({
   },
 });
 
+store.subscribe((state, action) => {
+  if (action.type !== "PLAYBACK_SELECT") return;
+  const itemId = String(state.playback.item.id);
+  // Queue and Media Session selection do not pass through a library card.
+  // Keep sharing/reloading and later library navigation on the playing title.
+  if (state.navigation.itemId !== itemId) {
+    supersedePendingNavigation();
+    store.dispatch({ type: "NAVIGATE", navigation: { itemId, start: 0 } });
+    window.history.replaceState({}, "", navigationUrl(
+      window.location.href, store.getState().navigation, state.server.rootFolderId,
+    ));
+  }
+  library.markCurrent(itemId);
+  document.title = `${state.playback.item.title} · ${state.server.name}`;
+});
+
 dom.layoutBrowse.addEventListener("click", () => setLayout(LAYOUT_MODES.BROWSE));
 dom.layoutWatch.addEventListener("click", () => setLayout(LAYOUT_MODES.WATCH));
 dom.showPlayer.addEventListener("click", focusPlayer);
@@ -315,19 +338,24 @@ async function applyNavigation(navigation, { initial = false } = {}) {
   const controller = new AbortController();
   navigationController = controller;
   try {
+    let libraryRequest;
     if (initial) {
-      await library.start();
+      libraryRequest = library.start();
     } else {
       library.cancelPendingSearch();
-      await library.navigate(navigation, {
+      libraryRequest = library.navigate(navigation, {
         history: "none",
         focusAfterLoad: true,
         supersedePending: false,
       });
     }
+    // Fetch linked metadata concurrently, but retain the library capability
+    // prerequisite before choosing Original or Compatible playback.
+    const [, payload] = await Promise.all([
+      libraryRequest,
+      navigation.itemId ? api.item(navigation.itemId, { signal: controller.signal }) : null,
+    ]);
     if (!navigationIsCurrent(epoch, controller) || !navigation.itemId) return;
-    const payload = await api.item(navigation.itemId, { signal: controller.signal });
-    if (!navigationIsCurrent(epoch, controller)) return;
     payload.item.chapters = payload.chapters || [];
     await player.select(payload.item, { startAt: navigation.start, signal: controller.signal });
     if (!navigationIsCurrent(epoch, controller)) return;

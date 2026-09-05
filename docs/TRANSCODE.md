@@ -75,6 +75,24 @@ monotonic decode timestamps on mobile Chromium decoders. The available caps are
 25 Mbps and 16 Mbps at 4K, 8 Mbps at 1080p, 3 Mbps at 720p, 1.5 Mbps at 480p,
 and 0.8 Mbps at 360p.
 
+Browser Encoding presets change only video encoder tuning, not codec/HDR
+negotiation, output resolution, bitrate caps, GPU filters, timestamp repair,
+one-second HLS/MSE IDRs or producer pacing:
+
+| Preset | NVENC (H.264 / HEVC) | Software H.264 |
+|---|---|---|
+| Balanced | `p4`, `hq` (existing behavior) | `veryfast` (existing behavior) |
+| Fast start | `p4`, `ll` | `veryfast`, `zerolatency` |
+| Maximum speed | `p2`, `ll` | `ultrafast`, `zerolatency` |
+
+Both experimental presets disable B-frames. NVENC additionally uses zero
+lookahead, `zerolatency=1`, and `delay=0` to avoid output queuing. Less buffering
+and faster presets can reduce compression efficiency or quality at the same
+bitrate; they do not guarantee lower end-to-end latency. The existing CPU
+fallback applies the selected software preset. Copied video and audio-only
+plans ignore tuning. Non-default encoded output adds the versioned
+`browser-encoding-v1` preset identity; Balanced output remains reusable.
+
 Configured browser AI-upscale profiles are an explicit exception to the normal
 no-enlargement rule. They apply only to user-selected, at-most-2× Compatible
 output for exactly 8-bit SDR sources inside a measured model envelope. The

@@ -5478,6 +5478,16 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .as_array()
         .expect("quality profiles");
     assert_eq!(profiles.len(), 7);
+    let presets = folders["capabilities"]["encoding_presets"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        presets
+            .iter()
+            .map(|preset| preset["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["balanced", "fast_start", "maximum_speed"]
+    );
     assert_eq!(profiles[0]["id"], "auto");
     assert_eq!(profiles[0]["max_width"], 3840);
     assert_eq!(profiles[0]["max_height"], 2160);
@@ -5912,6 +5922,83 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .remux_job
         .expect("fully copied HEVC/AAC browser job");
     assert!(copied_spec.cache_key.contains("aligned-seek-v2"));
+    let mut preset_keys = std::collections::HashSet::new();
+    for (preset, expected) in [
+        ("balanced", "veryfast"),
+        ("fast_start", "veryfast"),
+        ("maximum_speed", "ultrafast"),
+    ] {
+        let response = app.handle(&req(&get(
+            &format!(
+                "/web/media/{}.m3u8?delivery=hls&quality=full_hd&encoding_preset={preset}",
+                h264_audio_fallback.detail_id,
+            ),
+            "Browser/encoding-presets",
+        )));
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let spec = response.remux_job.unwrap();
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|pair| pair == ["-preset", expected]));
+        assert_eq!(
+            spec.args
+                .windows(2)
+                .any(|pair| pair == ["-tune", "zerolatency"]),
+            preset != "balanced"
+        );
+        preset_keys.insert(spec.cache_key);
+        let copied = app.handle(&req(&get(&format!(
+            "/web/media/{}.mp4?quality=auto&video_mode=copy&audio_mode=copy&encoding_preset={preset}", h264_audio_fallback.detail_id,
+        ), "Browser/encoding-presets"))).remux_job.unwrap();
+        assert_eq!(copied.cache_key, copied_spec.cache_key);
+        assert_eq!(copied.args, copied_spec.args);
+    }
+    assert_eq!(preset_keys.len(), 3);
+    for query in [
+        "encoding_preset=unknown",
+        "encoding_preset=",
+        "encoding_preset=balanced&encoding_preset=fast_start",
+    ] {
+        assert_eq!(
+            app.handle(&req(&get(
+                &format!("/web/media/{}.mp4?{query}", h264_audio_fallback.detail_id,),
+                "Browser/encoding-presets"
+            )))
+            .status,
+            400
+        );
+    }
+    for start in [0, 30] {
+        let hls_copy = app.handle(&req(&get(
+            &format!(
+                "/web/media/{}.m3u8?delivery=hls&quality=auto&video_mode=copy&audio_mode=transcode&start={start}",
+                h264_audio_fallback.detail_id
+            ),
+            "Safari/HEVC-HLS-trial",
+        )));
+        assert_eq!(
+            hls_copy.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&hls_copy.body)
+        );
+        let hls_copy = hls_copy.remux_job.expect("Safari HEVC HLS copy job");
+        assert!(!hls_copy.hls_all_fragments_independent);
+        for pair in [["-c:v", "copy"], ["-c:a", "aac"], ["-tag:v", "hvc1"]] {
+            assert!(hls_copy.args.windows(2).any(|args| args == pair));
+        }
+        assert!(!hls_copy.args.iter().any(|arg| arg == "-force_key_frames"));
+        assert!(!hls_copy
+            .args
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains("libplacebo")));
+    }
     assert!(copied_spec
         .args
         .windows(2)

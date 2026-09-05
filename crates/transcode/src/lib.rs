@@ -171,6 +171,47 @@ fn lowercase_hex(bytes: &[u8]) -> String {
     output
 }
 
+/// User-selected speed/latency tradeoff; independent of output resolution/HDR.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrowserEncodingPreset {
+    #[default]
+    Balanced,
+    FastStart,
+    MaximumSpeed,
+}
+
+impl BrowserEncodingPreset {
+    pub const ALL: [Self; 3] = [Self::Balanced, Self::FastStart, Self::MaximumSpeed];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::FastStart => "fast_start",
+            Self::MaximumSpeed => "maximum_speed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|preset| preset.id() == value)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Balanced => "Balanced",
+            Self::FastStart => "Fast start",
+            Self::MaximumSpeed => "Maximum speed",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Balanced => "Default quality and compression",
+            Self::FastStart => "Less encoder buffering; may reduce quality at the same bitrate",
+            Self::MaximumSpeed => "Faster encoding with a larger quality tradeoff",
+        }
+    }
+}
+
 /// Source and request traits that complete an embedded-browser output plan.
 ///
 /// `TranscodePlan` owns codec/encoder selection. These options own the
@@ -178,6 +219,7 @@ fn lowercase_hex(bytes: &[u8]) -> String {
 /// that depends on the selected source streams.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrowserOutputOptions {
+    pub encoding_preset: BrowserEncodingPreset,
     /// `None` for audio-only output.
     pub source_video: Option<VideoCodec>,
     pub selected_audio: AudioCodec,
@@ -1324,6 +1366,54 @@ fn apply_browser_hls_pacing(
     args.splice(input..input, pacing);
 }
 
+fn apply_browser_encoding_preset(
+    args: &mut Vec<OsString>,
+    plan: &TranscodePlan,
+    options: BrowserOutputOptions,
+) {
+    if options.source_video.is_none()
+        || plan.video_encoder == "copy"
+        || options.encoding_preset == BrowserEncodingPreset::Balanced
+    {
+        return;
+    }
+    let nvenc = matches!(plan.video_encoder.as_str(), "h264_nvenc" | "hevc_nvenc");
+    let fastest = options.encoding_preset == BrowserEncodingPreset::MaximumSpeed;
+    // Balanced is byte-for-byte unchanged. Preserve the established filters,
+    // HDR signaling, bitrate caps, IDRs and timestamp-repair path for every preset.
+    let preset = match (nvenc, fastest) {
+        (true, false) => "p4",
+        (true, true) => "p2",
+        (false, false) => "veryfast",
+        (false, true) => "ultrafast",
+    };
+    let tune = if nvenc { "ll" } else { "zerolatency" };
+    for (flag, value) in [("-preset", preset), ("-tune", tune), ("-bf", "0")] {
+        if let Some(index) = args.iter().position(|arg| arg == flag) {
+            if let Some(argument) = args.get_mut(index + 1) {
+                *argument = value.into();
+            }
+        } else {
+            let output = args.len().saturating_sub(1);
+            args.splice(output..output, [flag.into(), value.into()]);
+        }
+    }
+    if nvenc {
+        let output = args.len().saturating_sub(1);
+        args.splice(
+            output..output,
+            [
+                "-rc-lookahead".into(),
+                "0".into(),
+                "-zerolatency".into(),
+                "1".into(),
+                "-delay".into(),
+                "0".into(),
+            ],
+        );
+    }
+}
+
 fn browser_ffmpeg_os_args_with_readrate_catchup(
     src_path: &Path,
     dst_path: &Path,
@@ -1334,6 +1424,7 @@ fn browser_ffmpeg_os_args_with_readrate_catchup(
     debug_assert_eq!(plan.action, RecodeAction::Browser);
     let policy = browser_output_policy(plan, options);
     let mut args = ffmpeg_grow_os_args(src_path, dst_path, plan);
+    apply_browser_encoding_preset(&mut args, plan, options);
     if policy.apply_sdr_tonemap {
         apply_browser_sdr_tonemap(
             &mut args,
@@ -2650,6 +2741,13 @@ fn browser_cache_key_from_base(
 ) -> String {
     debug_assert_eq!(plan.action, RecodeAction::Browser);
     let policy = browser_output_policy(plan, options);
+    if options.source_video.is_some()
+        && plan.video_encoder != "copy"
+        && options.encoding_preset != BrowserEncodingPreset::Balanced
+    {
+        cache_key.push_str("-browser-encoding-v1-");
+        cache_key.push_str(options.encoding_preset.id());
+    }
     cache_key.push('-');
     cache_key.push_str(BROWSER_TIMELINE_CACHE_REVISION);
     cache_key.push('-');
@@ -4459,6 +4557,7 @@ action = "audio-ac3"
     #[test]
     fn browser_dolby_vision_repair_uses_real_sdr_tonemap_policy() {
         let options = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::Balanced,
             source_video: Some(VideoCodec::Hevc),
             selected_audio: AudioCodec::Aac,
             source_hdr: HdrKind::DolbyVisionProfile7,
@@ -4511,6 +4610,7 @@ action = "audio-ac3"
             ..TranscodePlan::default()
         };
         let options = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::Balanced,
             source_video: Some(VideoCodec::Hevc),
             selected_audio: browser_audio_codec_from_name("AAC"),
             source_hdr: HdrKind::DolbyVisionProfile7,
@@ -4625,6 +4725,7 @@ action = "audio-ac3"
             ..TranscodePlan::default()
         };
         let options = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::Balanced,
             source_video: Some(VideoCodec::H264),
             selected_audio: AudioCodec::Aac,
             source_hdr: HdrKind::Sdr,
@@ -4678,6 +4779,215 @@ action = "audio-ac3"
     }
 
     #[test]
+    fn browser_encoding_presets_preserve_stream_policy_and_own_cache_identity() {
+        let options = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::Balanced,
+            source_video: Some(VideoCodec::Hevc),
+            selected_audio: AudioCodec::Aac,
+            source_hdr: HdrKind::Hdr10,
+            start_seconds: 30,
+            hls: true,
+        };
+        for encoder in ["h264_nvenc", "hevc_nvenc", "libx264", "copy"] {
+            let plan = TranscodePlan {
+                action: RecodeAction::Browser,
+                video_encoder: encoder.into(),
+                browser_quality: Some(BrowserQuality::FullHd),
+                hardware_decode: if encoder.contains("nvenc") {
+                    HardwareDecode::Cuda
+                } else {
+                    HardwareDecode::None
+                },
+                keep_hdr10: encoder == "hevc_nvenc",
+                audio: AudioAction::Copy,
+                ..TranscodePlan::default()
+            };
+            let args = |options| {
+                browser_ffmpeg_os_args(Path::new("source"), Path::new("output"), &plan, options)
+            };
+            let key = |options| browser_cache_key_from_base("base".into(), &plan, options);
+            let balanced = args(options);
+            let mut keys = std::collections::HashSet::new();
+            for preset in BrowserEncodingPreset::ALL {
+                assert_eq!(BrowserEncodingPreset::parse(preset.id()), Some(preset));
+                let selected = BrowserOutputOptions {
+                    encoding_preset: preset,
+                    ..options
+                };
+                let actual = args(selected);
+                keys.insert(key(selected));
+                if encoder == "copy" || preset == BrowserEncodingPreset::Balanced {
+                    assert_eq!(actual, balanced);
+                    assert_eq!(key(selected), key(options));
+                    continue;
+                }
+                let expected_preset = match (encoder.contains("nvenc"), preset) {
+                    (true, BrowserEncodingPreset::FastStart) => "p4",
+                    (true, _) => "p2",
+                    (false, BrowserEncodingPreset::FastStart) => "veryfast",
+                    (false, _) => "ultrafast",
+                };
+                assert!(actual
+                    .windows(2)
+                    .any(|pair| pair == ["-preset", expected_preset]));
+                assert!(actual.windows(2).any(|pair| pair
+                    == [
+                        "-tune",
+                        if encoder.contains("nvenc") {
+                            "ll"
+                        } else {
+                            "zerolatency"
+                        }
+                    ]));
+                assert!(actual.windows(2).any(|pair| pair == ["-bf", "0"]));
+                for flag in [
+                    "-vf",
+                    "-c:v",
+                    "-c:a",
+                    "-ss",
+                    "-maxrate",
+                    "-bufsize",
+                    "-force_key_frames",
+                    "-color_trc",
+                    "-tag:v",
+                ] {
+                    let value = |values: &Vec<OsString>| {
+                        values
+                            .windows(2)
+                            .find(|pair| pair[0] == flag)
+                            .map(|pair| pair[1].clone())
+                    };
+                    assert_eq!(
+                        value(&actual),
+                        value(&balanced),
+                        "{encoder} {preset:?} {flag}"
+                    );
+                }
+            }
+            assert_eq!(keys.len(), if encoder == "copy" { 1 } else { 3 });
+            let audio_only = BrowserOutputOptions {
+                source_video: None,
+                ..options
+            };
+            assert_eq!(
+                args(audio_only),
+                args(BrowserOutputOptions {
+                    encoding_preset: BrowserEncodingPreset::FastStart,
+                    ..audio_only
+                })
+            );
+        }
+        assert_eq!(BrowserEncodingPreset::parse("unknown"), None);
+    }
+
+    #[test]
+    fn browser_encoding_presets_produce_decodable_monotonic_fragments() {
+        let tmp = tool_test_dir("encoding-presets");
+        let source = tmp.join("source.mkv");
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut generate: Vec<OsString> = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-t",
+            "3",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "24",
+            "-c:a",
+            "aac",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        generate.push(source.as_os_str().to_owned());
+        run_cmd_controlled(&generate, deadline(), &cancelled, None).unwrap();
+        let mut encoders = vec!["libx264"];
+        if std::env::var("RUSTY_DLNA_TEST_NVENC").as_deref() == Ok("1") {
+            encoders.extend(["h264_nvenc", "hevc_nvenc"]);
+        }
+        for encoder in encoders {
+            for preset in BrowserEncodingPreset::ALL {
+                let output = tmp.join(format!("{encoder}-{}.mp4", preset.id()));
+                let plan = TranscodePlan {
+                    action: RecodeAction::Browser,
+                    video_encoder: encoder.into(),
+                    audio: AudioAction::ToAac,
+                    browser_quality: Some(BrowserQuality::FullHd),
+                    ..TranscodePlan::default()
+                };
+                let options = BrowserOutputOptions {
+                    encoding_preset: preset,
+                    source_video: Some(VideoCodec::H264),
+                    selected_audio: AudioCodec::Aac,
+                    source_hdr: HdrKind::Sdr,
+                    start_seconds: 0,
+                    hls: true,
+                };
+                // Exercise portable pacing too: contributor FFmpeg may predate 8.
+                let args = browser_ffmpeg_os_args_with_readrate_catchup(
+                    &source, &output, &plan, options, false,
+                );
+                run_cmd_controlled(&args, deadline(), &cancelled, None).unwrap();
+                let bytes = std::fs::read(&output).unwrap();
+                assert!(bytes.windows(4).any(|word| word == b"moof"));
+                let mut probe: Vec<OsString> = [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "packet=dts_time,flags",
+                    "-of",
+                    "csv=p=0",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+                probe.push(output.as_os_str().to_owned());
+                let probe_output =
+                    run_cmd_capture_controlled(&probe, deadline(), &cancelled, None).unwrap();
+                let text = String::from_utf8(probe_output).unwrap();
+                let packets: Vec<_> = text.lines().filter(|line| !line.is_empty()).collect();
+                assert!(!packets.is_empty());
+                assert!(packets[0].split(',').nth(1).unwrap().contains('K'));
+                let times: Vec<f64> = packets
+                    .iter()
+                    .map(|packet| packet.split(',').next().unwrap().parse().unwrap())
+                    .collect();
+                assert!(times.windows(2).all(|pair| pair[1] > pair[0]));
+                let decode = vec![
+                    "ffmpeg".into(),
+                    "-v".into(),
+                    "error".into(),
+                    "-i".into(),
+                    output.into_os_string(),
+                    "-f".into(),
+                    "null".into(),
+                    "-".into(),
+                ];
+                run_cmd_controlled(&decode, deadline(), &cancelled, None).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
     fn browser_copy_options_add_aac_and_hevc_mp4_signaling() {
         let plan = TranscodePlan {
             decision: Decision::Recode,
@@ -4689,6 +4999,7 @@ action = "audio-ac3"
             ..TranscodePlan::default()
         };
         let options = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::Balanced,
             source_video: Some(VideoCodec::Hevc),
             selected_audio: AudioCodec::Aac,
             source_hdr: HdrKind::DolbyVisionProfile8,
@@ -4729,6 +5040,7 @@ action = "audio-ac3"
             ..TranscodePlan::default()
         };
         let options = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::Balanced,
             source_video: Some(VideoCodec::H264),
             selected_audio: AudioCodec::TrueHd,
             source_hdr: HdrKind::DolbyVisionProfile7,
@@ -4975,6 +5287,7 @@ action = "audio-ac3"
             ..encoded_plan.clone()
         };
         let encoded_options = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::Balanced,
             source_video: Some(VideoCodec::H264),
             selected_audio: AudioCodec::Other,
             source_hdr: HdrKind::Sdr,
@@ -4982,6 +5295,7 @@ action = "audio-ac3"
             hls: false,
         };
         let copy_options = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::Balanced,
             source_video: Some(VideoCodec::H264),
             selected_audio: AudioCodec::Other,
             source_hdr: HdrKind::Sdr,
@@ -5089,6 +5403,7 @@ action = "audio-ac3"
             ..TranscodePlan::default()
         };
         let options = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::Balanced,
             source_video: Some(VideoCodec::H264),
             selected_audio: AudioCodec::Ac3,
             source_hdr: HdrKind::Hdr10,
@@ -5741,6 +6056,7 @@ action = "audio-ac3"
             ..TranscodePlan::default()
         };
         let options = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::Balanced,
             source_video: Some(VideoCodec::Mpeg4),
             selected_audio: AudioCodec::Aac,
             source_hdr: HdrKind::Sdr,

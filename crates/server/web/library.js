@@ -33,7 +33,7 @@ export class LibraryController {
   #pagingNeedsExit = false;
   #artworkObserver = null;
   #artworkQueue = new Set();
-  #artworkActive = 0;
+  #artworkRequests = new Map();
 
   constructor({ store, api, dom, onSelect, onNavigate = () => {} }) {
     this.#store = store;
@@ -146,6 +146,7 @@ export class LibraryController {
     this.#dom.libraryEmpty.hidden = !["ready", "error"].includes(library.status)
       || (library.status === "ready" && library.total > 0);
     this.#dom.libraryRetry.hidden = library.status !== "error";
+    this.#dom.libraryClearSearch.hidden = library.status !== "ready" || library.total > 0 || !navigation.query;
     this.#dom.searchInput.placeholder = navigation.view === "folders" ? "Filter this folder…" : "Search titles, artists, albums…";
     const noun = navigation.view === "folders" ? (library.total === 1 ? "entry" : "entries") : (library.total === 1 ? "item" : "items");
     this.#announceState(library, server, noun);
@@ -159,8 +160,11 @@ export class LibraryController {
     }
     this.#dom.libraryPanel.setAttribute("aria-busy", String(["loading", "loading_more"].includes(library.status)));
     this.#dom.libraryCount.textContent = library.status === "loading" ? "Connecting…" : `${library.total} ${noun}`;
-    this.#dom.libraryEmptyTitle.textContent = navigation.query ? `No results for “${navigation.query}”` : "No media found";
-    this.#dom.libraryEmptyDetail.textContent = navigation.query ? "Try a different search." : "This view is empty.";
+    this.#dom.libraryEmptyTitle.textContent = navigation.query ? `No results for “${navigation.query}”`
+      : navigation.view === "continue" ? "Nothing to continue yet" : "No media found";
+    this.#dom.libraryEmptyDetail.textContent = navigation.query ? "Try a different search or clear it to see this view."
+      : navigation.view === "continue" ? "Start watching or listening. Your saved progress will appear here on this browser."
+        : "Try another folder or media view.";
     this.#dom.resultsSummary.textContent = navigation.query
       ? `${library.total} ${library.total === 1 ? "result" : "results"} for “${navigation.query}”`
       : `${library.total} ${noun}`;
@@ -274,7 +278,14 @@ export class LibraryController {
 
   renderCards({ appendFrom = null } = {}) {
     const { library, playback } = this.#store.getState();
-    if (appendFrom === null) this.#dom.grid.replaceChildren();
+    if (appendFrom === null) {
+      this.#artworkObserver?.disconnect();
+      this.#artworkQueue.clear();
+      // Detached images may never emit load/error. Release their admission
+      // slots explicitly so a slow old view cannot starve the current one.
+      for (const cancel of this.#artworkRequests.values()) cancel();
+      this.#dom.grid.replaceChildren();
+    }
     const entries = appendFrom === null ? library.entries : library.entries.slice(appendFrom);
     for (const entry of entries) {
       const card = entry.entry_type === "folder" ? this.#folderCard(entry) : this.#mediaCard(entry);
@@ -586,7 +597,7 @@ export class LibraryController {
     for (const image of this.#artworkQueue) {
       if (!image.isConnected || !image.dataset.src) this.#artworkQueue.delete(image);
     }
-    while (this.#artworkActive < MAX_ACTIVE_ARTWORK && this.#artworkQueue.size > 0) {
+    while (this.#artworkRequests.size < MAX_ACTIVE_ARTWORK && this.#artworkQueue.size > 0) {
       const viewportCenter = window.innerHeight / 2;
       const image = [...this.#artworkQueue].sort((left, right) => {
         const leftBounds = left.getBoundingClientRect();
@@ -605,22 +616,34 @@ export class LibraryController {
     const source = image.dataset.src;
     if (!source) return;
     delete image.dataset.src;
-    this.#artworkActive += 1;
     let settled = false;
     const settle = () => {
       if (settled) return;
       settled = true;
-      this.#artworkActive = Math.max(0, this.#artworkActive - 1);
+      image.removeEventListener("load", settle);
+      image.removeEventListener("error", failed);
+      this.#artworkRequests.delete(image);
       this.#drainArtworkQueue();
     };
-    image.addEventListener("load", settle, { once: true });
-    image.addEventListener("error", () => {
+    const failed = () => {
       image.classList.add("failed");
       settle();
-    }, { once: true });
+    };
+    this.#artworkRequests.set(image, () => {
+      settle();
+      image.removeAttribute("src");
+    });
+    image.addEventListener("load", settle, { once: true });
+    image.addEventListener("error", failed, { once: true });
+    // Visibility and concurrency are already controlled by this queue.
+    image.loading = "eager";
     image.src = source;
     window.queueMicrotask(() => {
-      if (image.complete) settle();
+      // A cached failure can already be complete before its error event.
+      if (!settled && image.complete) {
+        if (image.naturalWidth === 0) failed();
+        else settle();
+      }
     });
   }
 
@@ -698,6 +721,10 @@ export class LibraryController {
   }
 
   #bind() {
+    this.#dom.libraryClearSearch.addEventListener("click", () => {
+      this.navigate({ query: "" }, { history: "replace", focusAfterLoad: false });
+      this.#dom.searchInput.focus();
+    });
     this.#dom.libraryRetry.addEventListener("click", () => this.load({ reset: true }));
     this.#dom.libraryRetryTop.addEventListener("click", () => this.load({ reset: true }));
     this.#dom.searchInput.addEventListener("input", () => {

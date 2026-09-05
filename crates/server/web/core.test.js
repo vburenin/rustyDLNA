@@ -20,6 +20,8 @@ import {
   hdrVideoOutputCandidate,
   mediaMatchesQuery,
   nativeHlsQualityProfile,
+  nativeHlsHevcCopyEligible,
+  encodingPreset,
   navigationFromUrl,
   navigationUrl,
   negotiateCompatibleStreams,
@@ -326,6 +328,49 @@ test("quality preferences use bounded opaque IDs and follow advertised profiles"
   };
   try {
     assert.equal(loadPreferences().quality, "future.4k-v2");
+  } finally {
+    delete globalThis.localStorage;
+  }
+});
+
+test("native HLS HEVC copying is opt-in, Auto-only, and respects server eligibility", () => {
+  const item = { kind: "video", video_codec: "hevc", video_content_type: 'video/mp4; codecs="hvc1.2.4.L153.B0"' };
+  assert.equal(nativeHlsHevcCopyEligible(item, "auto", true), true);
+  for (const [candidate, quality, enabled] of [
+    [item, "auto", false], [item, "auto", "true"], [item, "full_hd", true],
+    [{ ...item, kind: "audio" }, "auto", true],
+    [{ ...item, video_codec: "h264" }, "auto", true],
+    [{ ...item, video_content_type: null }, "auto", true],
+    [{ ...item, video_repair_required: true }, "auto", true],
+    [null, "auto", true],
+  ]) assert.equal(nativeHlsHevcCopyEligible(candidate, quality, enabled), false);
+});
+
+test("encoding presets are validated, persisted, and gated by server support", () => {
+  for (const id of ["balanced", "fast_start", "maximum_speed"]) {
+    assert.equal(encodingPreset(id), id);
+    assert.equal(encodingPreset(id, []), "balanced");
+    assert.equal(encodingPreset(id, [{ id }]), id);
+  }
+  assert.equal(encodingPreset("unknown"), "balanced");
+  try {
+    for (const [stored, expected] of [[null, "balanced"], ["fast_start", "fast_start"], ["maximum_speed", "maximum_speed"], ["unknown", "balanced"]]) {
+      globalThis.localStorage = { getItem: (key) => key === "rustydlna.encodingPreset" ? stored : null };
+      assert.equal(loadPreferences().encodingPreset, expected);
+    }
+    globalThis.localStorage = { getItem: () => { throw new Error("blocked"); } };
+    assert.equal(loadPreferences().encodingPreset, "balanced");
+  } finally { delete globalThis.localStorage; }
+});
+
+test("HEVC HLS preference defaults off and handles unavailable storage", () => {
+  try {
+    for (const [stored, expected] of [[null, false], ["true", true], ["false", false], ["invalid", false]]) {
+      globalThis.localStorage = { getItem: (key) => key === "rustydlna.hevcHlsCopy" ? stored : null };
+      assert.equal(loadPreferences().hevcHlsCopy, expected);
+    }
+    globalThis.localStorage = { getItem: () => { throw new Error("blocked"); } };
+    assert.equal(loadPreferences().hevcHlsCopy, false);
   } finally {
     delete globalThis.localStorage;
   }

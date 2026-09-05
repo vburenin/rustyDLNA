@@ -1,4 +1,4 @@
-import { STREAM_MODES, validQualityProfileId } from "./core.js";
+import { STREAM_MODES, validQualityProfileId, encodingPreset } from "./core.js";
 
 const PREFIX = "rustydlna.";
 const PROGRESS_KEY = `${PREFIX}webProgress.v1`;
@@ -31,10 +31,12 @@ export function loadPreferences() {
     volume: Number.isFinite(volume) ? Math.max(0, Math.min(100, volume)) : 100,
     streamMode: Object.values(STREAM_MODES).includes(streamMode) ? streamMode : STREAM_MODES.AUTO,
     quality: validQualityProfileId(quality) ? quality : "auto",
+    encodingPreset: encodingPreset(read("encodingPreset", "balanced")),
     muted: read("muted", "false") === "true",
     loop: read("loop", "false") === "true",
     fill: read("fill", "false") === "true",
     autoplay: read("autoplay", "false") === "true",
+    hevcHlsCopy: read("hevcHlsCopy", "false") === "true",
     captionSize: ["normal", "large", "extra_large"].includes(read("captionSize", "normal")) ? read("captionSize", "normal") : "normal",
     captionBackground: ["translucent", "solid"].includes(read("captionBackground", "translucent")) ? read("captionBackground", "translucent") : "translucent",
   };

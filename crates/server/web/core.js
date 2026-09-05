@@ -324,6 +324,20 @@ export function nativeHlsQualityProfile(profiles, preferredId, appleMobile) {
   return saferCompatibleQualityProfile(profiles, preferredId) || preferredId;
 }
 
+export function encodingPreset(value, advertised = null) {
+  return ["balanced", "fast_start", "maximum_speed"].includes(value)
+    && (advertised === null || advertised.some((preset) => preset?.id === value))
+    ? value : "balanced";
+}
+
+export function nativeHlsHevcCopyEligible(item, quality, enabled) {
+  // The server only advertises a video content type for remux-compatible
+  // codecs/HDR. Keep that policy authoritative rather than duplicating it.
+  return enabled === true && quality === "auto" && item?.kind === "video"
+    && primaryVideoCodec(item.video_codec) === "hevc"
+    && Boolean(item.video_content_type) && !item.video_repair_required;
+}
+
 export function automaticCompatibleRecoveryProfile(profiles, currentId, preferredId) {
   return preferredId === "auto"
     ? saferCompatibleQualityProfile(profiles, currentId)

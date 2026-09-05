@@ -124,6 +124,7 @@ struct WebCapabilities {
     queue: bool,
     media_session: bool,
     quality_profiles: Vec<WebQualityProfile>,
+    encoding_presets: Vec<WebEncodingPreset>,
     video_outputs: Vec<WebVideoOutput>,
     ai_upscale: Option<WebAiUpscaleCapability>,
 }
@@ -143,6 +144,13 @@ struct WebAiUpscaleEnvelope {
     max_source_width: u32,
     max_source_height: u32,
     max_source_pixels_per_second: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct WebEncodingPreset {
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
 }
 
 #[derive(Clone, Serialize)]
@@ -452,6 +460,14 @@ fn web_capabilities(app: &App) -> WebCapabilities {
         queue: true,
         media_session: true,
         quality_profiles,
+        encoding_presets: rusty_dlna_transcode::BrowserEncodingPreset::ALL
+            .into_iter()
+            .map(|preset| WebEncodingPreset {
+                id: preset.id(),
+                label: preset.label(),
+                description: preset.description(),
+            })
+            .collect(),
         video_outputs,
         ai_upscale: (!app.ai_upscale_profiles.is_empty()).then(|| WebAiUpscaleCapability {
             label: "AI upscale",
@@ -2351,6 +2367,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         "audio",
         "start",
         "quality",
+        "encoding_preset",
         "reason",
         "request",
         "session",
@@ -2550,6 +2567,17 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
                 None,
             )
         }
+    };
+    let Some(encoding_preset) = rusty_dlna_transcode::BrowserEncodingPreset::parse(
+        params.get("encoding_preset").unwrap_or("balanced"),
+    ) else {
+        return api_error(
+            400,
+            "invalid_encoding_preset",
+            "Choose an available encoding preset.",
+            false,
+            None,
+        );
     };
     let requested_video_mode = match params.get("video_mode").unwrap_or("transcode") {
         "copy" | "repair" | "transcode" => params.get("video_mode").unwrap_or("transcode"),
@@ -2850,6 +2878,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         }),
     };
     let browser_options = rusty_dlna_transcode::BrowserOutputOptions {
+        encoding_preset,
         source_video: is_video.then_some(source.video_codec),
         selected_audio: rusty_dlna_transcode::browser_audio_codec_from_name(selected_audio_codec),
         source_hdr: source.hdr,
@@ -3053,6 +3082,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         source_mode = "compatible",
         fallback_reason,
         quality = quality.id(),
+        encoding_preset = if is_video && !copy_video { encoding_preset.id() } else { "not_used" },
         delivery,
         path = %req.path,
         range = req.header("Range").unwrap_or("-"),

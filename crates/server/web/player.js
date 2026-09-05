@@ -20,6 +20,8 @@ import {
   isSafariBrowser,
   mediaDetails,
   nativeHlsQualityProfile,
+  nativeHlsHevcCopyEligible,
+  encodingPreset,
   negotiateCompatibleStreams,
   parseHlsMediaPlaylist,
   playbackControlLabel,
@@ -424,6 +426,7 @@ export class PlaybackController {
   #captionRenderKey = "";
   #audioRenderKey = "";
   #chapterRenderKey = "";
+  #streamInfoRenderInputs = [];
   #capabilityCache = new Map();
   #automaticTranscodeRetries = 0;
   #pendingCompatibleRetrySession = null;
@@ -751,24 +754,30 @@ export class PlaybackController {
     if (next) this.select(next, { preserveQueue: true });
   }
 
-  async closePlayback() {
+  closePlayback() {
     const playback = this.#store.getState().playback;
     const fullscreenActionName = this.#fullscreenAction();
     this.#dom.captionMenu.hidden = true;
     this.#dom.captionsButton.setAttribute("aria-expanded", "false");
     for (const dialog of [
       this.#dom.advancedPlaybackDialog,
+      this.#dom.qualityDialog,
       this.#dom.streamInfoDialog,
       this.#dom.shortcutDialog,
     ]) {
       if (dialog.open) dialog.close();
     }
     this.#dom.resumePrompt.hidden = true;
+    // Display-mode promises can remain pending while the browser animates or
+    // waits for platform UI. Stop this session immediately; their completion
+    // must never clear a title selected in the meantime.
     if (fullscreenActionName.startsWith("exit_")) {
-      await this.toggleFullscreen();
+      void this.toggleFullscreen();
     }
     if (document.pictureInPictureElement === this.#dom.video) {
-      try { await document.exitPictureInPicture(); } catch (_) { /* Closing still proceeds. */ }
+      try {
+        void Promise.resolve(document.exitPictureInPicture()).catch(() => {});
+      } catch (_) { /* Closing still proceeds. */ }
     }
     if (!playback.item) {
       this.#onClosePlayback();
@@ -989,12 +998,14 @@ export class PlaybackController {
     this.#dom.playerStage.classList.toggle("has-media", Boolean(item));
     this.#dom.playerStage.classList.toggle("has-video", item?.kind === "video");
     this.#dom.playerStage.classList.toggle("is-playing", playback.status === "playing");
-    this.#dom.playerStage.classList.toggle("awaiting-play", playback.autoplayBlocked);
+    this.#dom.playerStage.classList.toggle("awaiting-play", playback.autoplayBlocked || playback.status === "error");
     this.#dom.playerEmpty.hidden = Boolean(item);
     this.#dom.nowPlaying.hidden = !item;
     this.#dom.closePlayerButton.hidden = !item;
     this.#dom.playbackControls.hidden = !item || !this.#dom.resumePrompt.hidden;
     if (!item) {
+      this.#dom.stageProgress.hidden = true;
+      this.#renderMessage();
       this.#dom.nowPlayingTitle.textContent = "Nothing selected";
       this.#dom.nowPlayingMeta.textContent = "";
       document.title = `${server.name} · Library`;
@@ -1020,6 +1031,10 @@ export class PlaybackController {
     this.#dom.captionSizeControl.value = preferences.captionSize;
     this.#dom.captionBackgroundControl.value = preferences.captionBackground;
     this.#dom.autoplayControl.checked = preferences.autoplay;
+    this.#dom.hevcHlsOption.hidden = !supportsNativeHlsDelivery(this.#dom.video);
+    this.#dom.hevcHlsControl.checked = preferences.hevcHlsCopy === true;
+    this.#dom.hevcHlsControl.disabled = !server.capabilities.transcoding;
+    this.#renderEncodingPresets();
 
     const busy = ["loading", "waiting", "seeking"].includes(playback.status);
     this.#dom.stageProgress.hidden = !busy;
@@ -1039,7 +1054,7 @@ export class PlaybackController {
     this.#dom.loopButton.setAttribute("aria-label", preferences.loop ? "Turn loop off" : "Turn loop on");
     this.#dom.fitButton.disabled = item.kind !== "video";
     this.#dom.fitButton.setAttribute("aria-pressed", String(preferences.fill));
-    this.#dom.fitButton.textContent = preferences.fill ? "Fit" : "Fill";
+    this.#dom.fitButton.textContent = "Fill frame";
     this.#dom.fitButton.setAttribute("aria-label", preferences.fill ? "Fit entire video in frame" : "Fill video frame");
     this.#dom.pipButton.disabled = item.kind !== "video" || !document.pictureInPictureEnabled;
     this.#dom.pipButton.setAttribute("aria-pressed", String(playback.pip));
@@ -1172,6 +1187,9 @@ export class PlaybackController {
     this.#sourceController = controller;
     const sourceMode = selected.mode;
     const advertisedProfiles = state.server.capabilities.quality_profiles || [];
+    const selectedEncodingPreset = encodingPreset(
+      state.preferences.encodingPreset, state.server.capabilities.encoding_presets || [],
+    );
     const requestedOutputQuality = sourceMode === SOURCE_MODES.COMPATIBLE
       && forceQuality
       && advertisedProfiles.some((profile) => profile?.id === forceQuality)
@@ -1189,6 +1207,8 @@ export class PlaybackController {
       && item.kind === "video"
       && supportsNativeHlsDelivery(player);
     let nativeHlsDelivery = nativeHlsAvailable;
+    const copyNativeHlsHevc = nativeHlsDelivery && !forceStreamNegotiation
+      && nativeHlsHevcCopyEligible(item, preferredOutputQuality, state.preferences.hevcHlsCopy);
     const androidTranscodeEligible = sourceMode === SOURCE_MODES.COMPATIBLE
       && item.kind === "video"
       && isAndroidDevice(navigator);
@@ -1199,7 +1219,8 @@ export class PlaybackController {
     // encode: a supported copied H.264/HEVC stream must remain at Auto so the
     // server can honor video_mode=copy. The Android negotiation below lowers
     // quality only when it actually switches video to the portable encoder.
-    let outputQuality = nativeHlsDelivery
+    let outputQuality = nativeHlsDelivery && !copyNativeHlsHevc
+      && forceStreamNegotiation?.video !== "copy"
       ? nativeHlsQualityProfile(
         advertisedProfiles,
         preferredOutputQuality,
@@ -1217,6 +1238,7 @@ export class PlaybackController {
       sourceReason: selected.reason,
       outputQuality,
       nativeHlsDelivery,
+      encodingPreset: selectedEncodingPreset,
       mediaSourceDelivery,
       segmentOffset,
       start,
@@ -1232,7 +1254,9 @@ export class PlaybackController {
     player.playbackRate = state.preferences.rate;
     player.volume = state.preferences.volume / 100;
     player.muted = state.preferences.muted;
-    player.loop = state.preferences.loop;
+    // Native looping would replay only the tail of a source opened by a
+    // compatible seek. Its ended handler restarts the complete title instead.
+    player.loop = state.preferences.loop && sourceMode === SOURCE_MODES.ORIGINAL;
     player.disableRemotePlayback = false;
     player.removeAttribute("disableremoteplayback");
     const valid = () => this.#store.getState().playback.sessionId === sessionId && !controller.signal.aborted;
@@ -1245,9 +1269,9 @@ export class PlaybackController {
         // an active recovery decision and must not be replaced by another HDR
         // capability check after the rendition has already failed to decode.
         streamNegotiation = forceStreamNegotiation || {
-          video: "transcode",
+          video: copyNativeHlsHevc ? "copy" : "transcode",
           audio: "transcode",
-          videoOutput: nativeHlsVideoOutput(item, state.server.capabilities),
+          videoOutput: copyNativeHlsHevc ? null : nativeHlsVideoOutput(item, state.server.capabilities),
           hdrDisplay: displayHdrSupport(),
         };
       } else if (forceStreamNegotiation) {
@@ -1271,6 +1295,8 @@ export class PlaybackController {
         });
       }
       if (!valid()) return;
+      // The user can pause or resume while the advisory probes are pending.
+      intent = this.#store.getState().playback.intent;
       if (this.#store.getState().server.negotiationEpoch !== negotiationEpoch) {
         return this.#loadSource(item, {
           start,
@@ -1329,7 +1355,7 @@ export class PlaybackController {
           mediaSourceDelivery = true;
         }
       }
-      const copiedHevcMediaSourceSupport = copiedHevcMediaSourceType(item, streamNegotiation);
+      const copiedHevcMediaSourceSupport = !nativeHlsDelivery && copiedHevcMediaSourceType(item, streamNegotiation);
       if (copiedHevcMediaSourceSupport) {
         mediaSourceType = copiedHevcMediaSourceSupport;
         mediaSourceDelivery = true;
@@ -1557,6 +1583,17 @@ export class PlaybackController {
         });
         return;
       }
+      if (sourceMode === SOURCE_MODES.COMPATIBLE && this.#store.getState().preferences.loop) {
+        this.#loadSource(item, {
+          start: 0,
+          intent: "playing",
+          forceSourceMode: SOURCE_MODES.COMPATIBLE,
+          forceStreamNegotiation: streamNegotiation,
+          forceQuality: outputQuality,
+          forceAndroidMediaSource: mediaSourceDelivery,
+        });
+        return;
+      }
       this.#store.dispatch({ type: "PLAYBACK_TIME", sessionId, currentTime: duration, duration });
       status("ended", { intent: "paused", message: null });
       clearProgress(item.id);
@@ -1570,7 +1607,6 @@ export class PlaybackController {
         item,
         sourceMode,
         start,
-        intent,
         streamNegotiation,
         null,
         mediaSourceRetry,
@@ -1584,6 +1620,9 @@ export class PlaybackController {
       params.set("audio", String(this.#store.getState().playback.selectedAudio));
       params.set("start", String(segmentOffset));
       params.set("quality", outputQuality);
+      if (selectedEncodingPreset !== "balanced" && streamNegotiation.video !== "copy") {
+        params.set("encoding_preset", selectedEncodingPreset);
+      }
       params.set("video_mode", streamNegotiation.video);
       if (streamNegotiation.video === "transcode") {
         params.set("video_output", streamNegotiation.videoOutput || "h264_sdr");
@@ -1612,7 +1651,6 @@ export class PlaybackController {
         playbackSessionId,
         item,
         start,
-        intent,
         streamNegotiation,
         mediaSourceRetry,
         signal: controller.signal,
@@ -1630,7 +1668,6 @@ export class PlaybackController {
         player,
         sourceUrl: playerSourceUrl,
         start,
-        intent,
         streamNegotiation,
         nativeHlsDelivery,
         mediaSourceDelivery,
@@ -1662,7 +1699,6 @@ export class PlaybackController {
     playbackSessionId,
     item,
     start,
-    intent,
     streamNegotiation,
     mediaSourceRetry,
     signal,
@@ -1704,7 +1740,6 @@ export class PlaybackController {
           item,
           SOURCE_MODES.COMPATIBLE,
           start,
-          intent,
           streamNegotiation,
           error,
           mediaSourceRetry,
@@ -1897,7 +1932,6 @@ export class PlaybackController {
     player,
     sourceUrl,
     start,
-    intent,
     streamNegotiation,
     nativeHlsDelivery,
     mediaSourceDelivery,
@@ -1907,7 +1941,6 @@ export class PlaybackController {
       const current = this.#store.getState().playback;
       if (signal.aborted || sessionId !== current.sessionId
         || ["ended", "error"].includes(current.status)) return;
-      const preparing = ["loading", "waiting", "seeking"].includes(current.status);
       try {
         const payload = await this.#api.transcodeStatus(
           item.id,
@@ -1915,6 +1948,7 @@ export class PlaybackController {
           playbackSessionId,
           signal,
         );
+        if (signal.aborted || sessionId !== this.#store.getState().playback.sessionId) return;
         const message = {
           queued: "Waiting for a transcode slot…",
           starting: "Starting compatible playback…",
@@ -1925,6 +1959,7 @@ export class PlaybackController {
         if (message && stillPreparing) {
           this.#store.dispatch({ type: "PLAYBACK_STATUS", sessionId, status: "loading", message });
         } else if (payload.state === "failed") {
+          if (this.#fallbackNativeHlsCopy(sessionId)) return;
           this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId, error: playbackError("transcode_failed", "The transcode producer failed.") });
           return;
         } else if (payload.state === "cancelled") {
@@ -1957,12 +1992,16 @@ export class PlaybackController {
           });
         }
       } catch (error) {
-        if (error?.name === "AbortError") return;
+        if (error?.name === "AbortError" || signal.aborted
+          || sessionId !== this.#store.getState().playback.sessionId) return;
         const category = apiErrorCategory(error);
         // Once decoded playback is underway, the media element remains the
         // authority for a connection failure. A missed lease heartbeat alone
         // must not interrupt buffered playback.
-        if (preparing && ["media_missing", "transcode_busy", "transcode_failed", "transcode_cancelled", "offline", "network"].includes(category)) {
+        const stillPreparing = ["loading", "waiting", "seeking"]
+          .includes(this.#store.getState().playback.status);
+        if (stillPreparing && ["media_missing", "transcode_busy", "transcode_failed", "transcode_cancelled", "offline", "network"].includes(category)) {
+          if (category === "transcode_failed" && this.#fallbackNativeHlsCopy(sessionId)) return;
           this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId, error: playbackError(category, error?.technical || "") });
           return;
         }
@@ -1998,6 +2037,7 @@ export class PlaybackController {
         || !["loading", "waiting", "seeking"].includes(playback.status)
         || player.readyState >= 2
         || player.getAttribute("src") !== sourceUrl) return;
+      if (this.#fallbackNativeHlsCopy(sessionId)) return;
       if (!mediaSourceDelivery
         && item.kind === "video"
         && streamNegotiation?.video === "transcode"
@@ -2039,6 +2079,29 @@ export class PlaybackController {
       // second stall advances to the bounded fresh-generation retry above.
       player.load();
     }, nativeHlsDelivery ? NATIVE_HLS_STARTUP_STALL_MS : COMPATIBLE_STARTUP_STALL_MS);
+  }
+
+  #fallbackNativeHlsCopy(sessionId) {
+    const { playback, preferences, server } = this.#store.getState();
+    if (sessionId !== playback.sessionId || !playback.nativeHlsDelivery
+      || playback.streamNegotiation?.video !== "copy" || !playback.item) return false;
+    // Force an encoded plan for the replacement session. The saved experiment
+    // stays enabled, but seeks/resume retain this plan instead of looping back
+    // into a failed copy attempt.
+    this.#loadSource(playback.item, {
+      start: this.globalTime() || playback.currentTime,
+      intent: playback.intent,
+      forceSourceMode: SOURCE_MODES.COMPATIBLE,
+      forceStreamNegotiation: {
+        video: "transcode", audio: "transcode",
+        videoOutput: nativeHlsVideoOutput(playback.item, server.capabilities),
+        hdrDisplay: displayHdrSupport(),
+      },
+      forceQuality: nativeHlsQualityProfile(server.capabilities.quality_profiles, preferences.quality, isAppleMobileDevice(navigator)),
+      message: "Re-encoding for reliable Safari playback…",
+      messageKind: "fallback",
+    });
+    return true;
   }
 
   #scheduleOriginalBufferRecovery({ sessionId, item, start, signal }) {
@@ -2200,12 +2263,15 @@ export class PlaybackController {
     item,
     sourceMode,
     start,
-    intent,
     streamNegotiation,
     deliveryError = null,
     mediaSourceRetry = false,
   ) {
     if (sessionId !== this.#store.getState().playback.sessionId) return;
+    const signal = this.#sourceController?.signal;
+    const current = () => !signal?.aborted
+      && sessionId === this.#store.getState().playback.sessionId;
+    let intent = this.#store.getState().playback.intent;
     const preferences = this.#store.getState().preferences;
     const capabilities = this.#store.getState().server.capabilities;
     const outputQuality = this.#store.getState().playback.outputQuality || preferences.quality;
@@ -2235,8 +2301,10 @@ export class PlaybackController {
           item.id,
           sessionId,
           this.#playbackSession,
+          signal,
         );
-        if (sessionId !== this.#store.getState().playback.sessionId) return;
+        if (!current()) return;
+        intent = this.#store.getState().playback.intent;
         producerState = payload.state;
         if (["queued", "cancelled", "idle"].includes(payload.state)) {
           const retryableProducerState = payload.state === "queued" || mediaCode !== 4;
@@ -2252,19 +2320,23 @@ export class PlaybackController {
           code = payload.state === "queued" ? "transcode_busy" : "transcode_cancelled";
         } else if (payload.state === "failed") code = "transcode_failed";
       } catch (error) {
-        if (sessionId !== this.#store.getState().playback.sessionId) return;
+        if (!current()) return;
         const category = apiErrorCategory(error);
         if (category !== "unknown") code = category;
       }
     } else if (sourceMode === SOURCE_MODES.ORIGINAL) {
       try {
-        await this.#api.item(item.id);
+        await this.#api.item(item.id, { signal });
       } catch (error) {
-        if (sessionId !== this.#store.getState().playback.sessionId) return;
+        if (!current()) return;
         const category = apiErrorCategory(error);
         if (["media_missing", "offline", "network"].includes(category)) code = category;
       }
     }
+    if (!current()) return;
+    intent = this.#store.getState().playback.intent;
+    if (([3, 4].includes(mediaCode) || producerState === "failed")
+      && this.#fallbackNativeHlsCopy(sessionId)) return;
     const mediaSourceDelivery = this.#store.getState().playback.mediaSourceDelivery;
     const retryableHevcMediaSource = sourceMode === SOURCE_MODES.COMPATIBLE
       && mediaSourceDelivery
@@ -2485,7 +2557,7 @@ export class PlaybackController {
     if (!playback.item || index === playback.selectedAudio || !state.server.capabilities.transcoding) return;
     this.#store.dispatch({ type: "PLAYBACK_AUX", sessionId: playback.sessionId, values: { selectedAudio: index } });
     const start = this.globalTime();
-    const intent = this.activePlayer().paused ? "paused" : "playing";
+    const intent = playback.intent;
     this.#loadSource(playback.item, {
       start,
       intent,
@@ -2500,6 +2572,12 @@ export class PlaybackController {
     const sessionId = this.#store.getState().playback.sessionId;
     this.#store.dispatch({ type: "PLAYBACK_AUX", sessionId, values: { selectedCaption: value } });
     this.#applyCaptionMode(value);
+  }
+
+  #closeCaptionMenu({ restoreFocus = false } = {}) {
+    this.#dom.captionMenu.hidden = true;
+    this.#dom.captionsButton.setAttribute("aria-expanded", "false");
+    if (restoreFocus) this.#dom.captionsButton.focus();
   }
 
   #attachCaptions(item) {
@@ -2605,6 +2683,29 @@ export class PlaybackController {
     }
   }
 
+  #renderEncodingPresets() {
+    const { playback, preferences, server } = this.#store.getState();
+    const presets = (server.capabilities.encoding_presets || [])
+      .filter((preset) => preset?.id === encodingPreset(preset?.id));
+    const control = this.#dom.encodingPresetControl;
+    const key = JSON.stringify(presets);
+    if (control.dataset.presets !== key) {
+      control.dataset.presets = key;
+      control.replaceChildren(...presets.map((preset) => {
+        const option = document.createElement("option");
+        option.value = preset.id;
+        option.textContent = preset.label;
+        return option;
+      }));
+    }
+    const selected = encodingPreset(preferences.encodingPreset, presets);
+    control.value = selected;
+    control.disabled = !server.capabilities.transcoding || playback.item?.kind !== "video";
+    this.#dom.encodingPresetOption.hidden = presets.length < 2;
+    this.#dom.encodingPresetHint.hidden = presets.length < 2;
+    this.#dom.encodingPresetHint.textContent = `${presets.find((preset) => preset.id === selected)?.description || ""}. Only affects re-encoded video in Compatible playback; resolution and HDR settings stay the same.`;
+  }
+
   #renderQualityProfiles() {
     const state = this.#store.getState();
     const advertisedProfiles = (state.server.capabilities.quality_profiles || [])
@@ -2658,13 +2759,23 @@ export class PlaybackController {
     }
     this.#dom.qualityMenuButton.disabled = disabled;
     this.#dom.qualityMenuButton.textContent = shortLabel;
-    this.#dom.qualityMenuButton.setAttribute("aria-label", `Transcoded quality: ${selectedLabel}`);
+    this.#dom.qualityMenuButton.setAttribute("aria-label", `Playback quality: ${selectedLabel}`);
   }
 
   #renderStreamInfo() {
     const { playback, preferences, server } = this.#store.getState();
     const item = playback.item;
     if (!item) return;
+    const inputs = [
+      item, playback.audioTracks, playback.selectedAudio, playback.sourceMode,
+      playback.outputQuality, playback.nativeHlsDelivery, playback.mediaSourceDelivery,
+      playback.streamNegotiation, preferences.quality, server.capabilities,
+      playback.encodingPreset,
+    ];
+    // Clock ticks and buffering updates do not change stream facts. Keep the
+    // existing nodes (and any text selection) until their inputs change.
+    if (inputs.every((value, index) => value === this.#streamInfoRenderInputs[index])) return;
+    this.#streamInfoRenderInputs = inputs;
     const selectedTrack = playback.audioTracks.find((track) => Number(track.index) === Number(playback.selectedAudio));
     const sourceAudio = selectedTrack
       ? audioTrackLabel(selectedTrack)
@@ -2778,6 +2889,8 @@ export class PlaybackController {
               : "The server is producing browser-compatible H.264 video and AAC audio in SDR.";
     replaceFacts(this.#dom.outputStreamFacts, [
       ["Container", "Fragmented MP4"],
+      ["Encoding preset", item.kind !== "video" || copiesVideo ? "Not used · video is not re-encoded"
+        : (server.capabilities.encoding_presets || []).find((preset) => preset.id === playback.encodingPreset)?.label || "Balanced"],
       ["Delivery", playback.nativeHlsDelivery
         ? "Native HLS · fragmented MP4"
         : playback.mediaSourceDelivery ? "Media Source · fragmented MP4" : "Native media loading"],
@@ -2791,20 +2904,27 @@ export class PlaybackController {
       ["Browser video probe", item.kind === "video" ? capabilityProbeLabel(negotiation.videoContentType, negotiation.videoProbe) : "Not applicable"],
       ["Browser output probe", transcodesHdr10
         ? capabilityProbeLabel(negotiation.outputVideoContentType, negotiation.outputVideoProbe)
-        : "Portable H.264 SDR"],
+        : copiesVideo ? "Not used · original video copied" : "Portable H.264 SDR"],
       ["Browser display range", transcodesHdr10
         ? negotiation.hdrDisplay === true
           ? "High dynamic range reported"
           : negotiation.hdrDisplay === false
             ? "Standard range reported · browser tone mapping may apply"
             : "Not reported · playback result is authoritative"
-        : "Not used for SDR output"],
+        : copiesVideo ? "Not used · original video copied" : "Not used for SDR output"],
       ["Browser audio probe", capabilityProbeLabel(negotiation.audioContentType, negotiation.audioProbe)],
     ]);
   }
 
   #renderMessage() {
     const { playback, server } = this.#store.getState();
+    // Element fullscreen only exposes descendants; keep the same recovery
+    // controls reachable there and in iPhone's expanded player.
+    const messageParent = playback.fullscreen ? this.#dom.playerStage : this.#dom.playerPanel;
+    if (this.#dom.playerMessage.parentElement !== messageParent) {
+      if (playback.fullscreen) messageParent.append(this.#dom.playerMessage);
+      else messageParent.insertBefore(this.#dom.playerMessage, this.#dom.playbackLive);
+    }
     const error = playback.error;
     const transient = !error && ["loading", "waiting", "seeking"].includes(playback.status);
     const text = error?.message || (transient ? null : playback.message);
@@ -2890,8 +3010,9 @@ export class PlaybackController {
     this.#dom.loopButton.addEventListener("click", () => {
       const loop = !this.#store.getState().preferences.loop;
       this.#setPreference("loop", loop);
-      this.#dom.video.loop = loop;
-      this.#dom.audio.loop = loop;
+      const nativeLoop = loop && this.#store.getState().playback.sourceMode !== SOURCE_MODES.COMPATIBLE;
+      this.#dom.video.loop = nativeLoop;
+      this.#dom.audio.loop = nativeLoop;
     });
     this.#dom.fitButton.addEventListener("click", () => this.#setPreference("fill", !this.#store.getState().preferences.fill));
     this.#dom.pipButton.addEventListener("click", async () => {
@@ -2959,6 +3080,11 @@ export class PlaybackController {
       this.#dom.captionsButton.setAttribute("aria-expanded", String(open));
       if (open) this.#dom.captionChoices.querySelector("input:checked")?.focus();
     });
+    document.addEventListener("pointerdown", (event) => {
+      if (!this.#dom.captionMenu.hidden
+        && !this.#dom.captionMenu.contains(event.target)
+        && !this.#dom.captionsButton.contains(event.target)) this.#closeCaptionMenu();
+    });
     this.#dom.audioTrackControls.addEventListener("change", () => this.#selectAudioTrack(Number(this.#dom.audioTrackControls.value)));
     this.#dom.audioTrackRetry.addEventListener("click", async () => {
       const enriched = await this.#enrichAudioTracks();
@@ -2966,7 +3092,7 @@ export class PlaybackController {
       if (enriched && playback.sourceMode === SOURCE_MODES.COMPATIBLE) {
         this.#loadSource(enriched, {
           start: this.globalTime(),
-          intent: this.activePlayer().paused ? "paused" : "playing",
+          intent: playback.intent,
           forceSourceMode: SOURCE_MODES.COMPATIBLE,
           message: "Applying stream details…",
         });
@@ -2982,9 +3108,37 @@ export class PlaybackController {
       if (!(event.target instanceof HTMLInputElement)) return;
       this.#setPreference("streamMode", event.target.value, "stream");
       const playback = this.#store.getState().playback;
-      if (playback.item) this.#loadSource(playback.item, { start: this.globalTime(), intent: this.activePlayer().paused ? "paused" : "playing" });
+      if (playback.item) this.#loadSource(playback.item, { start: this.globalTime(), intent: playback.intent });
     });
     this.#dom.qualityControl.addEventListener("change", () => this.#selectQuality(this.#dom.qualityControl.value));
+    this.#dom.encodingPresetControl.addEventListener("change", () => {
+      this.#setPreference("encodingPreset", encodingPreset(this.#dom.encodingPresetControl.value));
+      const { playback } = this.#store.getState();
+      if (playback.sourceMode === SOURCE_MODES.COMPATIBLE && playback.item?.kind === "video"
+        && playback.streamNegotiation?.video !== "copy") {
+        this.#resetAutomaticTranscodeRecovery();
+        this.#loadSource(playback.item, {
+          start: this.globalTime(), intent: playback.intent,
+          forceSourceMode: SOURCE_MODES.COMPATIBLE,
+          forceQuality: playback.outputQuality,
+          forceStreamNegotiation: playback.streamNegotiation,
+          forceAndroidMediaSource: playback.mediaSourceDelivery,
+          message: "Changing encoding preset…",
+        });
+      }
+    });
+    this.#dom.hevcHlsControl.addEventListener("change", () => {
+      this.#setPreference("hevcHlsCopy", this.#dom.hevcHlsControl.checked);
+      const { playback, preferences } = this.#store.getState();
+      if (playback.nativeHlsDelivery
+        && nativeHlsHevcCopyEligible(playback.item, preferences.quality, true)) {
+        this.#resetAutomaticTranscodeRecovery();
+        this.#loadSource(playback.item, {
+          start: this.globalTime(), intent: playback.intent,
+          forceSourceMode: SOURCE_MODES.COMPATIBLE,
+        });
+      }
+    });
     this.#dom.qualityChoices.addEventListener("change", (event) => {
       if (!(event.target instanceof HTMLInputElement) || event.target.name !== "quality-choice") return;
       this.#selectQuality(event.target.value);
@@ -3064,20 +3218,25 @@ export class PlaybackController {
   }
 
   #handleShortcut(event) {
+    if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
     const dialogOpen = this.#dom.advancedPlaybackDialog.open
+      || this.#dom.qualityDialog.open
       || this.#dom.streamInfoDialog.open
       || this.#dom.shortcutDialog.open
       || this.#dom.itemDetailsDialog.open;
-    if (event.key === "Escape" && !dialogOpen) {
+    // Modal keys belong to the dialog (including its native Escape handling),
+    // never to the playback surface behind it.
+    if (dialogOpen) return;
+    if (event.key === "Escape") {
+      if (!this.#dom.captionMenu.hidden) {
+        event.preventDefault();
+        this.#closeCaptionMenu({ restoreFocus: true });
+        return;
+      }
       if (currentFullscreenElement() === this.#dom.playerStage
         || nativeVideoFullscreenActive(this.#dom.video)
         || this.#dom.playerStage.classList.contains("expanded-player")) {
         this.toggleFullscreen();
-        return;
-      }
-      if (!this.#dom.captionMenu.hidden) {
-        this.#dom.captionMenu.hidden = true;
-        this.#dom.captionsButton.setAttribute("aria-expanded", "false");
         return;
       }
     }
@@ -3090,7 +3249,7 @@ export class PlaybackController {
       || this.#dom.playerStage.matches(":hover")
       || document.activeElement === this.#dom.playerStage
       || this.#dom.playerStage.contains(document.activeElement);
-    if (!scoped || formField || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
+    if (!scoped || formField) return;
     const key = event.key.toLowerCase();
     if (onButton && key !== "escape") return;
     if ([" ", "k"].includes(key)) { event.preventDefault(); this.togglePlay(); }
@@ -3099,7 +3258,6 @@ export class PlaybackController {
     else if (key === "m") { event.preventDefault(); this.#dom.muteButton.click(); }
     else if (key === "f") { event.preventDefault(); this.toggleFullscreen(); }
     else if (key === "escape") {
-      if (dialogOpen) return;
       event.preventDefault();
       this.closePlayback();
     }
@@ -3142,7 +3300,8 @@ export class PlaybackController {
   }
 
   #controlsArePinned() {
-    return !this.#dom.captionMenu.hidden || this.#controlsHaveKeyboardFocus();
+    return this.#store.getState().playback.status === "error"
+      || !this.#dom.captionMenu.hidden || this.#controlsHaveKeyboardFocus();
   }
 
   #controlsHaveKeyboardFocus() {
@@ -3172,10 +3331,10 @@ export class PlaybackController {
     const playback = this.#store.getState().playback;
     if (playback.item && (quality !== "auto" || playback.sourceMode === SOURCE_MODES.COMPATIBLE)) this.#loadSource(playback.item, {
       start: this.globalTime(),
-      intent: this.activePlayer().paused ? "paused" : "playing",
+      intent: playback.intent,
       forceSourceMode: quality !== "auto" ? SOURCE_MODES.COMPATIBLE : null,
       forceAndroidMediaSource: playback.mediaSourceDelivery,
-      message: "Changing transcoded quality…",
+      message: "Changing playback quality…",
     });
   }
 
@@ -3470,9 +3629,13 @@ export class PlaybackController {
 
   #installMediaSessionHandlers() {
     if (!("mediaSession" in navigator)) return;
+    const setPlaying = (playing) => {
+      const { status, intent } = this.#store.getState().playback;
+      if ((playbackControlLabel(status, intent) === "Pause") !== playing) this.togglePlay();
+    };
     const handlers = {
-      play: () => { if (this.activePlayer()?.paused) this.togglePlay(); },
-      pause: () => { if (this.activePlayer() && !this.activePlayer().paused) this.activePlayer().pause(); },
+      play: () => setPlaying(true),
+      pause: () => setPlaying(false),
       seekbackward: (details) => this.seekTo(this.globalTime() - (details.seekOffset || 10)),
       seekforward: (details) => this.seekTo(this.globalTime() + (details.seekOffset || 10)),
       seekto: (details) => this.seekTo(details.seekTime || 0),

@@ -36,9 +36,13 @@ presentation changes. Close player stops the current title, cancels any
 compatible job, and returns to Browse with the library focused. It remains on
 the player during resume, inline Watch, fullscreen, and iPhone expanded
 playback so leaving a movie does not require finding Browse in the header.
+Closing stops media and cancels its work immediately, even while the browser
+is still completing a fullscreen or picture-in-picture exit.
 Each video card's Details dialog contains a deliberately secondary “Download
 original” action. It downloads the indexed source file without starting or
 changing playback; audio details do not advertise that action.
+Empty searches offer Clear search without changing the current view or playback.
+An empty Continue watching view explains that progress is saved in this browser.
 
 On short touch-screen landscape viewports, Watch keeps the compact application
 header in the page and places the 16:9 player beside an independently scrolling
@@ -55,7 +59,10 @@ full library, and `/?layout=watch` opens an empty player. Presentation changes
 replace the current history entry rather than adding Back-button stops.
 Navigation uses a request epoch: when newer Back/Forward or in-page navigation
 or selection supersedes a linked title that is still loading or being enriched,
-the older request cannot select, focus, message, or start that title.
+the older request cannot select, focus, message, or start that title. Linked
+item details load alongside the library request; playback waits for the server
+capabilities before choosing a source. Queue changes also update the URL,
+page title, and current library card without adding history entries.
 
 Metadata titles from NFO files or tags are primary. The filename is shown only
 as secondary information when it differs. For videos, Details exposes the
@@ -64,6 +71,10 @@ explicit “Reveal full plot (spoilers)” disclosure. A plot is never substitut
 for a missing outline. Other media comments remain visible as About. Indexed
 descriptive and technical fields stay off the card. Missing artwork has an
 intentional fallback and never creates an empty image request.
+Folder cards use the same 2:3 portrait artwork dimensions as movie posters,
+with a centered folder icon and item count.
+Artwork uses four concurrent loading slots; leaving a view releases its pending
+images so a slow response cannot block artwork in the new view.
 
 Selecting an item takes a snapshot of the complete active folder/search order,
 including later API pages. Previous and Next use that snapshot even after
@@ -83,7 +94,15 @@ reachable if the Advanced section makes the fullscreen surface taller than the
 screen. Player settings, quality, stream information, keyboard help, and item
 details use the same top-right X action. When a dialog is taller than the
 viewport, its contents scroll beneath a pinned heading so that close action
-remains visible. Timeline and volume inputs keep at least a 44-pixel hit area
+remains visible. Long titles and metadata wrap within the dialog; exceptionally
+tall titles scroll independently so the close action stays reachable. Settings
+show selected stream modes, Loop, and Fill frame consistently. Stream modes
+include short explanations, and Playback quality explains that a specific
+quality switches to Compatible playback. On phones, stream modes use full-width
+rows. Recovery messages and actions remain inside the fullscreen or expanded
+player, and errors keep the playback and close controls visible. Closing clears
+loading and error UI as well as the source.
+Timeline and volume inputs keep at least a 44-pixel hit area
 even though their visible tracks remain thin. Coarse-pointer devices enlarge
 the timeline thumb and expose a 52-pixel-high horizontal drag area without
 making the track visually heavy. At the supported 300-pixel minimum
@@ -107,7 +126,25 @@ volume, speed, loop, fit/fill, picture-in-picture,
 fullscreen, captions, audio tracks, chapters, stream mode, and compatible
 quality. The player toolbar shows the active transcoded-quality shortcut; it
 opens a dedicated, scrollable chooser with every advertised profile, including
-480p and 360p. Playback settings retains the same selector. On touch
+480p and 360p. Playback settings retains the same selector.
+
+Playback settings also offers a browser-local **Encoding preset**, independent
+of quality/resolution: **Balanced** (default), **Fast start** (less encoder
+buffering), and **Maximum speed** (faster encoding with a larger quality
+tradeoff). The latter two are experimental choices, not guaranteed startup
+times; browser buffering, source keyframes, decoding and storage still matter.
+Changing this setting restarts currently re-encoded Compatible video at the
+same position and playback intent, keeping quality, HDR selection and tracks.
+Original playback, copied video and audio-only playback are not restarted.
+The selection is retained through seeks and codec recovery, and Stream
+information reports the active preset or that video is not re-encoded.
+Older servers without `capabilities.encoding_presets` hide the selector and
+retain Balanced requests. The media API accepts `encoding_preset=balanced`,
+`fast_start`, or `maximum_speed`, defaults to Balanced, and rejects invalid
+or duplicate values. Distinct encoded presets have distinct cache identities;
+copied-video output and existing Balanced caches are unchanged.
+
+On touch
 screens, two taps on the right half of the video seek forward
 30 seconds and two taps on the left half seek backward 30 seconds. A single
 video-surface tap only reveals the controls; touch play/pause remains on its
@@ -116,6 +153,12 @@ the empty area of the visible control overlay remains part of that video
 gesture surface, while buttons, sliders, menus, and other interactive controls
 keep their normal touch behavior. A source restart preserves playback intent,
 global time, rate, volume, mute, loop, caption choice, and audio choice.
+Play and Pause remain authoritative during capability checks and recovery,
+including commands from Media Session. Changing quality, audio, or stream mode
+while loading preserves that intent. Stream-information rows remain stable
+during clock updates so reading or selecting their text is not interrupted.
+Loop repeats the whole title, including after a compatible seek, and takes
+precedence over queue auto-advance.
 While playing media is loading, buffering, or being replaced after a seek, the
 transport continues to show Pause; seeking while paused continues to show Play.
 Selecting a different title stops and clears the previous media immediately,
@@ -186,8 +229,10 @@ denied platform APIs are nonfatal.
 
 Shortcuts apply only while the player is focused or hovered, or while it is in
 fullscreen. They are not captured in inputs, selects, or text areas. Transport
-shortcuts leave buttons alone; Escape still exits fullscreen or closes the
-player.
+shortcuts leave buttons alone. Open modal dialogs own their keyboard input, so
+Escape closes the dialog without changing playback or display mode. Escape in
+the captions popup closes it and restores focus to Captions before exiting
+fullscreen or closing the player. Clicking outside that popup also dismisses it.
 
 | Key | Action |
 |---|---|
@@ -249,6 +294,24 @@ media decode failure retains the same-quality H.264 SDR recovery. This does not
 delay attachment of the playlist URL on an asynchronous capability promise.
 macOS Safari keeps the
 selected Auto profile instead of inheriting the mobile 720p starting profile.
+Playback settings on native-HLS-capable Apple browsers include **Try original
+HEVC with HLS**, an experimental browser-local toggle that is off by default.
+With Compatible playback and Auto quality, eligible HEVC video is copied at
+source quality while audio still becomes AAC. This trial keeps Auto even on
+iPhone/iPad; it does not apply the encoded mobile fallback profile to a copied
+stream. Original playback, non-HEVC sources, explicit quality choices, and
+sources requiring timestamp repair are unchanged. Sources without a
+server-advertised compatible video type (including Dolby Vision Profile 7)
+are not eligible. Codec capability promises do not delay playlist attachment.
+Changing the toggle during eligible HLS playback restarts at the current
+position with playback intent, tracks, and other preferences preserved.
+Stream information identifies copied versus re-encoded video. A copy decode
+failure, producer failure, or startup stall returns to the normal encoded HLS
+plan, preferring advertised HDR output where available. Seeks and resume keep
+that recovered plan; the saved toggle remains enabled for future trials.
+Copying cannot force new keyframes, so startup and seeking depend on the source's
+keyframe spacing. The existing fragment index groups copied output at verified
+random-access points rather than assuming every fragment is independent.
 The encoder uses one-second random-access segments and publishes the initial
 playlist as soon as its first complete fragment is available; it does not wait
 for a second keyframe to confirm the already-forced boundary. Subsequent
@@ -618,6 +681,8 @@ it. Screen readers receive plain-language server/library and playback
 updates through separate polite, atomic live regions. Repeated renders of the
 same asynchronous state do not repeat an announcement, and visible status or
 alert messages are not mirrored into a competing live region.
+A delayed startup-status connection failure does not interrupt playback that
+has already become playable; subsequent media events remain authoritative.
 
 User-facing failures distinguish missing media, unsupported Original playback,
 disabled Compatible playback, a busy transcode queue, cancelled/failed

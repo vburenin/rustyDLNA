@@ -134,6 +134,63 @@ async function installDeferredDecodingInfo(page) {
   });
 }
 
+async function installHevcHlsTrial(page, { appleMobile = false, hdr = false } = {}) {
+  await usePreference(page, "stream", "compat");
+  await page.addInitScript(({ appleMobile }) => {
+    Object.defineProperty(navigator, "userAgent", { configurable: true, value: appleMobile
+      ? "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1"
+      : "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15" });
+    const sources = new WeakMap();
+    const positions = new WeakMap();
+    window.__hlsTrial = { sources: [], playCalls: 0 };
+    HTMLMediaElement.prototype.canPlayType = (type) => String(type).includes("mpegurl") ? "maybe" : "";
+    HTMLMediaElement.prototype.play = () => { window.__hlsTrial.playCalls += 1; return Promise.resolve(); };
+    HTMLMediaElement.prototype.pause = () => {};
+    HTMLMediaElement.prototype.load = function () { positions.set(this, 0); };
+    Object.defineProperty(HTMLMediaElement.prototype, "src", {
+      configurable: true, get() { return sources.has(this) ? new URL(sources.get(this), document.baseURI).href : ""; },
+      set(value) { sources.set(this, value); window.__hlsTrial.sources.push(new URL(value, document.baseURI).href); },
+    });
+    Object.defineProperty(HTMLMediaElement.prototype, "currentTime", {
+      configurable: true, get() { return positions.get(this) || 0; }, set(value) { positions.set(this, value); },
+    });
+    const getAttribute = Element.prototype.getAttribute;
+    const removeAttribute = Element.prototype.removeAttribute;
+    HTMLMediaElement.prototype.getAttribute = function (name) {
+      return name === "src" ? sources.get(this) || null : getAttribute.call(this, name);
+    };
+    HTMLMediaElement.prototype.removeAttribute = function (name) {
+      if (name === "src") sources.delete(this);
+      return removeAttribute.call(this, name);
+    };
+    // Desktop Safari may advertise MSE too; the trial must still stay native HLS.
+    if (globalThis.MediaSource) Object.defineProperty(MediaSource, "isTypeSupported", { configurable: true, value: () => true });
+    Object.defineProperty(navigator, "mediaCapabilities", { configurable: true, value: {
+      decodingInfo: () => { throw new Error("Native HLS must not wait on a capability promise"); },
+    } });
+  }, { appleMobile });
+  await page.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    if (hdr) payload.capabilities.video_outputs = [{
+      id: "hevc_hdr10", video_content_type: 'video/mp4; codecs="hvc1.2.4.L153.B0"',
+    }];
+    for (const item of payload.entries || []) {
+      if (item.entry_type !== "media" || item.title !== "tagged") continue;
+      Object.assign(item, {
+        video_codec: "hevc", video_content_type: 'video/mp4; codecs="hvc1.2.4.L153.B0"',
+        video_repair_required: false, width: 3840, height: 2160, resolution: "3840×2160",
+        duration_seconds: 600, duration: "0:10:00.000", stream_metadata_complete: true,
+        bit_depth: hdr ? 10 : 8, hdr: hdr ? "hdr10" : "sdr",
+      });
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  await page.route("**/api/web/transcode/*", (route) => route.fulfill({
+    json: { schema_version: 2, state: "producing", retry_after_seconds: null },
+  }));
+}
+
 async function deferDeepLinkEnrichment(page, itemId, { failAfterRelease = false } = {}) {
   let markStarted;
   const started = new Promise((resolve) => { markStarted = resolve; });
@@ -446,6 +503,171 @@ async function startDeferredWakeLockRequest(page) {
   await expect.poll(() => page.evaluate(() => window.__wakeLockTest.counts().requests)).toBe(1);
 }
 
+test("folder artwork matches movie poster dimensions across screen sizes", async ({ page }) => {
+  await openLibrary(page);
+  for (const width of [300, 390, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.getByRole("tab", { name: "Folders", exact: true }).click();
+    const folder = page.locator(".media-card.folder .art").first();
+    await expect(folder).toBeVisible();
+    const folderSize = await folder.evaluate((art) => {
+      const bounds = art.getBoundingClientRect();
+      const icon = art.querySelector(".folder-icon").getBoundingClientRect();
+      return { width: bounds.width, height: bounds.height, iconRatio: icon.width / icon.height };
+    });
+    expect(folderSize.iconRatio).toBeCloseTo(2, 1);
+    await expect(folder.locator(".folder-count")).toBeVisible();
+    await openVideoView(page);
+    const posterSize = await page.locator(".media-card.video .art").first().evaluate((art) => {
+      const bounds = art.getBoundingClientRect();
+      return { width: bounds.width, height: bounds.height };
+    });
+    expect(Math.abs(folderSize.width - posterSize.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(folderSize.height - posterSize.height)).toBeLessThanOrEqual(1);
+    expect(folderSize.height / folderSize.width).toBeCloseTo(1.5, 2);
+  }
+});
+
+test("long item details and settings fit narrow screens without horizontal scrolling", async ({ page }) => {
+  await serveFixtureMedia(page);
+  await openLibrary(page);
+  await openVideoView(page);
+  const details = page.getByRole("button", { name: /^Details for Movie/ }).first();
+  for (const viewport of [{ width: 300, height: 640 }, { width: 390, height: 320 }]) {
+    await page.setViewportSize(viewport);
+    await details.click();
+    const dialog = page.locator("#item-details-dialog");
+    await expect(dialog).toBeVisible();
+    const dimensions = await dialog.evaluate((element) => ({
+      width: element.clientWidth, contentWidth: element.scrollWidth,
+      titleLength: element.querySelector("h2").textContent.length,
+    }));
+    expect(dimensions.titleLength).toBeGreaterThan(35);
+    expect(dimensions.contentWidth).toBeLessThanOrEqual(dimensions.width + 1);
+    await dialog.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+    await dialog.getByRole("button", { name: "Close item details" }).click();
+  }
+  await page.setViewportSize({ width: 300, height: 640 });
+  await selectTaggedVideo(page);
+  await openAdvancedPlayback(page);
+  const settings = page.locator("#advanced-playback-dialog");
+  expect(await settings.evaluate((dialog) => dialog.scrollWidth <= dialog.clientWidth + 1)).toBe(true);
+  await page.locator("#loop-button").click();
+  await expect(page.locator("#loop-button")).toHaveAttribute("aria-pressed", "true");
+  await page.locator("#loop-button").focus();
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Shift+Tab");
+  expect(await page.locator("#loop-button").evaluate((button) => getComputedStyle(button).outlineWidth)).toBe("3px");
+  const toggleColors = await settings.evaluate((dialog) => ["#loop-button", "#fit-button"]
+    .map((selector) => getComputedStyle(dialog.querySelector(selector)).backgroundColor));
+  expect(toggleColors[0]).not.toBe(toggleColors[1]);
+  await page.locator("#fit-button").click();
+  await expect(page.locator("#fit-button")).toHaveText("Fill frame");
+  await expect(page.locator("#fit-button")).toHaveAttribute("aria-pressed", "true");
+  await settings.getByRole("button", { name: "Close playback settings" }).click();
+});
+
+test("modal keyboard input never controls playback behind the dialog", async ({ page }) => {
+  await serveFixtureMedia(page);
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  for (const [buttonId, dialogId] of [
+    ["quality-menu-button", "quality-dialog"],
+    ["advanced-playback-button", "advanced-playback-dialog"],
+    ["stream-info-button", "stream-info-dialog"],
+  ]) {
+    await page.locator(`#${buttonId}`).evaluate((button) => button.click());
+    const dialog = page.locator(`#${dialogId}`);
+    await expect(dialog).toBeVisible();
+    const unhandled = await dialog.evaluate((element) => {
+      element.tabIndex = -1;
+      element.focus();
+      return element.dispatchEvent(new KeyboardEvent("keydown", { key: "m", bubbles: true, cancelable: true }));
+    });
+    expect(unhandled).toBe(true);
+    await expect(page.locator("#mute-button")).toHaveAttribute("aria-pressed", "false");
+    await dialog.locator(".dialog-close").focus();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    await expect(page.locator("#now-playing-title")).toHaveText("tagged");
+    await expect(page.locator("#app-main")).toHaveAttribute("data-layout", "watch");
+  }
+});
+
+test("empty search offers a focused reset without changing the view or playback", async ({ page }) => {
+  await serveFixtureMedia(page);
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  const source = await page.locator("#video-player").getAttribute("src");
+  await page.locator("#layout-browse").click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator("#search-input").fill("unmatched".repeat(12));
+  await expect(page.locator("#library-empty-title")).toContainText("No results for");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.getByRole("button", { name: "Clear search", exact: true }).click();
+  await expect(page.locator("#search-input")).toBeFocused();
+  await expect(page.locator("#search-input")).toHaveValue("");
+  await expect(page.locator(".media-card.video").first()).toBeVisible();
+  await expect(page.locator("#tab-video")).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#video-player")).toHaveAttribute("src", source);
+  await expect(page.locator("#library-clear-search")).toBeHidden();
+  await page.getByRole("tab", { name: "Continue watching" }).click();
+  await expect(page.locator("#library-empty-title")).toHaveText("Nothing to continue yet");
+  await expect(page.locator("#library-empty-detail")).toContainText("on this browser");
+});
+
+for (const display of ["expanded", "fullscreen"]) {
+  test(`recovery actions stay reachable in ${display} playback and close clears the error`, async ({ page, browserName, isMobile }) => {
+    test.skip(display === "fullscreen" && (isMobile || browserName === "webkit" && process.platform === "linux"), "native element fullscreen is unavailable on this project");
+    await usePreference(page, "stream", "direct");
+    if (display === "expanded") await installIphoneUserAgent(page);
+    await page.addInitScript(() => {
+      const sources = new WeakMap();
+      HTMLMediaElement.prototype.load = () => {};
+      HTMLMediaElement.prototype.pause = () => {};
+      HTMLMediaElement.prototype.play = () => Promise.resolve();
+      Object.defineProperty(HTMLMediaElement.prototype, "src", {
+        configurable: true,
+        get() { return sources.get(this) || ""; },
+        set(value) { sources.set(this, new URL(value, document.baseURI).href); },
+      });
+    });
+    await openLibrary(page);
+    await selectTaggedVideo(page);
+    await showPlayerControls(page);
+    await page.locator("#fullscreen-button").click();
+    await expect(page.locator("#fullscreen-button")).toHaveAttribute("aria-pressed", "true");
+    await page.locator("#video-player").dispatchEvent("error");
+    const message = page.locator("#player-stage > #player-message");
+    await expect(message).toBeVisible();
+    await expect(message).toContainText("cannot play the original file");
+    const action = page.locator("#try-compatible");
+    await expect(action).toBeVisible();
+    expect(await action.evaluate((button) => {
+      const box = button.getBoundingClientRect();
+      return button.contains(document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2));
+    })).toBe(true);
+    await page.locator("#close-player-button").click();
+    await page.locator("#layout-watch").click();
+    await expect(page.locator("#player-empty")).toBeVisible();
+    await expect(page.locator("#stage-progress")).toBeHidden();
+    await expect(page.locator("#player-message")).toBeHidden();
+    await expect(page.locator("#player-panel > #player-message")).toHaveCount(1);
+  });
+}
+
+test("closing during loading leaves a clean empty player", async ({ page }) => {
+  await installDeferredWakeLock(page);
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  await expect(page.locator("#stage-progress")).toBeVisible();
+  await showPlayerControls(page);
+  await page.locator("#close-player-button").click();
+  await page.locator("#layout-watch").click();
+  await expect(page.locator("#player-empty")).toBeVisible();
+  await expect(page.locator("#stage-progress")).toBeHidden();
+});
+
 test("library tabs, player scoping, and overlay controls work", async ({ page }) => {
   const errors = await openLibrary(page);
   const folders = page.getByRole("tab", { name: "Folders" });
@@ -672,6 +894,99 @@ test("Close player stops playback and returns to the library", async ({ page }) 
   await expect(page.locator("#now-playing-title")).toHaveText("Nothing selected");
 });
 
+test("Close player stops immediately while picture-in-picture exit is pending", async ({ page }) => {
+  await serveFixtureMedia(page);
+  await openLibrary(page);
+  await openVideoView(page);
+  const cards = page.locator(".media-card.video");
+  const secondTitle = await cards.nth(1).locator(".card-title").textContent();
+  await cards.first().locator(".card-button").click();
+  await page.evaluate(() => {
+    Object.defineProperty(document, "pictureInPictureElement", {
+      configurable: true, get: () => document.getElementById("video-player"),
+    });
+    document.exitPictureInPicture = () => new Promise((resolve) => {
+      window.__finishPiPExit = () => {
+        Object.defineProperty(document, "pictureInPictureElement", { configurable: true, value: null });
+        resolve();
+      };
+    });
+  });
+  await page.locator("#close-player-button").click();
+  await expect(page.locator("#now-playing-title")).toHaveText("Nothing selected");
+  expect(await page.locator("#video-player").getAttribute("src")).toBeFalsy();
+  await cards.nth(1).locator(".card-button").click();
+  await page.evaluate(() => window.__finishPiPExit());
+  await expect(page.locator("#now-playing-title")).toHaveText(secondTitle);
+  await expect(page.locator("#app-main")).toHaveAttribute("data-layout", "watch");
+});
+
+test("linked item details start loading alongside the library", async ({ page, request }) => {
+  const response = await request.get("/api/web/library?view=library&kind=video");
+  expect(response.ok()).toBe(true);
+  const payload = await response.json();
+  const item = payload.entries.find((entry) => entry.title === "tagged");
+  expect(item).toBeTruthy();
+  let releaseLibrary;
+  const held = new Promise((resolve) => { releaseLibrary = resolve; });
+  let itemRequested = false;
+  await page.route("**/api/web/library?**", async (route) => {
+    await held;
+    await route.fallback();
+  });
+  await page.route(`**/api/web/item/${item.id}*`, async (route) => {
+    itemRequested = true;
+    await route.fallback();
+  });
+  await serveFixtureMedia(page);
+  try {
+    await page.goto(`/?view=video&item=${item.id}`);
+    await expect.poll(() => itemRequested).toBe(true);
+    expect(await page.locator("#video-player").getAttribute("src")).toBeFalsy();
+  } finally {
+    releaseLibrary();
+  }
+  await expect(page.locator("#now-playing-title")).toHaveText("tagged");
+  await expect(page.locator("#video-player")).toHaveAttribute("src", /web\/media/);
+});
+
+test("queue selection updates the shared URL, page title, and current library card", async ({ page }) => {
+  await serveFixtureMedia(page);
+  await openLibrary(page);
+  await openVideoView(page);
+  const cards = page.locator(".media-card.video");
+  const secondId = await cards.nth(1).getAttribute("data-media-id");
+  const secondTitle = await cards.nth(1).locator(".card-title").textContent();
+  await cards.first().locator(".card-button").click();
+  await expect(page.locator("#next-button")).toBeEnabled();
+  await page.locator("#next-button").evaluate((button) => button.click());
+  await expect(page.locator("#now-playing-title")).toHaveText(secondTitle);
+  await expect.poll(() => new URL(page.url()).searchParams.get("item")).toBe(secondId);
+  await expect(page).toHaveTitle(`${secondTitle} · rustyDLNA-web-test`);
+  await expect(page.locator(".media-card.playing")).toHaveAttribute("data-media-id", secondId);
+  await page.getByRole("tab", { name: "Folders" }).click();
+  expect(new URL(page.url()).searchParams.get("item")).toBe(secondId);
+});
+
+test("playback clock updates preserve stream-information text and nodes", async ({ page }) => {
+  await serveFixtureMedia(page);
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  const video = page.locator("#video-player");
+  await expect.poll(() => video.evaluate((player) => player.readyState)).toBeGreaterThanOrEqual(2);
+  await video.evaluate((player) => player.pause());
+  await page.locator("#stream-info-button").evaluate((button) => button.click());
+  await expect(page.locator("#source-stream-facts")).toContainText("H.264");
+  const unchanged = await page.evaluate(() => {
+    const facts = document.getElementById("source-stream-facts");
+    const row = facts.firstElementChild;
+    const player = document.getElementById("video-player");
+    for (let index = 0; index < 10; index += 1) player.dispatchEvent(new Event("timeupdate"));
+    return facts.firstElementChild === row;
+  });
+  expect(unchanged).toBe(true);
+});
+
 test("explicit layout URLs survive reload without adding history entries", async ({ page }) => {
   await page.goto("/?view=video&layout=watch");
   await expect(page.locator("#app-main")).toHaveAttribute("data-layout", "watch");
@@ -792,7 +1107,7 @@ test("Continue watching survives reload and supports clearing progress", async (
   await expect(page.locator(`[data-media-id="${itemId}"] .card-title`)).toHaveText(title);
   await page.getByRole("button", { name: `Clear progress for ${title}` }).click();
   await expect(page.locator(`[data-media-id="${itemId}"]`)).toHaveCount(0);
-  await expect(page.locator("#library-empty-title")).toHaveText("No media found");
+  await expect(page.locator("#library-empty-title")).toHaveText("Nothing to continue yet");
 });
 
 test("navigating away aborts a later Continue Watching batch", async ({ page }) => {
@@ -1565,6 +1880,139 @@ test("quality preferences follow advertised bounded opaque profile IDs", async (
   await page.reload();
   await expect(page.locator("#server-state")).toHaveAttribute("data-state", /ready|empty/);
   await expect.poll(() => page.evaluate(() => localStorage.getItem("rustydlna.quality"))).toBe("auto");
+});
+
+for (const control of ["toolbar", "Media Session"]) {
+  test(`Pause during deferred negotiation survives attaching the compatible source (${control})`, async ({ page }) => {
+    await usePreference(page, "stream", "compat");
+    await installDeferredDecodingInfo(page);
+    await serveFixtureMedia(page);
+    await page.addInitScript(() => {
+      window.__playCalls = 0;
+      HTMLMediaElement.prototype.play = () => { window.__playCalls += 1; return Promise.resolve(); };
+      window.__mediaActions = {};
+      Object.defineProperty(navigator, "mediaSession", {
+        configurable: true,
+        value: { setActionHandler: (action, handler) => { window.__mediaActions[action] = handler; } },
+      });
+    });
+    await openLibrary(page);
+    await selectTaggedVideo(page);
+    await expect.poll(() => page.evaluate(() => window.__decodingRace.count())).toBeGreaterThan(0);
+    if (control === "toolbar") {
+      await showPlayerControls(page);
+      await page.locator("#play-button").click();
+    } else {
+      await page.evaluate(() => {
+        window.__mediaActions.play();
+        window.__mediaActions.pause();
+      });
+    }
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+    await page.evaluate(() => window.__decodingRace.release());
+    await expect(page.locator("#video-player")).toHaveAttribute("src", /mode=compatible/);
+    await page.locator("#video-player").dispatchEvent("canplay");
+    expect(await page.evaluate(() => window.__playCalls)).toBe(0);
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+  });
+}
+
+test("changing quality during negotiation preserves playing intent", async ({ page }) => {
+  await usePreference(page, "stream", "compat");
+  await installDeferredDecodingInfo(page);
+  await serveFixtureMedia(page);
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  await expect.poll(() => page.evaluate(() => window.__decodingRace.count())).toBeGreaterThan(0);
+  await page.locator("#quality-control").evaluate((control) => {
+    control.value = [...control.options].find((option) => option.value !== "auto").value;
+    control.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Pause");
+  await page.evaluate(() => window.__decodingRace.release());
+  const quality = await page.locator("#quality-control").inputValue();
+  await expect.poll(async () => new URL(await page.locator("#video-player").evaluate((video) => video.src)).searchParams.get("quality"))
+    .toBe(quality);
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Pause");
+});
+
+test("a delayed startup status failure cannot interrupt playback that already started", async ({ page }) => {
+  await usePreference(page, "stream", "compat");
+  await disableFragmentedDelivery(page);
+  await page.addInitScript(() => {
+    const fetchOriginal = window.fetch.bind(window);
+    window.fetch = (input, options) => {
+      if (String(input).includes("/api/web/transcode/") && !options?.method) {
+        return new Promise((resolve, reject) => {
+          window.__failStartupStatus = () => reject(new TypeError("connection lost"));
+        });
+      }
+      return fetchOriginal(input, options);
+    };
+    const sources = new WeakMap();
+    Object.defineProperty(HTMLMediaElement.prototype, "src", {
+      configurable: true,
+      get() { return sources.get(this) || ""; },
+      set(value) { sources.set(this, value); },
+    });
+    HTMLMediaElement.prototype.load = () => {};
+    HTMLMediaElement.prototype.play = () => Promise.resolve();
+  });
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  await expect.poll(() => page.evaluate(() => typeof window.__failStartupStatus)).toBe("function");
+  await page.locator("#video-player").dispatchEvent("playing");
+  await page.evaluate(() => window.__failStartupStatus());
+  await page.waitForTimeout(0);
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Pause");
+  await expect(page.locator("#player-message")).toBeHidden();
+});
+
+test("Pause while a failed stream awaits producer status survives codec recovery", async ({ page }) => {
+  await usePreference(page, "stream", "compat");
+  await disableFragmentedDelivery(page);
+  await page.addInitScript(() => {
+    const fetchOriginal = window.fetch.bind(window);
+    const pending = [];
+    let defer = false;
+    const statusResponse = () => new Response(JSON.stringify({ schema_version: 2, state: "producing" }));
+    window.fetch = (input, options) => {
+      if (String(input).includes("/api/web/transcode/") && !options?.method) {
+        return defer ? new Promise((resolve) => pending.push(resolve)) : Promise.resolve(statusResponse());
+      }
+      return fetchOriginal(input, options);
+    };
+    window.__recoveryStatus = {
+      defer() { defer = true; },
+      count() { return pending.length; },
+      release() { defer = false; for (const resolve of pending.splice(0)) resolve(statusResponse()); },
+    };
+    const sources = new WeakMap();
+    Object.defineProperty(HTMLMediaElement.prototype, "src", {
+      configurable: true,
+      get() { return sources.get(this) || ""; },
+      set(value) { sources.set(this, value); },
+    });
+    HTMLMediaElement.prototype.load = () => {};
+    HTMLMediaElement.prototype.play = () => Promise.resolve();
+    HTMLMediaElement.prototype.canPlayType = (type) => String(type).includes("mpegurl") ? "" : "probably";
+  });
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  const video = page.locator("#video-player");
+  await expect.poll(() => video.evaluate((player) => player.src)).toContain("video_mode=copy");
+  await video.evaluate((player) => {
+    window.__recoveryStatus.defer();
+    Object.defineProperty(player, "error", { configurable: true, value: { code: 3 } });
+    player.dispatchEvent(new Event("error"));
+  });
+  await expect.poll(() => page.evaluate(() => window.__recoveryStatus.count())).toBeGreaterThan(0);
+  await showPlayerControls(page);
+  await page.locator("#play-button").click();
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+  await page.evaluate(() => window.__recoveryStatus.release());
+  await expect.poll(() => video.evaluate((player) => player.src)).toContain("video_mode=transcode");
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
 });
 
 test("a transcoding capability change invalidates deferred Compatible negotiation", async ({ page }) => {
@@ -2391,6 +2839,229 @@ test("HDR transcode is capability gated and retries the same quality as SDR", as
   await expect(page.locator("#player-message[role=alert]")).toBeVisible();
   await page.waitForTimeout(750);
   expect(requests).toHaveLength(2);
+});
+
+test("encoding presets preserve position, intent, HDR and quality through seeks and recovery", async ({ page }) => {
+  await installHevcHlsTrial(page, { hdr: true });
+  await usePreference(page, "rate", "1.5");
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  const source = () => page.evaluate(() => window.__hlsTrial.sources.at(-1));
+  expect(new URL(await source()).searchParams.has("encoding_preset")).toBe(false);
+  await showPlayerControls(page);
+  await page.locator("#play-button").click();
+  await page.locator("#video-player").evaluate((video) => {
+    video.currentTime = 127;
+    video.dispatchEvent(new Event("timeupdate"));
+  });
+  await openAdvancedPlayback(page);
+  const control = page.getByRole("combobox", { name: "Encoding preset", exact: true });
+  await expect(control).toHaveValue("balanced");
+  const before = new URL(await source());
+  for (const preset of ["fast_start", "maximum_speed"]) {
+    await control.selectOption(preset);
+    await expect.poll(async () => new URL(await source()).searchParams.get("encoding_preset")).toBe(preset);
+    const current = new URL(await source());
+    for (const key of ["quality", "video_output", "audio", "delivery"]) {
+      expect(current.searchParams.get(key)).toBe(before.searchParams.get(key));
+    }
+    expect(current.searchParams.get("start")).toBe("120");
+    await expect(page.locator("#timeline")).toHaveValue("127");
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+    expect(await page.locator("#video-player").evaluate((video) => video.playbackRate)).toBe(1.5);
+  }
+  await page.locator("#quality-control").selectOption("full_hd");
+  await expect.poll(async () => new URL(await source()).searchParams.get("quality")).toBe("full_hd");
+  await page.getByRole("button", { name: "Close playback settings" }).click();
+  await page.locator("#timeline").evaluate((timeline) => {
+    timeline.value = "247";
+    timeline.dispatchEvent(new Event("input", { bubbles: true }));
+    timeline.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await expect.poll(async () => new URL(await source()).searchParams.get("start")).toBe("240");
+  expect(new URL(await source()).searchParams.get("encoding_preset")).toBe("maximum_speed");
+  await page.locator("#video-player").evaluate((video) => {
+    Object.defineProperty(video, "error", { configurable: true, value: { code: 3 } });
+    video.dispatchEvent(new Event("error"));
+  });
+  await expect.poll(async () => new URL(await source()).searchParams.get("video_output")).toBe("h264_sdr");
+  expect(new URL(await source()).searchParams.get("encoding_preset")).toBe("maximum_speed");
+  await page.locator("#stream-info-button").evaluate((button) => button.click());
+  await expect(page.locator("#output-stream-facts")).toContainText("Maximum speed");
+  await page.goto("/");
+  await selectTaggedVideo(page);
+  await page.locator("#start-over-button").click();
+  await openAdvancedPlayback(page);
+  await expect(control).toHaveValue("maximum_speed");
+});
+
+for (const mode of ["direct", "copy"]) {
+  test(`encoding presets do not restart ${mode} video`, async ({ page }) => {
+    await installHevcHlsTrial(page);
+    if (mode === "direct") await usePreference(page, "stream", "direct");
+    else await usePreference(page, "hevcHlsCopy", "true");
+    await openLibrary(page);
+    await selectTaggedVideo(page);
+    const before = await page.evaluate(() => [...window.__hlsTrial.sources]);
+    await openAdvancedPlayback(page);
+    await page.getByRole("combobox", { name: "Encoding preset", exact: true }).selectOption("fast_start");
+    expect(await page.evaluate(() => window.__hlsTrial.sources)).toEqual(before);
+    expect(await page.evaluate(() => localStorage.getItem("rustydlna.encodingPreset"))).toBe("fast_start");
+    await page.getByRole("button", { name: "Close playback settings" }).click();
+    if (mode === "copy") {
+      await page.locator("#timeline").evaluate((timeline) => {
+        timeline.value = "127";
+        timeline.dispatchEvent(new Event("input", { bubbles: true }));
+        timeline.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await expect.poll(() => page.evaluate(() => window.__hlsTrial.sources.length)).toBe(before.length + 1);
+      const url = new URL(await page.evaluate(() => window.__hlsTrial.sources.at(-1)));
+      expect(url.searchParams.get("video_mode")).toBe("copy");
+      expect(url.searchParams.has("encoding_preset")).toBe(false);
+    }
+  });
+}
+
+test("an older server hides encoding presets and retains Balanced requests", async ({ page }) => {
+  await installHevcHlsTrial(page);
+  await usePreference(page, "encodingPreset", "maximum_speed");
+  await page.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    delete payload.capabilities.encoding_presets;
+    await route.fulfill({ response, json: payload });
+  });
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  await openAdvancedPlayback(page);
+  await expect(page.locator("#encoding-preset-option")).toBeHidden();
+  expect(new URL(await page.evaluate(() => window.__hlsTrial.sources.at(-1))).searchParams.has("encoding_preset")).toBe(false);
+});
+
+for (const appleMobile of [false, true]) {
+  test(`HEVC HLS toggle preserves intent, position, and source quality on ${appleMobile ? "iPad" : "desktop Safari"}`, async ({ page }) => {
+    await installHevcHlsTrial(page, { appleMobile });
+    const errors = await openLibrary(page);
+    await selectTaggedVideo(page);
+    const source = () => page.evaluate(() => window.__hlsTrial.sources.at(-1));
+    expect(new URL(await source()).searchParams.get("video_mode")).toBe("transcode");
+    await showPlayerControls(page);
+    await page.locator("#play-button").click();
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+    await page.locator("#video-player").evaluate((video) => {
+      video.currentTime = 127;
+      video.dispatchEvent(new Event("timeupdate"));
+    });
+    const playCalls = await page.evaluate(() => window.__hlsTrial.playCalls);
+    await openAdvancedPlayback(page);
+    const toggle = page.getByRole("checkbox", { name: "Try original HEVC with HLS" });
+    await expect(toggle).not.toBeChecked();
+    await toggle.check();
+    await expect.poll(async () => new URL(await source()).searchParams.get("video_mode")).toBe("copy");
+    const copied = new URL(await source());
+    expect(copied.pathname).toMatch(/\.m3u8$/);
+    expect(Object.fromEntries(["delivery", "video_mode", "audio_mode", "quality", "start"]
+      .map((key) => [key, copied.searchParams.get(key)]))).toEqual({
+      delivery: "hls", video_mode: "copy", audio_mode: "transcode", quality: "auto", start: "120",
+    });
+    expect(copied.searchParams.has("video_output")).toBe(false);
+    await expect(page.locator("#timeline")).toHaveValue("127");
+    expect(await page.evaluate(() => window.__hlsTrial.playCalls)).toBe(playCalls);
+    expect(await page.evaluate(() => localStorage.getItem("rustydlna.hevcHlsCopy"))).toBe("true");
+    await page.getByRole("button", { name: "Close playback settings" }).click();
+    await page.locator("#timeline").evaluate((timeline) => {
+      timeline.value = "247";
+      timeline.dispatchEvent(new Event("input", { bubbles: true }));
+      timeline.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await expect.poll(async () => new URL(await source()).searchParams.get("start")).toBe("240");
+    expect(new URL(await source()).searchParams.get("quality")).toBe("auto");
+    expect(new URL(await source()).searchParams.get("video_mode")).toBe("copy");
+    await page.locator("#stream-info-button").evaluate((button) => button.click());
+    await expect(page.locator("#output-stream-facts")).toContainText("copied unchanged");
+    await expect(page.locator("#output-stream-facts")).toContainText("Native HLS");
+    await page.getByRole("button", { name: "Close stream information" }).click();
+    await openAdvancedPlayback(page);
+    await toggle.uncheck();
+    await expect.poll(async () => new URL(await source()).searchParams.get("video_mode")).toBe("transcode");
+    await expect(page.locator("#timeline")).toHaveValue("247");
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+    await toggle.check();
+    await page.locator("#quality-control").selectOption("full_hd");
+    await expect.poll(async () => new URL(await source()).searchParams.get("quality")).toBe("full_hd");
+    expect(new URL(await source()).searchParams.get("video_mode")).toBe("transcode");
+    await page.goto("/");
+    await selectTaggedVideo(page);
+    await page.locator("#start-over-button").click();
+    await openAdvancedPlayback(page);
+    await expect(toggle).toBeChecked();
+    expect(new URL(await source()).searchParams.get("quality")).toBe("full_hd");
+    expect(errors).toEqual([]);
+  });
+}
+
+for (const failure of ["decode", "startup", "producer"]) {
+  test(`HEVC HLS trial falls back once on ${failure} failure and keeps the recovered seek plan`, async ({ page }) => {
+    await installHevcHlsTrial(page, { appleMobile: true, hdr: failure === "decode" });
+    await usePreference(page, "hevcHlsCopy", "true");
+    await page.clock.install();
+    await openLibrary(page);
+    await selectTaggedVideo(page);
+    const source = () => page.evaluate(() => window.__hlsTrial.sources.at(-1));
+    expect(new URL(await source()).searchParams.get("video_mode")).toBe("copy");
+    await showPlayerControls(page);
+    await page.locator("#play-button").click();
+    await page.locator("#video-player").evaluate((video) => {
+      video.currentTime = 127;
+      video.dispatchEvent(new Event("timeupdate"));
+    });
+    if (failure === "decode") {
+      await page.locator("#video-player").evaluate((video) => {
+        Object.defineProperty(video, "error", { configurable: true, value: { code: 3 } });
+        video.dispatchEvent(new Event("error"));
+      });
+    } else if (failure === "startup") {
+      await expect(page.locator("#stage-progress-label")).toHaveText("Preparing video…");
+      await page.clock.runFor(12_500);
+    } else {
+      await page.route("**/api/web/transcode/*", (route) => route.fulfill({ json: { schema_version: 2, state: "failed" } }));
+      await page.clock.runFor(600);
+    }
+    await expect.poll(async () => new URL(await source()).searchParams.get("video_mode")).toBe("transcode");
+    expect(new URL(await source()).searchParams.get("delivery")).toBe("hls");
+    expect(new URL(await source()).searchParams.get("video_output")).toBe(failure === "decode" ? "hevc_hdr10" : "h264_sdr");
+    expect(new URL(await source()).searchParams.get("start")).toBe("120");
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+    expect(await page.evaluate(() => window.__hlsTrial.sources.length)).toBe(2);
+    // A healthy recovered producer must not cause another HEVC-copy trial.
+    await page.route("**/api/web/transcode/*", (route) => route.fulfill({ json: { schema_version: 2, state: "producing" } }));
+    await page.locator("#timeline").evaluate((timeline) => {
+      timeline.value = "247";
+      timeline.dispatchEvent(new Event("input", { bubbles: true }));
+      timeline.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await page.clock.runFor(450);
+    await expect.poll(async () => new URL(await source()).searchParams.get("start")).toBe("240");
+    expect(new URL(await source()).searchParams.get("video_mode")).toBe("transcode");
+    expect(await page.evaluate(() => localStorage.getItem("rustydlna.hevcHlsCopy"))).toBe("true");
+    if (failure === "decode") {
+      await page.locator("#video-player").dispatchEvent("error");
+      await expect.poll(async () => new URL(await source()).searchParams.get("video_output")).toBe("h264_sdr");
+      expect(new URL(await source()).searchParams.get("video_mode")).toBe("transcode");
+    }
+  });
+}
+
+test("HEVC HLS toggle leaves Original playback untouched", async ({ page }) => {
+  await installHevcHlsTrial(page);
+  await usePreference(page, "stream", "direct");
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  const source = await page.evaluate(() => window.__hlsTrial.sources.at(-1));
+  await openAdvancedPlayback(page);
+  await page.getByRole("checkbox", { name: "Try original HEVC with HLS" }).check();
+  expect(await page.evaluate(() => window.__hlsTrial.sources)).toEqual([source]);
+  await expect(page.locator("#mode-label")).toHaveText("Original file");
 });
 
 test("desktop Safari keeps Auto quality for native HLS", async ({ page, browserName }) => {
@@ -4165,6 +4836,35 @@ test("keyboard seeking continues from an exact dragged target while compatible m
   await expect(page.locator("#timeline")).toHaveValue("137");
 });
 
+test("caption Escape closes the popup before expanded playback and restores focus", async ({ page }) => {
+  await installIphoneUserAgent(page);
+  await serveFixtureMedia(page);
+  await openLibrary(page);
+  await openVideoView(page);
+  const response = await page.request.get("/api/web/library?view=library&kind=video&q=&sort=title&offset=0&limit=60");
+  const payload = await response.json();
+  const captioned = payload.entries.find((entry) => entry.entry_type === "media"
+    && entry.captions?.some((caption) => caption.browser_supported));
+  expect(captioned).toBeTruthy();
+  await page.locator(`[data-media-id="${captioned.id}"] .card-button`).click();
+  await showPlayerControls(page);
+  await page.locator("#fullscreen-button").click();
+  await expect(page.locator("#player-stage")).toHaveClass(/expanded-player/);
+  const captions = page.locator("#captions-button");
+  await captions.click();
+  await expect(page.locator("#caption-menu")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#caption-menu")).toBeHidden();
+  await expect(captions).toBeFocused();
+  await expect(captions).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator("#player-stage")).toHaveClass(/expanded-player/);
+  await captions.click();
+  await expect(page.locator("#caption-menu")).toBeVisible();
+  await page.locator("#player-stage").dispatchEvent("pointerdown");
+  await expect(page.locator("#caption-menu")).toBeHidden();
+  await expect(captions).toHaveAttribute("aria-expanded", "false");
+});
+
 test("captions survive source restarts but reset for a different title", async ({ page }) => {
   await usePreference(page, "caption", "legacy-index");
   await serveFixtureMedia(page);
@@ -4473,6 +5173,8 @@ test("selecting a title clears prior media while enrichment is pending", async (
 
 test("queue snapshot crosses pagination, auto-advances, and survives navigation", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name === "mobile-chromium", "portrait phones intentionally hide the previous-item control");
+  // Queue transitions should not race an in-flight smooth scroll to the player.
+  await page.emulateMedia({ reducedMotion: "reduce" });
   await usePreference(page, "autoplay", "true");
   await serveFixtureMedia(page);
   await page.route("**/api/web/transcode/*", (route) => route.fulfill({
@@ -4515,6 +5217,9 @@ test("queue snapshot crosses pagination, auto-advances, and survives navigation"
   await page.locator("#video-player").dispatchEvent("ended");
   await expect(page.locator("#now-playing-title")).toHaveText("Queue 61");
   await page.getByRole("tab", { name: "Folders" }).click();
+  // Finish replacing the large grid before positioning the player controls.
+  await expect(page.locator("#loading")).toBeHidden();
+  await expect(page.locator(".media-card.folder").first()).toBeVisible();
   await showPlayerControls(page);
   await page.locator("#previous-button").click();
   await expect(page.locator("#now-playing-title")).toHaveText("Queue 60");
@@ -4528,6 +5233,7 @@ test("a stale queue page cannot replace a newer queue snapshot", async ({ page }
       value: class {
         observe() {}
         unobserve() {}
+        disconnect() {}
       },
     });
     const nativeFetch = window.fetch.bind(window);
@@ -4542,6 +5248,13 @@ test("a stale queue page cannot replace a newer queue snapshot", async ({ page }
     };
     window.fetch = async (input, options = {}) => {
       const url = new URL(typeof input === "string" ? input : input.url, document.baseURI);
+      if (url.pathname === "/api/web/library"
+        && url.searchParams.get("offset") === "60"
+        && url.searchParams.get("limit") !== "200") {
+        // Clicking the last card can also trigger ordinary infinite paging.
+        // Hold it so both selections must take an incomplete queue snapshot.
+        await firstGate;
+      }
       if (url.pathname === "/api/web/library"
         && url.searchParams.get("offset") === "60"
         && url.searchParams.get("limit") === "200") {
@@ -4614,6 +5327,64 @@ test("a stale queue page cannot replace a newer queue snapshot", async ({ page }
   await expect(page.locator("#next-button")).toHaveAttribute("title", "Next: Current queue tail");
 });
 
+test("already-complete broken artwork shows the fallback and releases its loading slots", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 1000 });
+  await page.addInitScript(() => {
+    // Model a cached failure whose complete flag precedes its queued error event.
+    const complete = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "complete").get;
+    Object.defineProperty(HTMLImageElement.prototype, "complete", {
+      configurable: true,
+      get() { return this.getAttribute("src")?.startsWith("/Thumbnails/") ? true : complete.call(this); },
+    });
+  });
+  let releaseArtwork;
+  const held = new Promise((resolve) => { releaseArtwork = resolve; });
+  await page.route("**/Thumbnails/**", async (route) => {
+    await held;
+    await route.fulfill({ status: 404 }).catch(() => {});
+  });
+  try {
+    await openLibrary(page);
+    await openVideoView(page);
+    const failedImages = page.locator('#media-grid img[src^="/Thumbnails/"].failed');
+    await expect.poll(() => failedImages.count()).toBeGreaterThan(3);
+    await expect(failedImages.first()).toBeHidden();
+    expect(await failedImages.evaluateAll((images) => images.every((image) => image.naturalWidth === 0))).toBe(true);
+  } finally {
+    releaseArtwork();
+  }
+});
+
+test("slow artwork from an abandoned view cannot block the current view", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 1000 });
+  await page.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    const view = new URL(route.request().url()).searchParams.get("kind");
+    for (const entry of payload.entries || []) {
+      if (entry.entry_type === "media") entry.art_url = `/review-art/${view}/${entry.id}.jpg`;
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  let releaseArtwork;
+  const held = new Promise((resolve) => { releaseArtwork = resolve; });
+  const requested = [];
+  await page.route("**/review-art/**", async (route) => {
+    requested.push(route.request().url());
+    await held;
+    await route.fulfill({ status: 404 }).catch(() => {});
+  });
+  try {
+    await openLibrary(page);
+    await openVideoView(page);
+    await expect.poll(() => requested.filter((url) => url.includes("/video/")).length).toBe(4);
+    await page.getByRole("tab", { name: "Audio", exact: true }).click();
+    await expect.poll(() => requested.filter((url) => url.includes("/audio/")).length).toBeGreaterThan(0);
+  } finally {
+    releaseArtwork();
+  }
+});
+
 test("infinite scroll loads each bounded page once and stops at the catalog end", async ({ page }) => {
   let firstPayload = null;
   const requestedOffsets = [];
@@ -4673,7 +5444,10 @@ test("infinite scroll loads each bounded page once and stops at the catalog end"
   const sentinel = page.locator("#load-more-sentinel");
   await expect(sentinel).toBeAttached();
   const firstArtwork = page.locator(".media-card img").first();
-  await expect(firstArtwork).toHaveAttribute("loading", "lazy");
+  // The application admits nearby images itself; offscreen images must stay
+  // unrequested regardless of the browser's native lazy-loading heuristic.
+  expect(await page.locator('.media-card img[src]').count()).toBeLessThanOrEqual(4);
+  await expect(page.locator('.media-card img').last()).not.toHaveAttribute("src");
   await expect(firstArtwork).toHaveAttribute("decoding", "async");
   await expect(firstArtwork).toHaveAttribute("fetchpriority", "low");
 
@@ -4726,6 +5500,7 @@ test("paging continues when WebKit omits the sentinel exit after appending cards
         }
 
         unobserve() {}
+        disconnect() {}
       },
     });
   });
@@ -4827,6 +5602,50 @@ test("a generation change during infinite scroll is recoverable without duplicat
   expect(new Set(ids).size).toBe(ids.length);
 });
 
+test("Compatible loop restarts the whole title after a seek and takes precedence over auto-advance", async ({ page }) => {
+  await usePreference(page, "stream", "compat");
+  await usePreference(page, "autoplay", "true");
+  await disableFragmentedDelivery(page);
+  await page.addInitScript(() => {
+    const sources = new WeakMap();
+    Object.defineProperty(HTMLMediaElement.prototype, "src", {
+      configurable: true,
+      get() { return sources.get(this) || ""; },
+      set(value) { sources.set(this, value); },
+    });
+    HTMLMediaElement.prototype.load = () => {};
+    HTMLMediaElement.prototype.play = () => Promise.resolve();
+  });
+  await page.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    for (const entry of payload.entries || []) {
+      if (entry.entry_type === "media") entry.duration_seconds = 600;
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  const video = page.locator("#video-player");
+  await expect.poll(() => video.evaluate((player) => player.src)).toContain("start=0");
+  await page.locator("#timeline").evaluate((timeline) => {
+    timeline.value = "25";
+    timeline.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await expect.poll(() => video.evaluate((player) => player.src)).toContain("start=20");
+  await page.locator("#loop-button").evaluate((button) => button.click());
+  await expect(page.locator("#loop-button")).toHaveAttribute("aria-pressed", "true");
+  expect(await video.evaluate((player) => player.loop)).toBe(false);
+  await video.evaluate((player) => {
+    Object.defineProperty(player, "currentTime", { configurable: true, value: 580 });
+    player.dispatchEvent(new Event("ended"));
+  });
+  await expect.poll(() => video.evaluate((player) => player.src)).toContain("start=0");
+  await expect(page.locator("#now-playing-title")).toHaveText("tagged");
+  await expect(page.locator("#timeline")).toHaveValue("0");
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Pause");
+});
+
 test("end state keeps the real duration and Replay starts from zero", async ({ page }) => {
   await usePreference(page, "stream", "direct");
   await page.addInitScript(() => {
@@ -4890,19 +5709,36 @@ test("direct failure stays visible until compatible media is playable", async ({
 });
 
 test("compatible seek while paused clears its busy description on metadata", async ({ page }) => {
-  const fixture = await readFile(compatibleFixture);
-  await page.route("**/web/media/*.mp4?**", (route) => route.fulfill({ status: 200, contentType: "video/mp4", body: fixture }));
+  await serveFixtureMedia(page);
+  let releaseMedia;
+  const held = new Promise((resolve) => { releaseMedia = resolve; });
+  let requests = 0;
+  await page.route("**/web/media/*.mp4?**", async (route) => {
+    requests += 1;
+    await held;
+    await route.fallback();
+  });
   await openLibrary(page);
   await openVideoView(page);
-  await page.getByRole("button", { name: /^Play dvp7\b/ }).first().click();
-  await expect(page.locator("#timeline")).toHaveAttribute("max", "10");
-  await showPlayerControls(page);
-  await page.locator("#play-button").click();
-  await page.locator("#timeline").evaluate((timeline) => {
-    timeline.value = "5";
-    timeline.dispatchEvent(new Event("input", { bubbles: true }));
-    timeline.dispatchEvent(new Event("change", { bubbles: true }));
-  });
+  try {
+    await page.getByRole("button", { name: /^Play dvp7\b/ }).first().click();
+    await expect(page.locator("#timeline")).toHaveAttribute("max", "10");
+    await expect.poll(() => requests).toBe(1);
+    // Pause before the tiny fixture can finish and turn the action into Replay.
+    await showPlayerControls(page);
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Pause");
+    await page.locator("#play-button").click();
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+    await page.locator("#timeline").evaluate((timeline) => {
+      timeline.value = "5";
+      timeline.dispatchEvent(new Event("input", { bubbles: true }));
+      timeline.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await expect(page.locator("#timeline")).toHaveAttribute("aria-busy", "true");
+    await expect.poll(() => requests).toBe(2);
+  } finally {
+    releaseMedia();
+  }
   await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
   await expect(page.locator("#timeline")).toHaveAttribute("aria-busy", "false");
   await expect(page.locator("#timeline-status")).not.toContainText("Starting a compatible stream");
