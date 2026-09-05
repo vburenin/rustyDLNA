@@ -46,6 +46,13 @@ set unchanged.
   configured `{stem}` / `%s` artwork names; ASCII sidecar suffixes such as
   `-poster.jpeg` are still recognized.
 
+Media and sidecar reads require a regular-file descriptor confined to a
+configured root. Both the Linux `openat2` path and its component-walking
+fallback open without waiting for a FIFO writer, then verify the opened file's
+type before reading. FIFOs, sockets, directories, and devices are rejected,
+including when reached through an allowed symlink or substituted for a file
+between path inspection and opening.
+
 ## Probe sidecars
 
 For a media path `movie.ext`, the scanner considers the raw, byte-preserving

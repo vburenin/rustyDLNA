@@ -25,6 +25,8 @@ compatibility decisions as rustyDLNA's own contract.
 - `crates/scan`: Filesystem scanning and watching, root confinement, SQLite
   persistence, metadata probing, NFO, artwork, captions, playlists, inode and
   symlink alias handling. It re-exports helper control types for compatibility.
+  `admission.rs` owns container admission, `artwork.rs` owns artwork selection
+  and persistence, and `session.rs` owns staged catalog publication and recovery.
 - `crates/transcode`: Codec/HDR models, remap policy, FFmpeg argument builders,
   cache identities, browser quality profiles, and controlled helper execution.
   Policy belongs here; HTTP/job orchestration does not.
@@ -42,7 +44,11 @@ compatibility decisions as rustyDLNA's own contract.
   helpers. Keep it browser-independent and cover it with `core.test.js`.
 - `crates/server/web/library.js`: Library loading, paging, search, and history.
 - `crates/server/web/player.js`: Playback session, source negotiation, controls,
-  seeking, recovery, captions, tracks, and Media Session integration.
+  seeking, recovery, audio tracks, and Media Session integration.
+- `crates/server/web/captions.js`: Caption selection, source-scoped text tracks,
+  and cue alignment with the current media timeline.
+- `crates/server/web/media-source.js`: MediaSource playlist delivery, bounded
+  buffer maintenance, and abortable media operations.
 - `crates/server/web/preferences.js`: Browser-local settings and progress.
 - `crates/server/web/store.js`: State transitions. Stale session events must not
   mutate a newer playback session.

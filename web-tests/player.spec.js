@@ -5058,6 +5058,152 @@ test("captions survive source restarts but reset for a different title", async (
   await expect(page.locator('input[name="caption-choice"][value="off"]')).toBeChecked();
 });
 
+// Real text tracks and media seeks exercise cue timing, not just menu state.
+async function captionTimelineFixture(page) {
+  await usePreference(page, "stream", "compat");
+  await page.addInitScript(() => {
+    // Keep the short media fixture paused while we inspect its real cue clock.
+    HTMLMediaElement.prototype.play = () => Promise.resolve();
+  });
+  await disableFragmentedDelivery(page);
+  const fixture = await readFile(compatibleFixture);
+  await page.route("**/web/media/*.mp4?**", async (route) => {
+    const range = /^bytes=(\d+)-(\d*)$/.exec(route.request().headers().range || "");
+    const start = range ? Number(range[1]) : 0;
+    const end = range?.[2] ? Math.min(Number(range[2]), fixture.length - 1) : fixture.length - 1;
+    await route.fulfill({
+      status: range ? 206 : 200,
+      contentType: "video/mp4",
+      headers: {
+        "accept-ranges": "bytes",
+        ...(range ? { "content-range": `bytes ${start}-${end}/${fixture.length}` } : {}),
+      },
+      body: fixture.subarray(start, end + 1),
+    });
+  });
+  const response = await page.request.get("/api/web/library?view=library&kind=video&q=&sort=title&offset=0&limit=60");
+  const payload = await response.json();
+  const item = payload.entries.find((entry) => entry.title === "tagged");
+  expect(item).toBeTruthy();
+  await page.route("**/api/web/item/**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    if (String(payload.item?.id) === String(item.id)) {
+      Object.assign(payload.item, {
+        duration_seconds: 600, duration: "0:10:00.000", stream_metadata_complete: true,
+        captions: [{ index: 0, browser_supported: true, label: "Timeline", language: "en", url: "/review-captions.vtt" }],
+      });
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  return item;
+}
+
+const captionTimelineVtt = `WEBVTT
+
+opening
+00:00:00.000 --> 00:00:00.350
+Opening scene
+
+crossing
+00:01:29.500 --> 00:01:30.150 align:start position:20%
+Crossing the source start
+
+ninety
+00:01:30.150 --> 00:01:30.350
+Scene at ninety seconds
+
+two-minutes
+00:02:00.000 --> 00:02:00.350
+Scene at two minutes
+
+`;
+
+async function expectCaptionAt(page, time, text) {
+  const video = page.locator("#video-player");
+  await expect.poll(() => video.evaluate((video) => video.readyState)).toBeGreaterThanOrEqual(2);
+  await expect.poll(() => video.evaluate((video) => video.textTracks[0]?.mode)).toBe("showing");
+  await video.evaluate((video, time) => { video.pause(); video.currentTime = time; }, time);
+  await expect.poll(() => video.evaluate((video) => video.currentTime)).toBeCloseTo(time, 2);
+  await expect.poll(() => video.evaluate((video) => [...(video.textTracks[0]?.activeCues || [])].map((cue) => cue.text)))
+    .toEqual([text]);
+}
+
+async function seekCaptionTimeline(page, time) {
+  await page.locator("#timeline").evaluate((timeline, time) => {
+    timeline.value = String(time);
+    timeline.dispatchEvent(new Event("input", { bubbles: true }));
+    timeline.dispatchEvent(new Event("change", { bubbles: true }));
+  }, time);
+  await expect.poll(() => page.locator("#video-player").evaluate((video) => (
+    new URL(video.src || document.baseURI).searchParams.get("start")
+  ))).toBe(String(time));
+}
+
+for (const start of ["deep link", "saved resume"]) {
+  test(`caption cues stay aligned through ${start}, repeated seeks, and original playback`, async ({ page }) => {
+    const item = await captionTimelineFixture(page);
+    await page.route("**/review-captions.vtt", (route) => route.fulfill({
+      contentType: "text/vtt", body: captionTimelineVtt,
+    }));
+    if (start === "saved resume") {
+      await page.addInitScript((id) => localStorage.setItem("rustydlna.webProgress.v1", JSON.stringify({
+        [id]: { position: 90, duration: 600, updated: Date.now() },
+      })), item.id);
+    }
+    await page.goto(`/?view=video&item=${item.id}${start === "deep link" ? "&t=90" : ""}`);
+    if (start === "saved resume") await page.locator("#resume-button").click();
+    await showPlayerControls(page);
+    await page.locator("#captions-button").click();
+    await page.locator('input[name="caption-choice"][value="0"]').check();
+    await expectCaptionAt(page, 0.05, "Crossing the source start");
+    expect(await page.locator("#video-player").evaluate((video) => {
+      const cue = video.textTracks[0].cues[0];
+      return { id: cue.id, start: cue.startTime, end: Math.round(cue.endTime * 1000) / 1000, align: cue.align, position: cue.position };
+    })).toEqual({ id: "crossing", start: 0, end: 0.15, align: "start", position: 20 });
+    await expectCaptionAt(page, 0.25, "Scene at ninety seconds");
+    await seekCaptionTimeline(page, 120);
+    await expectCaptionAt(page, 0.05, "Scene at two minutes");
+    await seekCaptionTimeline(page, 90);
+    await expectCaptionAt(page, 0.25, "Scene at ninety seconds");
+    await seekCaptionTimeline(page, 0);
+    await expectCaptionAt(page, 0.05, "Opening scene");
+    await openAdvancedPlayback(page);
+    await page.locator('input[name="stream-mode"][value="direct"]').check();
+    await expect.poll(() => page.locator("#video-player").evaluate((video) => new URL(video.src || document.baseURI).searchParams.get("mode")))
+      .toBe("direct");
+    await expectCaptionAt(page, 0.05, "Opening scene");
+  });
+}
+
+test("a caption load superseded by a seek cannot apply its old offset", async ({ page }) => {
+  const item = await captionTimelineFixture(page);
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  let requested = false;
+  await page.route("**/review-captions.vtt", async (route) => {
+    requested = true;
+    await pending;
+    await route.fulfill({ contentType: "text/vtt", body: captionTimelineVtt }).catch(() => {});
+  });
+  try {
+    await page.goto(`/?view=video&item=${item.id}&t=90`);
+    await showPlayerControls(page);
+    await page.locator("#captions-button").click();
+    await page.locator('input[name="caption-choice"][value="0"]').check();
+    await expect.poll(() => requested).toBe(true);
+    await page.locator("#video-player track").evaluate((track) => { window.__oldCaption = track; });
+    await seekCaptionTimeline(page, 120);
+    release();
+    await expectCaptionAt(page, 0.05, "Scene at two minutes");
+    await page.evaluate(() => window.__oldCaption.dispatchEvent(new Event("load")));
+    await expectCaptionAt(page, 0.05, "Scene at two minutes");
+    expect(await page.evaluate(() => window.__oldCaption.isConnected)).toBe(false);
+  } finally {
+    release();
+  }
+});
+
 test("resume offers Start over and blocked browser storage remains nonfatal", async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 480 });
   await page.route("**/api/web/library?**", async (route) => {

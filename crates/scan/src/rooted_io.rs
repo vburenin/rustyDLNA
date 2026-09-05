@@ -151,7 +151,9 @@ fn open_beneath_directory(
     // SAFETY: open_how is a plain kernel ABI struct for which zero is the
     // documented default for every field; assigned fields are valid flags.
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
-    how.flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
+    // Check the opened descriptor's type below. A pathname can be a FIFO
+    // (including after replacement), so opening must not wait for a writer.
+    how.flags = REGULAR_FILE_OPEN_FLAGS as u64;
     how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_SYMLINKS;
     // SAFETY: pointers refer to initialized values for the syscall duration;
     // a successful descriptor is transferred to File below.
@@ -166,7 +168,7 @@ fn open_beneath_directory(
     };
     if fd >= 0 {
         // SAFETY: fd is the unique successful openat2 return value.
-        return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
+        return require_regular_file(unsafe { std::fs::File::from_raw_fd(fd) });
     }
     let openat2_error = std::io::Error::last_os_error();
     if !matches!(
@@ -176,8 +178,34 @@ fn open_beneath_directory(
         return Err(openat2_error);
     }
 
-    // Safe fallback for old kernels or seccomp profiles: walk the canonical
-    // relative path one component at a time and reject every symlink.
+    open_beneath_directory_fallback(directory, relative)
+}
+
+const REGULAR_FILE_OPEN_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+fn require_regular_file(file: std::fs::File) -> std::io::Result<std::fs::File> {
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "allowed path is not a regular file",
+        ));
+    }
+    // O_NONBLOCK has no effect on regular-file reads. Retaining it avoids
+    // another syscall and does not change the descriptor's media semantics.
+    Ok(file)
+}
+
+// Old kernels and seccomp profiles use the same file-type policy, walking
+// the canonical relative path one component at a time without symlinks.
+fn open_beneath_directory_fallback(
+    directory: &std::fs::File,
+    relative: &Path,
+) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
     let mut current = directory.try_clone()?;
     let mut components = relative.components().peekable();
     while let Some(component) = components.next() {
@@ -192,7 +220,7 @@ fn open_beneath_directory(
         let flags = if components.peek().is_some() {
             libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
         } else {
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+            REGULAR_FILE_OPEN_FLAGS
         };
         // SAFETY: current is live and component is a valid C string.
         let next = unsafe { libc::openat(current.as_raw_fd(), component.as_ptr(), flags) };
@@ -202,7 +230,7 @@ fn open_beneath_directory(
         // SAFETY: next is the unique successful openat return value.
         current = unsafe { std::fs::File::from_raw_fd(next) };
     }
-    Ok(current)
+    require_regular_file(current)
 }
 
 /// Open a regular file under `roots` without a check-then-open pathname race.
@@ -250,12 +278,6 @@ pub fn open_file_under_roots(
 
     let directory = open_directory_without_symlinks(&directory_path)?;
     let file = open_beneath_directory(&directory, &relative)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "allowed path is not a regular file",
-        ));
-    }
     Ok(RootedFile {
         file,
         resolved_path,
@@ -360,6 +382,111 @@ pub fn media_rel_key_for_config(path: &Path, cfg: &ScanConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{symlink, OpenOptionsExt};
+    use std::time::Duration;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "rusty-rooted-io-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a live NUL-terminated filename in our private test tree.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
+    #[test]
+    fn rooted_and_fallback_opens_reject_fifos_without_waiting_for_a_writer() {
+        for fallback in [false, true] {
+            let dir = TestDirectory::new();
+            let path = dir.0.join("movie.mp4");
+            // Cover a regular catalog path replaced by a FIFO, as well as
+            // discovery of a media-named symlink to that FIFO.
+            std::fs::write(&path, b"previous regular file").unwrap();
+            std::fs::remove_file(&path).unwrap();
+            fifo(&path);
+            symlink("movie.mp4", dir.0.join("alias.mp4")).unwrap();
+            let root = dir.0.clone();
+            let (sent, received) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = if fallback {
+                    let directory = open_directory_without_symlinks(&root).unwrap();
+                    open_beneath_directory_fallback(&directory, Path::new("movie.mp4"))
+                } else {
+                    open_file_under_roots(&root.join("alias.mp4"), &[root], false)
+                        .map(|opened| opened.file)
+                };
+                let _ = sent.send(result.map_err(|error| error.kind()));
+            });
+            let result = received.recv_timeout(Duration::from_secs(1));
+            // A regression must fail instead of hanging the suite. Linux
+            // O_RDWR opens a FIFO without a peer and releases a blocked reader.
+            let _release = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+                .unwrap();
+            worker.join().unwrap();
+            assert!(
+                matches!(result, Ok(Err(std::io::ErrorKind::InvalidInput))),
+                "fallback={fallback}: FIFO open must reject promptly: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rooted_and_fallback_opens_preserve_regular_reads_and_reject_special_files() {
+        use std::io::{Read, Seek};
+        let dir = TestDirectory::new();
+        std::fs::create_dir(dir.0.join("nested")).unwrap();
+        std::fs::write(dir.0.join("nested/movie.mp4"), b"0123456789").unwrap();
+        symlink("nested/movie.mp4", dir.0.join("alias.mp4")).unwrap();
+        let directory = open_directory_without_symlinks(&dir.0).unwrap();
+        for mut file in [
+            open_file_under_roots(
+                &dir.0.join("alias.mp4"),
+                std::slice::from_ref(&dir.0),
+                false,
+            )
+            .unwrap()
+            .file,
+            open_beneath_directory_fallback(&directory, Path::new("nested/movie.mp4")).unwrap(),
+        ] {
+            file.seek(std::io::SeekFrom::Start(3)).unwrap();
+            let mut bytes = [0; 4];
+            file.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"3456");
+        }
+        let _socket = std::os::unix::net::UnixListener::bind(dir.0.join("socket")).unwrap();
+        for path in ["nested", "socket"] {
+            assert!(open_beneath_directory(&directory, Path::new(path)).is_err());
+            assert!(open_beneath_directory_fallback(&directory, Path::new(path)).is_err());
+        }
+        // The fallback accepts canonical paths only; it cannot follow even an
+        // in-root symlink, nor escape through a parent component.
+        for path in ["alias.mp4", "../movie.mp4"] {
+            assert!(open_beneath_directory_fallback(&directory, Path::new(path)).is_err());
+        }
+    }
 
     #[test]
     fn database_path_encoding_preserves_plain_and_reserved_prefix_names() {

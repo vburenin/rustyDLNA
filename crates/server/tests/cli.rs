@@ -456,3 +456,61 @@ fn config_path_errors_retain_validation_context() {
     let stderr = String::from_utf8(output.stderr).expect("diagnostic is UTF-8");
     assert!(stderr.contains("thumbnail_quality must be between 2 and 31"));
 }
+
+#[test]
+fn rescan_skips_fifo_media_aliases_and_sidecars_without_hanging() {
+    use rusty_dlna_helper::{
+        CaptureConfig, CaptureRetention, SupervisedCommand, SupervisedOutcome,
+    };
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::{Duration, Instant};
+
+    let sandbox = Sandbox::new("fifo-scan");
+    let root = sandbox.as_ref().join("library");
+    std::fs::create_dir(&root).unwrap();
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/library/video/tagged.mp4");
+    std::fs::copy(source, root.join("movie.mp4")).unwrap();
+    for name in ["pipe", "movie.srt", "playlist.m3u"] {
+        let path = std::ffi::CString::new(root.join(name).as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a live C string inside the owned temporary library.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    std::os::unix::fs::symlink("pipe", root.join("alias.mp4")).unwrap();
+    let config = write_config(
+        &sandbox,
+        "media_dir = [\"library\"]\ncache_dir = \"cache\"\ndb_dir = \"database\"\nrescan_secs = 0\n",
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rusty-dlna"));
+    command
+        .args(["--config"])
+        .arg(config)
+        .arg("--rescan")
+        .current_dir(&sandbox)
+        .env("RUSTY_DLNA_HTTP_PORT", "18200")
+        .env("RUSTY_DLNA_SSDP_PORT", "11900");
+    let outcome = SupervisedCommand::new(&mut command)
+        .capture_stdout(CaptureConfig::new(16 * 1024, CaptureRetention::Tail))
+        .capture_stderr(CaptureConfig::new(16 * 1024, CaptureRetention::Tail))
+        .run_until(
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_millis(10),
+            || std::ops::ControlFlow::<()>::Continue(()),
+        )
+        .unwrap();
+    let SupervisedOutcome::Exited(output) = outcome else {
+        panic!("scan hung on a FIFO: {outcome:?}");
+    };
+    assert!(output.status.success(), "scan failed: {output:?}");
+    let db =
+        rusty_dlna_scan::LibraryDb::open_read_only(&sandbox.as_ref().join("database/files.db"))
+            .unwrap();
+    assert!(db
+        .find_detail_by_path(&rusty_dlna_scan::path_to_db(&root.join("movie.mp4")))
+        .unwrap()
+        .is_some());
+    assert!(db
+        .find_detail_by_path(&rusty_dlna_scan::path_to_db(&root.join("alias.mp4")))
+        .unwrap()
+        .is_none());
+}

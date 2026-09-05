@@ -138,6 +138,8 @@ pub fn route(method: &str, path: &str) -> HttpRoute {
         | "/web/app.js"
         | "/web/api.js"
         | "/web/core.js"
+        | "/web/captions.js"
+        | "/web/media-source.js"
         | "/web/library.js"
         | "/web/player.js"
         | "/web/preferences.js"

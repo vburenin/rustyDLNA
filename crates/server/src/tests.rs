@@ -5391,6 +5391,8 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         "/web/app.js",
         "/web/api.js",
         "/web/core.js",
+        "/web/captions.js",
+        "/web/media-source.js",
         "/web/library.js",
         "/web/player.js",
         "/web/preferences.js",

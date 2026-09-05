@@ -1,9 +1,10 @@
+import { pumpMediaSource } from "./media-source.js";
+import { CaptionController } from "./captions.js";
 import {
   aiUpscaleQualityAvailable,
   apiErrorCategory,
   automaticCompatibleRecoveryProfile,
   audioTrackLabel,
-  bufferedRangeSecondsAhead,
   chooseSource,
   clockLabel,
   compatibleVideoDimensions,
@@ -24,7 +25,6 @@ import {
   encodingPreset,
   originalDownloadUrl,
   negotiateCompatibleStreams,
-  parseHlsMediaPlaylist,
   playbackControlLabel,
   playbackProcessing,
   playbackError,
@@ -70,13 +70,6 @@ const MAX_AUTOMATIC_TRANSCODE_RETRIES = 3;
 const TRANSCODE_BUSY_RETRY_WINDOW_MS = 5 * 60 * 1_000;
 const MAX_HELD_VIDEO_FRAME_PIXELS = 4_194_304;
 const MAX_DECODED_TRICKPLAY_SHEETS = 2;
-// Copied UHD fragments can exceed 10 MB per second. Keep the total window
-// below Chromium's practical SourceBuffer quota instead of treating every
-// codec and bitrate like a small mobile rendition. Seeks start a new
-// generation, so only a short backward window is useful here.
-const MEDIA_SOURCE_BUFFER_AHEAD_SECONDS = 10;
-const MEDIA_SOURCE_RETAIN_BEHIND_SECONDS = 5;
-const MEDIA_SOURCE_PLAYLIST_POLL_MS = 500;
 const MAX_MEDIA_CAPABILITY_CACHE_ENTRIES = 64;
 const ANDROID_MEDIA_SOURCE_TYPES = Object.freeze([
   'video/mp4; codecs="avc1.42c01f,mp4a.40.2"',
@@ -176,119 +169,6 @@ function copiedHevcMediaSourceType(item, streamNegotiation) {
   } catch (_) {
     return null;
   }
-}
-
-function abortedError() {
-  return new DOMException("Playback source was replaced.", "AbortError");
-}
-
-function abortableDelay(milliseconds, signal) {
-  if (signal.aborted) return Promise.reject(abortedError());
-  return new Promise((resolve, reject) => {
-    const timer = window.setTimeout(done, milliseconds);
-    signal.addEventListener("abort", abort, { once: true });
-    function cleanup() {
-      window.clearTimeout(timer);
-      signal.removeEventListener("abort", abort);
-    }
-    function done() {
-      cleanup();
-      resolve();
-    }
-    function abort() {
-      cleanup();
-      reject(abortedError());
-    }
-  });
-}
-
-function waitForMediaEvent(target, eventName, signal, errorEvent = "error") {
-  if (signal.aborted) return Promise.reject(abortedError());
-  return new Promise((resolve, reject) => {
-    target.addEventListener(eventName, done, { once: true });
-    if (errorEvent) target.addEventListener(errorEvent, failed, { once: true });
-    signal.addEventListener("abort", abort, { once: true });
-    function cleanup() {
-      target.removeEventListener(eventName, done);
-      if (errorEvent) target.removeEventListener(errorEvent, failed);
-      signal.removeEventListener("abort", abort);
-    }
-    function done() {
-      cleanup();
-      resolve();
-    }
-    function failed() {
-      cleanup();
-      reject(new Error(`Media Source ${errorEvent}`));
-    }
-    function abort() {
-      cleanup();
-      reject(abortedError());
-    }
-  });
-}
-
-function sourceBufferOperation(sourceBuffer, operation, signal) {
-  if (signal.aborted) return Promise.reject(abortedError());
-  return new Promise((resolve, reject) => {
-    sourceBuffer.addEventListener("updateend", done, { once: true });
-    sourceBuffer.addEventListener("error", failed, { once: true });
-    signal.addEventListener("abort", abort, { once: true });
-    function cleanup() {
-      sourceBuffer.removeEventListener("updateend", done);
-      sourceBuffer.removeEventListener("error", failed);
-      signal.removeEventListener("abort", abort);
-    }
-    function done() {
-      cleanup();
-      resolve();
-    }
-    function failed() {
-      cleanup();
-      reject(new Error("Media Source buffer rejected a fragment."));
-    }
-    function abort() {
-      cleanup();
-      reject(abortedError());
-    }
-    try {
-      operation();
-    } catch (error) {
-      cleanup();
-      reject(error);
-    }
-  });
-}
-
-function bufferedSecondsAhead(sourceBuffer, currentTime) {
-  const ranges = [];
-  for (let index = 0; index < sourceBuffer.buffered.length; index += 1) {
-    ranges.push({
-      start: sourceBuffer.buffered.start(index),
-      end: sourceBuffer.buffered.end(index),
-    });
-  }
-  return bufferedRangeSecondsAhead(ranges, currentTime);
-}
-
-function waitForMediaSourcePlayback(player, signal) {
-  if (!player.paused) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    player.addEventListener("play", resumed, { once: true });
-    signal.addEventListener("abort", aborted, { once: true });
-    function cleanup() {
-      player.removeEventListener("play", resumed);
-      signal.removeEventListener("abort", aborted);
-    }
-    function resumed() {
-      cleanup();
-      resolve();
-    }
-    function aborted() {
-      cleanup();
-      reject(abortedError());
-    }
-  });
 }
 
 function currentFullscreenElement() {
@@ -425,7 +305,7 @@ export class PlaybackController {
   #fullscreenActiveSession = null;
   #fullscreenActiveKind = null;
   #displayViewportFrame = null;
-  #captionRenderKey = "";
+  #captions;
   #audioRenderKey = "";
   #chapterRenderKey = "";
   #streamInfoRenderInputs = [];
@@ -455,6 +335,7 @@ export class PlaybackController {
     this.#progressWriter = createProgressWriter(() => this.#writeProgress());
     this.#onReturnLibrary = onReturnLibrary;
     this.#onClosePlayback = onClosePlayback || onReturnLibrary;
+    this.#captions = new CaptionController({ store, dom });
     this.#bindControls();
     this.#applyInitialPreferences();
     this.#store.subscribe(() => {
@@ -759,8 +640,7 @@ export class PlaybackController {
   closePlayback() {
     const playback = this.#store.getState().playback;
     const fullscreenActionName = this.#fullscreenAction();
-    this.#dom.captionMenu.hidden = true;
-    this.#dom.captionsButton.setAttribute("aria-expanded", "false");
+    this.#captions.closeMenu();
     for (const dialog of [
       this.#dom.advancedPlaybackDialog,
       this.#dom.qualityDialog,
@@ -1126,7 +1006,7 @@ export class PlaybackController {
     this.#dom.playbackMode.title = processing.description;
     this.#renderAudioTracks();
     this.#renderChapters();
-    this.#renderCaptions();
+    this.#captions.render();
     this.#renderStreamInfo();
     this.#renderMessage();
   }
@@ -1254,7 +1134,7 @@ export class PlaybackController {
     const inactive = item.kind === "audio" ? this.#dom.video : this.#dom.audio;
     this.#resetMediaElement(inactive);
     this.#resetMediaElement(player);
-    this.#attachCaptions(item);
+    this.#captions.attach(item.captions || [], { segmentOffset, signal: controller.signal });
     player.playbackRate = state.preferences.rate;
     player.volume = state.preferences.volume / 100;
     player.muted = state.preferences.muted;
@@ -1725,7 +1605,7 @@ export class PlaybackController {
         // Startup telemetry is best-effort and never changes playback.
       });
     };
-    this.#pumpMediaSource({
+    pumpMediaSource({
       player,
       mediaSource,
       playlistUrl,
@@ -1760,140 +1640,6 @@ export class PlaybackController {
         });
       });
     return objectUrl;
-  }
-
-  async #pumpMediaSource({
-    player,
-    mediaSource,
-    playlistUrl,
-    contentType,
-    signal,
-    reportStartup,
-  }) {
-    await waitForMediaEvent(mediaSource, "sourceopen", signal, "sourceclose");
-    if (signal.aborted || mediaSource.readyState !== "open") throw abortedError();
-    const sourceBuffer = mediaSource.addSourceBuffer(contentType);
-    sourceBuffer.mode = "segments";
-    const appended = new Set();
-    let initAppended = false;
-    let playlistReported = false;
-
-    while (!signal.aborted) {
-      if (appended.size > 0 && player.paused) {
-        await waitForMediaSourcePlayback(player, signal);
-      }
-      const requestUrl = new URL(playlistUrl);
-      requestUrl.searchParams.set("mse_after", String(appended.size));
-      const response = await fetch(requestUrl, {
-        cache: "no-store",
-        credentials: "same-origin",
-        signal,
-      });
-      if (!response.ok) throw new Error(`Media Source playlist returned HTTP ${response.status}.`);
-      const contentLength = Number(response.headers.get("content-length"));
-      if (contentLength > 4 * 1024 * 1024) throw new Error("Media Source playlist is too large.");
-      const playlist = parseHlsMediaPlaylist(await response.text(), requestUrl.href);
-      if (!playlist) throw new Error("Media Source playlist is invalid.");
-      if (!playlistReported) {
-        playlistReported = true;
-        reportStartup("mse_playlist_received");
-      }
-
-      if (!initAppended) {
-        await this.#appendMediaSourceResource(
-          sourceBuffer,
-          playlist.initUrl,
-          player,
-          signal,
-          {
-            onFetched: () => reportStartup("mse_init_fetched"),
-            onAppended: () => reportStartup("mse_init_appended"),
-          },
-        );
-        initAppended = true;
-      }
-
-      let appendedNewSegment = false;
-      for (const segmentUrl of playlist.segmentUrls) {
-        if (appended.has(segmentUrl)) continue;
-        // One complete fragment is enough to establish the SourceBuffer. Once
-        // playback is paused, do not keep polling or downloading against a
-        // stationary playback clock; the play event resumes this same pump.
-        if (appended.size > 0 && player.paused) {
-          await waitForMediaSourcePlayback(player, signal);
-        }
-        while (bufferedSecondsAhead(sourceBuffer, player.currentTime)
-          >= MEDIA_SOURCE_BUFFER_AHEAD_SECONDS) {
-          await abortableDelay(250, signal);
-        }
-        const firstFragment = appended.size === 0;
-        await this.#appendMediaSourceResource(
-          sourceBuffer,
-          segmentUrl,
-          player,
-          signal,
-          firstFragment ? {
-            onFetched: () => reportStartup("mse_first_fragment_fetched"),
-            onAppended: () => reportStartup("mse_first_fragment_appended"),
-          } : undefined,
-        );
-        appended.add(segmentUrl);
-        appendedNewSegment = true;
-        await this.#pruneMediaSourceBuffer(sourceBuffer, player.currentTime, signal);
-      }
-
-      if (playlist.ended) {
-        if (sourceBuffer.updating) await waitForMediaEvent(sourceBuffer, "updateend", signal);
-        if (mediaSource.readyState === "open") mediaSource.endOfStream();
-        return;
-      }
-      if (appended.size > 0 && player.paused) {
-        await waitForMediaSourcePlayback(player, signal);
-      }
-      if (!appendedNewSegment) await abortableDelay(MEDIA_SOURCE_PLAYLIST_POLL_MS, signal);
-    }
-  }
-
-  async #appendMediaSourceResource(sourceBuffer, url, player, signal, observers = {}) {
-    const response = await fetch(url, {
-      cache: "no-store",
-      credentials: "same-origin",
-      signal,
-    });
-    if (!response.ok) throw new Error(`Media Source fragment returned HTTP ${response.status}.`);
-    const contentLength = Number(response.headers.get("content-length"));
-    if (contentLength > 32 * 1024 * 1024) throw new Error("Media Source fragment is too large.");
-    const bytes = await response.arrayBuffer();
-    if (bytes.byteLength === 0 || bytes.byteLength > 32 * 1024 * 1024) {
-      throw new Error("Media Source fragment has an invalid size.");
-    }
-    observers.onFetched?.();
-    try {
-      await sourceBufferOperation(sourceBuffer, () => sourceBuffer.appendBuffer(bytes), signal);
-    } catch (error) {
-      if (error?.name !== "QuotaExceededError") throw error;
-      await this.#pruneMediaSourceBuffer(sourceBuffer, player.currentTime, signal, true);
-      await sourceBufferOperation(sourceBuffer, () => sourceBuffer.appendBuffer(bytes), signal);
-    }
-    observers.onAppended?.();
-  }
-
-  async #pruneMediaSourceBuffer(sourceBuffer, currentTime, signal, required = false) {
-    const removeEnd = Math.max(0, currentTime - MEDIA_SOURCE_RETAIN_BEHIND_SECONDS);
-    if (!(removeEnd > 0) || sourceBuffer.buffered.length === 0) {
-      if (required) throw new DOMException("Media Source buffer is full.", "QuotaExceededError");
-      return;
-    }
-    const removeStart = sourceBuffer.buffered.start(0);
-    if (!(removeEnd > removeStart)) {
-      if (required) throw new DOMException("Media Source buffer is full.", "QuotaExceededError");
-      return;
-    }
-    await sourceBufferOperation(
-      sourceBuffer,
-      () => sourceBuffer.remove(removeStart, removeEnd),
-      signal,
-    );
   }
 
   #rebindPiPSourceSession(item, sessionId) {
@@ -2572,44 +2318,6 @@ export class PlaybackController {
     });
   }
 
-  #selectCaption(value) {
-    const sessionId = this.#store.getState().playback.sessionId;
-    this.#store.dispatch({ type: "PLAYBACK_AUX", sessionId, values: { selectedCaption: value } });
-    this.#applyCaptionMode(value);
-  }
-
-  #closeCaptionMenu({ restoreFocus = false } = {}) {
-    this.#dom.captionMenu.hidden = true;
-    this.#dom.captionsButton.setAttribute("aria-expanded", "false");
-    if (restoreFocus) this.#dom.captionsButton.focus();
-  }
-
-  #attachCaptions(item) {
-    for (const old of this.#dom.video.querySelectorAll("track")) old.remove();
-    for (const caption of item.captions || []) {
-      if (!caption.browser_supported || !caption.url) continue;
-      const track = document.createElement("track");
-      track.kind = "subtitles";
-      track.label = caption.label;
-      track.srclang = caption.language || "und";
-      track.src = caption.url;
-      track.dataset.captionIndex = String(caption.index);
-      this.#dom.video.append(track);
-    }
-    window.setTimeout(() => this.#applyCaptionMode(this.#store.getState().playback.selectedCaption), 0);
-  }
-
-  #applyCaptionMode(value) {
-    for (const track of this.#dom.video.textTracks || []) {
-      track.mode = "disabled";
-    }
-    const nodes = [...this.#dom.video.querySelectorAll("track")];
-    nodes.forEach((node, index) => {
-      const selected = value !== "off" && node.dataset.captionIndex === String(value);
-      if (this.#dom.video.textTracks[index]) this.#dom.video.textTracks[index].mode = selected ? "showing" : "disabled";
-    });
-  }
-
   #renderAudioTracks() {
     const { playback, server } = this.#store.getState();
     const key = `${playback.item?.id}:${playback.audioTracksStatus}:${playback.audioTracks.map((track) => `${track.index}-${track.language}-${track.title}`).join("|")}`;
@@ -2661,30 +2369,6 @@ export class PlaybackController {
       this.#dom.chapterMarkers.append(marker);
     }
     if (currentChapter) this.#dom.chapterControls.value = String(currentChapter.start_seconds);
-  }
-
-  #renderCaptions() {
-    const { playback } = this.#store.getState();
-    const captions = playback.item?.captions || [];
-    const key = `${playback.item?.id}:${playback.selectedCaption}:${captions.map((caption) => `${caption.index}-${caption.browser_supported}`).join("|")}`;
-    this.#dom.captionsButton.disabled = playback.item?.kind !== "video" || captions.length === 0;
-    this.#dom.captionsButton.setAttribute("aria-pressed", String(playback.selectedCaption !== "off"));
-    if (key === this.#captionRenderKey) return;
-    this.#captionRenderKey = key;
-    this.#dom.captionChoices.replaceChildren();
-    const choices = [{ index: "off", label: "Off", browser_supported: true }, ...captions];
-    for (const caption of choices) {
-      const label = document.createElement("label");
-      const radio = document.createElement("input");
-      radio.type = "radio";
-      radio.name = "caption-choice";
-      radio.value = String(caption.index);
-      radio.checked = String(caption.index) === String(playback.selectedCaption);
-      radio.disabled = !caption.browser_supported;
-      radio.addEventListener("change", () => this.#selectCaption(radio.value));
-      label.append(radio, document.createTextNode(caption.browser_supported ? caption.label : `${caption.label} (${caption.source_format?.toUpperCase()} is not supported in browsers)`));
-      this.#dom.captionChoices.append(label);
-    }
   }
 
   #renderEncodingPresets() {
@@ -3092,17 +2776,6 @@ export class PlaybackController {
       if (nativeVideoFullscreenActive(this.#dom.video)) this.#fullscreenEntered("native_video");
       else this.#fullscreenExited("native_video");
     });
-    this.#dom.captionsButton.addEventListener("click", () => {
-      const open = this.#dom.captionMenu.hidden;
-      this.#dom.captionMenu.hidden = !open;
-      this.#dom.captionsButton.setAttribute("aria-expanded", String(open));
-      if (open) this.#dom.captionChoices.querySelector("input:checked")?.focus();
-    });
-    document.addEventListener("pointerdown", (event) => {
-      if (!this.#dom.captionMenu.hidden
-        && !this.#dom.captionMenu.contains(event.target)
-        && !this.#dom.captionsButton.contains(event.target)) this.#closeCaptionMenu();
-    });
     this.#dom.audioTrackControls.addEventListener("change", () => this.#selectAudioTrack(Number(this.#dom.audioTrackControls.value)));
     this.#dom.audioTrackRetry.addEventListener("click", async () => {
       const enriched = await this.#enrichAudioTracks();
@@ -3248,7 +2921,7 @@ export class PlaybackController {
     if (event.key === "Escape") {
       if (!this.#dom.captionMenu.hidden) {
         event.preventDefault();
-        this.#closeCaptionMenu({ restoreFocus: true });
+        this.#captions.closeMenu({ restoreFocus: true });
         return;
       }
       if (currentFullscreenElement() === this.#dom.playerStage

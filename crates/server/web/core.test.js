@@ -8,6 +8,7 @@ import {
   audioDecodingConfiguration,
   audioTrackLabel,
   bufferedRangeSecondsAhead,
+  captionCueWindow,
   chooseSource,
   compatibleSegmentStart,
   clockLabel,
@@ -56,6 +57,18 @@ import {
 } from "./core.js";
 import { initialState, Store } from "./store.js";
 import { loadPreferences, progressDetails, progressSnapshot } from "./preferences.js";
+
+test("caption cue windows follow the source timeline and clip crossing cues", () => {
+  assert.deepEqual(captionCueWindow(90, 95, 0), { start: 90, end: 95 });
+  assert.deepEqual(captionCueWindow(90, 95, 90), { start: 0, end: 5 });
+  assert.deepEqual(captionCueWindow(89, 91, 90), { start: 0, end: 1 });
+  assert.deepEqual(captionCueWindow(91.25, 93.5, 90), { start: 1.25, end: 3.5 });
+  assert.equal(captionCueWindow(85, 90, 90), null);
+  assert.equal(captionCueWindow(0, 2, 90), null);
+  for (const args of [[NaN, 2, 0], [0, Infinity, 0], [0, 2, NaN], [0, 2, -1], [-1, 2, 0], [3, 2, 0], [2, 2, 0]]) {
+    assert.equal(captionCueWindow(...args), null);
+  }
+});
 
 test("processing labels describe actual streams rather than the selected playback policy", () => {
   const playback = { sourceMode: SOURCE_MODES.COMPATIBLE, item: { kind: "video", audio_codec: "aac" } };

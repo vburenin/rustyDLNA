@@ -683,6 +683,17 @@ path-jail failures return structured errors. Captions default to Off for each
 title. The selected caption survives source restarts for that title, while
 caption size and background remain browser-local preferences.
 
+Caption URLs use the full title's timestamps. When Compatible playback starts
+at a nonzero position, the browser shifts parsed cues to the source's local
+timeline before showing them. It drops cues that have already ended and clips
+a cue spanning the source start to local time zero, preserving its text,
+identifier, and positioning. Each source restart gets fresh tracks; delayed
+loads from an earlier source cannot change the current captions. This keeps
+deep links, saved resume, repeated seeks, and returns to Original playback in
+sync. `captions.js` owns these tracks and their selection; `player.js` supplies
+the source lifetime and timeline origin. Fragmented MediaSource delivery and
+buffer maintenance live in `media-source.js`.
+
 Audio language, title, channel count, codec, default disposition, and chapters
 are normally read from compact scan metadata. Legacy records can request a
 strict, helper-admitted one-item enrichment probe. The UI shows loading and a

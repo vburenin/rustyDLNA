@@ -159,6 +159,14 @@ export function doubleTapSeekDelta({
   return 0;
 }
 
+// Caption files use global title time; restarted compatible sources use a
+// local timeline. Drop expired cues and clip cues crossing the source start.
+export function captionCueWindow(start, end, segmentOffset = 0) {
+  if (![start, end, segmentOffset].every(Number.isFinite)
+    || start < 0 || end <= start || segmentOffset < 0 || end <= segmentOffset) return null;
+  return { start: Math.max(0, start - segmentOffset), end: end - segmentOffset };
+}
+
 export function compatibleSegmentStart(value, bucketSeconds = 10) {
   const target = Math.max(0, Math.floor(Number(value) || 0));
   const bucket = Math.max(1, Math.floor(Number(bucketSeconds) || 1));
