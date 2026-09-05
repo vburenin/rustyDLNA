@@ -326,6 +326,13 @@ random-access point; incomplete fragments are never exposed. The playlist
 gains an end marker only after the producer finishes and the cache file is
 published atomically.
 
+Publication preserves the generation's pinned output descriptor for playlist,
+fragment and range reads. Stopping and immediately restarting the same output
+waits up to two seconds for the cancelled producer to release its helper/GPU
+permits and finish cleanup; longer cleanup returns `503 transcode_busy`.
+New generations never attach to a producer whose cancellation has begun.
+Cancelling one session leaves a producer owned by other sessions usable.
+
 Apple mobile HLS uses the server-designated automatic fallback profile only
 when the saved quality is Auto; an explicit quality remains explicit. For an
 eligible HDR source and advertised HEVC Main 10 output, native Apple HLS tries
@@ -392,7 +399,13 @@ long-polled playlist; it does not repeatedly download and parse the complete
 movie history. Native HLS continues to advertise only independently decodable
 one-second keyframe-aligned segments. After Media Source has one
 playable fragment, pausing also suspends its playlist polling and media
-downloads until Play; the bounded generation heartbeat continues so resuming
+downloads until Play. An exact seek within a ten-second server bucket keeps
+its target pending until the corresponding fragment is buffered and the native
+media clock accepts that offset. A paused seek fetches only enough fragments
+to reach the target and stays paused; resumed and deep-linked starts apply the
+same offset before playback begins. Replacing the source discards its pending
+target. Seeking or deep-linking to the title's exact end shows Replay without
+opening a replacement bucket. The bounded generation heartbeat continues so resuming
 does not discard an otherwise healthy compatible stream. Playlist fetch,
 fragment fetch, and SourceBuffer failures use the same producer-status and
 codec/quality recovery policy as native media-element errors; a temporarily
@@ -701,8 +714,12 @@ retry action if that probe fails. Selecting a different audio track explains
 that Compatible playback is required. English-tagged audio (`eng`, `en`, and
 regional variants) is preferred over a non-English file default. In Auto mode,
 the player starts Compatible playback when necessary to enforce that choice;
-explicit Original mode keeps the file's original/default track. If no English
-tag is present, the marked default and existing codec fallback order are kept.
+explicit Original mode keeps and displays the file's original/default track.
+A successful metadata retry re-negotiates Auto or Prepared playback to apply
+the preferred audio track, preserving the title session, position, and pause
+intent. Explicit track choices survive later metadata updates, including when
+the chosen index was previously the default. If no English tag is present, the
+marked default and existing codec fallback order are kept.
 When transcoding is disabled, the track selector is disabled and no recovery,
 retry, quality, or audio-track action can start a Compatible request.
 

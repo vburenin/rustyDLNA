@@ -5,6 +5,7 @@
 //! already work.
 
 pub mod captions;
+pub mod class;
 pub mod client_cache;
 pub mod clients;
 pub mod date;

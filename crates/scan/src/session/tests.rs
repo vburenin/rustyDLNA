@@ -1466,3 +1466,60 @@ fn blocked_fill_probe_never_holds_the_live_writer() {
     assert_eq!(live.get_bookmark(detail_id).unwrap(), Some((77, 2)));
     assert_eq!(live.get_update_id().unwrap(), 88);
 }
+
+#[test]
+fn targeted_session_keeps_art_heavy_catalog_references_and_small_journals() {
+    let temp = TempPath::new("art-heavy-session");
+    let root = temp.join("media");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = root.join("source.mkv");
+    write_fake_mkv(&source, 64);
+    let cfg = ScanConfig {
+        media_dirs: vec![root.clone()],
+        db_path: Some(temp.join("files.db")),
+        types: MediaTypes::video_only(),
+        thumbnails: false,
+        ..Default::default()
+    };
+    scan(&cfg).unwrap();
+    let live = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+    // Seed unrelated persisted catalog entries without creating a large media
+    // fixture. A targeted update must retain every referenced artwork row.
+    live.connection()
+        .execute_batch(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < 2048)
+         INSERT INTO ALBUM_ART(PATH) SELECT 'synthetic-art-' || x FROM n;
+         INSERT INTO DETAILS(PATH, ALBUM_ART, MIME)
+         SELECT 'synthetic-media-' || ID, ID, 'video/x-matroska' FROM ALBUM_ART;",
+        )
+        .unwrap();
+    let mut session = ScanSession::new(&cfg).unwrap();
+    for name in ["new-a.mkv", "new-b.mkv"] {
+        let path = root.join(name);
+        std::fs::copy(&source, &path).unwrap();
+        let prepared = session
+            .prepare_monitor(std::slice::from_ref(&path), true)
+            .unwrap();
+        let stage = session.stage.as_ref().unwrap();
+        let counts = stage.scan_change_counts().unwrap();
+        assert_eq!(counts[0], 1, "only the changed media is journaled");
+        assert!(counts[1] <= 12, "unrelated objects must not be journaled");
+        assert_eq!(
+            stage
+                .connection()
+                .query_row("SELECT count(*) FROM ALBUM_ART", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2048
+        );
+        session.publish(prepared).unwrap();
+        assert_eq!(session.backup_count(), 1);
+        assert_eq!(
+            live.connection()
+                .query_row("SELECT count(*) FROM ALBUM_ART", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2048
+        );
+    }
+}

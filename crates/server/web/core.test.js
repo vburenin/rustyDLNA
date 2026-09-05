@@ -7,7 +7,10 @@ import {
   automaticCompatibleRecoveryProfile,
   audioDecodingConfiguration,
   audioTrackLabel,
+  initialCompatibleRecovery,
+  nextCompatibleRetry,
   bufferedRangeSecondsAhead,
+  bufferedSeekTarget,
   captionCueWindow,
   chooseSource,
   compatibleSegmentStart,
@@ -28,6 +31,7 @@ import {
   negotiateCompatibleStreams,
   originalAudioTrackIndex,
   originalDownloadUrl,
+  playbackAudioTrackIndex,
   playbackControlLabel,
   playbackProcessing,
   primaryVideoCodec,
@@ -1016,7 +1020,7 @@ test("audio enrichment adopts the newly discovered preferred track", () => {
   });
   assert.equal(store.getState().playback.selectedAudio, 2);
 
-  store.dispatch({ type: "PLAYBACK_AUX", sessionId: 4, values: { selectedAudio: 0 } });
+  store.dispatch({ type: "AUDIO_TRACK_SELECT", sessionId: 4, index: 0 });
   store.dispatch({
     type: "AUDIO_TRACKS_SUCCESS",
     sessionId: 4,
@@ -1141,4 +1145,44 @@ test("captions reset per title but survive playback source restarts", () => {
 
   store.dispatch({ type: "PLAYBACK_SELECT", sessionId: 3, item: second, duration: 100 });
   assert.equal(store.getState().playback.selectedCaption, "off");
+});
+
+test("compatible retry accounting persists across generations until an explicit reset", () => {
+  let recovery = initialCompatibleRecovery();
+  for (let sessionId = 1; sessionId <= 3; sessionId += 1) {
+    recovery = nextCompatibleRetry(recovery, { sessionId, now: sessionId });
+    assert.equal(recovery.retries, sessionId);
+    assert.equal(nextCompatibleRetry(recovery, { sessionId, now: sessionId }), recovery);
+    recovery = { ...recovery, pendingSession: null };
+  }
+  assert.equal(nextCompatibleRetry(recovery, { sessionId: 4, now: 4 }), null);
+  assert.equal(nextCompatibleRetry(initialCompatibleRecovery(), { sessionId: 5, now: 5 }).retries, 1);
+  const busy = nextCompatibleRetry(recovery, { sessionId: 4, busy: true, now: 10 });
+  assert.equal(busy.retries, 3);
+  assert.equal(nextCompatibleRetry(busy, { sessionId: 5, busy: true, now: 300_010 }), null);
+});
+
+test("exact buffered seeks wait for data beyond the requested point", () => {
+  assert.equal(bufferedSeekTarget([{ start: 0, end: 1 }], 7), false);
+  assert.equal(bufferedSeekTarget([{ start: 0, end: 7 }], 7), false);
+  assert.equal(bufferedSeekTarget([{ start: 0, end: 8 }], 7), true);
+  assert.equal(bufferedSeekTarget([{ start: 0, end: 1 }, { start: 6, end: 8 }], 7), true);
+  assert.equal(bufferedSeekTarget([{ start: 0, end: 1 }, { start: 8, end: 9 }], 7), false);
+});
+
+test("audio enrichment preserves an explicit default selection and reports Original accurately", () => {
+  const store = new Store(initialState({}, {}));
+  const tracks = [{ index: 7, language: "eng" }, { index: 3, default: true }];
+  const item = { id: "1", default_audio_index: 3, audio_tracks: tracks };
+  store.dispatch({ type: "PLAYBACK_SELECT", sessionId: 1, item });
+  store.dispatch({ type: "AUDIO_TRACK_SELECT", sessionId: 1, index: 3 });
+  store.dispatch({ type: "AUDIO_TRACKS_SUCCESS", sessionId: 1, item: { default_audio_index: 7 }, tracks: [...tracks].reverse() });
+  assert.equal(store.getState().playback.selectedAudio, 3);
+  store.dispatch({ type: "AUDIO_TRACK_SELECT", sessionId: 1, index: 7 });
+  assert.equal(playbackAudioTrackIndex({ ...store.getState().playback, sourceMode: SOURCE_MODES.ORIGINAL }), 3);
+  assert.equal(playbackAudioTrackIndex({ ...store.getState().playback, sourceMode: SOURCE_MODES.COMPATIBLE }), 7);
+  store.dispatch({ type: "PLAYBACK_SELECT", sessionId: 2, item });
+  store.dispatch({ type: "AUDIO_TRACKS_SUCCESS", sessionId: 1, item: { default_audio_index: 7 }, tracks });
+  assert.equal(store.getState().playback.selectedAudio, 3);
+  assert.equal(store.getState().playback.audioSelectionExplicit, false);
 });

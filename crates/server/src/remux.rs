@@ -16,7 +16,6 @@ use rusty_dlna_transcode::{
     write_cache_stamp_for_key, BrowserOutputOptions, RecodeAction, RemuxP8Error, RemuxP8Input,
     TranscodeCacheIdentity, TranscodePlan,
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::App;
 
@@ -280,6 +279,11 @@ pub struct RemuxJob {
     web_spec: Option<RemuxJobSpec>,
     cache_hit: bool,
     registry_finalized: AtomicBool,
+    /// All producer I/O, permit drops and registry cleanup have finished.
+    producer_finished: AtomicBool,
+    /// One descriptor survives staging publication and pathname replacement.
+    /// Reads use explicit offsets while holding its short synchronous lock.
+    output: Mutex<Option<Arc<Mutex<std::fs::File>>>>,
     startup_observations: WebStartupObservations,
     pub dest: PathBuf,
     pub part: PathBuf,
@@ -588,6 +592,26 @@ impl EphemeralCleanupScheduler {
 }
 
 impl RemuxJob {
+    fn open_output(&self) -> std::io::Result<Arc<Mutex<std::fs::File>>> {
+        let mut output = crate::lock_recover(&self.output);
+        if self.cancelled.load(Ordering::Acquire) || self.err().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "remux is unavailable",
+            ));
+        }
+        if let Some(file) = output.as_ref() {
+            return Ok(file.clone());
+        }
+        let file = std::fs::File::open(current_path(self))?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other("remux output is not a regular file"));
+        }
+        let file = Arc::new(Mutex::new(file));
+        *output = Some(file.clone());
+        Ok(file)
+    }
+
     fn add_web_request(&self, session_id: Option<u64>, request_id: Option<u64>) -> Option<u64> {
         let replaced = session_id
             .zip(request_id)
@@ -689,6 +713,7 @@ impl RemuxJob {
     }
 
     fn cancel(&self) {
+        let _deadline = crate::lock_recover(&self.disconnect_deadline);
         self.cancelled.store(true, Ordering::Release);
         self.changed.notify_waiters();
     }
@@ -787,12 +812,15 @@ impl RemuxJob {
         let expired = deadline.is_some_and(|deadline| Instant::now() >= deadline);
         if expired {
             *deadline = None;
+            self.cancelled.store(true, Ordering::Release);
+            self.changed.notify_waiters();
         }
         expired
     }
 }
 
 fn remove_ephemeral_output(app: &App, job: &RemuxJob) {
+    let _maintenance = crate::lock_recover(&app.cache_maintenance);
     let bytes = job
         .dest
         .metadata()
@@ -886,7 +914,17 @@ impl Drop for RemuxCompletionGuard {
                 .transition(RemuxState::Failed("remux worker panicked".into()));
             cleanup_intermediates(&self.job.part);
         }
+        if matches!(
+            self.job.state(),
+            RemuxState::Failed(_) | RemuxState::Cancelled
+        ) {
+            // Failure paths may have removed staging bytes after their last
+            // observer scan. Refresh before publishing cleanup completion.
+            let _ = enforce_active_cache_limits(&self.app);
+        }
         finish_job(&self.app, &self.job_key, &self.job);
+        self.job.producer_finished.store(true, Ordering::Release);
+        self.job.changed.notify_waiters();
     }
 }
 
@@ -1098,6 +1136,8 @@ fn spawn_ffmpeg(
         tracing::error!(id = id_err, %e, "remux thread spawn failed");
         job_err.transition(RemuxState::Failed(format!("thread: {e}")));
         finish_job(&app_err, &key_err, &job_err);
+        job_err.producer_finished.store(true, Ordering::Release);
+        job_err.changed.notify_waiters();
     }
 }
 
@@ -1386,7 +1426,17 @@ fn finalize_remux(
         )));
         return;
     }
-    if let Err(e) = std::fs::rename(part, dest) {
+    // Pin the output before publication, and serialize the rename with first
+    // opens. Readers keep this descriptor for their entire generation.
+    let opened = job.open_output();
+    let _maintenance = crate::lock_recover(&app.cache_maintenance);
+    let _publication = crate::lock_recover(&job.output);
+    if job.cancelled.load(Ordering::Acquire) {
+        cleanup_intermediates(part);
+        job.transition(RemuxState::Cancelled);
+        return;
+    }
+    if let Err(e) = opened.and_then(|_| std::fs::rename(part, dest)) {
         let msg = format!("remux rename: {e}");
         tracing::error!(id, dest = %dest.display(), "{msg}");
         job.transition(RemuxState::Failed(msg));
@@ -1394,9 +1444,8 @@ fn finalize_remux(
         return;
     }
     tracing::info!(id, dest = %dest.display(), bytes = n, "remux job done");
-    app.remux_metrics
-        .cache_bytes
-        .fetch_add(n, Ordering::Relaxed);
+    // The pre-publication scan already counted these staging bytes. Renaming
+    // under the maintenance lock changes neither their size nor their count.
     job.transition(RemuxState::Complete);
 }
 
@@ -1486,6 +1535,39 @@ fn attach_job(
     spec: RemuxJobSpec,
     register_client: bool,
 ) -> Result<Arc<RemuxJob>, String> {
+    let deadline = Instant::now() + WEB_SUPERSEDED_JOB_HANDOFF;
+    loop {
+        match attach_job_attempt(app.clone(), &spec, register_client)? {
+            RemuxAttachment::Ready(job) => return Ok(job),
+            RemuxAttachment::Retiring(job) => {
+                // Never hold the registry lock while the old worker observes
+                // cache pressure, reaps its helper, or cleans shared paths.
+                while !job.producer_finished.load(Ordering::Acquire) {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err("transcode busy (previous producer is stopping)".into());
+                    }
+                    std::thread::sleep(POLL.min(remaining));
+                }
+                // Recheck generation tombstones and the registry after waiting.
+                if Instant::now() >= deadline {
+                    return Err("transcode busy (previous producer is stopping)".into());
+                }
+            }
+        }
+    }
+}
+
+enum RemuxAttachment {
+    Ready(Arc<RemuxJob>),
+    Retiring(Arc<RemuxJob>),
+}
+
+fn attach_job_attempt(
+    app: Arc<App>,
+    spec: &RemuxJobSpec,
+    register_client: bool,
+) -> Result<RemuxAttachment, String> {
     let web = spec.job_key.starts_with("web:");
     let mut newer_generation = false;
     let mut superseded_producer = false;
@@ -1584,11 +1666,11 @@ fn attach_job(
         }
     }
     if let Some(job) = map.get(&spec.job_key) {
-        if job.err().is_none() {
+        let mut disconnect_deadline = crate::lock_recover(&job.disconnect_deadline);
+        if job.err().is_none() && !job.cancelled.load(Ordering::Acquire) {
+            let replaced = job.add_web_request(spec.web_session_id, spec.web_request_id);
             if new_web_generation || !web {
-                if let Some(replaced) =
-                    job.add_web_request(spec.web_session_id, spec.web_request_id)
-                {
+                if let Some(replaced) = replaced {
                     if Some(replaced) != spec.web_request_id {
                         record_recent_web_state(
                             app.as_ref(),
@@ -1627,9 +1709,16 @@ fn attach_job(
                 );
             }
             if register_client {
-                job.attach_client();
+                job.clients.fetch_add(1, Ordering::Relaxed);
+                job.ever_had_client.store(true, Ordering::Release);
+                job.client_epoch.fetch_add(1, Ordering::AcqRel);
+                *disconnect_deadline = None;
             }
-            return Ok(job.clone());
+            return Ok(RemuxAttachment::Ready(job.clone()));
+        }
+        drop(disconnect_deadline);
+        if !job.producer_finished.load(Ordering::Acquire) {
+            return Ok(RemuxAttachment::Retiring(job.clone()));
         }
         map.remove(&spec.job_key);
     }
@@ -1665,6 +1754,8 @@ fn attach_job(
             web_spec: web.then(|| spec.clone()),
             cache_hit: true,
             registry_finalized: AtomicBool::new(true),
+            producer_finished: AtomicBool::new(true),
+            output: Mutex::new(None),
             startup_observations: WebStartupObservations::default(),
             dest: spec.dest.clone(),
             part: cache_part(&spec.dest),
@@ -1679,13 +1770,16 @@ fn attach_job(
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
         });
+        job.open_output()
+            .map_err(|error| format!("open completed remux: {error}"))?;
         if register_client {
             job.attach_client();
             map.insert(spec.job_key.clone(), job.clone());
         }
-        return Ok(job);
+        return Ok(RemuxAttachment::Ready(job));
     }
     if spec.dest.is_file() {
+        let _maintenance = crate::lock_recover(&app.cache_maintenance);
         tracing::info!(
             id = spec.detail_id,
             dest = %spec.dest.display(),
@@ -1760,6 +1854,8 @@ fn attach_job(
         web_spec: web.then(|| spec.clone()),
         cache_hit: false,
         registry_finalized: AtomicBool::new(false),
+        producer_finished: AtomicBool::new(false),
+        output: Mutex::new(None),
         startup_observations: WebStartupObservations::default(),
         dest: spec.dest.clone(),
         part: part.clone(),
@@ -1781,13 +1877,13 @@ fn attach_job(
     drop(map);
     spawn_ffmpeg(
         app,
-        spec,
+        spec.clone(),
         job.clone(),
         helper_permit,
         job_permit,
         ai_upscale_permit,
     );
-    Ok(job)
+    Ok(RemuxAttachment::Ready(job))
 }
 
 fn browser_preparation_options(mut options: BrowserOutputOptions) -> BrowserOutputOptions {
@@ -1968,10 +2064,17 @@ pub(crate) fn web_job_produced_seconds(
             .find(|job| job.detail_id == detail_id && job.matches_web_request(request_id))
             .cloned()
     }?;
-    let complete = matches!(job.state(), RemuxState::Complete);
-    let path = if complete { &job.dest } else { &job.part };
+    // Small primary/preprocessing artifacts can still be replaced by portable
+    // fallback. Status polling must not pin those provisional bytes.
+    let state = job.state();
+    if !matches!(state, RemuxState::Growing | RemuxState::Complete) {
+        return None;
+    }
+    let complete = state == RemuxState::Complete;
+    let output = job.open_output().ok()?;
+    let mut file = crate::lock_recover(&output);
     let mut index = crate::lock_recover(&job.hls_index);
-    index.update(path, complete).ok()?;
+    index.update_file(&mut file, complete).ok()?;
     index.produced_duration_seconds()
 }
 
@@ -2157,24 +2260,19 @@ pub(crate) fn cancel_web_request(
     }
 }
 
-pub async fn wait_ready(job: &RemuxJob) -> Result<PathBuf, String> {
+pub async fn wait_ready(job: &Arc<RemuxJob>) -> Result<PathBuf, String> {
     let mut deadline = Instant::now() + FIRST_WAIT;
     loop {
         let notified = job.changed.notified();
         match job.state() {
             RemuxState::Complete => {
-                if job.dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                if current_len_async(job).await? > 0 {
                     return Ok(job.dest.clone());
                 }
                 return Err("completed remux is missing or empty".into());
             }
             RemuxState::Growing => {
-                if job
-                    .part
-                    .metadata()
-                    .map(|m| m.len() >= FIRST_BYTES)
-                    .unwrap_or(false)
-                {
+                if current_len_async(job).await? >= FIRST_BYTES {
                     return Ok(job.part.clone());
                 }
             }
@@ -2206,7 +2304,23 @@ pub async fn serve_remux(
     spec: RemuxJobSpec,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let head = req.method.eq_ignore_ascii_case("HEAD");
-    let job = match attach_for_client(app.clone(), spec.clone()) {
+    let attach_app = app.clone();
+    let attach_spec = spec.clone();
+    // Admission may wait for a cancelled producer's bounded cleanup handoff.
+    // Keep it off the asynchronous socket worker, including cache filesystem I/O.
+    let attached = tokio::task::spawn_blocking(move || {
+        let job = attach_for_client(attach_app.clone(), attach_spec.clone())?;
+        // If the awaiting request disappears during admission, dropping the
+        // blocking task's result must still release its newly registered reader.
+        Ok::<_, String>(RemuxClient {
+            app: attach_app,
+            job,
+            job_key: attach_spec.job_key,
+            continue_after_disconnect: attach_spec.continue_after_disconnect,
+        })
+    })
+    .await?;
+    let _client = match attached {
         Ok(j) => j,
         Err(e) => {
             if e == WEB_REQUEST_CANCELLED {
@@ -2246,13 +2360,8 @@ pub async fn serve_remux(
             return Ok(());
         }
     };
-    let _client = RemuxClient {
-        app: app.clone(),
-        job: job.clone(),
-        job_key: spec.job_key.clone(),
-        continue_after_disconnect: spec.continue_after_disconnect,
-    };
-    let path = match wait_ready(&job).await {
+    let job = _client.job.clone();
+    let _path = match wait_ready(&job).await {
         Ok(p) => p,
         Err(e) => {
             let cancelled = e == REMUX_CANCELLED;
@@ -2315,11 +2424,9 @@ pub async fn serve_remux(
         }
         _ => {}
     }
-    let finished = path == job.dest
-        && job.dest.is_file()
-        && job.dest.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    let finished = job.is_complete() && current_len_async(&job).await? > 0;
     if finished {
-        return serve_finished(app, sock, req, &job.dest, spec.mime, head).await;
+        return serve_finished(app, sock, req, &job, spec.mime, head).await;
     }
     serve_growing(app, sock, req, &job, spec.mime, head).await
 }
@@ -2426,10 +2533,16 @@ async fn serve_fragment_playlist(
             _ => {}
         }
         let complete = job.is_complete();
-        let path = current_path(job);
-        let indexed = {
-            let mut index = crate::lock_recover(&job.hls_index);
-            index.update(&path, complete).and_then(|()| {
+        let index_job = job.clone();
+        let init_uri = init_uri.clone();
+        let segment_uri = segment_uri.clone();
+        let indexed = tokio::task::spawn_blocking(move || {
+            let output = index_job
+                .open_output()
+                .map_err(|error| format!("open HLS media: {error}"))?;
+            let mut file = crate::lock_recover(&output);
+            let mut index = crate::lock_recover(&index_job.hls_index);
+            index.update_file(&mut file, complete).and_then(|()| {
                 if media_source {
                     index
                         .has_mse_fragments_after(mse_after, complete)
@@ -2447,7 +2560,8 @@ async fn serve_fragment_playlist(
                         .transpose()
                 }
             })
-        };
+        })
+        .await?;
         match indexed {
             Ok(Some(playlist)) => break playlist,
             Ok(None) if !complete && Instant::now() < deadline => {
@@ -2588,7 +2702,7 @@ async fn serve_hls_resource(
         crate::socket_write_http_response(app, sock, &response).await?;
         return Ok(());
     }
-    if current_len(job) < slice_end {
+    if current_len_async(job).await? < slice_end {
         return Err("HLS resource is outside the compatible output".into());
     }
     let range = match req.header("Range") {
@@ -2640,8 +2754,7 @@ async fn serve_hls_resource(
     if !crate::socket_write_http_response(app, sock, &response).await? {
         return Ok(());
     }
-    let path = current_path(job);
-    if let Err(error) = crate::stream_file_range(app, sock, &path, start, end).await {
+    if let Err(error) = stream_growing(app, sock, job, start, Some(end)).await {
         if job.state() == RemuxState::Cancelled {
             tracing::debug!(
                 id = job.detail_id,
@@ -2651,7 +2764,7 @@ async fn serve_hls_resource(
             );
             return Ok(());
         }
-        return Err(error.into());
+        return Err(error);
     }
     Ok(())
 }
@@ -2783,14 +2896,18 @@ async fn serve_finished(
     app: &App,
     sock: &mut tokio::net::TcpStream,
     req: &HttpRequest,
-    dest: &Path,
+    job: &Arc<RemuxJob>,
     mime: &str,
     head: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let size = dest.metadata()?.len();
-    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(dest) {
+    let metadata_job = job.clone();
+    let size = tokio::task::spawn_blocking(move || {
+        let output = metadata_job.open_output()?;
+        let file = crate::lock_recover(&output);
         let _ = file.set_modified(std::time::SystemTime::now());
-    }
+        file.metadata().map(|metadata| metadata.len())
+    })
+    .await??;
     let range = match req.header("Range") {
         None => None,
         Some(v) => match parse_byte_range(v, size) {
@@ -2833,7 +2950,7 @@ async fn serve_finished(
     if !crate::socket_write_http_response(app, sock, &resp).await? {
         return Ok(());
     }
-    crate::stream_file_range(app, sock, dest, start, end).await?;
+    stream_growing(app, sock, job, start, Some(end)).await?;
     Ok(())
 }
 
@@ -2898,7 +3015,7 @@ async fn serve_growing(
         crate::socket_write_http_response(app, sock, &resp).await?;
         return Ok(());
     }
-    let have = current_len(job);
+    let have = current_len_async(job).await?;
     if start >= have {
         let mut resp = HttpResponse::html(
             416,
@@ -2941,6 +3058,12 @@ async fn serve_open_growing(
 }
 
 fn current_len(job: &RemuxJob) -> u64 {
+    if let Some(output) = crate::lock_recover(&job.output).as_ref() {
+        return crate::lock_recover(output)
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
+    }
     if job.dest.is_file() {
         return job.dest.metadata().map(|m| m.len()).unwrap_or(0);
     }
@@ -2955,7 +3078,14 @@ fn current_path(job: &RemuxJob) -> PathBuf {
     }
 }
 
-async fn wait_offset(job: &RemuxJob, need: u64) -> Result<(), String> {
+async fn current_len_async(job: &Arc<RemuxJob>) -> Result<u64, String> {
+    let job = job.clone();
+    tokio::task::spawn_blocking(move || current_len(&job))
+        .await
+        .map_err(|error| format!("remux metadata task: {error}"))
+}
+
+async fn wait_offset(job: &Arc<RemuxJob>, need: u64) -> Result<(), String> {
     let deadline = Instant::now() + FIRST_WAIT;
     loop {
         let notified = job.changed.notified();
@@ -2966,7 +3096,8 @@ async fn wait_offset(job: &RemuxJob, need: u64) -> Result<(), String> {
         if state == RemuxState::Cancelled {
             return Err(REMUX_CANCELLED.into());
         }
-        if current_len(job) >= need || state == RemuxState::Complete && current_len(job) > 0 {
+        let len = current_len_async(job).await?;
+        if len >= need || state == RemuxState::Complete && len > 0 {
             return Ok(());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -2983,90 +3114,74 @@ async fn stream_growing(
     start: u64,
     end: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut path = current_path(job);
-    let mut f = match tokio::fs::File::open(&path).await {
+    let open_job = job.clone();
+    let output = match tokio::task::spawn_blocking(move || open_job.open_output()).await? {
         Ok(file) => file,
-        Err(_) if job.web && job.state() == RemuxState::Cancelled => {
-            tracing::debug!(
-                id = job.detail_id,
-                dest = %path.display(),
-                "superseded compatible media stream closed during cleanup"
-            );
-            return Ok(());
-        }
+        Err(_) if job.web && job.cancelled.load(Ordering::Acquire) => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    f.seek(std::io::SeekFrom::Start(start)).await?;
     let mut pos = start;
     let mut buf = vec![0u8; 64 * 1024];
     let mut sent = 0u64;
     loop {
         let notified = job.changed.notified();
-        if let Some(e) = end {
-            if pos > e {
-                break;
-            }
-        }
-        if let Some(err) = job.err() {
-            if sent == 0 {
-                if job.web && err == REMUX_CANCELLED {
-                    tracing::debug!(
-                        id = job.detail_id,
-                        dest = %path.display(),
-                        "superseded compatible media stream cancelled before response bytes"
-                    );
-                    return Ok(());
-                }
-                tracing::error!(dest = %path.display(), "{err}");
-                return Err(err.into());
-            }
+        if end.is_some_and(|end| pos > end) {
             break;
         }
-        let size = match std::fs::metadata(&path) {
-            Ok(m) => m.len(),
-            Err(_) => {
-                let next = current_path(job);
-                if next != path && next.is_file() {
-                    path = next;
-                    f = tokio::fs::File::open(&path).await?;
-                    f.seek(std::io::SeekFrom::Start(pos)).await?;
-                    continue;
-                }
-                if job.is_complete() {
-                    break;
-                }
+        if let Some(err) = job.err() {
+            if sent == 0 && !(job.web && err == REMUX_CANCELLED) {
+                return Err(err.into());
+            }
+            return Ok(());
+        }
+        let complete = job.is_complete();
+        let read_output = output.clone();
+        let (returned, got, size) = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = crate::lock_recover(&read_output);
+            let size = file.metadata()?.len();
+            let available = size.saturating_sub(pos);
+            let want = end.map_or(available, |end| {
+                end.saturating_sub(pos).saturating_add(1).min(available)
+            });
+            let count = usize::try_from(want.min(buf.len() as u64)).unwrap_or(buf.len());
+            let got = if count == 0 {
                 0
-            }
-        };
-        if pos < size {
-            let want = match end {
-                Some(e) => (e + 1).saturating_sub(pos).min(size - pos),
-                None => size - pos,
+            } else {
+                file.seek(SeekFrom::Start(pos))?;
+                file.read(&mut buf[..count])?
             };
-            let n = std::cmp::min(buf.len(), want as usize);
-            let got = f.read(&mut buf[..n]).await?;
-            if got == 0 {
-                notified.await;
-                continue;
-            }
-            if let Err(e) = crate::socket_write_all(app, sock, &buf[..got]).await {
+            Ok::<_, std::io::Error>((buf, got, size))
+        })
+        .await??;
+        buf = returned;
+        if got > 0 {
+            if let Err(error) = crate::socket_write_all(app, sock, &buf[..got]).await {
                 if sent == 0 {
-                    tracing::error!(dest = %path.display(), %e, "client dropped before remux bytes");
-                    return Err(e.into());
+                    return Err(error.into());
                 }
                 return Ok(());
             }
-            pos += got as u64;
-            sent += got as u64;
+            pos = pos.saturating_add(got as u64);
+            sent = sent.saturating_add(got as u64);
             continue;
         }
-        if job.is_complete() || job.dest.is_file() && pos >= current_len(job) {
+        if pos < size || complete && end.is_some_and(|end| pos <= end) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "remux output ended before its promised range",
+            )
+            .into());
+        }
+        if complete {
             break;
         }
+        if job.is_complete() {
+            // Publication may have raced this read's size snapshot. Read the
+            // pinned descriptor once more before accepting complete EOF.
+            continue;
+        }
         notified.await;
-    }
-    if sent == 0 {
-        tracing::error!(dest = %path.display(), "remux stream sent 0 bytes");
     }
     Ok(())
 }
@@ -3269,6 +3384,8 @@ mod tests {
             web_spec: None,
             cache_hit: false,
             registry_finalized: AtomicBool::new(true),
+            producer_finished: AtomicBool::new(true),
+            output: Mutex::new(None),
             startup_observations: WebStartupObservations::default(),
             dest,
             part: dir.join(format!("{id}.mp4.part")),
@@ -3298,6 +3415,8 @@ mod tests {
             web_spec: None,
             cache_hit: false,
             registry_finalized: AtomicBool::new(false),
+            producer_finished: AtomicBool::new(true),
+            output: Mutex::new(None),
             startup_observations: WebStartupObservations::default(),
             dest: dir.join(format!("growing-{id}.mp4")),
             part,
@@ -3748,6 +3867,8 @@ mod tests {
             web_spec: None,
             cache_hit: false,
             registry_finalized: AtomicBool::new(false),
+            producer_finished: AtomicBool::new(true),
+            output: Mutex::new(None),
             startup_observations: WebStartupObservations::default(),
             dest: dest.clone(),
             part: part.clone(),
@@ -4054,6 +4175,8 @@ mod tests {
             web_spec: None,
             cache_hit: false,
             registry_finalized: AtomicBool::new(false),
+            producer_finished: AtomicBool::new(true),
+            output: Mutex::new(None),
             startup_observations: WebStartupObservations::default(),
             dest: protected_dest,
             part: protected_part.clone(),
@@ -4164,6 +4287,8 @@ mod tests {
             web_spec: None,
             cache_hit: false,
             registry_finalized: AtomicBool::new(false),
+            producer_finished: AtomicBool::new(true),
+            output: Mutex::new(None),
             startup_observations: WebStartupObservations::default(),
             dest,
             part: part.clone(),
@@ -4225,6 +4350,8 @@ mod tests {
             web_spec: None,
             cache_hit: false,
             registry_finalized: AtomicBool::new(false),
+            producer_finished: AtomicBool::new(true),
+            output: Mutex::new(None),
             startup_observations: WebStartupObservations::default(),
             dest,
             part,
@@ -4380,6 +4507,8 @@ mod tests {
             web_spec: None,
             cache_hit: false,
             registry_finalized: AtomicBool::new(false),
+            producer_finished: AtomicBool::new(true),
+            output: Mutex::new(None),
             startup_observations: WebStartupObservations::default(),
             dest: dest.clone(),
             part,
@@ -4429,8 +4558,9 @@ mod tests {
 
         let dir = temp_dir("head-wire");
         let app = test_app(&dir, 1);
-        let dest = dir.join("finished.mp4");
-        std::fs::write(&dest, b"finished-transcode-bytes").unwrap();
+        let finished_job = growing_test_job(&dir, 44, b"finished-transcode-bytes");
+        std::fs::rename(&finished_job.part, &finished_job.dest).unwrap();
+        finished_job.transition(RemuxState::Complete);
         let finished_req = HttpRequest::parse_headers(
             "HEAD /Transcode/42.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nRange: bytes=0-7\r\n\r\n",
         )
@@ -4438,14 +4568,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server_app = app.clone();
-        let server_dest = dest.clone();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             serve_finished(
                 &server_app,
                 &mut socket,
                 &finished_req,
-                &server_dest,
+                &finished_job,
                 "video/mp4",
                 true,
             )
@@ -5337,6 +5466,8 @@ mod tests {
             web_spec: None,
             cache_hit: false,
             registry_finalized: AtomicBool::new(false),
+            producer_finished: AtomicBool::new(true),
+            output: Mutex::new(None),
             startup_observations: WebStartupObservations::default(),
             dest: dir.join("idle.mp4"),
             part: dir.join("idle.mp4.part"),
@@ -5460,5 +5591,528 @@ mod tests {
         let cancelled = AtomicBool::new(false);
         assert!(verify_finished_output(&corrupt, Duration::from_secs(2), &cancelled).is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn same_key_restart_must_not_reuse_cancelled_producer() {
+        let dir = temp_dir("review-same-key-restart");
+        let app = test_app(&dir, 1);
+        let mut first = job_spec(&dir, "review-restart", vec!["sleep".into(), "30".into()]);
+        first.job_key = "web:42:review-restart".into();
+        first.web_session_id = Some(9);
+        first.web_request_id = Some(77);
+        first.continue_after_disconnect = false;
+        let mut second = first.clone();
+        second.web_request_id = Some(78);
+        let first_job = attach_started_long_running_job(app.clone(), first);
+        assert!(cancel_web_request(&app, 42, Some(9), 77));
+        let second_job = attach_for_client(app.clone(), second).unwrap();
+        let reused = Arc::ptr_eq(&first_job, &second_job);
+        let cancelled = second_job.cancelled.load(Ordering::Acquire);
+        second_job.cancel();
+        wait_for_terminal_cleanup(&app, &second_job);
+        assert!(
+            !reused && !cancelled,
+            "new request reused cancelled producer: reused={reused}, cancelled={cancelled}"
+        );
+    }
+
+    #[test]
+    fn finished_cache_bytes_must_equal_actual_output() {
+        let dir = temp_dir("review-cache-accounting");
+        let app = test_app(&dir, 1);
+        let key = "b".repeat(64);
+        let mut spec = job_spec(&dir, &key, Vec::new());
+        spec.dest = rusty_dlna_transcode::cache_dest_for_key(&dir, 42, RecodeAction::Hdr10, &key);
+        spec.args = vec![
+            "cp".into(),
+            spec.src.as_os_str().to_owned(),
+            cache_part(&spec.dest).into_os_string(),
+        ];
+        let job = attach(app.clone(), spec).unwrap();
+        wait_for_terminal_cleanup(&app, &job);
+        assert_eq!(job.state(), RemuxState::Complete);
+        let bytes = job.dest.metadata().unwrap().len();
+        assert_eq!(app.remux_metrics.cache_bytes.load(Ordering::Relaxed), bytes);
+    }
+
+    #[test]
+    fn growing_file_open_survives_atomic_publication() {
+        use tokio::io::AsyncReadExt;
+        for mode in ["full", "range", "fragment", "playlist"] {
+            let dir = temp_dir("growing-rename");
+            let app = test_app(&dir, 1);
+            let bytes = hls::tests::fixture();
+            let job = growing_test_job(&dir, 73, &bytes);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let connect = tokio::net::TcpStream::connect(listener.local_addr().unwrap());
+                let (client, accepted) = tokio::join!(connect, listener.accept());
+                let mut client = client.unwrap();
+                let (mut socket, _) = accepted.unwrap();
+                let (release, wait_release) = std::sync::mpsc::channel();
+                let (started, wait_started) = tokio::sync::oneshot::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    wait_release.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+                wait_started.await.unwrap();
+                {
+                    let stream = async {
+                        match mode {
+                            "range" => stream_growing(&app, &mut socket, &job, 6, Some(13)).await,
+                            "fragment" => {
+                                let req = HttpRequest::parse_headers(
+                                    "GET /web/media/73.m4s?delivery=mse_segment&hls_offset=6&hls_length=8 HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=1-4\r\n\r\n",
+                                ).unwrap();
+                                serve_hls_resource(&app, &mut socket, &req, &job, "video/iso.segment", false).await
+                            }
+                            "playlist" => {
+                                let req = HttpRequest::parse_headers(
+                                    "GET /web/media/73.m3u8?delivery=hls HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                                ).unwrap();
+                                serve_fragment_playlist(&app, &mut socket, &req, &job, false, false).await
+                            }
+                            _ => stream_growing(&app, &mut socket, &job, 0, None).await,
+                        }
+                    };
+                    tokio::pin!(stream);
+                    tokio::select! {
+                        result = &mut stream => panic!("file open unexpectedly finished: {result:?}"),
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+                    }
+                    std::fs::rename(&job.part, &job.dest).unwrap();
+                    job.transition(RemuxState::Complete);
+                    release.send(()).unwrap();
+                    blocker.await.unwrap();
+                    stream.await.unwrap();
+                }
+                drop(socket);
+                let mut received = Vec::new();
+                client.read_to_end(&mut received).await.unwrap();
+                match mode {
+                    "full" => assert_eq!(received, bytes),
+                    "range" => assert_eq!(received, bytes[6..14]),
+                    "fragment" => assert_eq!(wire_body(&received), &bytes[7..11]),
+                    "playlist" => {
+                        let playlist = std::str::from_utf8(wire_body(&received)).unwrap();
+                        assert!(playlist.contains("#EXTINF:"));
+                        assert!(playlist.contains("delivery=hls_segment"));
+                    }
+                    _ => unreachable!(),
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn same_key_handoff_waits_for_term_cleanup_and_gpu_permits() {
+        for disconnect in [false, true] {
+            let dir = temp_dir("same-key-cleanup");
+            let app = test_app(&dir, 1);
+            let mut first = job_spec(&dir, "same-key-cleanup", Vec::new());
+            first.job_key = "web:42:same-key-cleanup".into();
+            first.web_session_id = Some(9);
+            first.web_request_id = Some(77);
+            first.cacheable = false;
+            first.continue_after_disconnect = false;
+            first.ai_upscale_shader_file = Some(Arc::new(std::fs::File::open(&first.src).unwrap()));
+            let key = first.job_key.clone();
+            let mut second = first.clone();
+            second.web_request_id = Some(78);
+            second.args = vec![
+                "cp".into(),
+                second.src.as_os_str().to_owned(),
+                cache_part(&second.dest).into_os_string(),
+            ];
+            let first_job = attach_started_long_running_job(app.clone(), first);
+            if disconnect {
+                first_job.detach_client(
+                    app.clone(),
+                    key.clone(),
+                    false,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                );
+                wait_until(Duration::from_secs(2), || {
+                    first_job.cancelled.load(Ordering::Acquire)
+                });
+            } else {
+                assert!(cancel_web_request(&app, 42, Some(9), 77));
+            }
+            let second_job = attach_for_client(app.clone(), second).unwrap();
+            assert!(!Arc::ptr_eq(&first_job, &second_job));
+            assert!(first_job.producer_finished.load(Ordering::Acquire));
+            wait_until(Duration::from_secs(3), || {
+                second_job.producer_finished.load(Ordering::Acquire)
+            });
+            assert_eq!(second_job.state(), RemuxState::Complete);
+            assert_eq!(std::fs::read(&second_job.dest).unwrap(), b"source bytes");
+            assert_eq!(app.jobs.in_use(), 0);
+            assert_eq!(app.ai_upscale_jobs.in_use(), 0);
+            // A stale owner's final registry removal/detach cannot claim the
+            // replacement's entry or unlink its output.
+            remove_job(&app, &key, &first_job);
+            if !disconnect {
+                first_job.detach_client(
+                    app.clone(),
+                    key.clone(),
+                    false,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                );
+            }
+            assert!(Arc::ptr_eq(
+                crate::lock_recover(&app.remuxes).get(&key).unwrap(),
+                &second_job
+            ));
+            assert_eq!(std::fs::read(&second_job.dest).unwrap(), b"source bytes");
+            second_job.detach_client(app.clone(), key, false, Duration::ZERO, Duration::ZERO);
+            sweep_ephemeral_cleanups(&app, Instant::now(), true);
+            assert!(crate::lock_recover(&app.remuxes).is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopping_same_key_returns_bounded_busy_without_blocking_socket_runtime() {
+        use tokio::io::AsyncReadExt;
+        let dir = temp_dir("same-key-busy");
+        let app = test_app(&dir, 1);
+        let job = growing_test_job(&dir, 42, b"old output");
+        job.cancel();
+        job.producer_finished.store(false, Ordering::Release);
+        let mut spec = job_spec(&dir, "same-key-busy", vec!["false".into()]);
+        spec.job_key = "web:42:same-key-busy".into();
+        crate::lock_recover(&app.remuxes).insert(spec.job_key.clone(), job.clone());
+        let req =
+            HttpRequest::parse_headers("GET /web/media/42.mp4 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_app = app.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            serve_remux(&server_app, &mut socket, &req, spec)
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "handoff blocked the socket runtime"
+        );
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        assert!(std::str::from_utf8(&response)
+            .unwrap()
+            .contains("503 Service Unavailable"));
+        job.producer_finished.store(true, Ordering::Release);
+        crate::lock_recover(&app.remuxes).clear();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pinned_output_survives_final_replacement_and_parallel_ranges() {
+        let dir = temp_dir("pinned-replacement");
+        let app = test_app(&dir, 1);
+        let original: Vec<u8> = (0..200).collect();
+        let job = growing_test_job(&dir, 42, &original);
+        job.open_output().unwrap();
+        std::fs::rename(&job.part, &job.dest).unwrap();
+        job.transition(RemuxState::Complete);
+        let replacement = dir.join("replacement");
+        std::fs::write(&replacement, b"unrelated replacement output").unwrap();
+        std::fs::rename(&replacement, &job.dest).unwrap();
+        let mut readers = tokio::task::JoinSet::new();
+        for start in 0..20 {
+            let app = app.clone();
+            let job = job.clone();
+            let expected = original[start..start + 40].to_vec();
+            readers.spawn(async move {
+                let request = format!("GET /Transcode/42.mp4 HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes={start}-{}\r\n\r\n", start + 39);
+                let response = growing_wire(app, job, &request, false).await;
+                assert_eq!(wire_body(&response), expected);
+            });
+        }
+        while let Some(result) = readers.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&job.dest).unwrap(),
+            b"unrelated replacement output"
+        );
+    }
+
+    #[test]
+    fn failed_publication_and_cancelled_output_do_not_reopen_other_paths() {
+        let dir = temp_dir("failed-publication");
+        let app = test_app(&dir, 1);
+        let job = growing_test_job(&dir, 42, b"staging");
+        job.open_output().unwrap();
+        std::fs::create_dir(&job.dest).unwrap();
+        finalize_remux(
+            &app,
+            &job,
+            42,
+            &job.dest,
+            &job.part,
+            Duration::from_secs(1),
+            false,
+        );
+        assert!(matches!(job.state(), RemuxState::Failed(_)));
+        assert!(!job.part.exists());
+        assert!(job.open_output().is_err());
+        let other = growing_test_job(&dir, 43, b"cancelled staging");
+        other.cancel();
+        finalize_remux(
+            &app,
+            &other,
+            43,
+            &other.dest,
+            &other.part,
+            Duration::from_secs(1),
+            false,
+        );
+        assert_eq!(other.state(), RemuxState::Cancelled);
+        std::fs::write(&other.dest, b"other generation").unwrap();
+        assert!(other.open_output().is_err());
+        assert_eq!(std::fs::read(&other.dest).unwrap(), b"other generation");
+    }
+
+    #[test]
+    fn cache_gauge_tracks_concurrent_completion_failure_and_ephemeral_expiry() {
+        let dir = temp_dir("cache-gauge-lifecycle");
+        let app = test_app(&dir, 3);
+        let existing = dir.join(format!("40-hdr10-{}.mp4", "a".repeat(64)));
+        std::fs::write(&existing, vec![0u8; 600]).unwrap();
+        let mut jobs = Vec::new();
+        for (id, fill) in [(41, 'b'), (42, 'c')] {
+            let key = fill.to_string().repeat(64);
+            let mut spec = job_spec(&dir, &key, Vec::new());
+            spec.dest =
+                rusty_dlna_transcode::cache_dest_for_key(&dir, id, RecodeAction::Hdr10, &key);
+            spec.args = vec![
+                "cp".into(),
+                spec.src.as_os_str().to_owned(),
+                cache_part(&spec.dest).into_os_string(),
+            ];
+            jobs.push(attach(app.clone(), spec).unwrap());
+        }
+        let maintenance_app = app.clone();
+        let maintenance = std::thread::spawn(move || {
+            for _ in 0..10 {
+                enforce_active_cache_limits(&maintenance_app).unwrap();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        for job in &jobs {
+            wait_until(Duration::from_secs(3), || {
+                job.producer_finished.load(Ordering::Acquire)
+            });
+            assert_eq!(job.state(), RemuxState::Complete);
+        }
+        maintenance.join().unwrap();
+        let expected = 600
+            + jobs
+                .iter()
+                .map(|job| job.dest.metadata().unwrap().len())
+                .sum::<u64>();
+        assert_eq!(runtime_status(&app).cache_bytes, expected);
+
+        let key = "d".repeat(64);
+        let mut failed = job_spec(&dir, &key, Vec::new());
+        failed.dest = rusty_dlna_transcode::cache_dest_for_key(&dir, 43, RecodeAction::Hdr10, &key);
+        failed.args = vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "dd if=/dev/zero of=\"$1\" bs={FIRST_BYTES} count=1 2>/dev/null; sleep 0.3; exit 1"
+            )
+            .into(),
+            "failed-producer".into(),
+            cache_part(&failed.dest).into_os_string(),
+        ];
+        let failed_job = attach(app.clone(), failed).unwrap();
+        wait_until(Duration::from_secs(3), || {
+            failed_job.state() == RemuxState::Growing
+        });
+        assert_eq!(runtime_status(&app).cache_bytes, expected + FIRST_BYTES);
+        wait_until(Duration::from_secs(3), || {
+            failed_job.producer_finished.load(Ordering::Acquire)
+        });
+        assert!(matches!(failed_job.state(), RemuxState::Failed(_)));
+        assert_eq!(runtime_status(&app).cache_bytes, expected);
+
+        let key = "e".repeat(64);
+        let mut ephemeral = job_spec(&dir, &key, Vec::new());
+        ephemeral.job_key = "web:44:ephemeral-gauge".into();
+        ephemeral.web_session_id = Some(9);
+        ephemeral.web_request_id = Some(77);
+        ephemeral.cacheable = false;
+        ephemeral.dest =
+            rusty_dlna_transcode::cache_dest_for_key(&dir, 44, RecodeAction::Hdr10, &key);
+        ephemeral.args = vec![
+            "cp".into(),
+            ephemeral.src.as_os_str().to_owned(),
+            cache_part(&ephemeral.dest).into_os_string(),
+        ];
+        let ephemeral_key = ephemeral.job_key.clone();
+        let ephemeral_job = attach_for_client(app.clone(), ephemeral).unwrap();
+        wait_until(Duration::from_secs(3), || {
+            ephemeral_job.producer_finished.load(Ordering::Acquire)
+        });
+        assert_eq!(runtime_status(&app).cache_bytes, expected + 12);
+        ephemeral_job.detach_client(
+            app.clone(),
+            ephemeral_key,
+            false,
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        sweep_ephemeral_cleanups(&app, Instant::now(), true);
+        assert_eq!(runtime_status(&app).cache_bytes, expected);
+
+        let key = "f".repeat(64);
+        let mut rename_failure = job_spec(&dir, &key, Vec::new());
+        rename_failure.dest =
+            rusty_dlna_transcode::cache_dest_for_key(&dir, 45, RecodeAction::Hdr10, &key);
+        std::fs::create_dir(&rename_failure.dest).unwrap();
+        rename_failure.args = vec![
+            "cp".into(),
+            rename_failure.src.as_os_str().to_owned(),
+            cache_part(&rename_failure.dest).into_os_string(),
+        ];
+        let failed_job = attach(app.clone(), rename_failure).unwrap();
+        wait_until(Duration::from_secs(3), || {
+            failed_job.producer_finished.load(Ordering::Acquire)
+        });
+        assert!(matches!(failed_job.state(), RemuxState::Failed(_)));
+        assert!(!failed_job.part.exists());
+        assert_eq!(runtime_status(&app).cache_bytes, expected);
+    }
+
+    #[test]
+    fn output_cursor_contention_does_not_block_socket_runtime() {
+        let dir = temp_dir("pinned-cursor-contention");
+        let job = growing_test_job(&dir, 42, b"output");
+        let output = job.open_output().unwrap();
+        let (locked, acquired) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _cursor = crate::lock_recover(&output);
+            locked.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(3)).unwrap();
+        });
+        acquired.recv_timeout(Duration::from_secs(1)).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut metadata = tokio::spawn(async move { current_len_async(&job).await });
+            let started = Instant::now();
+            tokio::select! {
+                _ = &mut metadata => panic!("metadata unexpectedly acquired the held cursor"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+            }
+            assert!(started.elapsed() < Duration::from_millis(500));
+            release.send(()).unwrap();
+            assert_eq!(metadata.await.unwrap().unwrap(), 6);
+        });
+        holder.join().unwrap();
+    }
+    #[test]
+    fn cancellation_before_helper_spawn_releases_same_key_for_replacement() {
+        let dir = temp_dir("cancel-before-spawn");
+        let app = test_app(&dir, 1);
+        let job = growing_test_job(&dir, 42, b"old staging");
+        job.producer_finished.store(false, Ordering::Release);
+        job.transition(RemuxState::Starting);
+        job.cancel();
+        let marker = dir.join("old-helper-started");
+        let mut spec = job_spec(&dir, "cancel-before-spawn", Vec::new());
+        spec.job_key = "web:42:cancel-before-spawn".into();
+        spec.web_session_id = Some(9);
+        spec.web_request_id = Some(77);
+        spec.dest = job.dest.clone();
+        spec.args = vec!["touch".into(), marker.as_os_str().to_owned()];
+        let mut replacement = spec.clone();
+        replacement.web_request_id = Some(78);
+        replacement.args = vec![
+            "cp".into(),
+            replacement.src.as_os_str().to_owned(),
+            cache_part(&replacement.dest).into_os_string(),
+        ];
+        crate::lock_recover(&app.remuxes).insert(spec.job_key.clone(), job.clone());
+        let helper = app.helpers.try_acquire().unwrap();
+        let permit = app.jobs.try_acquire().unwrap();
+        spawn_ffmpeg(app.clone(), spec, job.clone(), helper, permit, None);
+        let newer = attach_for_client(app.clone(), replacement).unwrap();
+        assert!(!Arc::ptr_eq(&job, &newer));
+        wait_until(Duration::from_secs(3), || {
+            newer.producer_finished.load(Ordering::Acquire)
+        });
+        assert_eq!(job.state(), RemuxState::Cancelled);
+        assert!(!marker.exists());
+        assert_eq!(newer.state(), RemuxState::Complete);
+        assert_eq!(std::fs::read(&newer.dest).unwrap(), b"source bytes");
+        assert_eq!(app.jobs.in_use(), 0);
+    }
+    #[test]
+    fn status_before_portable_fallback_does_not_pin_failed_primary_bytes() {
+        let dir = temp_dir("status-before-fallback");
+        let app = test_app(&dir, 1);
+        let release = dir.join("release-primary");
+        let mut spec = job_spec(&dir, "status-before-fallback", Vec::new());
+        spec.job_key = "web:42:status-before-fallback".into();
+        spec.web_request_id = Some(77);
+        spec.args = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf failed > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done; exit 1".into(),
+            "primary".into(),
+            cache_part(&spec.dest).into_os_string(),
+            release.as_os_str().to_owned(),
+        ];
+        spec.fallback_args = Some(vec![
+            "cp".into(),
+            spec.src.as_os_str().to_owned(),
+            cache_part(&spec.dest).into_os_string(),
+        ]);
+        let job = attach(app.clone(), spec).unwrap();
+        wait_until(Duration::from_secs(3), || {
+            job.part
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() == 6)
+        });
+        assert_eq!(job.state(), RemuxState::Starting);
+        assert_eq!(web_job_produced_seconds(&app, 42, Some(77)), None);
+        std::fs::write(&release, b"release").unwrap();
+        wait_until(Duration::from_secs(3), || {
+            job.producer_finished.load(Ordering::Acquire)
+        });
+        assert_eq!(job.state(), RemuxState::Complete);
+        assert_eq!(std::fs::read(&job.dest).unwrap(), b"source bytes");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let received = runtime.block_on(growing_wire(
+            app,
+            job,
+            "GET /Transcode/42.mp4 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            false,
+        ));
+        assert_eq!(wire_body(&received), b"source bytes");
     }
 }

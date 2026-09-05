@@ -9,6 +9,9 @@ use rusty_dlna_protocol::w3c_normalize_date;
 const NFO_READ_LIMIT: usize = 64 * 1024;
 pub const NFO_MAX_BYTES: u64 = NFO_READ_LIMIT as u64;
 
+const NFO_WITHOUT_TITLE_PREFIX: &str = "nfo-v1:without-title:";
+const NFO_WITH_TITLE_PREFIX: &str = "nfo-v1:with-title:";
+
 #[derive(Debug, thiserror::Error)]
 #[error("read NFO {path}: {source}")]
 pub struct NfoError {
@@ -37,6 +40,24 @@ pub struct NfoMeta {
 }
 
 impl NfoMeta {
+    /// Fingerprint the parsed effective override, including absent fields.
+    /// Versioning makes a future change to this representation self-invalidating.
+    pub(crate) fn fingerprint(&self) -> String {
+        format!(
+            "{}{}",
+            if self.title.is_some() {
+                NFO_WITH_TITLE_PREFIX
+            } else {
+                NFO_WITHOUT_TITLE_PREFIX
+            },
+            crate::sha256_hex(format!("{self:?}").as_bytes())
+        )
+    }
+
+    pub(crate) fn fingerprint_has_no_title(fingerprint: &str) -> bool {
+        fingerprint.starts_with(NFO_WITHOUT_TITLE_PREFIX)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.title.is_none()
             && self.about.is_none()

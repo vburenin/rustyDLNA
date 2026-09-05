@@ -67,6 +67,18 @@ or `RUSTY_DLNA_MEDIA`; caches and IMDb dumps stay in
 `<library>/.rusty-library/`. rustyDLNA does not run them, and they must not
 embed TMDB or OMDb credentials.
 
+Operator intake and Profile 7 archiving use atomic no-replace moves, including
+rollback and privileged retries. Occupied destinations (even dangling symlinks
+or concurrent arrivals) are preserved; cross-device and unsupported native
+rename operations fail without moving the source. A rollback collision reports
+paths that need manual recovery. Existing Streamer derivatives must pass
+compatibility and duration checks before an original is archived. Preview
+generation enforces an absolute per-attempt deadline even when progress output
+stalls mid-line, with at most five seconds of termination grace before killing
+the helper group and reaping its child. See the
+[operator guide](../contrib/library/README.md#safe-intake-and-conversion) for
+platform requirements and replacement options.
+
 Configured UUID syntax and listen, advertise, and interface selection are
 resolved before rustyDLNA creates `files.db` or a persisted UUID, loads the
 catalog, or maintains caches. A failure in that pure preflight leaves existing
@@ -161,6 +173,14 @@ seek generations that reused source sampling and the verified FFmpeg identity.
 playlist, init, segment, or range requests made within one generation. Those
 resource reattachments also do not count as job/cache reuse or trigger another
 cache-maintenance pass while their producer remains active.
+
+`transcode.cache_bytes` reports the latest cache accounting snapshot of
+generated output and staging artifacts on disk. Atomic publication renames
+already-counted staging bytes; it does not add them again. Failed producer
+cleanup refreshes the snapshot, and completed ephemeral-output removal updates
+the gauge under the cache-maintenance lock. Active producers can grow between
+snapshots; quota enforcement inspects actual storage on its maintenance pass.
+
 The same object reports separate `startup_to_initial_bytes_ms`,
 `startup_to_playlist_ready_ms`, Media Source playlist/init/first-fragment
 fetch-and-append phase summaries, `startup_to_canplay_ms`, and
@@ -237,8 +257,12 @@ runs after deadlines, cancellation, polling failures, and panics. Atomic image
 and transcode staging files are removed on the error path.
 
 GENA shutdown closes notification admission, discards queued deliveries, and
-wakes idle delivery workers. An in-flight callback may finish only its current,
-socket-timeout-bounded delivery; it cannot retry after cancellation. Completed
+wakes idle delivery workers. Callback attempts have absolute phase deadlines:
+500 ms to connect, two seconds to write the request, and 200 ms to receive the
+status line (at most 128 bytes), with a 2.7-second whole-attempt ceiling. Partial
+progress never renews a deadline. Failed attempts retain the bounded three-try
+policy. Reads/writes check shutdown between waits of at most 50 ms; connect may
+take its remaining 500 ms. An in-flight callback cannot retry after cancellation. Completed
 workers are reaped within the same shutdown budget. At the shared deadline any
 worker that has not exited, including one still inside a bounded socket
 operation, is detached from application ownership. It owns only dispatcher

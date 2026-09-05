@@ -93,6 +93,7 @@ use http_app::{
     sniff_renderer_location, trusted_renderer_location, RendererFetchLimiter, SsdpReplyLimiter,
 };
 pub use lifecycle::serve;
+pub(crate) use lifecycle::socket_write_all;
 #[cfg(test)]
 use lifecycle::{
     accept_loop, apply_catalog, apply_catalog_update, apply_prepared_catalog_change, handle_conn,
@@ -103,7 +104,6 @@ use lifecycle::{
     active_ipv4_interfaces, default_route_interface, os_version, read_open_file_range,
     select_advertise_ip, select_ssdp_interfaces, unix_now, usable_lan_ipv4, InterfaceV4,
 };
-pub(crate) use lifecycle::{socket_write_all, stream_file_range};
 use metrics::{ComponentState, RuntimeMetrics};
 #[cfg(test)]
 use rusty_dlna_scan::{

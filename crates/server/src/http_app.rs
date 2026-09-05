@@ -1317,8 +1317,7 @@ impl App {
         let order = default_order(client);
         let query = catalog_query(&clauses, &sort, order);
         let query_generation = self.update_id.load(Ordering::Acquire);
-        let query_cache_key =
-            format!("search\u{1f}{scope}\u{1f}{query:?}\u{1f}{start}\u{1f}{take}");
+        let query_cache_key = search_cache_key(&scope, &query, start, take);
         let db_page = self
             .cached_catalog_query_page(query_generation, &query_cache_key)
             .map(|page| CatalogQuerySnapshot {

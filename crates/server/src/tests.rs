@@ -3124,6 +3124,141 @@ fn published_catalog_object_ids_are_globally_unique() {
 }
 
 #[test]
+fn search_accepts_the_class_value_emitted_in_didl() {
+    let app = testdata_app();
+    let arguments = |criteria: &str| {
+        format!("<ContainerID>0</ContainerID><SearchCriteria>{criteria}</SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>100</RequestedCount><SortCriteria></SortCriteria>")
+    };
+    let (status, xml) = soap_action(
+        &app,
+        "Search",
+        &arguments("upnp:class derivedfrom \"object.item.videoItem\""),
+        "ClassSearchTest/1.0",
+    );
+    assert_eq!(status, 200);
+    let envelope = roxmltree::Document::parse(&xml).unwrap();
+    let result = envelope
+        .descendants()
+        .find(|node| node.tag_name().name() == "Result")
+        .unwrap()
+        .text()
+        .unwrap();
+    let didl = roxmltree::Document::parse(result).unwrap();
+    let class = didl
+        .descendants()
+        .find(|node| node.tag_name().name() == "class")
+        .unwrap()
+        .text()
+        .unwrap();
+    let (status, xml) = soap_action(
+        &app,
+        "Search",
+        &arguments(&format!("upnp:class = \"{class}\"")),
+        "ClassSearchTest/1.0",
+    );
+    assert_eq!(status, 200);
+    let envelope = roxmltree::Document::parse(&xml).unwrap();
+    let total = envelope
+        .descendants()
+        .find(|node| node.tag_name().name() == "TotalMatches")
+        .unwrap()
+        .text()
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    assert!(
+        total > 0,
+        "class emitted in DIDL must match equality: {class}"
+    );
+}
+
+#[test]
+fn class_search_sqlite_and_memory_operator_matrix() {
+    use std::collections::BTreeSet;
+    let app = testdata_app();
+    let cat = read_recover(&app.catalog);
+    let client = identify_user_agent("DLNADOC/1.50").unwrap();
+    let matches = |criteria: &str| {
+        let clauses = try_parse_search_criteria(Some(criteria)).unwrap();
+        let query = catalog_query(&clauses, &[], DefaultOrder::FoldersFirst);
+        let db = query_db_search(
+            app.db_pool.as_deref(),
+            app.scan_cfg.db_path.as_deref(),
+            "0",
+            &query,
+            0,
+            MAX_SOAP_PAGE_OBJECTS,
+        )
+        .unwrap();
+        let (memory, total) = search_memory_page(
+            &app,
+            &cat,
+            "0",
+            &clauses,
+            &[],
+            DefaultOrder::FoldersFirst,
+            0,
+            MAX_SOAP_PAGE_OBJECTS,
+            client,
+            Some("DLNADOC/1.50"),
+            &FilterBits::default(),
+        );
+        let memory: BTreeSet<_> = memory.iter().map(|object| object.id.clone()).collect();
+        let db: BTreeSet<_> = db.page.object_ids.into_iter().collect();
+        assert_eq!(total as usize, memory.len());
+        assert_eq!(db, memory, "{criteria}");
+        db
+    };
+    let all = matches("*");
+    for op in [
+        "=",
+        "!=",
+        "<",
+        "<=",
+        ">",
+        ">=",
+        "derivedfrom",
+        "contains",
+        "doesNotContain",
+    ] {
+        for class in [
+            "item.videoItem",
+            "object.item.videoItem",
+            "OBJECT.ITEM.VIDEOITEM",
+            "container",
+            "object.container",
+            "OBJECT.CONTAINER",
+        ] {
+            let criteria = format!("upnp:class {op} \"{class}\"");
+            let _ = matches(&criteria);
+        }
+    }
+    for class in [
+        "item.videoItem",
+        "object.item.videoItem",
+        "OBJECT.ITEM.VIDEOITEM",
+    ] {
+        let eq = matches(&format!("upnp:class = \"{class}\""));
+        assert!(
+            !eq.is_empty(),
+            "emitted/full and short class equality must find video items"
+        );
+        let neq = matches(&format!("upnp:class != \"{class}\""));
+        assert!(eq.is_disjoint(&neq));
+        assert_eq!(eq.union(&neq).cloned().collect::<BTreeSet<_>>(), all);
+        assert_eq!(eq, matches("upnp:class = \"item.videoItem\""));
+    }
+    for needle in ["object.item", "ITEM", "object.container", "not-a-class", ""] {
+        let yes = matches(&format!("upnp:class contains \"{needle}\""));
+        let no = matches(&format!("upnp:class doesNotContain \"{needle}\""));
+        assert!(yes.is_disjoint(&no));
+        assert_eq!(yes.union(&no).cloned().collect::<BTreeSet<_>>(), all);
+    }
+    assert_eq!(matches("upnp:class exists true"), all);
+    assert!(matches("upnp:class exists false").is_empty());
+}
+
+#[test]
 fn request_time_sqlite_query_matches_the_published_catalog_generation() {
     let app = testdata_app();
     let query = CatalogQuery {
@@ -7586,6 +7721,58 @@ fn scan_worker_join_never_exceeds_the_supplied_shutdown_deadline() {
     stop_library_watch_until(&app, started + Duration::from_millis(40));
     assert!(started.elapsed() < Duration::from_millis(200));
     assert!(app.scan_control.threads.lock().unwrap().is_empty());
+}
+
+#[test]
+fn search_expansion_faults_before_database_or_cache_key_allocation() {
+    let app = testdata_app();
+    let db_path = app.scan_cfg.db_path.as_deref().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    count_catalog_queries_for_test(db_path, Arc::clone(&count));
+    let suffix = " and (dc:title = \"a\" or dc:title = \"b\")";
+    for criteria in [
+        format!(
+            "dc:title contains \"{}\"{}",
+            "x".repeat(64 * 1024),
+            suffix.repeat(8)
+        ),
+        format!("dc:title = \"{}\"", "x".repeat(64 * 1024 + 1)),
+        format!(
+            "dc:title contains \"{}\"{}",
+            "x".repeat(64 * 1024),
+            suffix.repeat(2)
+        ),
+    ] {
+        let (status, xml) = soap_action(&app, "Search", &format!(
+            "<ContainerID>0</ContainerID><SearchCriteria>{criteria}</SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>10</RequestedCount><SortCriteria></SortCriteria>"
+        ), "SearchBoundsTest/1.0");
+        assert_eq!(status, 500);
+        assert!(xml.contains("<errorCode>708</errorCode>"), "{xml}");
+    }
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+    stop_counting_catalog_queries_for_test(db_path);
+}
+
+#[test]
+fn search_cache_digest_is_bounded_canonical_and_sensitive_to_page() {
+    let criteria = format!("dc:title contains \"{}\"", "\n".repeat(64 * 1024));
+    let parsed = try_parse_search_criteria(Some(&criteria)).unwrap();
+    let query = catalog_query(&parsed, &[], DefaultOrder::FoldersFirst);
+    let key = search_cache_key("0", &query, 0, 100);
+    assert_eq!(key.len(), 71);
+    assert_ne!(key, search_cache_key("0", &query, 1, 100));
+    assert_ne!(key, search_cache_key("1", &query, 0, 100));
+    assert_ne!(key, search_cache_key("0", &query, 0, 99));
+    let spaced = try_parse_search_criteria(Some(&format!("  {criteria}  "))).unwrap();
+    assert_eq!(
+        key,
+        search_cache_key(
+            "0",
+            &catalog_query(&spaced, &[], DefaultOrder::FoldersFirst),
+            0,
+            100
+        )
+    );
 }
 
 #[test]

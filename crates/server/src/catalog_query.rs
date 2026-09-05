@@ -98,6 +98,33 @@ use rusty_dlna_soap::{
 
 use super::{App, CatalogChildRef, DbPool, MAX_SOAP_PAGE_OBJECTS};
 
+/// Hash the canonical structured query as it is formatted, without allocating
+/// an expanded Debug string (or a cache key proportional to request size).
+pub(super) fn search_cache_key(
+    scope: &str,
+    query: &CatalogQuery,
+    start: usize,
+    take: usize,
+) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    struct DigestWriter(Sha256);
+    impl std::fmt::Write for DigestWriter {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0.update(text.as_bytes());
+            Ok(())
+        }
+    }
+    let mut writer = DigestWriter(Sha256::new());
+    // DigestWriter is infallible; Debug for these owned query types only writes.
+    let _ = write!(writer, "{:?}", ("search", scope, query, start, take));
+    let mut key = String::from("search:");
+    for byte in writer.0.finalize() {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
 pub(super) fn container_search_row(c: &rusty_dlna_scan::Container) -> SearchRow<'_> {
     SearchRow {
         title: &c.title,

@@ -255,7 +255,7 @@ fn apply_nfo_to_detail(db: &LibraryDb, id: i64, nfo: &NfoMeta) -> ScanResult<()>
         return Ok(());
     }
     db.update_detail_nfo(id, nfo)?;
-    db.copy_nfo_to_inode_aliases(id)?;
+    db.copy_nfo_to_inode_aliases_with_title(id, nfo.title.is_some())?;
     Ok(())
 }
 
@@ -537,12 +537,38 @@ fn apply_nfo_in_dir(
     dir: &Path,
     recursive: bool,
 ) -> ScanResult<bool> {
+    apply_nfo_in_dir_with_stack(
+        db,
+        cfg,
+        dir,
+        recursive,
+        &mut HashMap::new(),
+        &mut HashSet::new(),
+    )
+}
+
+fn apply_nfo_in_dir_with_stack(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    dir: &Path,
+    recursive: bool,
+    ancestors: &mut HashMap<(u64, u64), ()>,
+    refreshed: &mut HashSet<i64>,
+) -> ScanResult<bool> {
+    cfg.check_cancelled()?;
     if !path_is_allowed_dir(dir, cfg) {
+        return Ok(false);
+    }
+    let key = inode_key(&std::fs::metadata(dir).map_err(|error| scan_io(dir, error))?);
+    // Only ancestors are cycles. Separate aliases to the same directory must
+    // still be visited, exactly as in the primary catalog walker.
+    if ancestors.insert(key, ()).is_some() {
         return Ok(false);
     }
     let rd = std::fs::read_dir(dir).map_err(|error| scan_io(dir, error))?;
     let mut any = false;
     for ent in rd {
+        cfg.check_cancelled()?;
         let ent = ent.map_err(|error| scan_io(dir, error))?;
         let path = ent.path();
         let name = ent.file_name().to_string_lossy().into_owned();
@@ -555,7 +581,7 @@ fn apply_nfo_in_dir(
             if recursive
                 && !is_skipped_dir_os_name(&ent.file_name())
                 && path_is_allowed_dir(&path, cfg)
-                && apply_nfo_in_dir(db, cfg, &path, true)?
+                && apply_nfo_in_dir_with_stack(db, cfg, &path, true, ancestors, refreshed)?
             {
                 any = true;
             }
@@ -569,38 +595,39 @@ fn apply_nfo_in_dir(
         }
         let path_s = path_to_db(&path);
         if let Some(existing) = db.find_detail_by_path(&path_s)? {
-            let id = existing.id;
-            let before = db.detail_presentation(id)?;
-            let title = path
-                .file_stem()
-                .map(display_os_name)
-                .unwrap_or_else(|| "item".to_string());
-            db.reset_detail_tags_to_file_defaults(id, &title, &file_mtime_date(&path))?;
-            // Reconstruct the complete precedence chain. This is essential
-            // for deletion: merely applying the now-empty NFO would retain
-            // values written by the old sidecar forever.
-            db.copy_embedded_tags_to_inode_aliases(id)?;
-            persist_probe(db, cfg, &path, id)?;
-            apply_nfo(db, cfg, &path, id)?;
-            if let Some(browse) = db.browse_object_for_detail(id)? {
-                let (_, class, _) = mime_and_class(&name);
-                if is_video(&name) {
-                    attach_video_virtuals(db, id, class, &browse)?;
-                } else {
-                    attach_audio_virtuals(db, id, class, &browse)?;
-                }
+            if refreshed.contains(&existing.id) {
+                continue;
             }
-            if db.detail_presentation(id)? != before {
-                any = true;
-            }
+            let aliases = db.inode_alias_stats(existing.id)?;
+            any |= refresh_nfo_periodic(db, cfg, &aliases)?;
+            refreshed.extend(aliases.iter().map(|row| row.id));
         }
     }
+    ancestors.remove(&key);
+    cfg.check_cancelled()?;
     Ok(any)
 }
 
-/// Re-apply changed effective NFO metadata once per physical inode. Inotify
-/// handles live sidecar deletion; the periodic pass must not reopen media when
-/// its selected NFO already matches the persisted presentation.
+fn refresh_nfo_virtuals(db: &LibraryDb, id: i64, path: &Path) -> ScanResult<()> {
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default();
+    let (_, class, _) = mime_and_class(&name);
+    if let Some(browse) = db.browse_object_for_detail(id)? {
+        if is_video(&name) {
+            attach_video_virtuals(db, id, class, &browse)?;
+        } else if is_audio(&name) {
+            attach_audio_virtuals(db, id, class, &browse)?;
+        } else if is_image(&name) {
+            attach_image_virtuals(db, id, class, &browse)?;
+        }
+    }
+    Ok(())
+}
+
+/// With matching provenance, explicit overrides can be repaired after a
+/// stream-metadata backfill without reopening unchanged physical media.
 fn presentation_matches_nfo(presentation: &db::DetailPresentation, nfo: &NfoMeta) -> bool {
     fn matches<T: PartialEq>(actual: &Option<T>, expected: &Option<T>) -> bool {
         expected
@@ -608,8 +635,8 @@ fn presentation_matches_nfo(presentation: &db::DetailPresentation, nfo: &NfoMeta
             .is_none_or(|expected| actual.as_ref() == Some(expected))
     }
     matches(&presentation.title, &nfo.title)
-        && presentation.outline.as_ref() == nfo.about.as_ref()
-        && presentation.plot.as_ref() == nfo.plot.as_ref()
+        && presentation.outline == nfo.about
+        && presentation.plot == nfo.plot
         && matches(&presentation.genre, &nfo.genre)
         && matches(&presentation.creator, &nfo.creator)
         && matches(&presentation.artist, &nfo.artist)
@@ -619,9 +646,12 @@ fn presentation_matches_nfo(presentation: &db::DetailPresentation, nfo: &NfoMeta
         && matches(&presentation.album, &nfo.showtitle)
 }
 
+/// Reconstruct changed effective NFO metadata once per physical inode, sharing
+/// exactly the same removal/precedence policy between periodic and dirty walks.
 fn refresh_nfo_periodic(db: &LibraryDb, cfg: &ScanConfig, rows: &[DetailStat]) -> ScanResult<bool> {
     let mut groups: HashMap<(i64, i64, i64), Vec<(i64, PathBuf)>> = HashMap::new();
     for row in rows {
+        cfg.check_cancelled()?;
         let unique = if row.inode == 0 { row.id } else { 0 };
         groups
             .entry((row.device, row.inode, unique))
@@ -630,86 +660,60 @@ fn refresh_nfo_periodic(db: &LibraryDb, cfg: &ScanConfig, rows: &[DetailStat]) -
     }
     let mut changed = false;
     for mut aliases in groups.into_values() {
+        cfg.check_cancelled()?;
         aliases.sort_by(|left, right| left.1.cmp(&right.1));
         let mut parsed = Vec::with_capacity(aliases.len());
         for (id, path) in &aliases {
+            cfg.check_cancelled()?;
             let live = rebase_media_path_for_config(path, cfg);
             let nfo = nfo_for_file_with_policy_result(&live, &cfg.media_dirs, cfg.wide_links)?;
             parsed.push((*id, live, nfo));
         }
-        let selected = parsed
+        let Some((selected_id, selected_path, selected_nfo)) = parsed
             .iter()
             .find(|(_, _, nfo)| !nfo.is_empty())
-            .or_else(|| parsed.first());
-        let Some((selected_id, _selected_path, selected_nfo)) = selected else {
+            .or_else(|| parsed.first())
+        else {
             continue;
         };
+        let fingerprint = selected_nfo.fingerprint();
+        let fingerprints = aliases
+            .iter()
+            .map(|(id, _)| db.detail_nfo_fingerprint(*id))
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let unchanged_nfo = fingerprints
+            .iter()
+            .all(|stored| stored.as_deref() == Some(&fingerprint));
         let before = aliases
             .iter()
             .map(|(id, _)| db.detail_presentation(*id))
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        if selected_nfo.is_empty() {
-            // Inotify normally observes NFO deletion. If it happened while
-            // the service was stopped, video title policy still gives us an
-            // unambiguous cheap repair: no NFO means the filename is the
-            // title. Do not reopen media merely to recover embedded tags.
-            for ((id, path), presentation) in aliases.iter().zip(&before) {
-                if !path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(is_video)
-                {
-                    continue;
-                }
-                if db.clear_detail_nfo_descriptions(*id)? {
-                    changed = true;
-                }
-                let wanted = path
-                    .file_stem()
-                    .map(display_os_name)
-                    .unwrap_or_else(|| "item".to_string());
-                if presentation.title.as_deref() == Some(wanted.as_str()) {
-                    continue;
-                }
-                db.update_detail_title(*id, &wanted)?;
-                let fields = db.detail_group_fields(*id)?;
-                let series_title = episode_display_title(&wanted, fields.album.as_deref());
-                db.update_detail_names_under_root(*id, VIDEO_SERIES_ID, &series_title)?;
-                db.update_detail_names_under_root(*id, VIDEO_GENRE_ID, &wanted)?;
-                db.update_detail_names_under_root(*id, VIDEO_ACTOR_ID, &wanted)?;
-                changed = true;
-            }
-            continue;
-        }
-        // Inotify handles live NFO writes/deletes. The periodic pass only
-        // needs libav when an effective NFO value differs from persisted
-        // presentation metadata; unchanged media must never be re-probed.
-        if before
-            .iter()
-            .all(|presentation| presentation_matches_nfo(presentation, selected_nfo))
+        if unchanged_nfo
+            && before
+                .iter()
+                .all(|presentation| presentation_matches_nfo(presentation, selected_nfo))
         {
             continue;
         }
-        // A periodic walk may discover NFO state written while the service was
-        // offline. Apply its explicit overrides directly; reconstructing the
-        // embedded base requires libav and is reserved for a real sidecar
-        // inotify event, never routine reconciliation.
-        apply_nfo_to_detail(db, *selected_id, selected_nfo)?;
-        for (id, path) in &aliases {
-            let name = path
-                .file_name()
-                .map(|value| value.to_string_lossy())
-                .unwrap_or_default();
-            let (_, class, _) = mime_and_class(&name);
-            if let Some(browse) = db.browse_object_for_detail(*id)? {
-                if is_video(&name) {
-                    attach_video_virtuals(db, *id, class, &browse)?;
-                } else if is_audio(&name) {
-                    attach_audio_virtuals(db, *id, class, &browse)?;
-                } else if is_image(&name) {
-                    attach_image_virtuals(db, *id, class, &browse)?;
-                }
+        if !unchanged_nfo {
+            // Recreate defaults for each browseable path, then probe the physical
+            // source once. An undecodable source has a valid filename/mtime base.
+            // Probe cancellation/errors abort the surrounding staged transaction.
+            for (id, path, _) in &parsed {
+                cfg.check_cancelled()?;
+                let title = path
+                    .file_stem()
+                    .map(display_os_name)
+                    .unwrap_or_else(|| "item".into());
+                db.reset_detail_tags_to_file_defaults(*id, &title, &file_mtime_date(path))?;
             }
+            persist_probe(db, cfg, selected_path, *selected_id)?;
+        }
+        apply_nfo_to_detail(db, *selected_id, selected_nfo)?;
+        for (id, path, _) in &parsed {
+            cfg.check_cancelled()?;
+            refresh_nfo_virtuals(db, *id, path)?;
+            db.set_detail_nfo_fingerprint(*id, &fingerprint)?;
         }
         let after = aliases
             .iter()
@@ -3975,7 +3979,13 @@ fn index_one_file_with_artwork(
         {
             apply_or_reuse_prepared_probe(db, cfg, path, id, (device, inode), prepared, &opened)?;
         }
-        apply_nfo_to_detail(db, id, &nfo)?;
+        if stat_changed {
+            apply_nfo_to_detail(db, id, &nfo)?;
+            db.set_detail_nfo_fingerprint(id, &nfo.fingerprint())?;
+        } else {
+            refresh_nfo_periodic(db, cfg, &db.inode_alias_stats(id)?)?;
+            apply_nfo_to_detail(db, id, &nfo)?;
+        }
         attach_objects(db, folder_id, id, &title, class, device, inode)?;
         attach_album_art_for_index(db, cfg, path, id, prepared, artwork_selection, &opened)?;
         return Ok(true);
@@ -4025,7 +4035,41 @@ fn index_one_file_with_artwork(
         }
         if source.size == size && source.timestamp >= mtime {
             let id = db.clone_detail_for_path(source.id, &path_s, size, mtime, device, inode)?;
+            // Video defaults belong to each browseable filename. The copied
+            // provenance distinguishes a curated NFO title from a base title
+            // without reparsing every physical alias during admission.
+            if is_video(&name)
+                && db
+                    .detail_nfo_fingerprint(id)?
+                    .as_deref()
+                    .is_some_and(NfoMeta::fingerprint_has_no_title)
+            {
+                db.update_detail_title(id, &title)?;
+            }
             db.set_detail_collection_source(id, &opened, cfg)?;
+            if !nfo.is_empty() {
+                let aliases = db.inode_alias_stats(id)?;
+                let empty_fingerprint = NfoMeta::default().fingerprint();
+                let base_is_unmodified = aliases
+                    .iter()
+                    .map(|row| db.detail_nfo_fingerprint(row.id))
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+                    .iter()
+                    .all(|fingerprint| fingerprint.as_deref() == Some(&empty_fingerprint));
+                if base_is_unmodified {
+                    // A later alias can be the first path with an NFO. Its
+                    // cloned embedded/default base is still intact, so apply
+                    // the new override without repeating the physical probe.
+                    apply_nfo_to_detail(db, id, &nfo)?;
+                    let fingerprint = nfo.fingerprint();
+                    for alias in &aliases {
+                        db.set_detail_nfo_fingerprint(alias.id, &fingerprint)?;
+                        refresh_nfo_virtuals(db, alias.id, &path_from_db(&alias.path))?;
+                    }
+                } else {
+                    refresh_nfo_periodic(db, cfg, &aliases)?;
+                }
+            }
             attach_objects(db, folder_id, id, &title, class, device, inode)?;
             attach_album_art_for_index(db, cfg, path, id, prepared, artwork_selection, &opened)?;
             return Ok(true);
@@ -4059,6 +4103,7 @@ fn index_one_file_with_artwork(
     // override filename defaults, but video titles deliberately remain the
     // filename stem unless an NFO supplies a curated title.
     apply_nfo_to_detail(db, detail, &nfo)?;
+    db.set_detail_nfo_fingerprint(detail, &nfo.fingerprint())?;
     attach_objects(db, folder_id, detail, &title, class, device, inode)?;
     attach_album_art_for_index(db, cfg, path, detail, prepared, artwork_selection, &opened)?;
     Ok(true)

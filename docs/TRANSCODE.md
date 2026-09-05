@@ -170,6 +170,21 @@ rename). Ordinary growing-MP4 delivery may attach after the first ~16 KiB;
 fragment delivery waits for its initialization and first complete media
 fragment. The rest fills in behind the client.
 
+Each job pins its output descriptor before atomic publication. Growing reads,
+finished ranges, and HLS/Media Source indexing retain that descriptor across
+the `.part` rename, so publication cannot invalidate an in-flight first open.
+Reads and index updates use explicit offsets on the pinned file; a later
+pathname replacement cannot redirect an existing generation to different
+bytes. Output I/O and admission waits run outside asynchronous socket tasks.
+
+A producer that has received cancellation is unavailable for new attachments,
+even while its public state still says Starting or Growing. A same-output
+restart waits up to two seconds for helper reaping, intermediate cleanup and
+permit release before registering a replacement. If cleanup takes longer,
+admission returns retryable busy. Cancellation tombstones and shared-session
+ownership still apply while waiting; the old producer cannot remove the
+replacement's registry entry or output.
+
 HLS/Media Source output that encodes either track runs without input pacing for
 its first 30 seconds of media, then reads at playback rate. This preserves a
 useful startup buffer without racing through the rest of a feature film at full

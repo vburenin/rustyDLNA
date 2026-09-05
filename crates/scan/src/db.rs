@@ -428,6 +428,7 @@ CREATE TABLE IF NOT EXISTS SETTINGS (
   VALUE TEXT
 );
 CREATE INDEX IF NOT EXISTS IDX_DETAILS_INODE ON DETAILS(DEVICE, INODE);
+CREATE INDEX IF NOT EXISTS IDX_DETAILS_ALBUM_ART ON DETAILS(ALBUM_ART);
 CREATE INDEX IF NOT EXISTS IDX_DETAILS_PATH ON DETAILS(PATH);
 CREATE INDEX IF NOT EXISTS IDX_OBJECTS_PARENT ON OBJECTS(PARENT_ID, NAME, OBJECT_ID);
 CREATE INDEX IF NOT EXISTS IDX_OBJECTS_DETAIL ON OBJECTS(DETAIL_ID);
@@ -580,19 +581,25 @@ fn catalog_field_sql(field: CatalogQueryField) -> &'static str {
 }
 
 fn full_class_sql() -> &'static str {
-    "CASE WHEN o.CLASS LIKE 'object.%' THEN o.CLASS ELSE 'object.' || o.CLASS END"
+    "CASE WHEN COALESCE(o.CLASS, '') = '' THEN '' WHEN o.CLASS LIKE 'object.%' THEN o.CLASS ELSE 'object.' || o.CLASS END"
 }
 
 fn catalog_clause_sql(clause: &CatalogQueryClause, values: &mut Vec<Value>) -> String {
-    let field = catalog_field_sql(clause.field);
+    let field = if clause.field == CatalogQueryField::Class {
+        full_class_sql()
+    } else {
+        catalog_field_sql(clause.field)
+    };
+    let comparison_value = |value: &str| {
+        if clause.field == CatalogQueryField::Class {
+            rusty_dlna_protocol::class::full_object_class(value).into_owned()
+        } else {
+            value.to_string()
+        }
+    };
     match &clause.op {
         CatalogQueryOp::Contains(value) => {
             values.push(Value::Text(value.to_ascii_lowercase()));
-            let field = if clause.field == CatalogQueryField::Class {
-                full_class_sql()
-            } else {
-                field
-            };
             format!("instr(lower({field}), ?) > 0")
         }
         CatalogQueryOp::DoesNotContain(value) => {
@@ -600,40 +607,31 @@ fn catalog_clause_sql(clause: &CatalogQueryClause, values: &mut Vec<Value>) -> S
             format!("instr(lower({field}), ?) = 0")
         }
         CatalogQueryOp::Equals(value) => {
-            values.push(Value::Text(value.clone()));
+            values.push(Value::Text(comparison_value(value)));
             format!("{field} = ? COLLATE NOCASE")
         }
         CatalogQueryOp::NotEquals(value) => {
-            values.push(Value::Text(value.clone()));
+            values.push(Value::Text(comparison_value(value)));
             format!("{field} <> ? COLLATE NOCASE")
         }
         CatalogQueryOp::LessThan { value, inclusive } => {
-            values.push(Value::Text(value.clone()));
+            values.push(Value::Text(comparison_value(value)));
             format!(
                 "{field} {} ? COLLATE NOCASE",
                 if *inclusive { "<=" } else { "<" }
             )
         }
         CatalogQueryOp::GreaterThan { value, inclusive } => {
-            values.push(Value::Text(value.clone()));
+            values.push(Value::Text(comparison_value(value)));
             format!(
                 "{field} {} ? COLLATE NOCASE",
                 if *inclusive { ">=" } else { ">" }
             )
         }
         CatalogQueryOp::DerivedFrom(value) => {
-            let value = if value.starts_with("object.") {
-                value.clone()
-            } else {
-                format!("object.{value}")
-            };
+            let value = rusty_dlna_protocol::class::full_object_class(value).into_owned();
             values.push(Value::Text(value.clone()));
             values.push(Value::Text(value));
-            let field = if clause.field == CatalogQueryField::Class {
-                full_class_sql()
-            } else {
-                field
-            };
             format!("(lower({field}) = lower(?) OR instr(lower({field}), lower(?) || '.') = 1)")
         }
         CatalogQueryOp::Exists(want) => {
@@ -1205,7 +1203,7 @@ impl LibraryDb {
                  GENRE, OUTLINE, PLOT, COMMENT, CHANNELS, DISC, TRACK, RATING, DATE, RESOLUTION,
                  THUMBNAIL, ALBUM_ART, ROTATION, DLNA_PN, MIME, DEVICE, INODE,
                  CONTAINER, VIDEO, AUDIO, AUDIO_STREAMS, HDR, STREAM_PROBE_REV,
-                 PROBE_SIDECAR_FINGERPRINT, COLLECTION_PATH
+                 PROBE_SIDECAR_FINGERPRINT, COLLECTION_PATH, NFO_FINGERPRINT
              )
              SELECT staged.ID, staged.PATH, staged.SIZE, staged.TIMESTAMP,
                  staged.TITLE, staged.DURATION, staged.BITRATE, staged.SAMPLERATE,
@@ -1217,12 +1215,13 @@ impl LibraryDb {
                  staged.DEVICE, staged.INODE, staged.CONTAINER,
                  staged.VIDEO, staged.AUDIO,
                  staged.AUDIO_STREAMS, staged.HDR, staged.STREAM_PROBE_REV,
-                 staged.PROBE_SIDECAR_FINGERPRINT, staged.COLLECTION_PATH
+                 staged.PROBE_SIDECAR_FINGERPRINT, staged.COLLECTION_PATH, staged.NFO_FINGERPRINT
              FROM scan_stage.DETAILS staged
              JOIN scan_stage._scan_detail_changes changed ON changed.ID = staged.ID
              WHERE true
              ON CONFLICT(ID) DO UPDATE SET
                  COLLECTION_PATH=excluded.COLLECTION_PATH,
+                 NFO_FINGERPRINT=excluded.NFO_FINGERPRINT,
                  PATH=excluded.PATH, SIZE=excluded.SIZE, TIMESTAMP=excluded.TIMESTAMP,
                  TITLE=excluded.TITLE, DURATION=excluded.DURATION,
                  BITRATE=excluded.BITRATE, SAMPLERATE=excluded.SAMPLERATE,
@@ -1242,7 +1241,8 @@ impl LibraryDb {
                  HDR=excluded.HDR,
                  STREAM_PROBE_REV=excluded.STREAM_PROBE_REV,
                  PROBE_SIDECAR_FINGERPRINT=excluded.PROBE_SIDECAR_FINGERPRINT
-             WHERE DETAILS.COLLECTION_PATH COLLATE BINARY IS NOT excluded.COLLECTION_PATH COLLATE BINARY
+             WHERE DETAILS.NFO_FINGERPRINT COLLATE BINARY IS NOT excluded.NFO_FINGERPRINT COLLATE BINARY
+                OR DETAILS.COLLECTION_PATH COLLATE BINARY IS NOT excluded.COLLECTION_PATH COLLATE BINARY
                 OR DETAILS.PATH COLLATE BINARY IS NOT excluded.PATH COLLATE BINARY
                 OR DETAILS.SIZE IS NOT excluded.SIZE
                 OR DETAILS.TIMESTAMP IS NOT excluded.TIMESTAMP
@@ -1888,13 +1888,13 @@ impl LibraryDb {
                 ALBUM, GENRE, OUTLINE, PLOT, COMMENT, CHANNELS, DISC, TRACK, RATING,
                 DATE, RESOLUTION, THUMBNAIL, ALBUM_ART, ROTATION, DLNA_PN, MIME,
                 DEVICE, INODE, CONTAINER, VIDEO, AUDIO, AUDIO_STREAMS, HDR,
-                STREAM_PROBE_REV, PROBE_SIDECAR_FINGERPRINT, COLLECTION_PATH)
+                STREAM_PROBE_REV, PROBE_SIDECAR_FINGERPRINT, COLLECTION_PATH, NFO_FINGERPRINT)
              SELECT ?1, ?2, ?3, TITLE, DURATION, BITRATE, SAMPLERATE,
                 CREATOR, ARTIST, ALBUM_ARTIST, COMPOSER, CONTRIBUTOR,
                 ALBUM, GENRE, OUTLINE, PLOT, COMMENT, CHANNELS, DISC, TRACK, RATING,
                 DATE, RESOLUTION, THUMBNAIL, ALBUM_ART, ROTATION, DLNA_PN, MIME,
                 ?4, ?5, CONTAINER, VIDEO, AUDIO, AUDIO_STREAMS, HDR,
-                STREAM_PROBE_REV, PROBE_SIDECAR_FINGERPRINT, NULL
+                STREAM_PROBE_REV, PROBE_SIDECAR_FINGERPRINT, NULL, NFO_FINGERPRINT
              FROM DETAILS WHERE ID = ?6",
             params![path, size, mtime, device, inode, src_id],
         )?;
@@ -1933,6 +1933,48 @@ impl LibraryDb {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    pub(crate) fn inode_alias_stats(&self, id: i64) -> rusqlite::Result<Vec<DetailStat>> {
+        let mut statement = self.conn.prepare(
+            "SELECT PATH, ID, SIZE, TIMESTAMP, DEVICE, INODE FROM DETAILS
+             WHERE (ID = ?1 OR (INODE != 0
+                 AND DEVICE = (SELECT DEVICE FROM DETAILS WHERE ID = ?1)
+                 AND INODE = (SELECT INODE FROM DETAILS WHERE ID = ?1)))
+               AND PATH IS NOT NULL AND MIME IS NOT NULL",
+        )?;
+        let rows = statement.query_map([id], |row| {
+            Ok(DetailStat {
+                path: row.get(0)?,
+                id: row.get(1)?,
+                size: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                timestamp: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                device: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                inode: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub(crate) fn detail_nfo_fingerprint(&self, id: i64) -> rusqlite::Result<Option<String>> {
+        self.conn.query_row(
+            "SELECT NFO_FINGERPRINT FROM DETAILS WHERE ID = ?1",
+            [id],
+            |row| row.get(0),
+        )
+    }
+
+    pub(crate) fn set_detail_nfo_fingerprint(
+        &self,
+        id: i64,
+        fingerprint: &str,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE DETAILS SET NFO_FINGERPRINT = ?2
+             WHERE ID = ?1 AND NFO_FINGERPRINT COLLATE BINARY IS NOT ?2",
+            params![id, fingerprint],
+        )?;
+        Ok(())
     }
 
     pub fn detail_stats_for_paths(&self, paths: &[String]) -> rusqlite::Result<Vec<DetailStat>> {
@@ -2167,7 +2209,7 @@ impl LibraryDb {
         let mut stmt = self.conn.prepare(
             "SELECT a.PATH FROM ALBUM_ART a
              WHERE NOT EXISTS (
-               SELECT 1 FROM DETAILS d WHERE COALESCE(d.ALBUM_ART, 0) = a.ID
+               SELECT 1 FROM DETAILS d WHERE d.ALBUM_ART = a.ID
              )",
         )?;
         let paths = stmt
@@ -2177,7 +2219,7 @@ impl LibraryDb {
         self.conn.execute(
             "DELETE FROM ALBUM_ART
              WHERE NOT EXISTS (
-               SELECT 1 FROM DETAILS d WHERE COALESCE(d.ALBUM_ART, 0) = ALBUM_ART.ID
+               SELECT 1 FROM DETAILS d WHERE d.ALBUM_ART = ALBUM_ART.ID
              )",
             [],
         )?;
@@ -2371,9 +2413,18 @@ impl LibraryDb {
     }
 
     pub fn copy_nfo_to_inode_aliases(&self, id: i64) -> rusqlite::Result<()> {
+        self.copy_nfo_to_inode_aliases_with_title(id, true)
+    }
+
+    pub(crate) fn copy_nfo_to_inode_aliases_with_title(
+        &self,
+        id: i64,
+        title_override: bool,
+    ) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE DETAILS SET
-                 TITLE = (SELECT TITLE FROM DETAILS WHERE ID = ?1),
+                 TITLE = CASE WHEN ?2 = 0 AND COALESCE(MIME, '') LIKE 'video/%'
+                     THEN TITLE ELSE (SELECT TITLE FROM DETAILS WHERE ID = ?1) END,
                  CREATOR = (SELECT CREATOR FROM DETAILS WHERE ID = ?1),
                  ARTIST = (SELECT ARTIST FROM DETAILS WHERE ID = ?1),
                  ALBUM = (SELECT ALBUM FROM DETAILS WHERE ID = ?1),
@@ -2387,7 +2438,7 @@ impl LibraryDb {
                AND INODE = (SELECT INODE FROM DETAILS WHERE ID = ?1)
                AND INODE != 0
                AND ID != ?1",
-            [id],
+            params![id, title_override],
         )?;
         Ok(())
     }
@@ -4229,7 +4280,7 @@ fn is_virtual_container(id: &str) -> bool {
     )
 }
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
     let sql = format!("PRAGMA table_info({table})");
@@ -4400,6 +4451,11 @@ fn migrate_schema_inner(
         // Backfill during normal confined scanner reconciliation, including
         // unchanged files. Schema migration must not walk mutable media paths.
     }
+    if version < 14 && !table_has_column(&tx, "DETAILS", "NFO_FINGERPRINT")? {
+        tx.execute("ALTER TABLE DETAILS ADD COLUMN NFO_FINGERPRINT TEXT", [])?;
+        // Unknown provenance is reconstructed once by normal confined
+        // reconciliation; migration never opens mutable media or sidecars.
+    }
     let rev: i64 = tx
         .query_row(
             "SELECT VALUE FROM SETTINGS WHERE KEY = 'stream_probe_rev' LIMIT 1",
@@ -4484,6 +4540,84 @@ pub fn mime_to_ext(mime: &str) -> &'static str {
 #[cfg(test)]
 mod query_tests {
     use super::*;
+
+    #[test]
+    fn artwork_cleanup_preserves_references_and_installs_index_on_existing_databases() {
+        let path = temp_db("art-cleanup-index");
+        {
+            let db = LibraryDb::open(&path).unwrap();
+            db.conn
+                .execute_batch(
+                    "INSERT INTO ALBUM_ART(ID, PATH) VALUES (1, 'referenced'), (2, 'unreferenced');
+                 INSERT INTO DETAILS(PATH, ALBUM_ART) VALUES ('one', 1), ('two', 1), ('none', NULL);
+                 DROP INDEX IDX_DETAILS_ALBUM_ART;",
+                )
+                .unwrap();
+        }
+        let db = LibraryDb::open(&path).unwrap();
+        // Zero remains the no-art sentinel used by imported legacy catalogs.
+        db.conn.execute_batch("PRAGMA foreign_keys=OFF; INSERT INTO DETAILS(PATH, ALBUM_ART) VALUES ('zero', 0); PRAGMA foreign_keys=ON;").unwrap();
+        assert_eq!(
+            db.prune_unreferenced_album_art().unwrap(),
+            vec!["unreferenced"]
+        );
+        assert_eq!(db.album_art_path(1).unwrap().as_deref(), Some("referenced"));
+        assert_eq!(db.album_art_path(2).unwrap(), None);
+        let index: String = db
+            .conn
+            .query_row(
+                "SELECT name FROM sqlite_schema WHERE name='IDX_DETAILS_ALBUM_ART'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, "IDX_DETAILS_ALBUM_ART");
+        db.conn
+            .execute("DELETE FROM DETAILS WHERE PATH='one'", [])
+            .unwrap();
+        assert!(db.prune_unreferenced_album_art().unwrap().is_empty());
+        db.conn
+            .execute("DELETE FROM DETAILS WHERE PATH='two'", [])
+            .unwrap();
+        assert_eq!(
+            db.prune_unreferenced_album_art().unwrap(),
+            vec!["referenced"]
+        );
+    }
+
+    #[test]
+    fn artwork_cleanup_work_scales_linearly() {
+        fn steps(count: usize) -> usize {
+            let db = LibraryDb::open_memory().unwrap();
+            db.conn
+                .execute_batch(&format!(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x < {count})
+                 INSERT INTO ALBUM_ART(ID, PATH) SELECT x, 'art-' || x FROM n;
+                 INSERT INTO DETAILS(PATH, ALBUM_ART) SELECT 'media-' || ID, ID FROM ALBUM_ART;"
+            ))
+                .unwrap();
+            let steps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = steps.clone();
+            db.conn
+                .progress_handler(
+                    100,
+                    Some(move || {
+                        counter.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+                        false
+                    }),
+                )
+                .unwrap();
+            assert!(db.prune_unreferenced_album_art().unwrap().is_empty());
+            steps.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        let small = steps(512);
+        let large = steps(2048);
+        eprintln!("artwork cleanup VM steps: 512 rows={small}; 2048 rows={large}");
+        assert!(
+            large <= small * 6,
+            "512 rows: {small} VM steps; 2048 rows: {large} VM steps"
+        );
+    }
 
     #[test]
     fn synthetic_sqlite_page_counts_do_not_narrow_or_wrap() {
@@ -4744,6 +4878,7 @@ mod query_tests {
                     "HDR",
                     "PROBE_SIDECAR_FINGERPRINT",
                     "COLLECTION_PATH",
+                    "NFO_FINGERPRINT",
                 ],
             ),
             ("ALBUM_ART", &["ID", "PATH"]),
@@ -5720,6 +5855,7 @@ mod query_tests {
             .unwrap();
         assert_eq!(version, 9);
         assert!(!table_has_column(&conn, "DETAILS", "PROBE_SIDECAR_FINGERPRINT").unwrap());
+        assert!(!table_has_column(&conn, "DETAILS", "NFO_FINGERPRINT").unwrap());
         let row: (String, i64, String) = conn
             .query_row(
                 "SELECT PATH, STREAM_PROBE_REV,
@@ -5743,6 +5879,15 @@ mod query_tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert!(table_has_column(&conn, "DETAILS", "PROBE_SIDECAR_FINGERPRINT").unwrap());
+        assert!(table_has_column(&conn, "DETAILS", "NFO_FINGERPRINT").unwrap());
+        let nfo_fingerprint: Option<String> = conn
+            .query_row(
+                "SELECT NFO_FINGERPRINT FROM DETAILS WHERE ID=17",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nfo_fingerprint, None);
         let fingerprint: Option<String> = conn
             .query_row(
                 "SELECT PROBE_SIDECAR_FINGERPRINT FROM DETAILS WHERE ID=17",
@@ -5782,6 +5927,7 @@ mod query_tests {
             .unwrap();
         assert_eq!(version, 9);
         assert!(!table_has_column(&conn, "DETAILS", "PROBE_SIDECAR_FINGERPRINT").unwrap());
+        assert!(!table_has_column(&conn, "DETAILS", "NFO_FINGERPRINT").unwrap());
         let sentinel: String = conn
             .query_row(
                 "SELECT VALUE FROM SETTINGS WHERE KEY='migration_sentinel'",

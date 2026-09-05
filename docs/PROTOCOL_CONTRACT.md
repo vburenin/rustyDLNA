@@ -11,6 +11,11 @@ Emit `YYYY-MM-DD` or `…Z` (length ≥ 20). Never a
 NFO wins when present: `<premiered>`, then `<aired>`, then `<year>`
 (`1999` → `1999-01-01`), then file mtime.
 
+Image EXIF dates are checked as ASCII timestamps before normalization. Missing,
+short, malformed, or non-ASCII timestamp fields are ignored without rejecting
+an otherwise usable JPEG; the image keeps its other metadata and file-date
+fallback. Valid EXIF timestamps and normalized date forms retain their dates.
+
 ## Library paths
 
 - `exclude_dir=` — prefix or path-component; scan + inotify.
@@ -45,6 +50,22 @@ set unchanged.
 - On Linux, non-UTF-8 media stems remain byte-exact when matching built-in or
   configured `{stem}` / `%s` artwork names; ASCII sidecar suffixes such as
   `-poster.jpeg` are still recognized.
+
+Targeted NFO events and periodic reconciliation use the same precedence:
+filename/mtime defaults, embedded metadata, inherited `tvshow.nfo`, then local
+NFO overrides. Removing a sidecar or an individual tag restores the underlying
+value and rebuilds the affected virtual groups for every physical alias. The
+catalog stores a fingerprint of the effective parsed NFO, including missing
+fields. A changed fingerprint during reconciliation causes one physical
+metadata probe; unchanged passes do not probe or publish another visible
+generation. Newly admitted aliases also apply their sidecars immediately,
+reusing the cloned embedded/default base when it has no previous NFO override.
+Video filename titles stay local to each alias unless the effective NFO supplies
+a title or show title; genre-only metadata does not replace those defaults. Catalogs predating
+this fingerprint reconstruct their metadata once during reconciliation.
+Malformed sidecars, cancellation, or probe-operation errors leave the published
+catalog intact; a media decoder that returns no metadata still has the valid
+filename/mtime defaults.
 
 Media and sidecar reads require a regular-file descriptor confined to a
 configured root. Both the Linux `openat2` path and its component-walking
@@ -106,6 +127,11 @@ remain byte-exact when deriving the child directory beneath `.rusty_previews`.
 Every path is browseable. Physical probe work is shared per inode (device +
 inode), while probe-sidecar overlays remain path-local. Later NFO/poster updates
 rewrite every compatible alias. Deleting one path must not delete the others.
+
+Recursive `tvshow.nfo` refresh follows the catalog walker's ancestor device/inode
+cycle policy. Self-links and links to ancestors are pruned, while separate
+non-cyclic directory aliases remain browseable and receive metadata updates.
+The walk checks cancellation before entry and between directory entries.
 
 ## Subtitles
 
@@ -174,6 +200,21 @@ matches the database generation read from the same SQLite snapshot. Each
 request makes at most three snapshot attempts. UPnP's `ui4` SystemUpdateID
 advances modulo 2^32 (`4294967295` wraps to `0`); every publication clears
 generation-keyed query caches so wrap cannot revive an ancient page.
+Class searches compare full DIDL `object.*` values case insensitively in both
+SQLite and memory. Equality, inequality, ordering, and `derivedfrom` also accept
+the stored short form (for example `item.videoItem`). `contains` and
+`doesNotContain` search the same full value with literal substring semantics and
+are complementary; substring needles are never prefixed. Stored classes and
+object IDs are unchanged.
+
+SOAP Search criteria admit at most 128 KiB of UTF-8 input, 512 tokens, and
+64 KiB per literal. Before expanding parentheses, rustyDLNA checks the complete
+expression against 256 OR groups, 64 clauses per group, 1,024 total expanded
+clauses, and 256 KiB of expanded literal bytes. Exceeding any limit returns
+fault 708 before catalog conversion or SQL parameter allocation. Search cache
+keys are canonical structured-query digests built incrementally, with fixed
+storage independent of literal escaping or expansion size.
+
 SQLite and in-memory Browse/Search ordering both append ascending object ID as
 the final tie-breaker so page boundaries remain stable during fallback.
 
@@ -249,7 +290,14 @@ reclaims expired addresses before reporting the cache full.
 
 A new GENA subscription admits its mandatory `SEQ: 0` notification atomically
 with publishing the subscriber. Later pending updates for that SID coalesce to
-the newest sequence but cannot overtake sequence zero. If initial notification
+the newest sequence but cannot overtake sequence zero. ContentDirectory deltas
+retain the union of pending parent IDs and the last update ID received for each
+parent, including across sequence/update-ID wrap. A later global update does
+not erase earlier parent invalidations. Each pending SID is limited to 1,024
+parent IDs and 64 KiB of ID bytes. If either bound is exceeded, the server retires
+that subscription and sends its final SystemUpdateID with an empty container
+list; renewal returns 412, requiring a new subscription and catalog refresh.
+Truncated parent lists are never delivered as complete deltas. If initial notification
 admission is full, the subscription is rolled back and returns 503.
 
 ## Architectural boundaries

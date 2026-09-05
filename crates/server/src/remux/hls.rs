@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
+#[cfg(test)]
 use std::path::Path;
 
 const MAX_INDEX_BOX_BYTES: u64 = 4 * 1024 * 1024;
@@ -64,8 +65,13 @@ struct SliceBox<'a> {
 }
 
 impl Index {
+    #[cfg(test)]
     pub(super) fn update(&mut self, path: &Path, complete: bool) -> Result<(), String> {
         let mut file = File::open(path).map_err(|error| format!("open HLS media: {error}"))?;
+        self.update_file(&mut file, complete)
+    }
+
+    pub(super) fn update_file(&mut self, file: &mut File, complete: bool) -> Result<(), String> {
         let available = file
             .metadata()
             .map_err(|error| format!("stat HLS media: {error}"))?
@@ -73,7 +79,7 @@ impl Index {
         if available < self.scan_offset {
             *self = Self::default();
         }
-        while let Some(header) = read_box_header(&mut file, self.scan_offset, available)
+        while let Some(header) = read_box_header(file, self.scan_offset, available)
             .map_err(|error| format!("read fragmented MP4: {error}"))?
         {
             let end = header
@@ -89,7 +95,7 @@ impl Index {
                     if header.size > MAX_INDEX_BOX_BYTES {
                         return Err("fragmented MP4 initialization is too large".into());
                     }
-                    let bytes = read_box(&mut file, header)
+                    let bytes = read_box(file, header)
                         .map_err(|error| format!("read fragmented MP4 initialization: {error}"))?;
                     let (track, defaults) = parse_moov(&bytes)?;
                     self.selected_track = Some(track);
@@ -106,7 +112,7 @@ impl Index {
                     if header.size > MAX_INDEX_BOX_BYTES {
                         return Err("fragmented MP4 movie fragment is too large".into());
                     }
-                    let bytes = read_box(&mut file, header)
+                    let bytes = read_box(file, header)
                         .map_err(|error| format!("read fragmented MP4 movie fragment: {error}"))?;
                     let timing = parse_moof(&bytes, track, self.defaults.get(&track.id).copied())?;
                     self.pending_fragment = Some(Fragment {
@@ -625,7 +631,7 @@ fn nonzero(value: u32) -> Option<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
@@ -675,7 +681,7 @@ mod tests {
         atom(kind, &full)
     }
 
-    fn fixture() -> Vec<u8> {
+    pub(crate) fn fixture() -> Vec<u8> {
         let mut tkhd = vec![0_u8; 16];
         tkhd[12..16].copy_from_slice(&1_u32.to_be_bytes());
         let mut mdhd = vec![0_u8; 16];

@@ -75,9 +75,11 @@ export function initialState(navigation, preferences) {
       currentTime: 0,
       duration: 0,
       previewTime: null,
+      pendingSeekTime: null,
       message: null,
       error: null,
       selectedAudio: 0,
+      audioSelectionExplicit: false,
       audioTracks: [],
       audioTracksStatus: "idle",
       streamNegotiation: null,
@@ -226,9 +228,11 @@ function reduce(state, action) {
           currentTime: 0,
           duration: action.duration || 0,
           previewTime: null,
+          pendingSeekTime: null,
           message: null,
           error: null,
           selectedAudio: action.item.default_audio_index ?? 0,
+          audioSelectionExplicit: false,
           audioTracks: action.item.audio_tracks || [],
           audioTracksStatus: "idle",
           streamNegotiation: null,
@@ -264,9 +268,11 @@ function reduce(state, action) {
           currentTime: 0,
           duration: 0,
           previewTime: null,
+          pendingSeekTime: null,
           message: null,
           error: null,
           selectedAudio: 0,
+          audioSelectionExplicit: false,
           audioTracks: [],
           audioTracksStatus: "idle",
           streamNegotiation: null,
@@ -295,6 +301,7 @@ function reduce(state, action) {
           segmentOffset: action.segmentOffset,
           currentTime: action.start,
           previewTime: null,
+          pendingSeekTime: null,
           streamNegotiation: null,
           message: action.message || null,
           error: null,
@@ -344,6 +351,10 @@ function reduce(state, action) {
     case "PLAYBACK_AUX":
       if (action.sessionId !== state.playback.sessionId) return state;
       return { ...state, playback: { ...state.playback, ...action.values } };
+    case "AUDIO_TRACK_SELECT":
+      if (action.sessionId !== state.playback.sessionId) return state;
+      if (!state.playback.audioTracks.some((track) => Number(track.index) === action.index)) return state;
+      return { ...state, playback: { ...state.playback, selectedAudio: action.index, audioSelectionExplicit: true } };
     case "AUDIO_TRACKS_LOADING":
       if (action.sessionId !== state.playback.sessionId) return state;
       return { ...state, playback: { ...state.playback, audioTracksStatus: "loading" } };
@@ -354,10 +365,10 @@ function reduce(state, action) {
         playback: {
           ...state.playback,
           item: action.item ? { ...state.playback.item, ...action.item } : state.playback.item,
-          selectedAudio: state.playback.selectedAudio
-            === (state.playback.item?.default_audio_index ?? 0)
-            ? action.item?.default_audio_index ?? state.playback.selectedAudio
-            : state.playback.selectedAudio,
+          selectedAudio: state.playback.audioSelectionExplicit
+            && action.tracks.some((track) => Number(track.index) === Number(state.playback.selectedAudio))
+            ? state.playback.selectedAudio
+            : action.item?.default_audio_index ?? state.playback.selectedAudio,
           audioTracks: action.tracks,
           chapters: action.chapters || state.playback.chapters,
           audioTracksStatus: "ready",

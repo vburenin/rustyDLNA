@@ -1,5 +1,89 @@
 //! `SearchCriteria` parsing and matching.
 
+const MAX_CRITERIA_BYTES: usize = 128 * 1024;
+const MAX_LITERAL_BYTES: usize = 64 * 1024;
+const MAX_EXPANDED_LITERAL_BYTES: usize = 256 * 1024;
+const MAX_EXPANDED_CLAUSES: usize = 1024;
+
+impl SearchClause {
+    fn literal_bytes(&self) -> usize {
+        match self {
+            Self::Contains { needle, .. } | Self::DoesNotContain { needle, .. } => needle.len(),
+            Self::Equals { value, .. }
+            | Self::NotEquals { value, .. }
+            | Self::LessThan { value, .. }
+            | Self::GreaterThan { value, .. } => value.len(),
+            Self::DerivedFrom { prefix, .. } => prefix.len(),
+            Self::Exists { .. } | Self::Unknown | Self::All => 0,
+        }
+    }
+}
+
+/// Account for the complete DNF before allocating any expanded groups. Each
+/// intermediate expression is checked too, bounding cumulative cloning work by
+/// the token bound times these limits, even for left-associated expressions.
+struct Expansion {
+    groups: usize,
+    clauses: usize,
+    width: usize,
+    bytes: usize,
+}
+
+impl Expression {
+    fn expansion(&self) -> Result<Expansion, SearchParseError> {
+        let complex = || SearchParseError("criteria is too complex".into());
+        let sum = |a: usize, b: usize| a.checked_add(b).ok_or_else(complex);
+        let product = |a: usize, b: usize| a.checked_mul(b).ok_or_else(complex);
+        let count = match self {
+            Self::Clause(clause) => {
+                if clause.literal_bytes() > MAX_LITERAL_BYTES {
+                    return Err(complex());
+                }
+                Expansion {
+                    groups: 1,
+                    clauses: 1,
+                    width: 1,
+                    bytes: clause.literal_bytes(),
+                }
+            }
+            Self::Or(left, right) => {
+                let left = left.expansion()?;
+                let right = right.expansion()?;
+                Expansion {
+                    groups: sum(left.groups, right.groups)?,
+                    clauses: sum(left.clauses, right.clauses)?,
+                    width: left.width.max(right.width),
+                    bytes: sum(left.bytes, right.bytes)?,
+                }
+            }
+            Self::And(left, right) => {
+                let left = left.expansion()?;
+                let right = right.expansion()?;
+                Expansion {
+                    groups: product(left.groups, right.groups)?,
+                    clauses: sum(
+                        product(left.clauses, right.groups)?,
+                        product(right.clauses, left.groups)?,
+                    )?,
+                    width: sum(left.width, right.width)?,
+                    bytes: sum(
+                        product(left.bytes, right.groups)?,
+                        product(right.bytes, left.groups)?,
+                    )?,
+                }
+            }
+        };
+        if count.groups > 256
+            || count.width > 64
+            || count.clauses > MAX_EXPANDED_CLAUSES
+            || count.bytes > MAX_EXPANDED_LITERAL_BYTES
+        {
+            return Err(complex());
+        }
+        Ok(count)
+    }
+}
+
 /// A single rustyDLNA search clause. Unknown properties match nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SearchClause {
@@ -330,6 +414,9 @@ fn to_groups(expression: Expression) -> Result<Vec<Vec<SearchClause>>, SearchPar
 }
 
 pub fn try_parse_search_criteria(raw: Option<&str>) -> Result<SearchQuery, SearchParseError> {
+    if raw.is_some_and(|raw| raw.len() > MAX_CRITERIA_BYTES) {
+        return Err(SearchParseError("criteria is too large".into()));
+    }
     let s = raw.map(str::trim).unwrap_or("");
     if s.is_empty() || s == "*" || s == "1=1" {
         return Ok(SearchQuery {
@@ -348,6 +435,7 @@ pub fn try_parse_search_criteria(raw: Option<&str>) -> Result<SearchQuery, Searc
     if parser.position != parser.tokens.len() {
         return Err(SearchParseError("unexpected trailing token".into()));
     }
+    expression.expansion()?;
     Ok(SearchQuery {
         groups: to_groups(expression)?,
     })
@@ -387,31 +475,41 @@ fn field<'a>(row: &SearchRow<'a>, prop: SearchProp) -> &'a str {
 }
 
 pub fn clause_matches(clause: &SearchClause, row: &SearchRow<'_>) -> bool {
+    use rusty_dlna_protocol::class::{full_object_class, object_class_derived_from};
+    let normalized = |prop| {
+        if prop == SearchProp::Class {
+            full_object_class(field(row, prop))
+        } else {
+            std::borrow::Cow::Borrowed(field(row, prop))
+        }
+    };
+    let compare = |prop, value: &str| {
+        let value = if prop == SearchProp::Class {
+            full_object_class(value)
+        } else {
+            std::borrow::Cow::Borrowed(value)
+        };
+        normalized(prop)
+            .to_ascii_lowercase()
+            .cmp(&value.to_ascii_lowercase())
+    };
     match clause {
         SearchClause::All => true,
         SearchClause::Unknown => false,
-        SearchClause::Contains { prop, needle } => {
-            let hay = if *prop == SearchProp::Class {
-                class_full(field(row, *prop))
-            } else {
-                field(row, *prop).to_string()
-            };
-            hay.to_ascii_lowercase()
-                .contains(&needle.to_ascii_lowercase())
-        }
-        SearchClause::DoesNotContain { prop, needle } => !field(row, *prop)
+        SearchClause::Contains { prop, needle } => normalized(*prop)
             .to_ascii_lowercase()
             .contains(&needle.to_ascii_lowercase()),
-        SearchClause::Equals { prop, value } => field(row, *prop).eq_ignore_ascii_case(value),
-        SearchClause::NotEquals { prop, value } => !field(row, *prop).eq_ignore_ascii_case(value),
+        SearchClause::DoesNotContain { prop, needle } => !normalized(*prop)
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase()),
+        SearchClause::Equals { prop, value } => compare(*prop, value).is_eq(),
+        SearchClause::NotEquals { prop, value } => !compare(*prop, value).is_eq(),
         SearchClause::LessThan {
             prop,
             value,
             inclusive,
         } => {
-            let order = field(row, *prop)
-                .to_ascii_lowercase()
-                .cmp(&value.to_ascii_lowercase());
+            let order = compare(*prop, value);
             order.is_lt() || (*inclusive && order.is_eq())
         }
         SearchClause::GreaterThan {
@@ -419,37 +517,14 @@ pub fn clause_matches(clause: &SearchClause, row: &SearchRow<'_>) -> bool {
             value,
             inclusive,
         } => {
-            let order = field(row, *prop)
-                .to_ascii_lowercase()
-                .cmp(&value.to_ascii_lowercase());
+            let order = compare(*prop, value);
             order.is_gt() || (*inclusive && order.is_eq())
         }
         SearchClause::DerivedFrom { prop, prefix } => {
-            let hay = field(row, *prop);
-            class_derivedfrom(hay, prefix)
+            object_class_derived_from(field(row, *prop), prefix)
         }
-        SearchClause::Exists { prop, want } => {
-            let present = !field(row, *prop).is_empty();
-            present == *want
-        }
+        SearchClause::Exists { prop, want } => !field(row, *prop).is_empty() == *want,
     }
-}
-
-/// `object.item.videoItem` derivedfrom must not treat `object.container` as a hit.
-/// Class values in the catalog are stored without the `object.` prefix
-/// (`item.videoItem`); accept both forms.
-fn class_full(hay: &str) -> String {
-    if hay.starts_with("object.") {
-        hay.to_string()
-    } else {
-        format!("object.{hay}")
-    }
-}
-
-fn class_derivedfrom(hay: &str, prefix: &str) -> bool {
-    let hay_full = class_full(hay);
-    let pre = class_full(prefix);
-    hay_full == pre || hay_full.starts_with(&format!("{pre}."))
 }
 
 pub fn row_matches(query: &SearchQuery, row: &SearchRow<'_>) -> bool {
@@ -479,6 +554,46 @@ mod tests {
             is_container: true,
             ..SearchRow::default()
         }
+    }
+
+    #[test]
+    fn expanded_search_literals_are_bounded_before_cloning() {
+        let mut criteria = format!("dc:title contains \"{}\"", "x".repeat(64 * 1024));
+        for _ in 0..8 {
+            criteria.push_str(" and (dc:title = \"a\" or dc:title = \"b\")");
+        }
+        assert!(try_parse_search_criteria(Some(&criteria)).is_err());
+    }
+
+    #[test]
+    fn search_limits_accept_boundaries_and_reject_expanded_bytes_and_work() {
+        let criterion = |size| format!("dc:title = \"{}\"", "x".repeat(size));
+        assert!(try_parse_search_criteria(Some(&criterion(MAX_LITERAL_BYTES))).is_ok());
+        assert!(try_parse_search_criteria(Some(&criterion(MAX_LITERAL_BYTES + 1))).is_err());
+        assert!(try_parse_search_criteria(Some(&" ".repeat(MAX_CRITERIA_BYTES + 1))).is_err());
+        let suffix = " and (dc:title = \"a\" or dc:title = \"b\")";
+        let near = format!("{}{}{}", criterion(MAX_LITERAL_BYTES - 2), suffix, suffix);
+        let query = try_parse_search_criteria(Some(&near)).unwrap();
+        assert_eq!(
+            query
+                .groups
+                .iter()
+                .flatten()
+                .map(SearchClause::literal_bytes)
+                .sum::<usize>(),
+            MAX_EXPANDED_LITERAL_BYTES
+        );
+        let over = format!("{}{}{}", criterion(MAX_LITERAL_BYTES - 1), suffix, suffix);
+        assert!(try_parse_search_criteria(Some(&over)).is_err());
+        // Small literals can still amplify the number of clauses and SQL parameters.
+        let wide = std::iter::repeat_n("(dc:title = \"a\" or dc:title = \"b\")", 8)
+            .collect::<Vec<_>>()
+            .join(" and ");
+        assert!(try_parse_search_criteria(Some(&wide)).is_err());
+        let deep = std::iter::repeat_n("dc:title = \"a\"", 65)
+            .collect::<Vec<_>>()
+            .join(" and ");
+        assert!(try_parse_search_criteria(Some(&deep)).is_err());
     }
 
     #[test]

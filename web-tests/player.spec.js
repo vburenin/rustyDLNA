@@ -4547,7 +4547,11 @@ test("brief playback cannot reset the compatible retry budget", async ({ page })
     HTMLMediaElement.prototype.play = function playBriefly() {
       window.__briefPlayEvents += 1;
       this.dispatchEvent(new Event("playing"));
-      window.setTimeout(() => this.dispatchEvent(new Event("error")), 25);
+      window.setTimeout(() => {
+        Object.defineProperty(this, "currentTime", { configurable: true, value: 0.1 });
+        this.dispatchEvent(new Event("timeupdate"));
+        this.dispatchEvent(new Event("error"));
+      }, 25);
       return Promise.resolve();
     };
   });
@@ -4575,6 +4579,13 @@ test("brief playback cannot reset the compatible retry budget", async ({ page })
   expect(await page.evaluate(() => window.__briefPlayEvents)).toBeGreaterThanOrEqual(4);
   await page.waitForTimeout(750);
   expect(generations.size).toBe(4);
+  await page.locator("#player-retry").click();
+  await expect.poll(() => generations.size).toBe(8);
+  await expect(page.locator("#player-message-text")).toContainText("could not prepare this title");
+  await openVideoView(page);
+  await page.locator(".media-card.video .card-button").filter({ hasNotText: "tagged" }).first().click();
+  await expect.poll(() => generations.size).toBe(12);
+  expect(new Set(generations.values()).size).toBe(2);
 });
 
 test("rapid item switching suppresses an older media failure", async ({ page }) => {
@@ -5947,9 +5958,19 @@ test("end state keeps the real duration and Replay starts from zero", async ({ p
   await usePreference(page, "stream", "direct");
   await page.addInitScript(() => {
     const sources = new WeakMap();
-    HTMLMediaElement.prototype.play = () => Promise.resolve();
-    HTMLMediaElement.prototype.pause = () => {};
-    HTMLMediaElement.prototype.load = () => {};
+    HTMLMediaElement.prototype.play = function playFixture() {
+      Object.defineProperty(this, "paused", { configurable: true, value: false });
+      this.dispatchEvent(new Event("playing"));
+      return Promise.resolve();
+    };
+    HTMLMediaElement.prototype.pause = function pauseFixture() {
+      Object.defineProperty(this, "paused", { configurable: true, value: true });
+      this.dispatchEvent(new Event("pause"));
+    };
+    HTMLMediaElement.prototype.load = function loadFixture() {
+      Object.defineProperty(this, "currentTime", { configurable: true, writable: true, value: 0 });
+      if (sources.has(this)) queueMicrotask(() => this.dispatchEvent(new Event("loadedmetadata")));
+    };
     Object.defineProperty(HTMLMediaElement.prototype, "src", {
       configurable: true,
       get() { return sources.get(this) || ""; },
@@ -5958,6 +5979,7 @@ test("end state keeps the real duration and Replay starts from zero", async ({ p
   });
   await openLibrary(page);
   await selectTaggedVideo(page);
+  const firstSource = new URL(await page.locator("#video-player").evaluate((video) => video.src));
   const duration = await page.locator("#timeline").getAttribute("max");
   await page.locator("#video-player").dispatchEvent("ended");
   await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Replay");
@@ -5965,7 +5987,15 @@ test("end state keeps the real duration and Replay starts from zero", async ({ p
   await showPlayerControls(page);
   await page.locator("#play-button").click();
   await expect(page.locator("#timeline")).toHaveValue("0");
-  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Pause");
+  const replaySource = new URL(await page.locator("#video-player").evaluate((video) => video.src));
+  expect(replaySource.pathname).toBe(firstSource.pathname);
+  expect(Number(replaySource.searchParams.get("request"))).toBeGreaterThan(Number(firstSource.searchParams.get("request")));
+  await page.locator("#video-player").evaluate((video) => {
+    video.currentTime = 0.1;
+    video.dispatchEvent(new Event("timeupdate"));
+  });
+  await expect(page.locator("#timeline")).toHaveValue("0.1");
 });
 
 test("reduced motion, 200% zoom, and focus restoration remain usable", async ({ page }) => {

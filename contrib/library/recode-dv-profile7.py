@@ -16,6 +16,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import math
 import os
 import re
 import shutil
@@ -37,6 +38,7 @@ from lib.dv_profile7 import (
     streamer_filename,
 )
 from lib.paths import add_root_argument, require_library_root
+from lib.safe_move import move_without_overwrite
 
 
 ARCHIVE_DIRNAME = "to-review/P7-Recoded-For-Streamer"
@@ -425,6 +427,11 @@ def verify_streamer(source: Path, dest: Path, lossless_video: bool) -> None:
 
     source_duration = video_duration_seconds(source_info)
     dest_duration = video_duration_seconds(dest_info)
+    if any(
+        duration is None or not math.isfinite(duration) or duration <= 0
+        for duration in (source_duration, dest_duration)
+    ):
+        raise RuntimeError("cannot verify Streamer completeness without valid video durations")
     if source_duration and dest_duration:
         if abs(source_duration - dest_duration) > DURATION_TOLERANCE_SECONDS:
             source_packets = video_packet_count(source) if lossless_video else None
@@ -498,15 +505,8 @@ def append_build_manifest(archive_dir: Path, row: dict[str, str]) -> None:
 
 
 def move_preserving_source(source: Path, dest: Path) -> None:
-    """Rename media, using the library's admin path for root-owned intake."""
-    try:
-        source.replace(dest)
-    except PermissionError:
-        completed = subprocess.run(
-            ["sudo", "-n", "mv", "--", str(source), str(dest)]
-        )
-        if completed.returncode != 0:
-            raise
+    """Archive media without replacing even a concurrently created entry."""
+    move_without_overwrite(source, dest)
 
 
 def replace_verified_output(source: Path, dest: Path) -> None:
@@ -572,13 +572,17 @@ def recode_one(
             dest = existing
 
     if dest.exists() and not replace_existing:
+        # Existing derivatives can have been explicitly transcoded in an earlier
+        # run. Require playback compatibility and completeness, without claiming
+        # they are a lossless copy or silently rebuilding an invalid file.
+        verify_streamer(source, dest, lossless_video=False)
         if job.already_archived:
             return f"keep existing Streamer: {dest}"
         action = "archive-only"
         if dry_run:
             return f"DRY {action}: keep {dest.name}; archive {source.name}"
         archived = archive_dir / archive_name(source, library_root)
-        if archived.exists():
+        if os.path.lexists(archived):
             raise RuntimeError(f"archive collision: {archived}")
         source_size = source.stat().st_size
         move_preserving_source(source, archived)
@@ -638,12 +642,15 @@ def recode_one(
 
     # The old derived playback file remains intact until the replacement has
     # passed all verification above. Path.replace is atomic on this filesystem.
-    replace_verified_output(temp_out, dest)
+    if replace_existing:
+        replace_verified_output(temp_out, dest)
+    else:
+        move_without_overwrite(temp_out, dest)
 
     archived = source
     if not job.already_archived:
         archived = archive_dir / archive_name(source, library_root)
-        if archived.exists():
+        if os.path.lexists(archived):
             raise RuntimeError(f"archive collision: {archived}")
         original_relative = str(source.relative_to(library_root))
         move_preserving_source(source, archived)

@@ -292,18 +292,56 @@ fn exif_ascii(exif: &exif::Exif, tag: exif::Tag) -> Option<String> {
     })
 }
 
-fn exif_date(value: String) -> String {
+fn exif_date(value: String) -> Option<String> {
+    // EXIF timestamps are ASCII. Validate every byte before slicing: lossy
+    // decoding of malformed tag bytes may have introduced multibyte U+FFFD.
     let bytes = value.as_bytes();
-    if bytes.len() >= 19 && bytes[4] == b':' && bytes[7] == b':' && bytes[10] == b' ' {
-        format!(
+    // Retain the valid date-only forms accepted by the metadata normalizer.
+    if (bytes.len() == 4 && bytes.iter().all(u8::is_ascii_digit))
+        || (bytes.len() == 10
+            && bytes.iter().enumerate().all(|(index, byte)| {
+                if matches!(index, 4 | 7) {
+                    *byte == b'-'
+                } else {
+                    byte.is_ascii_digit()
+                }
+            }))
+    {
+        return Some(rusty_dlna_protocol::w3c_normalize_date(&value));
+    }
+    let timestamp = bytes.get(..19)?;
+    let exif = timestamp[4] == b':' && timestamp[7] == b':';
+    for (index, byte) in timestamp.iter().enumerate() {
+        let valid = match index {
+            4 | 7 => *byte == if exif { b':' } else { b'-' },
+            13 | 16 => *byte == b':',
+            10 => *byte == b' ' || (!exif && *byte == b'T'),
+            _ => byte.is_ascii_digit(),
+        };
+        if !valid {
+            return None;
+        }
+    }
+    if exif {
+        Some(format!(
             "{}-{}-{}T{}Z",
             &value[0..4],
             &value[5..7],
             &value[8..10],
             &value[11..19]
-        )
+        ))
+    } else if bytes.len() == 19
+        || (bytes.len() == 20 && bytes[19] == b'Z')
+        || (bytes.len() == 25
+            && matches!(bytes[19], b'+' | b'-')
+            && bytes[22] == b':'
+            && [20, 21, 23, 24]
+                .iter()
+                .all(|index| bytes[*index].is_ascii_digit()))
+    {
+        Some(rusty_dlna_protocol::w3c_normalize_date(&value))
     } else {
-        rusty_dlna_protocol::w3c_normalize_date(&value)
+        None
     }
 }
 
@@ -326,7 +364,7 @@ fn apply_exif(path: &Path, image: &mut MediaProbe) {
     image.tags.title = image.tags.comment.clone();
     image.tags.date = exif_ascii(&exif, exif::Tag::DateTimeOriginal)
         .or_else(|| exif_ascii(&exif, exif::Tag::DateTime))
-        .map(exif_date);
+        .and_then(exif_date);
     let orientation = exif
         .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
         .and_then(|field| field.value.get_uint(0));
@@ -1666,6 +1704,39 @@ mod tests {
 
         fn deref(&self) -> &Self::Target {
             &self.0
+        }
+    }
+
+    #[test]
+    fn exif_dates_require_complete_ascii_timestamps() {
+        for value in [
+            "",
+            "202",
+            "2026:01:01",
+            "2026:01:01 12:34:5é",
+            "2026:01:01 12:34:5�",
+            "202é:01:01 12:34:56",
+            "2026:01:01 12-34:56",
+            "2026:aa:01 12:34:56",
+        ] {
+            assert_eq!(exif_date(value.into()), None, "{value}");
+        }
+        assert_eq!(
+            exif_date("2026:01:01 12:34:56".into()).as_deref(),
+            Some("2026-01-01T12:34:56Z")
+        );
+        for value in ["2026", "2026-01-01"] {
+            assert_eq!(exif_date(value.into()).as_deref(), Some("2026-01-01"));
+        }
+        assert_eq!(
+            exif_date("2026-01-01T12:34:56+05:30".into()).as_deref(),
+            Some("2026-01-01T12:34:56+05:30")
+        );
+        for value in ["2026-01-01T12:34:56", "2026-01-01T12:34:56Z"] {
+            assert_eq!(
+                exif_date(value.into()).as_deref(),
+                Some("2026-01-01T12:34:56Z")
+            );
         }
     }
 

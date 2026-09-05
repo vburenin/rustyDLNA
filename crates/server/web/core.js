@@ -911,3 +911,32 @@ export function apiErrorCategory(error) {
   if (error?.name === "TypeError" || error?.status === 0) return "network";
   return "unknown";
 }
+
+// A budget belongs to a selected title or explicit user restart, never to a
+// source generation or a successful media event. Busy admission has its own
+// bounded window and does not consume failures of an admitted producer.
+export function initialCompatibleRecovery() {
+  return { retries: 0, busyStartedAt: null, busyRetries: 0, pendingSession: null };
+}
+
+export function nextCompatibleRetry(recovery, { sessionId, busy = false, now }) {
+  if (recovery.pendingSession === sessionId) return recovery;
+  if (busy) {
+    const busyStartedAt = recovery.busyStartedAt ?? now;
+    if (now - busyStartedAt >= 5 * 60 * 1_000) return null;
+    return { ...recovery, busyStartedAt, busyRetries: recovery.busyRetries + 1, pendingSession: sessionId };
+  }
+  if (recovery.retries >= 3) return null;
+  return { retries: recovery.retries + 1, busyStartedAt: null, busyRetries: 0, pendingSession: sessionId };
+}
+
+export function bufferedSeekTarget(ranges, target) {
+  return Number.isFinite(target) && target >= 0
+    && ranges.some((range) => range.start <= target && target < range.end);
+}
+
+export function playbackAudioTrackIndex(playback) {
+  return playback.sourceMode === SOURCE_MODES.ORIGINAL
+    ? originalAudioTrackIndex(playback.audioTracks)
+    : playback.selectedAudio;
+}

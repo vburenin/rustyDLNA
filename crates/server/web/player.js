@@ -5,6 +5,7 @@ import {
   apiErrorCategory,
   automaticCompatibleRecoveryProfile,
   audioTrackLabel,
+  bufferedSeekTarget,
   chooseSource,
   clockLabel,
   compatibleVideoDimensions,
@@ -17,6 +18,8 @@ import {
   isAndroidDevice,
   isApplePhoneDevice,
   itemDuration,
+  initialCompatibleRecovery,
+  nextCompatibleRetry,
   isAppleMobileDevice,
   isSafariBrowser,
   mediaDetails,
@@ -25,6 +28,7 @@ import {
   encodingPreset,
   originalDownloadUrl,
   negotiateCompatibleStreams,
+  playbackAudioTrackIndex,
   playbackControlLabel,
   playbackProcessing,
   playbackError,
@@ -66,8 +70,6 @@ const ORIGINAL_BUFFER_STALL_MS = 12_000;
 const COMPATIBLE_STARTUP_STALL_MS = 8_000;
 const NATIVE_HLS_STARTUP_STALL_MS = 12_000;
 const MAX_COMPATIBLE_SOURCE_RELOADS = 1;
-const MAX_AUTOMATIC_TRANSCODE_RETRIES = 3;
-const TRANSCODE_BUSY_RETRY_WINDOW_MS = 5 * 60 * 1_000;
 const MAX_HELD_VIDEO_FRAME_PIXELS = 4_194_304;
 const MAX_DECODED_TRICKPLAY_SHEETS = 2;
 const MAX_MEDIA_CAPABILITY_CACHE_ENTRIES = 64;
@@ -310,10 +312,7 @@ export class PlaybackController {
   #chapterRenderKey = "";
   #streamInfoRenderInputs = [];
   #capabilityCache = new Map();
-  #automaticTranscodeRetries = 0;
-  #pendingCompatibleRetrySession = null;
-  #transcodeBusyStartedAt = null;
-  #transcodeBusyRetries = 0;
+  #compatibleRecovery = initialCompatibleRecovery();
   #compatibleSourceReloads = 0;
   #nativeHlsSuspendedSession = null;
   #progressWriter;
@@ -387,6 +386,10 @@ export class PlaybackController {
     const duration = itemDuration(item);
     const linkedStart = seekTarget(startAt, duration);
     const resumeAt = linkedStart > 0 ? 0 : resumePosition(progressFor(item.id), duration);
+    if (duration > 0 && linkedStart >= duration) {
+      this.seekTo(duration);
+      return;
+    }
     if (linkedStart > 0) {
       this.#loadSource(item, { start: linkedStart, intent: "playing", messageKind: "deep_link" });
       return;
@@ -416,6 +419,7 @@ export class PlaybackController {
   globalTime() {
     const playback = this.#store.getState().playback;
     const player = this.activePlayer();
+    if (playback.pendingSeekTime !== null) return playback.pendingSeekTime;
     const local = Number.isFinite(player?.currentTime) ? player.currentTime : 0;
     if (playback.sourceMode === SOURCE_MODES.COMPATIBLE) {
       if (playback.status === "seeking") return playback.currentTime;
@@ -436,18 +440,13 @@ export class PlaybackController {
     const { playback } = this.#store.getState();
     if (!playback.item) return;
     if (playback.status === "ended") {
-      if (playback.sourceMode === SOURCE_MODES.COMPATIBLE) {
-        this.#loadSource(playback.item, {
-          start: 0,
-          intent: "playing",
-          forceSourceMode: SOURCE_MODES.COMPATIBLE,
-          forceAndroidMediaSource: playback.mediaSourceDelivery,
-        });
-        return;
-      }
-      this.seekTo(0);
-      this.#store.dispatch({ type: "PLAYBACK_STATUS", sessionId: playback.sessionId, status: "paused", intent: "playing", message: null });
-      await this.#attemptPlay(playback.sessionId, this.activePlayer());
+      this.#resetAutomaticTranscodeRecovery();
+      this.#loadSource(playback.item, {
+        start: 0,
+        intent: "playing",
+        forceSourceMode: playback.sourceMode,
+        forceAndroidMediaSource: playback.mediaSourceDelivery,
+      });
       return;
     }
     const player = this.activePlayer();
@@ -480,7 +479,9 @@ export class PlaybackController {
     const target = seekTarget(value, playback.duration);
     this.#resetAutomaticTranscodeRecovery();
     if (target >= playback.duration) {
-      this.#cancelSeekTimer();
+      // End is an explicit finished position, not a new seek bucket. Detach
+      // stale media events before pause can repaint it or overwrite the clock.
+      this.#cancelSource();
       this.activePlayer().pause();
       this.#store.dispatch({
         type: "PLAYBACK_TIME", sessionId: playback.sessionId,
@@ -1269,6 +1270,7 @@ export class PlaybackController {
           streamNegotiation,
           nativeHlsDelivery,
           mediaSourceDelivery,
+          pendingSeekTime: mediaSourceDelivery && start > segmentOffset ? start : null,
           outputQuality,
           ...(mediaSourceDelivery && !message
             ? {
@@ -1304,17 +1306,39 @@ export class PlaybackController {
       }
     });
     listen("seeking", () => { if (sourceMode === SOURCE_MODES.ORIGINAL) status("seeking", { message: "Seeking…" }); });
+    const applyPendingSeek = () => {
+      if (!valid()) return false;
+      const target = this.#store.getState().playback.pendingSeekTime;
+      if (target === null) return true;
+      const local = target - segmentOffset;
+      const ranges = Array.from({ length: player.buffered.length }, (_, index) => ({
+        start: player.buffered.start(index), end: player.buffered.end(index),
+      }));
+      if (!bufferedSeekTarget(ranges, local)) return false;
+      if (Math.abs(player.currentTime - local) > 0.05) {
+        try { player.currentTime = local; } catch (_) { return false; }
+      }
+      if (Math.abs(player.currentTime - local) > 0.05 || player.seeking) return false;
+      this.#store.dispatch({ type: "PLAYBACK_AUX", sessionId, values: { pendingSeekTime: null } });
+      return true;
+    };
     listen("seeked", () => {
-      if (sourceMode !== SOURCE_MODES.ORIGINAL) return;
-      this.#releaseHeldVideoFrame();
-      status(player.paused ? "paused" : "playing", { message: null });
+      if (!valid() || !applyPendingSeek()) return;
+      if (mediaSourceDelivery) {
+        void readyToPlay();
+      } else if (sourceMode === SOURCE_MODES.ORIGINAL) {
+        this.#releaseHeldVideoFrame();
+        status(player.paused ? "paused" : "playing", { message: null });
+      }
     });
     listen("loadedmetadata", () => {
       if (!valid()) return;
-      if (sourceMode === SOURCE_MODES.ORIGINAL && start > 0) {
-        try { player.currentTime = Math.min(start, Number.isFinite(player.duration) ? player.duration : start); } catch (_) { /* canplay retries naturally */ }
+      if (mediaSourceDelivery) {
+        applyPendingSeek();
+      } else if (sourceMode === SOURCE_MODES.ORIGINAL && start > 0) {
+        try { player.currentTime = Math.min(start, Number.isFinite(player.duration) ? player.duration : start); } catch (_) { /* Native metadata is not seekable yet. */ }
       } else if (sourceMode === SOURCE_MODES.COMPATIBLE && start > segmentOffset) {
-        try { player.currentTime = start - segmentOffset; } catch (_) { /* canplay retries naturally */ }
+        try { player.currentTime = start - segmentOffset; } catch (_) { /* Native metadata is not seekable yet. */ }
       }
       const duration = itemDuration(item, player.duration);
       this.#store.dispatch({ type: "PLAYBACK_TIME", sessionId, currentTime: start, duration });
@@ -1325,12 +1349,12 @@ export class PlaybackController {
       this.#store.dispatch({ type: "PLAYBACK_TIME", sessionId, currentTime: this.globalTime(), duration: itemDuration(item, player.duration) });
     });
     listen("loadeddata", () => {
-      if (!valid()) return;
+      if (!valid() || !applyPendingSeek()) return;
       if (sourceMode === SOURCE_MODES.COMPATIBLE) this.#clearStartupTimer();
       this.#releaseHeldVideoFrame();
     });
-    listen("canplay", async () => {
-      if (!valid()) return;
+    const readyToPlay = async () => {
+      if (!valid() || !applyPendingSeek()) return;
       if (sourceMode === SOURCE_MODES.COMPATIBLE) this.#clearStartupTimer();
       this.#releaseHeldVideoFrame();
       this.#startTrickplayPreload();
@@ -1357,7 +1381,8 @@ export class PlaybackController {
         // already-running element as paused merely because it recovered data.
         status("playing", { autoplayBlocked: false, intent: "playing", message: null });
       }
-    });
+    };
+    listen("canplay", readyToPlay);
     listen("playing", () => {
       if (!valid()) return;
       if (sourceMode === SOURCE_MODES.COMPATIBLE
@@ -1397,8 +1422,7 @@ export class PlaybackController {
       this.#progressWriter.flush();
     });
     listen("timeupdate", () => {
-      if (!valid()) return;
-      if (player.currentTime > 0) this.#resetAutomaticTranscodeRecovery();
+      if (!valid() || !applyPendingSeek()) return;
       const global = sourceMode === SOURCE_MODES.COMPATIBLE ? segmentOffset + player.currentTime : player.currentTime;
       this.#store.dispatch({ type: "PLAYBACK_TIME", sessionId, currentTime: global, duration: itemDuration(item, player.duration) });
       // A seek while paused is still valuable resume state, and some engines do
@@ -1537,6 +1561,14 @@ export class PlaybackController {
         start,
         streamNegotiation,
         mediaSourceRetry,
+        pendingSeek: () => {
+          const target = this.#store.getState().playback.pendingSeekTime;
+          return target === null ? null : target - segmentOffset;
+        },
+        onBuffered: () => {
+          if (this.#store.getState().playback.pendingSeekTime !== null
+            && applyPendingSeek() && player.readyState >= 3) void readyToPlay();
+        },
         signal: controller.signal,
         valid,
       });
@@ -1585,6 +1617,8 @@ export class PlaybackController {
     start,
     streamNegotiation,
     mediaSourceRetry,
+    pendingSeek,
+    onBuffered,
     signal,
     valid,
   }) {
@@ -1612,6 +1646,8 @@ export class PlaybackController {
       contentType,
       signal,
       reportStartup,
+      pendingSeek,
+      onBuffered,
     })
       .catch((error) => {
         if (signal.aborted || error?.name === "AbortError" || !valid()) return;
@@ -1901,7 +1937,6 @@ export class PlaybackController {
       || playback.sourceMode !== SOURCE_MODES.COMPATIBLE
       || !playback.item) return false;
     this.#nativeHlsSuspendedSession = null;
-    this.#resetAutomaticTranscodeRecovery();
     this.#loadSource(playback.item, {
       start: playback.currentTime,
       intent: "playing",
@@ -1915,10 +1950,7 @@ export class PlaybackController {
   }
 
   #resetAutomaticTranscodeRecovery() {
-    this.#automaticTranscodeRetries = 0;
-    this.#pendingCompatibleRetrySession = null;
-    this.#transcodeBusyStartedAt = null;
-    this.#transcodeBusyRetries = 0;
+    this.#compatibleRecovery = initialCompatibleRecovery();
   }
 
   #scheduleCompatibleRetry({
@@ -1935,27 +1967,18 @@ export class PlaybackController {
     // its producer-status request is in flight. Count and schedule that source
     // only once; otherwise a duplicate callback can consume another retry and
     // cancel the first callback's timer without loading a new generation.
-    if (this.#pendingCompatibleRetrySession === sessionId) return true;
-    if (busy) {
-      const now = Date.now();
-      this.#transcodeBusyStartedAt ??= now;
-      if (now - this.#transcodeBusyStartedAt >= TRANSCODE_BUSY_RETRY_WINDOW_MS) return false;
-      this.#transcodeBusyRetries += 1;
-    } else {
-      this.#transcodeBusyStartedAt = null;
-      this.#transcodeBusyRetries = 0;
-      if (this.#automaticTranscodeRetries >= MAX_AUTOMATIC_TRANSCODE_RETRIES) return false;
-      this.#automaticTranscodeRetries += 1;
-    }
+    const recovery = nextCompatibleRetry(this.#compatibleRecovery, { sessionId, busy, now: Date.now() });
+    if (!recovery) return false;
+    if (recovery === this.#compatibleRecovery) return true;
+    this.#compatibleRecovery = recovery;
     const target = this.#store.getState().playback.currentTime || start;
     const playback = this.#store.getState().playback;
     const outputQuality = playback.outputQuality;
     const forceAndroidMediaSource = playback.mediaSourceDelivery;
     const requestedDelay = Math.max(250, Number(retryAfterSeconds || 1) * 1_000);
     const delay = busy
-      ? Math.min(5_000, Math.max(requestedDelay, 250 * (2 ** Math.min(4, this.#transcodeBusyRetries - 1))))
+      ? Math.min(5_000, Math.max(requestedDelay, 250 * (2 ** Math.min(4, recovery.busyRetries - 1))))
       : Math.min(2_000, requestedDelay);
-    this.#pendingCompatibleRetrySession = sessionId;
     this.#cancelSource({ keepElement: false });
     this.#store.dispatch({
       type: "PLAYBACK_STATUS",
@@ -1969,8 +1992,8 @@ export class PlaybackController {
     });
     this.#statusTimer = window.setTimeout(() => {
       this.#statusTimer = null;
-      if (this.#pendingCompatibleRetrySession === sessionId) {
-        this.#pendingCompatibleRetrySession = null;
+      if (this.#compatibleRecovery.pendingSession === sessionId) {
+        this.#compatibleRecovery = { ...this.#compatibleRecovery, pendingSession: null };
       }
       const latest = this.#store.getState().playback;
       if (sessionId !== latest.sessionId) return;
@@ -1989,6 +2012,7 @@ export class PlaybackController {
   }
 
   async #attemptPlay(sessionId, player) {
+    if (this.#store.getState().playback.pendingSeekTime !== null) return;
     try {
       await player.play();
     } catch (error) {
@@ -2304,8 +2328,9 @@ export class PlaybackController {
   #selectAudioTrack(index) {
     const state = this.#store.getState();
     const { playback } = state;
-    if (!playback.item || index === playback.selectedAudio || !state.server.capabilities.transcoding) return;
-    this.#store.dispatch({ type: "PLAYBACK_AUX", sessionId: playback.sessionId, values: { selectedAudio: index } });
+    if (!playback.item || !state.server.capabilities.transcoding) return;
+    this.#store.dispatch({ type: "AUDIO_TRACK_SELECT", sessionId: playback.sessionId, index });
+    if (index === playbackAudioTrackIndex(playback)) return;
     const start = this.globalTime();
     const intent = playback.intent;
     this.#loadSource(playback.item, {
@@ -2332,7 +2357,7 @@ export class PlaybackController {
       }
     }
     this.#dom.audioTrackControl.hidden = playback.audioTracks.length < 2;
-    this.#dom.audioTrackControls.value = String(playback.selectedAudio);
+    this.#dom.audioTrackControls.value = String(playbackAudioTrackIndex(playback));
     const switchingUnavailable = playback.audioTracks.length > 1 && !server.capabilities.transcoding;
     this.#dom.audioTrackControls.disabled = playback.audioTracksStatus === "loading" || switchingUnavailable;
     this.#dom.audioTrackRetry.hidden = playback.audioTracksStatus !== "error";
@@ -2455,7 +2480,7 @@ export class PlaybackController {
     const item = playback.item;
     if (!item) return;
     const inputs = [
-      item, playback.audioTracks, playback.selectedAudio, playback.sourceMode,
+      item, playback.audioTracks, playbackAudioTrackIndex(playback), playback.sourceMode,
       playback.outputQuality, playback.nativeHlsDelivery, playback.mediaSourceDelivery,
       playback.streamNegotiation, preferences.quality, server.capabilities,
       playback.encodingPreset,
@@ -2476,7 +2501,7 @@ export class PlaybackController {
     }
     this.#dom.streamDiagnostics.hidden = playback.sourceMode !== SOURCE_MODES.COMPATIBLE || !playback.streamNegotiation;
     if (this.#dom.streamDiagnostics.hidden) this.#dom.streamDiagnosticFacts.replaceChildren();
-    const selectedTrack = playback.audioTracks.find((track) => Number(track.index) === Number(playback.selectedAudio));
+    const selectedTrack = playback.audioTracks.find((track) => Number(track.index) === Number(playbackAudioTrackIndex(playback)));
     const sourceAudio = selectedTrack
       ? audioTrackLabel(selectedTrack)
       : [codecLabel(item.audio_codec), item.audio_layout || (item.channels ? `${item.channels}ch` : "")].filter(Boolean).join(" · ");
@@ -2778,13 +2803,15 @@ export class PlaybackController {
     });
     this.#dom.audioTrackControls.addEventListener("change", () => this.#selectAudioTrack(Number(this.#dom.audioTrackControls.value)));
     this.#dom.audioTrackRetry.addEventListener("click", async () => {
+      const sessionId = this.#store.getState().playback.sessionId;
       const enriched = await this.#enrichAudioTracks();
-      const playback = this.#store.getState().playback;
-      if (enriched && playback.sourceMode === SOURCE_MODES.COMPATIBLE) {
+      const { playback, preferences } = this.#store.getState();
+      if (!enriched || playback.sessionId !== sessionId || playback.audioTracksStatus !== "ready") return;
+      if (playback.sourceMode === SOURCE_MODES.COMPATIBLE || preferences.streamMode !== STREAM_MODES.ORIGINAL) {
         this.#loadSource(enriched, {
           start: this.globalTime(),
           intent: playback.intent,
-          forceSourceMode: SOURCE_MODES.COMPATIBLE,
+          forceSourceMode: playback.sourceMode === SOURCE_MODES.COMPATIBLE ? SOURCE_MODES.COMPATIBLE : null,
           message: "Applying stream details…",
         });
       }
@@ -3056,6 +3083,9 @@ export class PlaybackController {
     this.#progressWriter.flush();
     this.#sourceController?.abort();
     this.#sourceController = null;
+    if (playback.pendingSeekTime !== null) {
+      this.#store.dispatch({ type: "PLAYBACK_AUX", sessionId: playback.sessionId, values: { pendingSeekTime: null } });
+    }
     this.#api.abortItem();
     if (this.#statusTimer !== null) window.clearTimeout(this.#statusTimer);
     this.#statusTimer = null;

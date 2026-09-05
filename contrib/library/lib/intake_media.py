@@ -22,11 +22,13 @@ try:
     )
     from .imdb_index import Candidate, load_imdb_matches, normalized_title
     from .paths import state_dir
+    from .safe_move import move_without_overwrite as _move_without_overwrite
     from .tmdb_metadata import TmdbClient, TmdbMovie
 except ImportError:  # direct execution/import from scripts/lib workflows
     from catalog_config import MOVIE_INTAKE_OVERRIDES, MOVIE_SOURCES, catalog_item_label
     from imdb_index import Candidate, load_imdb_matches, normalized_title
     from paths import state_dir
+    from safe_move import move_without_overwrite as _move_without_overwrite
     from tmdb_metadata import TmdbClient, TmdbMovie
 
 
@@ -917,7 +919,7 @@ def _mapping_collision(mappings: tuple[tuple[Path, Path], ...]) -> Path | None:
     origins = {origin for origin, _target in mappings}
     seen: set[Path] = set()
     for _origin, target in mappings:
-        if target in seen or (target.exists() and target not in origins):
+        if target in seen or (os.path.lexists(target) and target not in origins):
             return target
         seen.add(target)
     return None
@@ -1190,20 +1192,6 @@ def print_intake_report(
     print(f"Intake plans: {len(plans)}; review items: {len(issues)}")
 
 
-def _move_without_overwrite(source: Path, destination: Path) -> None:
-    if destination.exists():
-        raise FileExistsError(f"destination appeared during intake: {destination}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        source.rename(destination)
-    except PermissionError:
-        completed = subprocess.run(
-            ["sudo", "-n", "mv", "--no-clobber", "--", str(source), str(destination)]
-        )
-        if completed.returncode != 0 or source.exists() or not destination.exists():
-            raise RuntimeError(f"could not move {source} to {destination}")
-
-
 def _append_duplicate_manifests(
     library_root: Path, plans: list[IntakePlan]
 ) -> None:
@@ -1266,11 +1254,17 @@ def apply_intake(library_root: Path, plans: list[IntakePlan]) -> list[Path]:
             for source, destination in plan.mappings:
                 _move_without_overwrite(source, destination)
                 completed_mappings.append((source, destination))
-    except Exception:
+    except Exception as error:
+        rollback_errors: list[str] = []
         for source, destination in reversed(completed_mappings):
-            if destination.exists() and not source.exists():
-                source.parent.mkdir(parents=True, exist_ok=True)
-                destination.rename(source)
+            try:
+                _move_without_overwrite(destination, source)
+            except Exception as rollback_error:
+                rollback_errors.append(f"{destination} -> {source}: {rollback_error}")
+        if rollback_errors:
+            raise RuntimeError(
+                "intake failed; rollback needs manual recovery: " + "; ".join(rollback_errors)
+            ) from error
         raise
     _append_duplicate_manifests(library_root, plans)
     return [

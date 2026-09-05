@@ -5175,7 +5175,7 @@ fn tagged_audio_populates_metadata_views_and_sidecar_precedence() {
 
     let nfo = root.join("tagged.nfo");
     std::fs::write(&nfo, "<musicvideo><title>Sidecar Wins</title></musicvideo>").unwrap();
-    let (updated, delta) = monitor_dirty(&cfg, &[nfo]).unwrap();
+    let (updated, delta) = monitor_dirty(&cfg, std::slice::from_ref(&nfo)).unwrap();
     assert_eq!(delta.changed, 1);
     let updated = updated.unwrap();
     let item = updated
@@ -5185,6 +5185,38 @@ fn tagged_audio_populates_metadata_views_and_sidecar_precedence() {
         .expect("updated tagged audio item");
     assert_eq!(item.title, "Sidecar Wins");
     assert_eq!(item.artist.as_deref(), Some("Track Artist"));
+    std::fs::write(&nfo, "<musicvideo><title>Sidecar Wins</title><genre>Rock</genre><showtitle>Override Album</showtitle><studio>Studio</studio><season>9</season><episode>8</episode><year>2001</year></musicvideo>").unwrap();
+    monitor(&cfg).unwrap();
+    std::fs::write(&nfo, "<musicvideo><title>Sidecar Wins</title></musicvideo>").unwrap();
+    let (restored, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.changed, 1);
+    let restored = restored.unwrap();
+    let item = restored
+        .items
+        .values()
+        .find(|item| item.path == audio)
+        .unwrap();
+    assert_eq!(item.genre.as_deref(), Some("Jazz"));
+    assert_eq!(item.album.as_deref(), Some("Tagged Album"));
+    assert_eq!(item.creator, None);
+    assert_eq!(item.disc, Some(2));
+    assert_eq!(item.track, Some(3));
+    assert!(item.date.starts_with("2024-02-03"));
+    std::fs::remove_file(&nfo).unwrap();
+    let (restored, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.changed, 1);
+    let restored = restored.unwrap();
+    let item = restored
+        .items
+        .values()
+        .find(|item| item.path == audio)
+        .unwrap();
+    assert_eq!(item.title, "Tagged Song");
+    assert_eq!(item.artist.as_deref(), Some("Track Artist"));
+    assert_eq!(item.album_artist.as_deref(), Some("Album Artist"));
+    assert_eq!(item.composer.as_deref(), Some("Composer Name"));
+    assert_eq!(item.contributor.as_deref(), Some("Guest Name"));
+    assert!(monitor(&cfg).unwrap().0.is_none());
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
@@ -6149,4 +6181,320 @@ fn non_utf8_paths_survive_scan_restart_caption_and_rename() {
     let reserved = PathBuf::from(format!("{PATH_HEX_PREFIX}ordinary"));
     assert_eq!(path_from_db(&path_to_db(&reserved)), reserved);
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn malformed_exif_date_keeps_image_probe_and_scan_usable() {
+    let temp = TempPath::new("malformed-exif-date");
+    std::fs::create_dir_all(&temp).unwrap();
+    let image = temp.join("photo.jpg");
+    write_solid_jpeg(&image, 2, 4);
+    let mut jpeg = jpeg_with_test_exif(&std::fs::read(&image).unwrap());
+    let date = b"2024:02:03 04:05:06";
+    let offset = jpeg
+        .windows(date.len())
+        .position(|bytes| bytes == date)
+        .unwrap();
+    jpeg[offset + 18] = 0xff;
+    std::fs::write(&image, jpeg).unwrap();
+    let probed = probe_image(&image).expect("usable malformed-metadata JPEG");
+    assert_eq!(probed.tags.date, None);
+    assert_eq!(probed.tags.camera_make.as_deref(), Some("TestCam"));
+    let cfg = ScanConfig {
+        media_dirs: vec![temp.clone()],
+        db_path: Some(temp.join("files.db")),
+        types: MediaTypes {
+            video: false,
+            audio: false,
+            image: true,
+        },
+        thumbnails: false,
+        ..Default::default()
+    };
+    let catalog = scan(&cfg).unwrap();
+    assert!(catalog.items.values().any(|item| item.path == image));
+}
+
+#[test]
+fn recursive_nfo_refresh_obeys_precancellation() {
+    let temp = TempPath::new("nfo-precancelled");
+    std::fs::create_dir_all(&temp).unwrap();
+    let cfg = ScanConfig {
+        media_dirs: vec![temp.clone()],
+        ..Default::default()
+    };
+    let db = LibraryDb::open_memory().unwrap();
+    cfg.cancellation.cancel();
+    assert!(matches!(
+        apply_nfo_in_dir(&db, &cfg, &temp, true),
+        Err(ScanError::Cancelled)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn recursive_nfo_refresh_prunes_multiple_ancestor_cycles() {
+    let temp = TempPath::new("nfo-recursive-cycles");
+    std::fs::create_dir_all(temp.join("show/season")).unwrap();
+    for name in ["loop1", "loop2"] {
+        std::os::unix::fs::symlink(".", temp.join(name)).unwrap();
+    }
+    std::os::unix::fs::symlink("../..", temp.join("show/season/parent")).unwrap();
+    let cfg = ScanConfig {
+        media_dirs: vec![temp.clone()],
+        ..Default::default()
+    };
+    let db = LibraryDb::open_memory().unwrap();
+    let start = std::time::Instant::now();
+    assert!(!apply_nfo_in_dir(&db, &cfg, &temp, true).unwrap());
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn periodic_nfo_removal_converges_with_targeted_and_clean_scan() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct NfoSnapshot {
+        details: Vec<(String, db::DetailPresentation)>,
+        groups: Vec<(PathBuf, Vec<String>, String)>,
+    }
+    fn snapshot(cfg: &ScanConfig) -> NfoSnapshot {
+        let db = open_library_db(cfg.db_path.as_ref().unwrap()).unwrap();
+        let mut details = db
+            .all_detail_stats()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.path, db.detail_presentation(row.id).unwrap()))
+            .collect::<Vec<_>>();
+        details.sort_by(|left, right| left.0.cmp(&right.0));
+        let catalog = db.load_catalog().unwrap();
+        let mut groups = Vec::new();
+        for item in catalog.items.values().filter(|item| {
+            [VIDEO_SERIES_ID, VIDEO_GENRE_ID, VIDEO_ACTOR_ID]
+                .iter()
+                .any(|root| item.parent_id.starts_with(root))
+        }) {
+            let mut ancestors = Vec::new();
+            let mut parent = item.parent_id.as_str();
+            while let Some(container) = catalog.containers.get(parent) {
+                ancestors.push(container.title.clone());
+                parent = &container.parent_id;
+            }
+            groups.push((item.path.clone(), ancestors, item.title.clone()));
+        }
+        groups.sort();
+        NfoSnapshot { details, groups }
+    }
+    for (failed_probe, sidecar_on_alias) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let temp = TempPath::new("periodic-nfo-removal");
+        let root = temp.join("media");
+        std::fs::create_dir_all(root.join("z-alias")).unwrap();
+        let media = root.join("episode.mkv");
+        let alias = root.join("z-alias/alternate.mkv");
+        if failed_probe {
+            let mut bytes = vec![0_u8; 64];
+            bytes[..4].copy_from_slice(&[0x1a, 0x45, 0xdf, 0xa3]);
+            std::fs::write(&media, bytes).unwrap();
+            assert!(probe_media(&media).is_none());
+        } else {
+            write_fake_mkv(&media, 64);
+        }
+        std::fs::hard_link(&media, &alias).unwrap();
+        let sidecar = if sidecar_on_alias { &alias } else { &media }.with_extension("nfo");
+        let full = "<episodedetails><title>Episode</title><showtitle>Show</showtitle><genre>Drama</genre><studio>Studio</studio><season>2</season><episode>3</episode><aired>2020-02-03</aired></episodedetails>";
+        std::fs::write(&sidecar, full).unwrap();
+        let gate = std::sync::Arc::new(HelperGate::new(1, 8));
+        let periodic = ScanConfig {
+            media_dirs: vec![root.clone()],
+            db_path: Some(temp.join("periodic.db")),
+            types: MediaTypes::video_only(),
+            thumbnails: false,
+            helper_gate: Some(gate.clone()),
+            ..Default::default()
+        };
+        let mut targeted = periodic.clone();
+        targeted.db_path = Some(temp.join("targeted.db"));
+        let initial = scan(&periodic).unwrap();
+        assert!(initial
+            .items
+            .values()
+            .any(|item| item.path == media && item.genre.as_deref() == Some("Drama")));
+        scan(&targeted).unwrap();
+        let probes = gate.metrics().admitted_total;
+        assert!(monitor(&periodic).unwrap().0.is_none());
+        assert_eq!(
+            gate.metrics().admitted_total,
+            probes,
+            "source-only NFO provenance is shared with its fresh alias"
+        );
+        let tags = [
+            "<genre>Drama</genre>",
+            "<showtitle>Show</showtitle>",
+            "<studio>Studio</studio>",
+            "<season>2</season>",
+            "<episode>3</episode>",
+            "<aired>2020-02-03</aired>",
+        ];
+        let mut variants = tags
+            .iter()
+            .map(|tag| Some(full.replace(tag, "")))
+            .collect::<Vec<_>>();
+        variants.push(Some(
+            "<episodedetails><genre>Drama</genre></episodedetails>".into(),
+        ));
+        variants.push(Some(
+            "<episodedetails><title>Episode</title></episodedetails>".into(),
+        ));
+        variants.push(None);
+        for (index, next) in variants.iter().enumerate() {
+            if let Some(next) = next {
+                std::fs::write(&sidecar, next).unwrap();
+            } else {
+                std::fs::remove_file(&sidecar).unwrap();
+            }
+            let probes = gate.metrics().admitted_total;
+            let (_, periodic_delta) = monitor(&periodic).unwrap();
+            assert_eq!(
+                gate.metrics().admitted_total - probes,
+                1,
+                "one physical reconstruction per change"
+            );
+            let (_, targeted_delta) =
+                monitor_dirty(&targeted, std::slice::from_ref(&sidecar)).unwrap();
+            assert_eq!(periodic_delta.changed, 1);
+            assert_eq!(targeted_delta.changed, 1);
+            let mut clean = periodic.clone();
+            clean.db_path = Some(temp.join(format!("clean-{index}.db")));
+            scan(&clean).unwrap();
+            assert_eq!(
+                snapshot(&periodic),
+                snapshot(&targeted),
+                "targeted versus periodic variant {index}"
+            );
+            assert_eq!(
+                snapshot(&periodic),
+                snapshot(&clean),
+                "periodic versus clean variant {index}"
+            );
+            let probes = gate.metrics().admitted_total;
+            let db = open_library_db(periodic.db_path.as_ref().unwrap()).unwrap();
+            let generation = db.get_update_id().unwrap();
+            let (catalog, delta) = monitor(&periodic).unwrap();
+            assert!(catalog.is_none());
+            assert_eq!(delta.changed, 0);
+            assert_eq!(
+                gate.metrics().admitted_total,
+                probes,
+                "unchanged NFO cannot reopen media"
+            );
+            assert_eq!(db.get_update_id().unwrap(), generation);
+        }
+        // A pre-fingerprint catalog may retain removed overrides even though
+        // every sidecar is now absent. Reconstruct its unknown provenance once.
+        let expected = snapshot(&periodic);
+        let db = open_library_db(periodic.db_path.as_ref().unwrap()).unwrap();
+        db.connection().execute("UPDATE DETAILS SET NFO_FINGERPRINT=NULL, GENRE='Legacy Genre', ALBUM='Legacy Show'", []).unwrap();
+        let probes = gate.metrics().admitted_total;
+        monitor(&periodic).unwrap();
+        assert_eq!(gate.metrics().admitted_total - probes, 1);
+        assert_eq!(snapshot(&periodic), expected);
+        let probes = gate.metrics().admitted_total;
+        assert!(monitor(&periodic).unwrap().0.is_none());
+        assert_eq!(gate.metrics().admitted_total, probes);
+        // Invalid XML cannot replace either presentation or recorded provenance.
+        let before = snapshot(&periodic);
+        std::fs::write(&sidecar, "<movie><title>broken</movie>").unwrap();
+        assert!(monitor(&periodic).is_err());
+        assert_eq!(snapshot(&periodic), before);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn recursive_nfo_events_preserve_aliases_and_cancel_staged_changes() {
+    let temp = TempPath::new("nfo-recursive-events");
+    let root = temp.join("media");
+    let show = root.join("show");
+    std::fs::create_dir_all(show.join("season")).unwrap();
+    write_fake_mkv(&show.join("season/episode.mkv"), 64);
+    std::os::unix::fs::symlink("show", root.join("alias-a")).unwrap();
+    std::os::unix::fs::symlink("show", root.join("alias-b")).unwrap();
+    for name in ["loop-a", "loop-b"] {
+        std::os::unix::fs::symlink(".", root.join(name)).unwrap();
+    }
+    std::os::unix::fs::symlink("..", show.join("parent")).unwrap();
+    let gate = std::sync::Arc::new(HelperGate::new(1, 8));
+    let mut cfg = ScanConfig {
+        media_dirs: vec![root.clone()],
+        db_path: Some(temp.join("files.db")),
+        types: MediaTypes::video_only(),
+        thumbnails: false,
+        helper_gate: Some(gate.clone()),
+        ..Default::default()
+    };
+    scan(&cfg).unwrap();
+    let nfo = root.join("tvshow.nfo");
+    std::fs::write(
+        &nfo,
+        "<tvshow><title>Inherited Show</title><genre>Drama</genre></tvshow>",
+    )
+    .unwrap();
+    let probes = gate.metrics().admitted_total;
+    let start = std::time::Instant::now();
+    let (catalog, delta) = monitor_dirty(&cfg, std::slice::from_ref(&nfo)).unwrap();
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(delta.changed, 1);
+    assert_eq!(
+        gate.metrics().admitted_total - probes,
+        1,
+        "all non-cyclic aliases share one probe"
+    );
+    let catalog = catalog.unwrap();
+    for prefix in ["show", "alias-a", "alias-b"] {
+        assert!(
+            catalog.items.values().any(|item| item.path
+                == root.join(prefix).join("season/episode.mkv")
+                && item.genre.as_deref() == Some("Drama")),
+            "missing alias {prefix}"
+        );
+    }
+    let db = open_library_db(cfg.db_path.as_ref().unwrap()).unwrap();
+    let id = db.all_detail_stats().unwrap()[0].id;
+    let before = db.detail_presentation(id).unwrap();
+    let fingerprint = db.detail_nfo_fingerprint(id).unwrap();
+    let epoch = db.scan_catalog_epoch().unwrap();
+    std::fs::remove_file(&nfo).unwrap();
+    // Cancel only after the walk has reached its first reconstruction and
+    // queued for the held helper permit, so this is mid-walk cancellation.
+    let permit = gate.try_acquire().unwrap();
+    let cancellation = cfg.cancellation.clone();
+    let cancel_gate = gate.clone();
+    let canceller = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while cancel_gate.metrics().queued == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "walk did not reach reconstruction"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        cancellation.cancel();
+    });
+    let start = std::time::Instant::now();
+    assert!(monitor_dirty(&cfg, std::slice::from_ref(&nfo)).is_err());
+    canceller.join().unwrap();
+    drop(permit);
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(db.detail_presentation(id).unwrap(), before);
+    assert_eq!(db.detail_nfo_fingerprint(id).unwrap(), fingerprint);
+    assert_eq!(db.scan_catalog_epoch().unwrap(), epoch);
+    cfg.cancellation = CancellationToken::default();
+    let (catalog, delta) = monitor_dirty(&cfg, std::slice::from_ref(&nfo)).unwrap();
+    assert_eq!(delta.changed, 1);
+    assert!(catalog
+        .unwrap()
+        .items
+        .values()
+        .all(|item| item.genre.is_none()));
 }

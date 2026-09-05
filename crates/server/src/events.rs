@@ -1,7 +1,7 @@
 //! In-memory GENA subscriber table and NOTIFY behavior.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -286,14 +286,24 @@ pub fn propertyset(service: EventService, update_id: u32) -> String {
 /// invalidation signal consumed by Kodi's Platinum browser; each value is a
 /// `container-id,update-id` pair.
 pub fn content_dir_propertyset(update_id: u32, container_ids: &[String]) -> String {
+    content_dir_pairs_propertyset(
+        update_id,
+        container_ids.iter().map(|id| (id.as_str(), update_id)),
+    )
+}
+
+fn content_dir_pairs_propertyset<'a>(
+    update_id: u32,
+    pairs: impl Iterator<Item = (&'a str, u32)>,
+) -> String {
     let mut updates = String::new();
-    for container_id in container_ids {
+    for (container_id, container_update_id) in pairs {
         if !updates.is_empty() {
             updates.push(',');
         }
         updates.push_str(&rusty_dlna_soap::xml_escape(container_id));
         updates.push(',');
-        updates.push_str(&update_id.to_string());
+        updates.push_str(&container_update_id.to_string());
     }
     format!(
         "<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\" xmlns:s=\"urn:schemas-upnp-org:service:ContentDirectory:1\">\r\n  <e:property><SystemUpdateID>{update_id}</SystemUpdateID></e:property>\r\n  <e:property><ContainerUpdateIDs>{updates}</ContainerUpdateIDs></e:property>\r\n</e:propertyset>"
@@ -307,7 +317,28 @@ enum DeliveryOutcome {
     PermanentFailure,
 }
 
+#[cfg(test)]
 fn send_notify_outcome(job: &NotifyJob, body: &str) -> DeliveryOutcome {
+    send_notify_until_stopped(job, body, &AtomicBool::new(false))
+}
+
+fn send_notify_until_stopped(
+    job: &NotifyJob,
+    body: &str,
+    stopping: &AtomicBool,
+) -> DeliveryOutcome {
+    // Each phase has one absolute budget. Progress never renews it. All socket
+    // waits after connect are additionally sliced to observe shutdown promptly.
+    let attempt_deadline = Instant::now() + Duration::from_millis(2700);
+    let remaining = |deadline: Instant| {
+        if stopping.load(Ordering::Acquire) {
+            return None;
+        }
+        deadline
+            .min(attempt_deadline)
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+    };
     let Some(cb) = parse_http_callback(&job.callback) else {
         return DeliveryOutcome::PermanentFailure;
     };
@@ -330,24 +361,84 @@ Cache-Control: no-cache\r\n\
         sid = job.sid,
         seq = job.seq,
     );
+    if remaining(attempt_deadline).is_none() {
+        return DeliveryOutcome::RetryableFailure;
+    }
     let Ok(mut sock) = TcpStream::connect_timeout(&cb.socket_addr(), Duration::from_millis(500))
     else {
         return DeliveryOutcome::RetryableFailure;
     };
-    let _ = sock.set_write_timeout(Some(Duration::from_secs(2)));
-    let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
-    if sock.write_all(wire.as_bytes()).is_err() {
+    let write_deadline = Instant::now() + Duration::from_secs(2);
+    let mut pending = wire.as_bytes();
+    while !pending.is_empty() {
+        let Some(left) = remaining(write_deadline) else {
+            return DeliveryOutcome::RetryableFailure;
+        };
+        if sock
+            .set_write_timeout(Some(left.min(Duration::from_millis(50))))
+            .is_err()
+        {
+            return DeliveryOutcome::RetryableFailure;
+        }
+        match sock.write(pending) {
+            Ok(0) => return DeliveryOutcome::RetryableFailure,
+            Ok(n) => pending = &pending[n..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return DeliveryOutcome::RetryableFailure,
+        }
+    }
+    if remaining(write_deadline).is_none() {
         return DeliveryOutcome::RetryableFailure;
     }
     let _ = sock.shutdown(std::net::Shutdown::Write);
-    let mut status_line = Vec::with_capacity(64);
-    let Ok(read) = BufReader::new(sock)
-        .take(129)
-        .read_until(b'\n', &mut status_line)
-    else {
+    let response_deadline = Instant::now() + Duration::from_millis(200);
+    let mut status_line = Vec::with_capacity(128);
+    loop {
+        let Some(left) = remaining(response_deadline) else {
+            return DeliveryOutcome::RetryableFailure;
+        };
+        if sock
+            .set_read_timeout(Some(left.min(Duration::from_millis(50))))
+            .is_err()
+        {
+            return DeliveryOutcome::RetryableFailure;
+        }
+        // Read exactly the bounded status line, leaving headers/body unread.
+        let mut byte = [0];
+        match sock.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                if remaining(response_deadline).is_none() {
+                    return DeliveryOutcome::RetryableFailure;
+                }
+                status_line.push(byte[0]);
+                if status_line.len() > 128 {
+                    return DeliveryOutcome::PermanentFailure;
+                }
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return DeliveryOutcome::RetryableFailure,
+        }
+    }
+    if remaining(response_deadline).is_none() {
         return DeliveryOutcome::RetryableFailure;
-    };
-    if read == 0 || read > 128 {
+    }
+    if status_line.is_empty() {
         return DeliveryOutcome::PermanentFailure;
     }
     let Ok(status_line) = std::str::from_utf8(&status_line) else {
@@ -416,10 +507,116 @@ impl AtomicNotifyMetrics {
     }
 }
 
+// Bound both entry overhead and owned object-ID bytes per pending SID.
+const MAX_PENDING_CONTAINER_IDS: usize = 1024;
+const MAX_PENDING_CONTAINER_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug)]
+struct ContentDirUpdate {
+    update_id: u32,
+    containers: BTreeMap<String, u32>,
+    bytes: usize,
+    resubscribe: bool,
+}
+
+impl ContentDirUpdate {
+    fn new(update_id: u32, ids: &[String]) -> Self {
+        let mut update = Self {
+            update_id,
+            containers: BTreeMap::new(),
+            bytes: 0,
+            resubscribe: false,
+        };
+        for id in ids {
+            update.insert(id, update_id);
+        }
+        update
+    }
+
+    fn insert(&mut self, id: &str, update_id: u32) {
+        if self.resubscribe {
+            return;
+        }
+        if !self.containers.contains_key(id) {
+            if self.containers.len() >= MAX_PENDING_CONTAINER_IDS
+                || id.len() > MAX_PENDING_CONTAINER_BYTES.saturating_sub(self.bytes)
+            {
+                self.resubscribe = true;
+                self.containers.clear();
+                self.bytes = 0;
+                return;
+            }
+            self.bytes += id.len();
+        }
+        self.containers.insert(id.to_owned(), update_id);
+    }
+
+    fn merge(&mut self, newer: Self) {
+        self.update_id = newer.update_id;
+        if newer.resubscribe {
+            self.resubscribe = true;
+            self.containers.clear();
+            self.bytes = 0;
+        }
+        for (id, update_id) in newer.containers {
+            self.insert(&id, update_id);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum NotifyBody {
+    Snapshot(String),
+    ContentDir(ContentDirUpdate),
+}
+
+impl From<String> for NotifyBody {
+    fn from(body: String) -> Self {
+        Self::Snapshot(body)
+    }
+}
+
+impl From<&str> for NotifyBody {
+    fn from(body: &str) -> Self {
+        Self::Snapshot(body.into())
+    }
+}
+
+impl NotifyBody {
+    fn render(&self) -> String {
+        match self {
+            Self::Snapshot(body) => body.clone(),
+            Self::ContentDir(update) => content_dir_pairs_propertyset(
+                update.update_id,
+                update
+                    .containers
+                    .iter()
+                    .map(|(id, update_id)| (id.as_str(), *update_id)),
+            ),
+        }
+    }
+
+    fn requires_resubscribe(&self) -> bool {
+        matches!(self, Self::ContentDir(update) if update.resubscribe)
+    }
+}
+
 #[derive(Debug)]
 struct QueuedNotify {
     job: NotifyJob,
-    body: String,
+    body: NotifyBody,
+}
+
+impl QueuedNotify {
+    fn merge(&mut self, newer: Self) {
+        self.job = newer.job;
+        match (&mut self.body, newer.body) {
+            (NotifyBody::ContentDir(current), NotifyBody::ContentDir(newer)) => {
+                current.merge(newer)
+            }
+            (current, newer) => *current = newer,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -450,11 +647,12 @@ impl QueueState {
                 if pending.len() == 1 {
                     pending.push_back(queued);
                 } else if let Some(latest) = pending.back_mut() {
-                    *latest = queued;
+                    latest.merge(queued);
                 }
             } else {
-                pending.clear();
-                pending.push_back(queued);
+                if let Some(latest) = pending.back_mut() {
+                    latest.merge(queued);
+                }
             }
             return true;
         }
@@ -566,6 +764,10 @@ impl NotifyDispatcher {
     }
 
     pub fn enqueue(&self, job: NotifyJob, body: String) -> bool {
+        self.enqueue_body(job, body.into())
+    }
+
+    fn enqueue_body(&self, job: NotifyJob, body: NotifyBody) -> bool {
         let mut state = lock_queue(&self.shared);
         let stopping = state.stopped || self.shared.stopping.load(Ordering::Acquire);
         let accepted = !stopping && state.enqueue(QueuedNotify { job, body }, self.capacity);
@@ -605,8 +807,8 @@ impl NotifyDispatcher {
     }
 
     /// Stop accepting notification work and wake idle workers. An in-flight
-    /// socket operation observes the stop before any retry; its existing
-    /// connect/read/write timeout remains the final bound.
+    /// socket operation observes stop between bounded I/O slices. Connect is
+    /// bounded by 500 ms; reads/writes check stop at most every 50 ms.
     pub(crate) fn begin_shutdown(&self) {
         self.shared.stopping.store(true, Ordering::Release);
         let mut state = lock_queue(&self.shared);
@@ -740,6 +942,17 @@ fn notify_worker(shared: Arc<NotifyShared>) {
         let Some(queued) = queued else {
             continue;
         };
+        let body = queued.body.render();
+        if queued.body.requires_resubscribe() {
+            // A truncated container delta cannot be delivered as if complete.
+            // Retire the SID so renewal explicitly returns 412 and the client
+            // obtains a fresh subscription/catalog snapshot.
+            let mut hub = crate::lock_recover(&shared.hub);
+            let _ = hub.unsubscribe(&queued.job.sid);
+            let mut state = lock_queue(&shared);
+            state.pending.remove(&queued.job.sid);
+            state.ready.retain(|sid| sid != &queued.job.sid);
+        }
         let mut delivered = false;
         for (attempt, delay) in [0, 100, 250].into_iter().enumerate() {
             if shared.stopping.load(Ordering::Acquire) {
@@ -751,7 +964,7 @@ fn notify_worker(shared: Arc<NotifyShared>) {
                     break;
                 }
             }
-            match send_notify_outcome(&queued.job, &queued.body) {
+            match send_notify_until_stopped(&queued.job, &body, &shared.stopping) {
                 DeliveryOutcome::Delivered => {
                     delivered = true;
                     shared.metrics.delivered.fetch_add(1, Ordering::Relaxed);
@@ -794,10 +1007,7 @@ pub(super) fn notify_content_dir(
     dispatcher: &NotifyDispatcher,
     update_id: u32,
 ) {
-    let body = propertyset(EventService::ContentDir, update_id);
-    admit_content_dir_jobs(hub, |job| {
-        dispatcher.enqueue(job, body.clone());
-    });
+    notify_content_dir_containers(hub, dispatcher, update_id, &[]);
 }
 
 pub(super) fn notify_content_dir_containers(
@@ -806,9 +1016,9 @@ pub(super) fn notify_content_dir_containers(
     update_id: u32,
     container_ids: &[String],
 ) {
-    let body = content_dir_propertyset(update_id, container_ids);
+    let body = NotifyBody::ContentDir(ContentDirUpdate::new(update_id, container_ids));
     admit_content_dir_jobs(hub, |job| {
-        dispatcher.enqueue(job, body.clone());
+        dispatcher.enqueue_body(job, body.clone());
     });
 }
 
@@ -822,6 +1032,324 @@ mod tests {
             callback: "http://127.0.0.1:9/event".into(),
             seq,
         }
+    }
+
+    #[test]
+    fn regression_coalescing_preserves_disjoint_container_invalidations() {
+        let mut state = QueueState::default();
+        for (seq, id) in [(1, "parent-a"), (2, "parent-b")] {
+            assert!(state.enqueue(
+                QueuedNotify {
+                    job: job("uuid:delta", seq),
+                    body: NotifyBody::ContentDir(ContentDirUpdate::new(seq, &[id.into()])),
+                },
+                1
+            ));
+        }
+        let latest = state.take().unwrap();
+        assert_eq!(latest.job.seq, 2);
+        assert!(
+            latest.body.render().contains("parent-a,1"),
+            "{}",
+            latest.body.render()
+        );
+        assert!(latest.body.render().contains("parent-b,2"));
+    }
+
+    #[test]
+    fn regression_trickled_callback_status_obeys_absolute_response_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let callback = format!("http://{}/event", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            socket.read_to_end(&mut request).unwrap();
+            for byte in b"HTTP/1.1 200 OK\r\n" {
+                if socket.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        });
+        let job = NotifyJob {
+            sid: "uuid:slow".into(),
+            callback,
+            seq: 0,
+        };
+        let started = Instant::now();
+        let outcome = send_notify_outcome(&job, "<x/>");
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+        assert_eq!(outcome, DeliveryOutcome::RetryableFailure);
+        assert!(elapsed < Duration::from_millis(600), "elapsed {elapsed:?}");
+    }
+
+    #[test]
+    fn kodi_coalesced_callback_delivers_all_parents_after_initial_event() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let callback = format!("http://{}/event", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for index in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = String::new();
+                socket.read_to_string(&mut request).unwrap();
+                requests.push(request);
+                if index == 0 {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                }
+                socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+            }
+            requests
+        });
+        let hub = Arc::new(Mutex::new(EventHub::new()));
+        let dispatcher = NotifyDispatcher::with_limits(1, 2, Arc::clone(&hub)).unwrap();
+        subscribe_and_enqueue_initial(
+            &hub,
+            &dispatcher,
+            "uuid:kodi".into(),
+            callback,
+            EventService::ContentDir,
+            300,
+            || propertyset(EventService::ContentDir, 0),
+        )
+        .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        notify_content_dir_containers(&hub, &dispatcher, u32::MAX, &["A".into()]);
+        notify_content_dir_containers(&hub, &dispatcher, 0, &["B".into()]);
+        notify_content_dir_containers(&hub, &dispatcher, 1, &["A".into()]);
+        // A later whole-catalog update retains outstanding per-parent deltas.
+        notify_content_dir(&hub, &dispatcher, 2);
+        release_tx.send(()).unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[0].contains("SEQ: 0\r\n"));
+        assert!(requests[1].contains("SEQ: 4\r\n"));
+        assert!(requests[1].contains("<SystemUpdateID>2</SystemUpdateID>"));
+        assert!(
+            requests[1].contains("<ContainerUpdateIDs>A,1,B,0</ContainerUpdateIDs>"),
+            "{}",
+            requests[1]
+        );
+        drop(dispatcher);
+    }
+
+    #[test]
+    fn container_delta_bounds_require_resubscription_and_remain_sticky() {
+        let ids: Vec<_> = (0..MAX_PENDING_CONTAINER_IDS)
+            .map(|i| format!("parent-{i}"))
+            .collect();
+        let mut update = ContentDirUpdate::new(7, &ids);
+        assert!(!update.resubscribe);
+        update.merge(ContentDirUpdate::new(8, &[ids[0].clone()]));
+        assert_eq!(update.containers.get(&ids[0]), Some(&8));
+        update.merge(ContentDirUpdate::new(9, &["overflow".into()]));
+        assert!(update.resubscribe);
+        assert!(update.containers.is_empty());
+        update.merge(ContentDirUpdate::new(10, &["later".into()]));
+        assert!(update.resubscribe && update.containers.is_empty());
+        let exact = ContentDirUpdate::new(1, &["x".repeat(MAX_PENDING_CONTAINER_BYTES)]);
+        assert!(!exact.resubscribe);
+        assert!(
+            ContentDirUpdate::new(1, &["x".repeat(MAX_PENDING_CONTAINER_BYTES + 1)]).resubscribe
+        );
+
+        let hub = Arc::new(Mutex::new(EventHub::new()));
+        hub.lock()
+            .unwrap()
+            .subscribe_new(
+                "uuid:overflow".into(),
+                "http://127.0.0.1:0/invalid".into(),
+                EventService::ContentDir,
+                300,
+            )
+            .unwrap();
+        let dispatcher = NotifyDispatcher::with_limits(1, 1, Arc::clone(&hub)).unwrap();
+        dispatcher.enqueue_body(job("uuid:overflow", 1), NotifyBody::ContentDir(update));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while hub.lock().unwrap().len() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(hub.lock().unwrap().renew("uuid:overflow", 300), Err(412));
+        drop(dispatcher);
+    }
+
+    #[test]
+    fn container_deltas_are_separate_per_sid_and_sequence_wrap_preserves_zero() {
+        let mut hub = EventHub::new();
+        hub.subscribe_new(
+            "a".into(),
+            "http://127.0.0.1/event".into(),
+            EventService::ContentDir,
+            300,
+        )
+        .unwrap();
+        hub.find_mut("a").unwrap().seq = u32::MAX;
+        assert_eq!(hub.take_content_dir_notifies()[0].seq, u32::MAX);
+        assert_eq!(hub.take_content_dir_notifies()[0].seq, 1);
+        let mut state = QueueState::default();
+        for (sid, id) in [("a", "A"), ("b", "B")] {
+            assert!(state.enqueue(
+                QueuedNotify {
+                    job: job(sid, 1),
+                    body: NotifyBody::ContentDir(ContentDirUpdate::new(3, &[id.into()]))
+                },
+                2
+            ));
+        }
+        let first = state.take().unwrap();
+        let second = state.take().unwrap();
+        assert!(first.body.render().contains("A,3"));
+        assert!(!first.body.render().contains("B,3"));
+        assert!(second.body.render().contains("B,3"));
+    }
+
+    #[test]
+    fn healthy_subscription_progresses_after_bounded_trickle_retries() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (healthy_tx, healthy_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut children = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while children.len() < 4 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        let started = started_tx.clone();
+                        let healthy = healthy_tx.clone();
+                        children.push(std::thread::spawn(move || {
+                            socket
+                                .set_read_timeout(Some(Duration::from_secs(1)))
+                                .unwrap();
+                            let mut request = String::new();
+                            socket.read_to_string(&mut request).unwrap();
+                            if request.starts_with("NOTIFY /slow ") {
+                                let _ = started.send(());
+                                for byte in b"HTTP/1.1 200 OK\r\n" {
+                                    if socket.write_all(&[*byte]).is_err() {
+                                        break;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(150));
+                                }
+                            } else {
+                                socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
+                                healthy.send(()).unwrap();
+                            }
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            let count = children.len();
+            for child in children {
+                child.join().unwrap();
+            }
+            count
+        });
+        let hub = Arc::new(Mutex::new(EventHub::new()));
+        let dispatcher = NotifyDispatcher::with_limits(1, 2, hub).unwrap();
+        let started = Instant::now();
+        dispatcher.enqueue(
+            NotifyJob {
+                callback: format!("http://{address}/slow"),
+                ..job("slow", 1)
+            },
+            "<x/>".into(),
+        );
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        dispatcher.enqueue(
+            NotifyJob {
+                callback: format!("http://{address}/healthy"),
+                ..job("healthy", 1)
+            },
+            "<x/>".into(),
+        );
+        healthy_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("healthy SID must progress even with one worker");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(server.join().unwrap(), 4);
+        let metrics = dispatcher.metrics();
+        assert_eq!(metrics.failed, 1);
+        assert_eq!(metrics.delivered, 1);
+        assert_eq!(metrics.retries, 2);
+        drop(dispatcher);
+    }
+
+    #[test]
+    fn callback_status_length_and_shutdown_are_bounded() {
+        for response in [b"HTTP/1.1 204 No Content\r\n".to_vec(), vec![b'x'; 129]] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let job = NotifyJob {
+                callback: format!("http://{}/event", listener.local_addr().unwrap()),
+                ..job("uuid:limit", 1)
+            };
+            let valid = response.starts_with(b"HTTP");
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                socket.read_to_end(&mut request).unwrap();
+                socket.write_all(&response).unwrap();
+            });
+            assert_eq!(send_notify(&job, "<x/>"), valid);
+            server.join().unwrap();
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let job = NotifyJob {
+            callback: format!("http://{}/event", listener.local_addr().unwrap()),
+            ..job("uuid:stop", 1)
+        };
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop_worker = Arc::clone(&stopping);
+        let worker =
+            std::thread::spawn(move || send_notify_until_stopped(&job, "<x/>", &stop_worker));
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        socket.read_to_end(&mut request).unwrap();
+        socket.write_all(b"H").unwrap();
+        let started = Instant::now();
+        stopping.store(true, Ordering::Release);
+        assert_eq!(worker.join().unwrap(), DeliveryOutcome::RetryableFailure);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn shared_shutdown_deadline_detaches_a_worker_that_cannot_exit() {
+        let dispatcher =
+            NotifyDispatcher::with_limits(1, 1, Arc::new(Mutex::new(EventHub::new()))).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // Model a worker stuck outside interruptible I/O. The shutdown fallback
+        // must still honor the common deadline without a second join on Drop.
+        dispatcher
+            .workers
+            .lock()
+            .unwrap()
+            .push(std::thread::spawn(move || {
+                release_rx.recv().unwrap();
+                done_tx.send(()).unwrap();
+            }));
+        let started = Instant::now();
+        assert!(
+            !dispatcher
+                .stop_until(started + Duration::from_millis(40))
+                .await
+        );
+        assert_eq!(dispatcher.metrics().workers_total, 0);
+        drop(dispatcher);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
@@ -945,7 +1473,7 @@ mod tests {
             assert!(state.enqueue(
                 QueuedNotify {
                     job: job("uuid:initial", sequence),
-                    body: format!("sequence-{sequence}"),
+                    body: format!("sequence-{sequence}").into(),
                 },
                 1,
             ));
@@ -953,11 +1481,11 @@ mod tests {
         assert_eq!(state.pending.len(), 1);
         let initial = state.take().unwrap();
         assert_eq!(initial.job.seq, 0);
-        assert_eq!(initial.body, "sequence-0");
+        assert_eq!(initial.body.render(), "sequence-0");
         state.complete("uuid:initial");
         let latest = state.take().unwrap();
         assert_eq!(latest.job.seq, 2);
-        assert_eq!(latest.body, "sequence-2");
+        assert_eq!(latest.body.render(), "sequence-2");
     }
 
     #[test]

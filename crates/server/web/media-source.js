@@ -1,6 +1,6 @@
 // Abort-scoped Media Source transport and bounded buffering.
 // Source selection, playback intent, and recovery belong to the player.
-import { bufferedRangeSecondsAhead, parseHlsMediaPlaylist } from "./core.js";
+import { bufferedSeekTarget, bufferedRangeSecondsAhead, parseHlsMediaPlaylist } from "./core.js";
 
 // Copied UHD fragments can exceed 10 MB per second. Keep the total window
 // below Chromium's practical SourceBuffer quota instead of treating every
@@ -92,7 +92,7 @@ function sourceBufferOperation(sourceBuffer, operation, signal) {
   });
 }
 
-function bufferedSecondsAhead(sourceBuffer, currentTime) {
+function bufferedRanges(sourceBuffer) {
   const ranges = [];
   for (let index = 0; index < sourceBuffer.buffered.length; index += 1) {
     ranges.push({
@@ -100,7 +100,11 @@ function bufferedSecondsAhead(sourceBuffer, currentTime) {
       end: sourceBuffer.buffered.end(index),
     });
   }
-  return bufferedRangeSecondsAhead(ranges, currentTime);
+  return ranges;
+}
+
+function bufferedSecondsAhead(sourceBuffer, currentTime) {
+  return bufferedRangeSecondsAhead(bufferedRanges(sourceBuffer), currentTime);
 }
 
 function waitForMediaSourcePlayback(player, signal) {
@@ -130,6 +134,8 @@ export async function pumpMediaSource({
   contentType,
   signal,
   reportStartup,
+  pendingSeek = () => null,
+  onBuffered = () => {},
 }) {
   await waitForMediaEvent(mediaSource, "sourceopen", signal, "sourceclose");
   if (signal.aborted || mediaSource.readyState !== "open") throw abortedError();
@@ -138,9 +144,13 @@ export async function pumpMediaSource({
   const appended = new Set();
   let initAppended = false;
   let playlistReported = false;
+  const needsSeekData = () => {
+    const target = pendingSeek();
+    return target !== null && !bufferedSeekTarget(bufferedRanges(sourceBuffer), target);
+  };
 
   while (!signal.aborted) {
-    if (appended.size > 0 && player.paused) {
+    if (appended.size > 0 && player.paused && !needsSeekData()) {
       await waitForMediaSourcePlayback(player, signal);
     }
     const requestUrl = new URL(playlistUrl);
@@ -177,10 +187,10 @@ export async function pumpMediaSource({
     let appendedNewSegment = false;
     for (const segmentUrl of playlist.segmentUrls) {
       if (appended.has(segmentUrl)) continue;
-      // One complete fragment is enough to establish the SourceBuffer. Once
-      // playback is paused, do not keep polling or downloading against a
-      // stationary playback clock; the play event resumes this same pump.
-      if (appended.size > 0 && player.paused) {
+      // A paused exact seek may need several fragments within its ten-second
+      // server bucket. Stop as soon as its target is buffered, then wait for
+      // playback to resume; ordinary paused starts still fetch one fragment.
+      if (appended.size > 0 && player.paused && !needsSeekData()) {
         await waitForMediaSourcePlayback(player, signal);
       }
       while (bufferedSecondsAhead(sourceBuffer, player.currentTime)
@@ -200,15 +210,17 @@ export async function pumpMediaSource({
       );
       appended.add(segmentUrl);
       appendedNewSegment = true;
+      onBuffered();
       await pruneMediaSourceBuffer(sourceBuffer, player.currentTime, signal);
     }
 
     if (playlist.ended) {
+      if (needsSeekData()) throw new Error("Media Source ended before the requested seek position.");
       if (sourceBuffer.updating) await waitForMediaEvent(sourceBuffer, "updateend", signal);
       if (mediaSource.readyState === "open") mediaSource.endOfStream();
       return;
     }
-    if (appended.size > 0 && player.paused) {
+    if (appended.size > 0 && player.paused && !needsSeekData()) {
       await waitForMediaSourcePlayback(player, signal);
     }
     if (!appendedNewSegment) await abortableDelay(MEDIA_SOURCE_PLAYLIST_POLL_MS, signal);

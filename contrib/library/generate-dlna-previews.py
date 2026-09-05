@@ -33,6 +33,7 @@ import math
 import os
 import re
 import selectors
+import signal
 import shutil
 import subprocess
 import sys
@@ -77,6 +78,8 @@ TEMP_SHEET_RE = re.compile(
 )
 TEMP_MANIFEST_RE = re.compile(r"^\.manifest\..+\.tmp$")
 PROGRESS_INTERVAL_SECONDS = 5
+PROGRESS_READ_BYTES = 4096
+MAX_PROGRESS_LINE_BYTES = 1024
 MEDIA_DURATION_RE = re.compile(
     r"^(?P<hours>[0-9]+):(?P<minutes>[0-5][0-9]):"
     r"(?P<seconds>[0-5][0-9](?:\.[0-9]+)?)$"
@@ -504,14 +507,26 @@ def manifest_is_current(
     )
 
 
-def terminate_process(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
+def terminate_process(process: subprocess.Popen[bytes], *, process_group: bool = False) -> None:
+    if process.poll() is not None and not process_group:
         return
-    process.terminate()
+    try:
+        if process_group:
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        pass
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         process.kill()
+    finally:
+        if process_group:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         process.wait()
 
 
@@ -694,32 +709,53 @@ def run_ffmpeg_with_progress(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=diagnostics,
+        start_new_session=True,
+        bufsize=0,
     )
     if process.stdout is None:
         process.kill()
         process.wait()
         raise RuntimeError("ffmpeg progress pipe was not created")
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
+    pending = bytearray()
+    dropping_line = False
     try:
+        os.set_blocking(process.stdout.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ)
         while process.poll() is None:
             if stop_event.is_set():
-                terminate_process(process)
                 raise PreviewInterrupted
             now = time.monotonic()
             if now >= deadline:
-                terminate_process(process)
                 raise RuntimeError(f"ffmpeg exceeded its {timeout}s deadline")
-            for key, _ in selector.select(timeout=min(1.0, deadline - now)):
-                line = key.fileobj.readline()
-                if not line:
+            for key, _ in selector.select(timeout=min(0.1, deadline - now)):
+                try:
+                    chunk = os.read(key.fd, PROGRESS_READ_BYTES)
+                except BlockingIOError:
                     continue
-                name, separator, value = line.decode("ascii", "replace").strip().partition("=")
-                if separator and name == "frame":
-                    try:
-                        completed_sheets = max(completed_sheets, int(value))
-                    except ValueError:
-                        pass
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                # Read at most one bounded chunk per readiness event, so neither
+                # an unfinished line nor continuous output delays cancellation.
+                segments = chunk.split(b"\n") if chunk else [b"", b""]
+                for index, segment in enumerate(segments):
+                    if not dropping_line:
+                        if len(pending) + len(segment) <= MAX_PROGRESS_LINE_BYTES:
+                            pending.extend(segment)
+                        else:
+                            pending.clear()
+                            dropping_line = True
+                    if index == len(segments) - 1:
+                        continue
+                    if not dropping_line:
+                        name, separator, value = bytes(pending).strip().partition(b"=")
+                        if separator and name == b"frame":
+                            try:
+                                completed_sheets = max(completed_sheets, min(sheet_count, int(value)))
+                            except ValueError:
+                                pass
+                    pending.clear()
+                    dropping_line = False
             now = time.monotonic()
             if now - last_report < PROGRESS_INTERVAL_SECONDS:
                 continue
@@ -743,11 +779,11 @@ def run_ffmpeg_with_progress(
             last_report = now
         if stop_event.is_set():
             raise PreviewInterrupted
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"ffmpeg exceeded its {timeout}s deadline")
         return process.wait()
-    except BaseException:
-        terminate_process(process)
-        raise
     finally:
+        terminate_process(process, process_group=True)
         selector.close()
         process.stdout.close()
 

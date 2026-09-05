@@ -53,6 +53,28 @@ directory reads during the targeted update as a regression. Capacity samples
 must include the private stage, while live-writer latency should remain bounded
 during backup, probe, NFO, rebuild, and stage journal cleanup.
 
+## Artwork cleanup regression workload
+
+Artwork cleanup checks references through the `DETAILS(ALBUM_ART)` index,
+including in existing databases and reusable scan stages. It scans artwork
+rows with indexed reference lookups, so a targeted reconciliation does not do
+a full detail-table scan for each artwork row. NULL and zero detail values
+remain the no-art sentinel; a shared artwork row survives until its final
+reference disappears.
+
+The focused workload uses SQLite VM instruction counts for 512 and 2,048
+referenced artwork rows and checks that quadrupling the data does not produce
+quadratic growth. It also exercises a one-file update in a reusable stage with
+2,048 unrelated artwork references:
+
+```sh
+cargo test -p rusty-dlna-scan artwork_cleanup
+cargo test -p rusty-dlna-scan targeted_session_keeps_art_heavy_catalog
+```
+
+These assertions measure algorithmic work and reference preservation rather
+than imposing a machine-specific latency threshold.
+
 ## 2026-08-19 reference result
 
 The reference build was measured on Linux 6.8 x86_64 with Rust 1.97.1, an AMD

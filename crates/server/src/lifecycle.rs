@@ -1603,17 +1603,6 @@ pub(crate) async fn socket_write_all(
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "socket write timeout"))?
 }
 
-pub(crate) async fn stream_file_range(
-    app: &App,
-    sock: &mut tokio::net::TcpStream,
-    path: &std::path::Path,
-    start: u64,
-    end: u64,
-) -> std::io::Result<()> {
-    let file = std::fs::File::open(path)?;
-    stream_open_file_range(app, sock, file, start, end).await
-}
-
 pub(crate) async fn stream_open_file_range(
     app: &App,
     sock: &mut tokio::net::TcpStream,
@@ -1772,7 +1761,7 @@ mod shutdown_accounting_tests {
             .expect("notification worker must reach the withholding callback");
 
         let shutdown_started = Instant::now();
-        let shutdown_budget = Duration::from_millis(75);
+        let shutdown_budget = Duration::from_millis(500);
         let shutdown_deadline = shutdown_started + shutdown_budget;
         dispatcher.begin_shutdown();
 
@@ -1784,9 +1773,12 @@ mod shutdown_accounting_tests {
         let deadline_exceeded =
             shutdown_deadline_exceeded(shutdown_elapsed, shutdown_budget, 0, notifications_stopped);
 
-        assert!(!notifications_stopped);
-        assert!(deadline_exceeded);
-        assert!(shutdown_elapsed >= shutdown_budget);
+        assert!(
+            notifications_stopped,
+            "callback reads must observe shutdown"
+        );
+        assert!(!deadline_exceeded);
+        assert!(shutdown_elapsed < shutdown_budget);
         assert_eq!(dispatcher.metrics().workers_total, 0);
 
         release_tx.send(()).unwrap();
