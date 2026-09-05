@@ -37,6 +37,12 @@ and the second is the steady unchanged measurement. Browse and Search each get
 closed local HTTP connections. Update latency starts before an `fsync` of a new
 media file and ends when a targeted inotify update is visible through Browse.
 
+The HTTP check also validates web API schema 2 and measures the first video
+page, a later title-sorted page, and a search. The later page starts at offset
+40,000 for the reference workload, or at the final full page for smaller
+workloads, so reduced runs still exercise real pagination. Each web case must
+meet `RUSTY_DLNA_BENCH_WEB_P95_TARGET_MS` (250 ms by default).
+
 The scanner uses one online backup to initialize a reusable private stage,
 then records changed detail/object/art/caption/playlist/settings keys in
 disk-backed journals. A targeted watcher batch must not copy or full-merge the

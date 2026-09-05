@@ -330,6 +330,11 @@ export function encodingPreset(value, advertised = null) {
     ? value : "balanced";
 }
 
+export function originalDownloadUrl(item) {
+  return typeof item?.download_url === "string" && item.download_url.startsWith("/web/download/")
+    ? item.download_url : null;
+}
+
 export function nativeHlsHevcCopyEligible(item, quality, enabled) {
   // The server only advertises a video content type for remux-compatible
   // codecs/HDR. Keep that policy authoritative rather than duplicating it.

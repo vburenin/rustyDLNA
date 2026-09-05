@@ -754,6 +754,93 @@ test("library tabs, player scoping, and overlay controls work", async ({ page })
   expect(errors).toEqual([]);
 });
 
+test("compact settings keep two-column controls readable and touch-sized", async ({ page }, testInfo) => {
+  await serveFixtureMedia(page);
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  await openAdvancedPlayback(page);
+  const dialog = page.locator("#advanced-playback-dialog");
+  for (const width of [300, 412, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    const layout = await dialog.evaluate((element) => {
+      const grid = element.querySelector(".advanced-selects");
+      const controls = [...grid.querySelectorAll("select")].filter((control) => control.checkVisibility());
+      return {
+        overflow: element.scrollWidth > element.clientWidth,
+        dimensions: [element.clientWidth, element.scrollWidth],
+        spilling: [...element.querySelectorAll("*")].filter((child) => child.checkVisibility() && child.scrollWidth > child.clientWidth + 1)
+          .map((child) => [child.id || child.tagName, child.getAttribute("for"), child.clientWidth, child.scrollWidth, child.textContent.slice(0, 80)]),
+        overflowing: [...element.querySelectorAll("*")].filter((child) => child.checkVisibility()
+          && child.getBoundingClientRect().right > element.getBoundingClientRect().right)
+          .map((child) => child.id || child.className || child.tagName),
+        columns: getComputedStyle(grid).gridTemplateColumns.split(" ").length,
+        touchSized: controls.every((control) => control.getBoundingClientRect().height >= 44),
+        fits: controls.every((control) => control.getBoundingClientRect().right <= element.getBoundingClientRect().right),
+        height: element.getBoundingClientRect().height,
+      };
+    });
+    expect(layout.overflow, JSON.stringify(layout)).toBe(false);
+    expect(layout.columns).toBe(2);
+    expect(layout.touchSized).toBe(true);
+    expect(layout.fits).toBe(true);
+    if (width === 1280) expect(layout.height).toBeLessThan(650);
+    if (testInfo.project.name === "chromium") {
+      const path = testInfo.outputPath(`compact-settings-${width}.png`);
+      await dialog.screenshot({ path });
+      await testInfo.attach(`compact-settings-${width}`, { path, contentType: "image/png" });
+    }
+  }
+  const automatic = dialog.getByRole("radio", { name: /^Auto / });
+  await automatic.focus();
+  await automatic.press("ArrowRight");
+  const original = dialog.getByRole("radio", { name: /^Original / });
+  await expect(original).toBeChecked();
+  expect(await original.evaluate((input) => getComputedStyle(input.closest("label")).outlineWidth)).toBe("3px");
+  expect(await original.evaluate((input) => input.closest("label").getBoundingClientRect().height)).toBeGreaterThanOrEqual(44);
+  if (testInfo.project.name === "chromium") {
+    await page.emulateMedia({ forcedColors: "active" });
+    expect(await original.evaluate((input) => getComputedStyle(input).opacity)).toBe("1");
+    expect(await page.locator("#quality-control").evaluate((select) => getComputedStyle(select).appearance)).toBe("auto");
+  }
+});
+
+test("stream information downloads the current original without restarting playback", async ({ page }, testInfo) => {
+  await installHevcHlsTrial(page);
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  const sources = await page.evaluate(() => [...window.__hlsTrial.sources]);
+  await page.locator("#stream-info-button").evaluate((button) => button.click());
+  const dialog = page.locator("#stream-info-dialog");
+  const link = dialog.getByRole("link", { name: /^Download original file / });
+  await expect(link).toBeVisible();
+  await expect(link).toHaveAttribute("href", /^\/web\/download\/\d+$/);
+  const expectedFile = await link.getAttribute("download");
+  const [download] = await Promise.all([page.waitForEvent("download"), link.click()]);
+  expect(download.suggestedFilename()).toBe(expectedFile);
+  await download.cancel();
+  expect(await page.evaluate(() => window.__hlsTrial.sources)).toEqual(sources);
+  await expect(dialog).toBeVisible();
+  await expect(page.locator("#stream-diagnostic-facts")).toBeHidden();
+  if (testInfo.project.name === "chromium") {
+    const path = testInfo.outputPath("compact-stream-info.png");
+    await dialog.screenshot({ path });
+    await testInfo.attach("compact-stream-info", { path, contentType: "image/png" });
+  }
+  const summary = page.locator("#stream-diagnostics summary");
+  await summary.focus();
+  await summary.press("Enter");
+  await expect(page.locator("#stream-diagnostic-facts")).toBeVisible();
+  await summary.press("Enter");
+  await expect(page.locator("#stream-diagnostic-facts")).toBeHidden();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await page.getByRole("tab", { name: "Audio", exact: true }).click();
+  await page.locator("[data-media-id]").first().getByRole("button", { name: /^Play / }).click();
+  await page.locator("#stream-info-button").evaluate((button) => button.click());
+  await expect(page.locator("#stream-info-download")).toBeHidden();
+  await expect(page.locator("#stream-info-download")).not.toHaveAttribute("href");
+});
+
 test("scrollable player dialogs keep their X close action pinned", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 320 });
   await serveFixtureMedia(page);
@@ -2207,8 +2294,11 @@ test("compatible startup status is not duplicated and stream info explains an au
   await expect(page.locator("#stream-info-summary")).toContainText("video bitstream is copied unchanged");
   await expect(page.locator("#output-stream-facts")).toContainText("no video re-encode");
   await expect(page.locator("#output-stream-facts")).toContainText("AAC");
-  await expect(page.locator("#output-stream-facts")).toContainText("canPlayType: probably");
-  await expect(page.locator("#output-stream-facts")).toContainText("MediaCapabilities: supported");
+  await expect(page.locator("#stream-diagnostic-facts")).toBeHidden();
+  await page.getByText("Browser diagnostics", { exact: true }).click();
+  await expect(page.locator("#stream-diagnostic-facts")).toBeVisible();
+  await expect(page.locator("#stream-diagnostic-facts")).toContainText("canPlayType: probably");
+  await expect(page.locator("#stream-diagnostic-facts")).toContainText("MediaCapabilities: supported");
 });
 
 test("desktop Chrome tries encoded HDR before SDR when copied-HEVC Media Source rejects its SourceBuffer", async ({ page }, testInfo) => {
@@ -4543,7 +4633,13 @@ test("repeated compatible seeks coalesce and audio switching preserves global ti
     .map((url) => url.searchParams.get("session")));
   expect(playbackSessions.size).toBe(1);
   expect([...playbackSessions][0]).toMatch(/^\d+$/);
-  expect(await page.locator("#audio-track-controls").evaluate((select) => select.getBoundingClientRect().width)).toBeLessThanOrEqual(145);
+  const audioLayout = await page.locator("#audio-track-controls").evaluate((select) => ({
+    width: select.getBoundingClientRect().width,
+    columnWidth: select.closest("label").getBoundingClientRect().width,
+    speedWidth: document.getElementById("speed-control").getBoundingClientRect().width,
+  }));
+  expect(audioLayout.width).toBeLessThanOrEqual(audioLayout.columnWidth);
+  expect(Math.abs(audioLayout.width - audioLayout.speedWidth)).toBeLessThanOrEqual(1);
   await page.locator('#advanced-playback-dialog button[value="close"]').click();
   await expect(page.locator("#mode-label")).toHaveText("Compatible playback");
 });
@@ -6751,4 +6847,57 @@ test("stage keyboard focus pins visible controls and keeps Play reachable", asyn
     await page.keyboard.press("Tab");
   }
   await expect(page.locator("#play-button")).toBeFocused();
+});
+
+
+test("movie collection groups continue across pages and end before standalone cards", async ({ page }) => {
+  let initial = null;
+  await page.route("**/api/web/library?**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("view") !== "library" || url.searchParams.get("kind") !== "video") return route.fallback();
+    if (!initial) initial = await (await route.fetch()).json();
+    const base = initial.entries.find((entry) => entry.entry_type === "media");
+    const offset = Number(url.searchParams.get("offset") || 0);
+    const entries = Array.from({ length: 27 }, (_, index) => ({
+      ...base,
+      id: String(80000 + index),
+      title: index === 0 ? "Amber Road" : index === 26 ? "Copper Road" : `Chapter ${index}`,
+      file_name: `fictional-${index}.mkv`,
+      collection: index > 0 && index < 26 ? { id: "fictional-series", title: "Briar Saga", sequence: index } : null,
+      art_url: null,
+    })).slice(offset, offset + 24);
+    await route.fulfill({ json: {
+      ...initial, entries, offset, total: 27, limit: 24, has_more: offset + entries.length < 27,
+    } });
+  });
+  await page.goto("/?view=video");
+  await expect(page.locator("[data-media-id]")).toHaveCount(24);
+  await expect(page.getByRole("heading", { name: "Briar Saga" })).toHaveCount(1);
+  const collection = page.getByRole("region", { name: "Briar Saga" });
+  await expect(collection.locator(".media-card")).toHaveCount(23);
+  const firstCard = collection.locator(".media-card").first();
+  await firstCard.evaluate((card) => { card.dataset.preserved = "yes"; });
+  await page.locator("#load-more-sentinel").scrollIntoViewIfNeeded();
+  await expect(page.locator("[data-media-id]")).toHaveCount(27);
+  await expect(collection.locator(".media-card")).toHaveCount(25);
+  await expect(page.getByRole("heading", { name: "Briar Saga" })).toHaveCount(1);
+  await expect(firstCard).toHaveAttribute("data-preserved", "yes");
+  await expect(collection.locator(".card-title")).toHaveText(Array.from({ length: 25 }, (_, index) => `Chapter ${index + 1}`));
+  await expect(page.locator("#media-grid > .media-card .card-title")).toHaveText(["Amber Road", "Copper Road"]);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  const accessibility = await new AxeBuilder({ page }).include("#media-grid").analyze();
+  expect(accessibility.violations).toEqual([]);
+  const cardWidths = () => page.evaluate(() => ({
+    grouped: document.querySelector(".collection-group .media-card").getBoundingClientRect().width,
+    standalone: document.querySelector("#media-grid > .media-card").getBoundingClientRect().width,
+  }));
+  let widths = await cardWidths();
+  expect(Math.abs(widths.grouped - widths.standalone)).toBeLessThanOrEqual(1);
+  // Browsers without subgrid keep the same poster grid through display: contents.
+  await collection.evaluate((section) => { section.style.display = "contents"; });
+  widths = await cardWidths();
+  expect(Math.abs(widths.grouped - widths.standalone)).toBeLessThanOrEqual(1);
+  await page.locator("#sort-control").selectOption("date_desc");
+  await expect(page.locator("[data-media-id]")).toHaveCount(24);
+  await expect(page.locator(".collection-group")).toHaveCount(0);
 });

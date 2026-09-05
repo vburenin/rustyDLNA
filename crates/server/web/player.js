@@ -22,6 +22,7 @@ import {
   nativeHlsQualityProfile,
   nativeHlsHevcCopyEligible,
   encodingPreset,
+  originalDownloadUrl,
   negotiateCompatibleStreams,
   parseHlsMediaPlaylist,
   playbackControlLabel,
@@ -2703,7 +2704,7 @@ export class PlaybackController {
     control.disabled = !server.capabilities.transcoding || playback.item?.kind !== "video";
     this.#dom.encodingPresetOption.hidden = presets.length < 2;
     this.#dom.encodingPresetHint.hidden = presets.length < 2;
-    this.#dom.encodingPresetHint.textContent = `${presets.find((preset) => preset.id === selected)?.description || ""}. Only affects re-encoded video in Compatible playback; resolution and HDR settings stay the same.`;
+    this.#dom.encodingPresetHint.textContent = `${presets.find((preset) => preset.id === selected)?.description || ""}. Re-encoded video only; resolution and HDR unchanged.`;
   }
 
   #renderQualityProfiles() {
@@ -2776,6 +2777,18 @@ export class PlaybackController {
     // existing nodes (and any text selection) until their inputs change.
     if (inputs.every((value, index) => value === this.#streamInfoRenderInputs[index])) return;
     this.#streamInfoRenderInputs = inputs;
+    const download = this.#dom.streamInfoDownload;
+    const downloadUrl = originalDownloadUrl(item);
+    download.hidden = !downloadUrl;
+    if (downloadUrl) {
+      download.href = downloadUrl;
+      download.download = item.file_name || "";
+      download.setAttribute("aria-label", `Download original file ${item.file_name || item.title}`);
+    } else {
+      for (const attribute of ["href", "download", "aria-label"]) download.removeAttribute(attribute);
+    }
+    this.#dom.streamDiagnostics.hidden = playback.sourceMode !== SOURCE_MODES.COMPATIBLE || !playback.streamNegotiation;
+    if (this.#dom.streamDiagnostics.hidden) this.#dom.streamDiagnosticFacts.replaceChildren();
     const selectedTrack = playback.audioTracks.find((track) => Number(track.index) === Number(playback.selectedAudio));
     const sourceAudio = selectedTrack
       ? audioTrackLabel(selectedTrack)
@@ -2901,6 +2914,8 @@ export class PlaybackController {
         ? `${sourceVideo} · copied unchanged (no video re-encode)`
         : repairsVideo ? `${sourceVideo} → ${encodedVideo} · frame order repaired` : encodedVideo) : "None"],
       ["Audio", copiesAudio ? `${sourceAudio} · copied unchanged (no audio re-encode)` : `${sourceAudio} → ${outputAudio}`],
+    ]);
+    replaceFacts(this.#dom.streamDiagnosticFacts, [
       ["Browser video probe", item.kind === "video" ? capabilityProbeLabel(negotiation.videoContentType, negotiation.videoProbe) : "Not applicable"],
       ["Browser output probe", transcodesHdr10
         ? capabilityProbeLabel(negotiation.outputVideoContentType, negotiation.outputVideoProbe)

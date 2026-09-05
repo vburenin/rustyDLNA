@@ -4,6 +4,7 @@ import {
   mediaDetails,
   mediaMatchesQuery,
   navigationUrl,
+  originalDownloadUrl,
   reconcileQualityPreference,
   resumePosition,
   validDetailId,
@@ -277,7 +278,7 @@ export class LibraryController {
   }
 
   renderCards({ appendFrom = null } = {}) {
-    const { library, playback } = this.#store.getState();
+    const { library, playback, navigation } = this.#store.getState();
     if (appendFrom === null) {
       this.#artworkObserver?.disconnect();
       this.#artworkQueue.clear();
@@ -290,7 +291,26 @@ export class LibraryController {
     for (const entry of entries) {
       const card = entry.entry_type === "folder" ? this.#folderCard(entry) : this.#mediaCard(entry);
       if (entry.entry_type === "media" && String(entry.id) === String(playback.item?.id)) card.classList.add("playing");
-      this.#dom.grid.append(card);
+      const collection = navigation.view === "library" && navigation.sort === "title"
+        ? entry.collection : null;
+      if (collection?.id && collection.title) {
+        let section = this.#dom.grid.lastElementChild;
+        if (section?.dataset.collectionId !== collection.id) {
+          section = document.createElement("section");
+          section.className = "collection-group";
+          section.dataset.collectionId = collection.id;
+          const heading = document.createElement("h3");
+          heading.id = `collection-${this.#dom.grid.children.length}`;
+          heading.className = "collection-heading";
+          heading.textContent = collection.title;
+          section.setAttribute("aria-labelledby", heading.id);
+          section.append(heading);
+          this.#dom.grid.append(section);
+        }
+        section.append(card);
+      } else {
+        this.#dom.grid.append(card);
+      }
     }
     // IntersectionObserver delivery is advisory: WebKit can omit the initial
     // callback while a large grid is appended under load. Seed the same
@@ -436,9 +456,7 @@ export class LibraryController {
     this.#dom.itemDetailsPlot.open = false;
     this.#dom.itemDetailsPlot.hidden = !plot;
     this.#dom.itemDetailsPlotText.textContent = plot;
-    const downloadUrl = typeof item.download_url === "string" && item.download_url.startsWith("/web/download/")
-      ? item.download_url
-      : null;
+    const downloadUrl = originalDownloadUrl(item);
     this.#dom.itemDetailsDownload.hidden = !downloadUrl;
     if (downloadUrl) {
       this.#dom.itemDetailsDownload.href = downloadUrl;
@@ -653,7 +671,7 @@ export class LibraryController {
     const focused = this.#dom.grid.contains(element)
       && focusedBounds.bottom > 0 && focusedBounds.top < window.innerHeight;
     if (!focused) {
-      element = [...this.#dom.grid.children].find((card) => {
+      element = [...this.#dom.grid.querySelectorAll(".media-card")].find((card) => {
         const bounds = card.getBoundingClientRect();
         return bounds.bottom > 0 && bounds.top < window.innerHeight;
       });

@@ -732,7 +732,7 @@ fn web_item_samples_item_and_generation_under_one_catalog_snapshot() {
     assert_eq!(json["item"]["title"], old_title);
     assert_eq!(
         resp_header(&response, "ETag"),
-        Some(format!("W/\"web-v2-r5-{old_generation}-item-{detail_id}\"").as_str())
+        Some(format!("W/\"web-v2-r6-{old_generation}-item-{detail_id}\"").as_str())
     );
     done_rx.recv().unwrap().unwrap();
     publisher.join().unwrap();
@@ -5452,8 +5452,8 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     )));
     assert_eq!(folders.status, 200);
     let folders_etag = resp_header(&folders, "ETag").unwrap().to_owned();
-    assert!(folders_etag.starts_with("W/\"web-v2-r5-"), "{folders_etag}");
-    let stale_capability_etag = folders_etag.replacen("-r5-", "-r4-", 1);
+    assert!(folders_etag.starts_with("W/\"web-v2-r6-"), "{folders_etag}");
+    let stale_capability_etag = folders_etag.replacen("-r6-", "-r5-", 1);
     let stale_conditional = req(&format!(
         "GET /api/web/library?view=folders&folder=64&offset=0&limit=200 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\nIf-None-Match: {stale_capability_etag}\r\n\r\n"
     ));
@@ -8542,4 +8542,78 @@ fn sony_bdp_get_remaps_mkv_to_divx() {
         xml.contains("MPEG_PS_NTSC") && xml.contains("DLNA.ORG_CI=1"),
         "extra CI=1 still uses original mkv mime: {xml}"
     );
+}
+
+#[test]
+fn web_collection_metadata_and_memory_pages_keep_numbered_movies_together() {
+    let mut app = testdata_app();
+    app.db_pool = None;
+    app.scan_cfg.db_path = None;
+    {
+        let mut catalog = write_recover(&app.catalog);
+        let template = catalog
+            .items
+            .values()
+            .find(|item| item.mime.starts_with("video/"))
+            .unwrap()
+            .clone();
+        catalog.items.clear();
+        catalog.by_detail.clear();
+        for (index, path) in [
+            "/movies/Briar Saga/03 - The Last Beacon (2025).mkv",
+            "/movies/Copper Road (2006).mkv",
+            "/movies/Briar Saga/01 - Briar Saga (2002).mkv",
+            "/movies/Amber Road (1957).mkv",
+            "/movies/Briar Saga/02 - Across the River (2007).mkv",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut item = template.clone();
+            item.path = PathBuf::from(path);
+            item.collection_path = None;
+            item.title = item.path.file_stem().unwrap().to_str().unwrap().to_owned();
+            item.detail_id = index as i64 + 100;
+            item.object_id = format!("fictional-{index}");
+            item.inode = index as u64 + 1;
+            catalog
+                .by_detail
+                .insert(item.detail_id, item.object_id.clone());
+            catalog.items.insert(item.object_id.clone(), item);
+        }
+        let mut alias = catalog.items["fictional-0"].clone();
+        alias.detail_id = 1000;
+        alias.object_id = "fictional-alias".into();
+        alias.title = "! earlier-sorting alias title".into();
+        catalog
+            .by_detail
+            .insert(alias.detail_id, alias.object_id.clone());
+        catalog.items.insert(alias.object_id.clone(), alias);
+    }
+    let mut entries = Vec::new();
+    for offset in [0, 2, 4] {
+        let response = app.handle(&req(&get(
+            &format!("/api/web/library?view=library&kind=video&sort=title&offset={offset}&limit=2"),
+            "CollectionTest/1.0",
+        )));
+        assert_eq!(response.status, 200);
+        let payload: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(payload["total"], 5);
+        entries.extend(payload["entries"].as_array().unwrap().iter().cloned());
+    }
+    assert_eq!(
+        entries
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["103", "102", "104", "100", "101"]
+    );
+    assert!(entries[0]["collection"].is_null());
+    assert!(entries[4]["collection"].is_null());
+    for (index, item) in entries[1..4].iter().enumerate() {
+        assert_eq!(item["collection"]["title"], "Briar Saga");
+        assert_eq!(item["collection"]["sequence"], index + 1);
+        assert_eq!(item["collection"]["id"], entries[1]["collection"]["id"]);
+        assert!(!item["collection"].to_string().contains("/movies"));
+    }
 }

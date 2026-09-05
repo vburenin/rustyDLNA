@@ -82,6 +82,8 @@ pub struct MediaItem {
     pub class: String,
     pub date: String,
     pub path: PathBuf,
+    /// Root-qualified source identity captured by the scanner for grouping, not file I/O.
+    pub collection_path: Option<PathBuf>,
     pub mime: String,
     pub ext: String,
     pub size: u64,

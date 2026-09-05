@@ -175,6 +175,7 @@ fn page_children_matches_children_of_slice() {
                 class: "item.videoItem".into(),
                 date: "2024-01-01".into(),
                 path: PathBuf::from(format!("/m/{i}.mkv")),
+                collection_path: None,
                 mime: "video/x-matroska".into(),
                 ext: "mkv".into(),
                 size: 1000,
@@ -2171,6 +2172,7 @@ fn recent_is_200_unique_inodes_no_time_window() {
                 class: "item.videoItem".into(),
                 date: "2024-01-01".into(),
                 path: PathBuf::from(format!("/m/{i}.mkv")),
+                collection_path: None,
                 mime: "video/x-matroska".into(),
                 ext: "mkv".into(),
                 size: 1000,
@@ -2215,6 +2217,7 @@ fn recent_is_200_unique_inodes_no_time_window() {
                 class: "item.videoItem".into(),
                 date: "2024-01-01".into(),
                 path: PathBuf::from(format!("/genre/{i}.mkv")),
+                collection_path: None,
                 mime: "video/x-matroska".into(),
                 ext: "mkv".into(),
                 size: 1000,
@@ -3040,6 +3043,74 @@ fn per_root_masks_keys_and_persisted_relocation_survive_reconcile() {
         assert!(live.is_file(), "{} did not rebase", item.path.display());
     }
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn collection_sources_backfill_unchanged_files_and_follow_same_inode_alias_retargets() {
+    use std::os::unix::fs::symlink;
+    let tmp = TempPath::new("collection-reconciliation");
+    let root = tmp.join("media");
+    let first = root.join("Briar Saga/01 - The Garden (2001).mkv");
+    let second = root.join("Briar Saga/02 - The Lantern (2003).mkv");
+    let alias = root.join("genres/Adventure/01 - The Garden (2001).mkv");
+    std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+    write_fake_mkv(&first, 64);
+    std::fs::hard_link(&first, &second).unwrap();
+    symlink(&first, &alias).unwrap();
+    let database = tmp.join("cache/files.db");
+    let cfg = ScanConfig {
+        media_dirs: vec![root],
+        db_path: Some(database.clone()),
+        ..Default::default()
+    };
+    let mut catalog = scan(&cfg).unwrap();
+    let with_collection_bytes = catalog.estimated_memory_bytes();
+    let collection_bytes: u64 = catalog
+        .items
+        .values_mut()
+        .filter_map(|item| item.collection_path.take())
+        .map(|path| path.as_os_str().as_encoded_bytes().len() as u64)
+        .sum();
+    assert!(collection_bytes > 0);
+    assert_eq!(
+        with_collection_bytes - catalog.estimated_memory_bytes(),
+        collection_bytes
+    );
+    let sequence = || {
+        let catalog = load_existing(&cfg);
+        let item = catalog
+            .items
+            .values()
+            .find(|item| item.path == alias)
+            .unwrap();
+        video_collection(item.collection_path.as_deref().unwrap(), &item.mime)
+            .unwrap()
+            .sequence
+    };
+    assert_eq!(sequence(), 1);
+    {
+        let db = rusqlite::Connection::open(&database).unwrap();
+        db.execute_batch("UPDATE DETAILS SET COLLECTION_PATH = NULL; PRAGMA user_version=12;")
+            .unwrap();
+    }
+    let (published, delta) = monitor(&cfg).unwrap();
+    assert!(published.is_some());
+    assert!(
+        delta.changed > 0,
+        "collection backfill must publish even without file changes"
+    );
+    assert_eq!(sequence(), 1);
+    std::fs::remove_file(&alias).unwrap();
+    symlink(&second, &alias).unwrap();
+    let (published, delta) = monitor(&cfg).unwrap();
+    assert!(published.is_some());
+    assert!(
+        delta.changed > 0,
+        "equal inode, size and mtime must not hide an alias retarget"
+    );
+    assert_eq!(sequence(), 2);
+    assert_eq!(monitor(&cfg).unwrap().1, ScanDelta::default());
 }
 
 #[test]

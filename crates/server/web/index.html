@@ -85,25 +85,25 @@
             <div class="advanced-actions" aria-label="Additional player settings">
               <button type="button" id="loop-button" aria-pressed="false" aria-label="Turn loop on">Loop</button>
               <button type="button" id="fit-button" aria-pressed="false" aria-label="Fill video frame">Fill frame</button>
-              <button type="button" id="shortcut-help-button" aria-label="Keyboard shortcuts">Keyboard shortcuts</button>
+              <button type="button" id="shortcut-help-button" aria-label="Keyboard shortcuts">Shortcuts</button>
             </div>
             <fieldset id="stream-controls"><legend>Stream mode</legend><div class="stream-options"><label><input type="radio" name="stream-mode" value="auto" checked><span>Auto<small>Choose for this browser</small></span></label><label><input type="radio" name="stream-mode" value="direct"><span>Original<small>No conversion</small></span></label><label><input type="radio" name="stream-mode" value="compat"><span>Compatible<small>Prepare for this browser</small></span></label></div></fieldset>
             <div class="advanced-selects">
-              <label for="speed-control">Playback speed<select id="speed-control"><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
-              <label id="audio-track-control" for="audio-track-controls" hidden>Audio track<select id="audio-track-controls"></select></label><span id="audio-track-status" role="status" hidden></span>
-              <label id="chapter-control" for="chapter-controls" hidden>Chapter<select id="chapter-controls"></select></label>
+              <label for="quality-control"><span>Playback quality</span><select id="quality-control"><option value="auto">Auto</option></select></label>
+              <label id="encoding-preset-option" for="encoding-preset-control" hidden><span>Encoding preset</span><select id="encoding-preset-control" aria-describedby="encoding-preset-hint"><option value="balanced">Balanced</option></select></label>
+              <label for="speed-control"><span>Playback speed</span><select id="speed-control"><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+              <label id="audio-track-control" for="audio-track-controls" hidden><span>Audio track</span><select id="audio-track-controls"></select></label><span id="audio-track-status" role="status" hidden></span>
+              <label id="chapter-control" for="chapter-controls" hidden><span>Chapter</span><select id="chapter-controls"></select></label>
               <button type="button" class="text-action" id="audio-track-retry" hidden>Retry audio tracks</button>
-              <label for="quality-control">Playback quality<select id="quality-control"><option value="auto">Auto</option></select></label>
-              <label id="encoding-preset-option" for="encoding-preset-control" hidden>Encoding preset<select id="encoding-preset-control" aria-describedby="encoding-preset-hint"><option value="balanced">Balanced</option></select></label>
-              <label for="caption-size-control">Caption size<select id="caption-size-control"><option value="normal">Normal</option><option value="large">Large</option><option value="extra_large">Extra large</option></select></label>
-              <label for="caption-background-control">Caption background<select id="caption-background-control"><option value="translucent">Translucent</option><option value="solid">Solid</option></select></label>
+              <label for="caption-size-control"><span>Caption size</span><select id="caption-size-control"><option value="normal">Normal</option><option value="large">Large</option><option value="extra_large">Extra large</option></select></label>
+              <label for="caption-background-control"><span>Caption background</span><select id="caption-background-control"><option value="translucent">Translucent</option><option value="solid">Solid</option></select></label>
             </div>
             <p class="dialog-hint" id="encoding-preset-hint" hidden></p>
             <div id="hevc-hls-option" hidden>
               <label class="autoplay-option"><input id="hevc-hls-control" type="checkbox" aria-describedby="hevc-hls-hint"> Try original HEVC with HLS</label>
-              <p class="dialog-hint" id="hevc-hls-hint">Experimental. Keeps eligible HEVC video unchanged in Compatible playback at Auto quality; audio is still converted. Falls back to re-encoding if playback fails or stalls.</p>
+              <p class="dialog-hint" id="hevc-hls-hint">Experimental · Compatible + Auto only. Copies eligible video, converts audio; re-encodes if playback fails.</p>
             </div>
-            <label class="autoplay-option"><input id="autoplay-control" type="checkbox"> Automatically play the next queue item</label>
+            <label class="autoplay-option"><input id="autoplay-control" type="checkbox"> Automatically play next</label>
           </form>
         </dialog>
 
@@ -118,11 +118,13 @@
         <dialog class="stream-info-dialog" id="stream-info-dialog" aria-labelledby="stream-info-title">
           <form method="dialog">
             <div class="dialog-heading"><h2 id="stream-info-title">Stream information</h2><button class="dialog-close" value="close" aria-label="Close stream information"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div>
+            <a class="dialog-download" id="stream-info-download" download hidden>Download original</a>
             <p id="stream-info-summary"></p>
             <div class="stream-info-columns">
               <section aria-labelledby="source-stream-title"><h3 id="source-stream-title">Original source</h3><dl id="source-stream-facts"></dl></section>
               <section aria-labelledby="output-stream-title"><h3 id="output-stream-title">Current playback</h3><dl id="output-stream-facts"></dl></section>
             </div>
+            <details class="dialog-disclosure" id="stream-diagnostics" hidden><summary>Browser diagnostics</summary><dl id="stream-diagnostic-facts"></dl></details>
           </form>
         </dialog>
 

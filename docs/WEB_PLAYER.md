@@ -23,6 +23,21 @@ available, while Compatible is disabled and returns a structured error.
 
 ## Library and player behavior
 
+The flat library's Title sort groups explicitly numbered movie files by their
+canonical source collection folder, so genre symlink aliases share one group.
+The scanner captures a root-qualified, validated source identity in the catalog
+(stable across configured-root relocations); paging and
+schema migration do not resolve filesystem links. Existing catalogs acquire
+source identities during normal reconciliation, including unchanged files.
+Collection names sort alphabetically alongside
+standalone titles, and each collection's movies follow their numeric sequence.
+A numbered movie has the filename form `NN - Title (YYYY) ...`; episode and
+workout filenames without that movie year remain ordinary entries. Nested
+collection folders form their own groups. The browser shows a heading for each
+collection and joins its cards across page boundaries. Recently added,
+episode/track ordering, physical folder browsing, and DLNA sorting retain their
+existing behavior. No media filenames or metadata are rewritten.
+
 Folders follows the physical media tree. All media, Videos, and Audio use the
 SQLite-backed searchable catalog, with a bounded in-memory fallback if the
 database is unavailable. Browse presents that library across the available
@@ -40,7 +55,9 @@ Closing stops media and cancels its work immediately, even while the browser
 is still completing a fullscreen or picture-in-picture exit.
 Each video card's Details dialog contains a deliberately secondary “Download
 original” action. It downloads the indexed source file without starting or
-changing playback; audio details do not advertise that action.
+changing playback; audio details do not advertise that action. Stream information
+also offers Download original for the current video, using the same download
+endpoint without restarting or changing playback.
 Empty searches offer Clear search without changing the current view or playback.
 An empty Continue watching view explains that progress is saved in this browser.
 
@@ -98,8 +115,13 @@ remains visible. Long titles and metadata wrap within the dialog; exceptionally
 tall titles scroll independently so the close action stays reachable. Settings
 show selected stream modes, Loop, and Fill frame consistently. Stream modes
 include short explanations, and Playback quality explains that a specific
-quality switches to Compatible playback. On phones, stream modes use full-width
-rows. Recovery messages and actions remain inside the fullscreen or expanded
+quality switches to Compatible playback. Settings use a compact two-column
+selector grid and a single row of stream modes (stacked on the narrowest
+screens), with 44-pixel control targets.
+Quality choices also use two columns where space permits. Stream information
+keeps source and output facts compact and puts advisory browser probes behind
+an initially collapsed Browser diagnostics disclosure; no diagnostic data is
+removed. Recovery messages and actions remain inside the fullscreen or expanded
 player, and errors keep the playback and close controls visible. Closing clears
 loading and error UI as well as the source.
 Timeline and volume inputs keep at least a 44-pixel hit area
@@ -745,6 +767,9 @@ Browse parameters are `view=folders|library`, `folder`,
 `limit`, and `generation`. The server default page is 60 and the maximum is
 200; the interactive browser library requests 24 items at a time so card JSON,
 layout, and lazy artwork cannot monopolize the next scrolling interaction.
+Media DTOs include a nullable `collection` with an opaque directory `id`, a
+folder `title`, and numeric `sequence`. Collection ordering happens before
+pagination in both SQLite and the in-memory fallback.
 Passing the first page's generation on later pages gives stable pagination; a
 catalog change returns `409 catalog_changed` rather than mixing snapshots.
 The browser requests the next bounded page automatically when the end of the

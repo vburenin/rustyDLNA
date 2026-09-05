@@ -18,6 +18,7 @@ mod playlist;
 pub mod probe;
 mod rooted_io;
 pub mod watch;
+mod web_order;
 pub use catalog::*;
 pub use db::{
     mime_to_ext, CatalogDefaultOrder, CatalogQuery, CatalogQueryClause, CatalogQueryField,
@@ -54,6 +55,7 @@ pub use watch::{
     repair_objects_if_needed, run_inotify, run_inotify_prepared_updates_until, run_inotify_until,
     run_inotify_updates_until, WatchTelemetry,
 };
+pub use web_order::{video_collection, web_media_title_key, VideoCollection};
 
 use rusty_dlna_protocol::object_id::{
     BROWSEDIR_ID, IMAGE_ALBUM_ID, IMAGE_ALL_ID, IMAGE_CAMERA_ID, IMAGE_DATE_ID, IMAGE_DIR_ID,
@@ -5169,6 +5171,9 @@ fn monitor_dirty_with_db(
                         Err(error) => return Err(scan_io(&st.path, error)),
                     };
                     if let Some(opened) = opened {
+                        if db.set_detail_collection_source(row.id, &opened, cfg)? {
+                            changed += 1;
+                        }
                         let meta = opened
                             .file
                             .metadata()
@@ -5573,6 +5578,7 @@ fn refresh_replaced_inode_aliases(
             continue;
         }
         db.update_detail_stat(sid, size, timestamp, new_device, new_inode)?;
+        db.set_detail_collection_source(sid, &opened, cfg)?;
         apply_or_reuse_probe(db, cfg, &decoded, sid, new_device, new_inode, &opened)?;
         tracing::info!(
             target: "rusty_dlna",
@@ -5922,6 +5928,7 @@ fn index_one_file_with_artwork(
     let display_title = nfo.title.as_deref().unwrap_or(&title);
 
     if let Some(existing) = db.find_detail_by_path(&path_s)? {
+        db.set_detail_collection_source(existing.id, &opened, cfg)?;
         let ExistingDetail {
             id,
             size: old_sz,
@@ -5982,6 +5989,7 @@ fn index_one_file_with_artwork(
         let new_key = media_rel_key_for_config(path, cfg);
         // Host realpath vs container mount of the same file — not a new alias.
         if !src_key.is_empty() && src_key == new_key {
+            db.set_detail_collection_source(source.id, &opened, cfg)?;
             if let Some(existing) = db.find_detail_by_path(&source.path)? {
                 let ExistingDetail {
                     size: old_sz,
@@ -6017,6 +6025,7 @@ fn index_one_file_with_artwork(
         }
         if source.size == size && source.timestamp >= mtime {
             let id = db.clone_detail_for_path(source.id, &path_s, size, mtime, device, inode)?;
+            db.set_detail_collection_source(id, &opened, cfg)?;
             attach_objects(db, folder_id, id, &title, class, device, inode)?;
             attach_album_art_for_index(db, cfg, path, id, prepared, artwork_selection, &opened)?;
             return Ok(true);
@@ -6038,6 +6047,7 @@ fn index_one_file_with_artwork(
         inode,
         dlna_pn: None,
     })?;
+    db.set_detail_collection_source(detail, &opened, cfg)?;
     let caps = captions_for(path, cfg)?;
     db.replace_captions(detail, &caps)?;
     if let Some(prepared) = prepared.filter(|prepared| prepared.probe_attempted) {

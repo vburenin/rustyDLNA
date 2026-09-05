@@ -82,7 +82,7 @@ const WEB_SCHEMA_VERSION: u8 = 2;
 // Change when a browser API representation can differ without a catalog
 // generation change. This keeps conditional requests from reusing capability
 // or media metadata cached from an older rustyDLNA build.
-const WEB_API_CACHE_REVISION: u8 = 5;
+const WEB_API_CACHE_REVISION: u8 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WebItemId(i64);
@@ -294,10 +294,18 @@ enum WebEntryDto {
 }
 
 #[derive(Serialize)]
+struct WebMovieCollection {
+    id: String,
+    title: String,
+    sequence: u32,
+}
+
+#[derive(Serialize)]
 struct WebMediaItem {
     id: WebItemId,
     title: String,
     file_name: String,
+    collection: Option<WebMovieCollection>,
     kind: &'static str,
     mime: String,
     ext: String,
@@ -1116,20 +1124,35 @@ fn memory_web_page<'a>(
         })
         .filter(|item| query.is_empty() || media_matches(item, query))
         .collect::<Vec<_>>();
-    items.sort_by(|left, right| {
-        let ordering = match sort {
-            "date_desc" => right.date.cmp(&left.date),
-            "episode" => left
-                .disc
-                .unwrap_or(0)
-                .cmp(&right.disc.unwrap_or(0))
-                .then_with(|| left.track.unwrap_or(0).cmp(&right.track.unwrap_or(0))),
-            _ => left.title.to_lowercase().cmp(&right.title.to_lowercase()),
-        };
-        ordering.then_with(|| left.detail_id.cmp(&right.detail_id))
-    });
+    // Match SQLite's MIN(detail_id) representative before ordering, even when
+    // a symlink alias has a different NFO title that would otherwise sort first.
+    items.sort_unstable_by_key(|item| item.detail_id);
     let mut physical_files = HashSet::new();
     items.retain(|item| item.inode == 0 || physical_files.insert((item.device, item.inode)));
+    if sort == "title" {
+        items.sort_by_cached_key(|item| {
+            (
+                rusty_dlna_scan::web_media_title_key(
+                    item.collection_path.as_deref().unwrap_or(&item.path),
+                    &item.mime,
+                    &item.title,
+                ),
+                item.detail_id,
+            )
+        });
+    } else {
+        items.sort_by(|left, right| {
+            let ordering = match sort {
+                "date_desc" => right.date.cmp(&left.date),
+                _ => left
+                    .disc
+                    .unwrap_or(0)
+                    .cmp(&right.disc.unwrap_or(0))
+                    .then_with(|| left.track.unwrap_or(0).cmp(&right.track.unwrap_or(0))),
+            };
+            ordering.then_with(|| left.detail_id.cmp(&right.detail_id))
+        });
+    }
     let total = items.len();
     (items.into_iter().skip(offset).take(limit).collect(), total)
 }
@@ -1496,6 +1519,15 @@ fn media_dto(app: &App, item: &MediaItem) -> WebMediaItem {
         id: item.detail_id.into(),
         title: item.title.clone(),
         file_name,
+        collection: rusty_dlna_scan::video_collection(
+            item.collection_path.as_deref().unwrap_or(&item.path),
+            &item.mime,
+        )
+        .map(|group| WebMovieCollection {
+            id: group.id,
+            title: group.title,
+            sequence: group.sequence,
+        }),
         kind: media_kind,
         mime: item.mime.clone(),
         ext: item.ext.clone(),

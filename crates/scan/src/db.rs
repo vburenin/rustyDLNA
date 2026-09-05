@@ -22,6 +22,26 @@ use crate::{
     EmbeddedTags, MediaItem, NfoMeta, ScanConfig,
 };
 
+// Both SQLite paging and the in-memory web fallback use the same title key.
+fn register_web_order(conn: &Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "web_media_title_key",
+        3,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let path: String = context.get(0)?;
+            let mime: String = context.get(1)?;
+            let title: String = context.get(2)?;
+            Ok(crate::web_media_title_key(
+                &path_from_db(&path),
+                &mime,
+                &title,
+            ))
+        },
+    )
+}
+
 pub(crate) const STREAM_PROBE_REVISION: i64 = 5;
 pub(crate) const SCAN_CATALOG_EPOCH_KEY: &str = "scan_catalog_epoch";
 
@@ -215,6 +235,9 @@ fn media_item_from_catalog_row(
         class,
         date: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
         path,
+        collection_path: row
+            .get::<_, Option<String>>(40)?
+            .map(|path| path_from_db(&path)),
         mime,
         ext: ext.into(),
         size,
@@ -534,7 +557,7 @@ const CATALOG_ITEM_SELECT: &str =
             d.AUDIO_STREAMS, d.HDR,
             d.ALBUM_ART, d.TITLE, d.CREATOR, d.ARTIST, d.ALBUM, d.GENRE,
             d.COMMENT, d.DISC, d.TRACK, d.ALBUM_ARTIST, d.COMPOSER,
-            d.CONTRIBUTOR, d.RATING, d.ROTATION, d.OUTLINE, d.PLOT
+            d.CONTRIBUTOR, d.RATING, d.ROTATION, d.OUTLINE, d.PLOT, d.COLLECTION_PATH
      FROM OBJECTS o JOIN DETAILS d ON o.DETAIL_ID = d.ID";
 
 fn catalog_field_sql(field: CatalogQueryField) -> &'static str {
@@ -1182,7 +1205,7 @@ impl LibraryDb {
                  GENRE, OUTLINE, PLOT, COMMENT, CHANNELS, DISC, TRACK, RATING, DATE, RESOLUTION,
                  THUMBNAIL, ALBUM_ART, ROTATION, DLNA_PN, MIME, DEVICE, INODE,
                  CONTAINER, VIDEO, AUDIO, AUDIO_STREAMS, HDR, STREAM_PROBE_REV,
-                 PROBE_SIDECAR_FINGERPRINT
+                 PROBE_SIDECAR_FINGERPRINT, COLLECTION_PATH
              )
              SELECT staged.ID, staged.PATH, staged.SIZE, staged.TIMESTAMP,
                  staged.TITLE, staged.DURATION, staged.BITRATE, staged.SAMPLERATE,
@@ -1194,11 +1217,12 @@ impl LibraryDb {
                  staged.DEVICE, staged.INODE, staged.CONTAINER,
                  staged.VIDEO, staged.AUDIO,
                  staged.AUDIO_STREAMS, staged.HDR, staged.STREAM_PROBE_REV,
-                 staged.PROBE_SIDECAR_FINGERPRINT
+                 staged.PROBE_SIDECAR_FINGERPRINT, staged.COLLECTION_PATH
              FROM scan_stage.DETAILS staged
              JOIN scan_stage._scan_detail_changes changed ON changed.ID = staged.ID
              WHERE true
              ON CONFLICT(ID) DO UPDATE SET
+                 COLLECTION_PATH=excluded.COLLECTION_PATH,
                  PATH=excluded.PATH, SIZE=excluded.SIZE, TIMESTAMP=excluded.TIMESTAMP,
                  TITLE=excluded.TITLE, DURATION=excluded.DURATION,
                  BITRATE=excluded.BITRATE, SAMPLERATE=excluded.SAMPLERATE,
@@ -1218,7 +1242,8 @@ impl LibraryDb {
                  HDR=excluded.HDR,
                  STREAM_PROBE_REV=excluded.STREAM_PROBE_REV,
                  PROBE_SIDECAR_FINGERPRINT=excluded.PROBE_SIDECAR_FINGERPRINT
-             WHERE DETAILS.PATH COLLATE BINARY IS NOT excluded.PATH COLLATE BINARY
+             WHERE DETAILS.COLLECTION_PATH COLLATE BINARY IS NOT excluded.COLLECTION_PATH COLLATE BINARY
+                OR DETAILS.PATH COLLATE BINARY IS NOT excluded.PATH COLLATE BINARY
                 OR DETAILS.SIZE IS NOT excluded.SIZE
                 OR DETAILS.TIMESTAMP IS NOT excluded.TIMESTAMP
                 OR DETAILS.TITLE COLLATE BINARY IS NOT excluded.TITLE COLLATE BINARY
@@ -1436,6 +1461,7 @@ impl LibraryDb {
         cancellation: Option<crate::CancellationToken>,
     ) -> rusqlite::Result<Self> {
         let mut conn = Connection::open(path)?;
+        register_web_order(&conn)?;
         conn.busy_timeout(busy_timeout)?;
         if let Some(cancellation) = cancellation {
             conn.progress_handler(1_000, Some(move || cancellation.is_cancelled()))?;
@@ -1454,6 +1480,7 @@ impl LibraryDb {
 
     pub fn open_memory() -> rusqlite::Result<Self> {
         let mut conn = Connection::open_in_memory()?;
+        register_web_order(&conn)?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
         migrate_schema(&mut conn)?;
@@ -1470,6 +1497,7 @@ impl LibraryDb {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        register_web_order(&conn)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             conn,
@@ -1639,7 +1667,7 @@ impl LibraryDb {
             WebMediaKind::Audio => "d.MIME LIKE 'audio/%'",
         };
         let order = match sort {
-            WebMediaSort::Title => "LOWER(COALESCE(NULLIF(d.TITLE, ''), d.PATH)), d.ID",
+            WebMediaSort::Title => "web_media_title_key(COALESCE(d.COLLECTION_PATH, d.PATH, ''), COALESCE(d.MIME, ''), COALESCE(NULLIF(d.TITLE, ''), d.PATH, '')), d.ID",
             WebMediaSort::DateDescending => {
                 "COALESCE(d.DATE, '') DESC, LOWER(COALESCE(NULLIF(d.TITLE, ''), d.PATH)), d.ID"
             }
@@ -1860,13 +1888,13 @@ impl LibraryDb {
                 ALBUM, GENRE, OUTLINE, PLOT, COMMENT, CHANNELS, DISC, TRACK, RATING,
                 DATE, RESOLUTION, THUMBNAIL, ALBUM_ART, ROTATION, DLNA_PN, MIME,
                 DEVICE, INODE, CONTAINER, VIDEO, AUDIO, AUDIO_STREAMS, HDR,
-                STREAM_PROBE_REV, PROBE_SIDECAR_FINGERPRINT)
+                STREAM_PROBE_REV, PROBE_SIDECAR_FINGERPRINT, COLLECTION_PATH)
              SELECT ?1, ?2, ?3, TITLE, DURATION, BITRATE, SAMPLERATE,
                 CREATOR, ARTIST, ALBUM_ARTIST, COMPOSER, CONTRIBUTOR,
                 ALBUM, GENRE, OUTLINE, PLOT, COMMENT, CHANNELS, DISC, TRACK, RATING,
                 DATE, RESOLUTION, THUMBNAIL, ALBUM_ART, ROTATION, DLNA_PN, MIME,
                 ?4, ?5, CONTAINER, VIDEO, AUDIO, AUDIO_STREAMS, HDR,
-                STREAM_PROBE_REV, PROBE_SIDECAR_FINGERPRINT
+                STREAM_PROBE_REV, PROBE_SIDECAR_FINGERPRINT, NULL
              FROM DETAILS WHERE ID = ?6",
             params![path, size, mtime, device, inode, src_id],
         )?;
@@ -2783,6 +2811,37 @@ impl LibraryDb {
             params![size, timestamp, device, inode, id],
         )?;
         Ok(())
+    }
+
+    /// Capture the admitted source, without resolving the walked alias again.
+    /// Also refresh unchanged files after migration or a same-inode link retarget.
+    pub(crate) fn set_detail_collection_source(
+        &self,
+        id: i64,
+        opened: &crate::RootedFile,
+        cfg: &ScanConfig,
+    ) -> rusqlite::Result<bool> {
+        // A root-qualified logical identity survives host/container mount moves.
+        // This value is only for grouping; it must never be opened as a file.
+        let source = cfg
+            .selected_root(&opened.resolved_path)
+            .and_then(|root| {
+                opened
+                    .resolved_path
+                    .strip_prefix(root.relative_to)
+                    .ok()
+                    .map(|relative| PathBuf::from(root.key).join(root.title).join(relative))
+            })
+            .unwrap_or_else(|| opened.resolved_path.clone());
+        let path = crate::path_to_db(&source);
+        self.conn
+            .execute(
+                "UPDATE DETAILS SET COLLECTION_PATH = ?1
+             WHERE ID = ?2 AND MIME LIKE 'video/%'
+               AND COLLECTION_PATH COLLATE BINARY IS NOT ?1 COLLATE BINARY",
+                params![path, id],
+            )
+            .map(|changed| changed > 0)
     }
 
     pub fn upsert_object(
@@ -4170,7 +4229,7 @@ fn is_virtual_container(id: &str) -> bool {
     )
 }
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
     let sql = format!("PRAGMA table_info({table})");
@@ -4335,6 +4394,11 @@ fn migrate_schema_inner(
              WHERE MIME LIKE 'video/%' AND PLOT IS NULL AND COMMENT IS NOT NULL",
             [],
         )?;
+    }
+    if version < 13 && !table_has_column(&tx, "DETAILS", "COLLECTION_PATH")? {
+        tx.execute("ALTER TABLE DETAILS ADD COLUMN COLLECTION_PATH TEXT", [])?;
+        // Backfill during normal confined scanner reconciliation, including
+        // unchanged files. Schema migration must not walk mutable media paths.
     }
     let rev: i64 = tx
         .query_row(
@@ -4679,6 +4743,7 @@ mod query_tests {
                     "AUDIO_STREAMS",
                     "HDR",
                     "PROBE_SIDECAR_FINGERPRINT",
+                    "COLLECTION_PATH",
                 ],
             ),
             ("ALBUM_ART", &["ID", "PATH"]),
@@ -4874,6 +4939,7 @@ mod query_tests {
             class,
             date,
             path,
+            collection_path,
             mime,
             ext,
             size,
@@ -5075,6 +5141,208 @@ mod query_tests {
             .unwrap();
         assert_eq!(past_end.total, 3);
         assert!(past_end.object_ids.is_empty());
+    }
+
+    #[test]
+    fn collection_aliases_survive_migration_clone_and_snapshot_reads() {
+        use std::os::unix::fs::symlink;
+        struct Tree(PathBuf);
+        impl Drop for Tree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let database = temp_db("collection-alias");
+        let tree = Tree(database.with_extension("media"));
+        let root = &tree.0;
+        let first = root.join("catalog/Briar Saga/01 - The Garden (2001).mkv");
+        let second = root.join("catalog/Briar Saga/02 - The Lantern (2003).mkv");
+        let other = root.join("other/Briar Saga/01 - A Different Story (2002).mkv");
+        for path in [&first, &second, &other] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"fictional media").unwrap();
+        }
+        let first_alias = root
+            .join("genres/adventure/Briar Saga")
+            .join(first.file_name().unwrap());
+        let second_alias = root
+            .join("genres/fantasy/Briar Saga")
+            .join(second.file_name().unwrap());
+        for (alias, target) in [(&first_alias, &first), (&second_alias, &second)] {
+            std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            symlink(target, alias).unwrap();
+        }
+        let mut db = LibraryDb::open(&database).unwrap();
+        let open_source = |path: &Path| {
+            crate::open_file_under_roots(path, std::slice::from_ref(root), false).unwrap()
+        };
+        let cfg = ScanConfig::default();
+        let mut ids = Vec::new();
+        for (index, path) in [&first_alias, &second_alias, &other]
+            .into_iter()
+            .enumerate()
+        {
+            let stored = crate::path_to_db(path);
+            let id = db
+                .insert_detail(NewDetail {
+                    path: &stored,
+                    size: 15,
+                    timestamp: 1,
+                    title: path.file_stem().unwrap().to_str().unwrap(),
+                    date: "2001-01-01",
+                    mime: "video/x-matroska",
+                    device: 1,
+                    inode: index as i64 + 1,
+                    dlna_pn: None,
+                })
+                .unwrap();
+            assert!(db
+                .set_detail_collection_source(id, &open_source(path), &cfg)
+                .unwrap());
+            db.conn.execute("INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID, NAME) VALUES (?1, '2', 'item.videoItem', ?2, 'fixture')", params![format!("2${id}"), id]).unwrap();
+            ids.push(id);
+        }
+        let stored_path = |db: &LibraryDb, id| {
+            db.conn
+                .query_row(
+                    "SELECT COLLECTION_PATH FROM DETAILS WHERE ID = ?1",
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(stored_path(&db, ids[0]), crate::path_to_db(&first));
+        assert_eq!(stored_path(&db, ids[1]), crate::path_to_db(&second));
+        db.conn
+            .execute_batch("UPDATE DETAILS SET COLLECTION_PATH = NULL; PRAGMA user_version=12;")
+            .unwrap();
+        migrate_schema(&mut db.conn).unwrap();
+        let populated: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM DETAILS WHERE COLLECTION_PATH IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(populated, 0, "migration must not resolve media paths");
+        for (id, path) in ids.iter().zip([&first_alias, &second_alias, &other]) {
+            let opened = open_source(path);
+            assert!(db.set_detail_collection_source(*id, &opened, &cfg).unwrap());
+            assert!(!db.set_detail_collection_source(*id, &opened, &cfg).unwrap());
+        }
+        assert_eq!(stored_path(&db, ids[0]), crate::path_to_db(&first));
+        let cloned = db
+            .clone_detail_for_path(ids[0], &crate::path_to_db(&first), 15, 1, 1, 1)
+            .unwrap();
+        db.set_detail_collection_source(cloned, &open_source(&first), &cfg)
+            .unwrap();
+        assert_eq!(stored_path(&db, cloned), crate::path_to_db(&first));
+        // A request uses the published snapshot even when a link changes before
+        // the watcher publishes its next update. It performs no filesystem IO.
+        let admitted = open_source(&first_alias);
+        std::fs::remove_file(&first_alias).unwrap();
+        symlink(&second, &first_alias).unwrap();
+        assert!(!db
+            .set_detail_collection_source(ids[0], &admitted, &cfg)
+            .unwrap());
+        assert!(crate::open_file_under_roots(&first_alias, &[root.join("genres")], false).is_err());
+        let catalog = db.load_catalog().unwrap();
+        let first_item = &catalog.items[&format!("2${}", ids[0])];
+        let second_item = &catalog.items[&format!("2${}", ids[1])];
+        let first_group = crate::video_collection(
+            first_item.collection_path.as_deref().unwrap(),
+            &first_item.mime,
+        )
+        .unwrap();
+        let second_group = crate::video_collection(
+            second_item.collection_path.as_deref().unwrap(),
+            &second_item.mime,
+        )
+        .unwrap();
+        assert_eq!(first_group.id, second_group.id);
+        assert_eq!((first_group.sequence, second_group.sequence), (1, 2));
+        let other_group = crate::video_collection(&other, "video/").unwrap();
+        assert_ne!(
+            first_group.id, other_group.id,
+            "same-named physical collections stay distinct"
+        );
+        let page = db
+            .query_web_media_page(WebMediaKind::Video, "", WebMediaSort::Title, 0, 10)
+            .unwrap();
+        let position = page
+            .object_ids
+            .iter()
+            .position(|id| id == &first_item.object_id)
+            .unwrap();
+        assert_eq!(page.object_ids[position + 1], second_item.object_id);
+        db.update_detail_stat(ids[0], 15, 2, 1, 2).unwrap();
+        db.set_detail_collection_source(ids[0], &open_source(&first_alias), &cfg)
+            .unwrap();
+        assert_eq!(stored_path(&db, ids[0]), crate::path_to_db(&second));
+        drop(db);
+        let reader = LibraryDb::open_read_only(&database).unwrap();
+        assert_eq!(
+            reader
+                .query_web_media_page(WebMediaKind::Video, "", WebMediaSort::Title, 0, 10)
+                .unwrap()
+                .total,
+            2
+        );
+    }
+
+    #[test]
+    fn web_collection_order_is_applied_before_paging_and_matches_memory_key() {
+        let db = LibraryDb::open_memory().unwrap();
+        let paths = [
+            "/movies/Briar Saga/03 - The Last Beacon (2025).mkv",
+            "/movies/Copper Road (2006).mkv",
+            "/movies/Briar Saga/01 - Briar Saga (2002).mkv",
+            "/movies/Amber Road (1957).mkv",
+            "/movies/Briar Saga/02 - Across the River (2007).mkv",
+            "/anime/Example Studio/17 - The Lantern (2008).mkv",
+            "/anime/Example Studio/03 - The Garden (1988).mkv",
+        ];
+        for (index, path) in paths.iter().enumerate() {
+            let id = index as i64 + 1;
+            let title = Path::new(path).file_stem().unwrap().to_str().unwrap();
+            db.conn.execute("INSERT INTO DETAILS (ID, PATH, TITLE, MIME) VALUES (?1, ?2, ?3, 'video/x-matroska')", params![id, path, title]).unwrap();
+            db.conn.execute("INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID, NAME) VALUES (?1, '2', 'item.videoItem', ?2, ?3)", params![format!("2${id}"), id, title]).unwrap();
+        }
+        let mut actual = Vec::new();
+        for offset in (0..paths.len()).step_by(2) {
+            let page = db
+                .query_web_media_page(WebMediaKind::Video, "", WebMediaSort::Title, offset, 2)
+                .unwrap();
+            assert_eq!(page.total as usize, paths.len());
+            actual.extend(page.object_ids);
+        }
+        assert_eq!(actual, ["2$4", "2$3", "2$5", "2$1", "2$2", "2$7", "2$6"]);
+        let mut memory: Vec<_> = paths.iter().enumerate().collect();
+        memory.sort_by_cached_key(|(_, path)| {
+            crate::web_media_title_key(
+                Path::new(path),
+                "video/x-matroska",
+                Path::new(path).file_stem().unwrap().to_str().unwrap(),
+            )
+        });
+        assert_eq!(
+            actual,
+            memory
+                .iter()
+                .map(|(index, _)| format!("2${}", index + 1))
+                .collect::<Vec<_>>()
+        );
+        let searched = db
+            .query_web_media_page(
+                WebMediaKind::Video,
+                "Briar Saga",
+                WebMediaSort::Title,
+                0,
+                10,
+            )
+            .unwrap();
+        assert_eq!(searched.object_ids, ["2$3", "2$5", "2$1"]);
     }
 
     #[test]

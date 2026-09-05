@@ -59,7 +59,7 @@ def web_call(port: int, query: str) -> tuple[dict, float]:
     connection.close()
     elapsed_ms = (time.perf_counter() - started) * 1_000
     parsed = json.loads(payload)
-    if response.status != 200 or parsed.get("schema_version") != 1:
+    if response.status != 200 or parsed.get("schema_version") != 2:
         raise RuntimeError(f"web library returned HTTP {response.status}: {payload[:500]!r}")
     return parsed, elapsed_ms
 
@@ -105,9 +105,11 @@ def benchmark(port: int, requests: int, warmups: int, web_p95_target_ms: float) 
             "mean_ms": round(statistics.fmean(samples), 3),
             "max_ms": round(max(samples), 3),
         }
+    population, _ = web_call(port, "view=library&kind=video&sort=title&offset=0&limit=1")
+    later_offset = min(40000, max(0, population["total"] - 64))
     web_queries = {
         "web_first_page": "view=library&kind=video&sort=title&offset=0&limit=64",
-        "web_later_page": "view=library&kind=video&sort=title&offset=40000&limit=64",
+        "web_later_page": f"view=library&kind=video&sort=title&offset={later_offset}&limit=64",
         "web_search": "view=library&kind=video&sort=title&q=Title%204&offset=0&limit=64",
     }
     for name, query in web_queries.items():

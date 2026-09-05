@@ -26,6 +26,7 @@ import {
   navigationUrl,
   negotiateCompatibleStreams,
   originalAudioTrackIndex,
+  originalDownloadUrl,
   playbackControlLabel,
   primaryVideoCodec,
   queueNeighbor,
@@ -54,6 +55,14 @@ import {
 } from "./core.js";
 import { initialState, Store } from "./store.js";
 import { loadPreferences, progressDetails, progressSnapshot } from "./preferences.js";
+
+test("original downloads use only the advertised same-origin download route", () => {
+  assert.equal(originalDownloadUrl({ download_url: "/web/download/9" }), "/web/download/9");
+  for (const download_url of [null, "", 9, "https://example.com/web/download/9", "//example.com/web/download/9", "/MediaItems/9"]) {
+    assert.equal(originalDownloadUrl({ download_url }), null);
+  }
+  assert.equal(originalDownloadUrl(null), null);
+});
 
 test("time conversion and seek bounds keep the real end position", () => {
   assert.equal(durationSeconds("1:02:03.5"), 3723.5);

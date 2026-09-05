@@ -456,6 +456,11 @@ impl Catalog {
                 .saturating_add(item.class.capacity())
                 .saturating_add(item.date.capacity())
                 .saturating_add(item.path.as_os_str().as_encoded_bytes().len())
+                .saturating_add(
+                    item.collection_path
+                        .as_ref()
+                        .map_or(0, |path| path.as_os_str().as_encoded_bytes().len()),
+                )
                 .saturating_add(item.mime.capacity())
                 .saturating_add(item.ext.capacity())
                 .saturating_add(item.probe.container.capacity())
