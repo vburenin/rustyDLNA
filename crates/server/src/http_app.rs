@@ -2245,14 +2245,19 @@ impl App {
                 return HttpResponse::html(404, "Not Found", "missing file");
             }
         };
-        let size = match opened.file.metadata() {
-            Ok(metadata) => metadata.len(),
+        let metadata = match opened.file.metadata() {
+            Ok(metadata) => metadata,
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "media metadata failed");
                 return HttpResponse::html(404, "Not Found", "missing file");
             }
         };
-        let range = match req.header("Range") {
+        let size = metadata.len();
+        let etag = rusty_dlna_http::range::original_file_etag(&metadata);
+        let requested_range = req.header("Range").filter(|_| {
+            rusty_dlna_http::range::if_range_matches(req.header("If-Range"), etag.as_deref())
+        });
+        let range = match requested_range {
             None => None,
             Some(v) => match parse_byte_range(v, size) {
                 Ok(r) => r,
@@ -2296,6 +2301,9 @@ impl App {
                 pn: pn.as_deref(),
                 ci,
             });
+            if let Some(etag) = etag.as_deref() {
+                r.set("ETag", etag);
+            }
             if let Some(url) = caption_sec.as_deref() {
                 set_caption_info_sec(&mut r, url);
             }
@@ -2312,6 +2320,9 @@ impl App {
                 pn: pn.as_deref(),
                 ci,
             });
+            if let Some(etag) = etag.as_deref() {
+                r.set("ETag", etag);
+            }
             if let Some(url) = caption_sec.as_deref() {
                 set_caption_info_sec(&mut r, url);
             }
@@ -2337,6 +2348,9 @@ impl App {
             pn: pn.as_deref(),
             ci,
         });
+        if let Some(etag) = etag.as_deref() {
+            r.set("ETag", etag);
+        }
         if let Some(url) = caption_sec.as_deref() {
             set_caption_info_sec(&mut r, url);
         }

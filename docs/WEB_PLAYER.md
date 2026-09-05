@@ -819,6 +819,17 @@ used in item, media, caption, preview, and transcode-status URLs.
 | `/Captions/{id}/{index}...?format=webvtt` | Jailed browser caption conversion |
 | `/status` and `/api/status` | Operator status and metrics |
 
+Original downloads advertise an opaque strong `ETag` derived from the opened
+file's identity and change metadata. Clients can resume with `Range` and
+`If-Range`; a matching tag returns the requested bytes, while a changed file,
+weak tag, or unsupported date validator returns the complete current file.
+Finalized compatible cache artifacts also advertise a validator based on their
+completion stamp and physical file identity; touching cache recency does not
+change it. Outputs without a completion stamp have no resume validator.
+Growing compatible output does not advertise a stable validator. Its partial
+responses with an unknown total describe a snapshot and must not be treated as
+a complete offline movie.
+
 Browse parameters are `view=folders|library`, `folder`,
 `kind=all|video|audio`, `q`, `sort=title|date_desc|episode`, `offset`,
 `limit`, and `generation`. The server default page is 60 and the maximum is

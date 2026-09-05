@@ -2936,14 +2936,21 @@ async fn serve_finished(
     head: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let metadata_job = job.clone();
-    let size = tokio::task::spawn_blocking(move || {
+    let (size, etag) = tokio::task::spawn_blocking(move || {
         let output = metadata_job.open_output()?;
         let file = crate::lock_recover(&output);
+        let metadata = file.metadata()?;
+        let etag = std::fs::metadata(rusty_dlna_transcode::cache_stamp_path(&metadata_job.dest))
+            .ok()
+            .and_then(|stamp| rusty_dlna_http::range::completed_cache_etag(&metadata, &stamp));
         let _ = file.set_modified(std::time::SystemTime::now());
-        file.metadata().map(|metadata| metadata.len())
+        Ok::<_, std::io::Error>((metadata.len(), etag))
     })
     .await??;
-    let range = match req.header("Range") {
+    let requested_range = req.header("Range").filter(|_| {
+        rusty_dlna_http::range::if_range_matches(req.header("If-Range"), etag.as_deref())
+    });
+    let range = match requested_range {
         None => None,
         Some(v) => match parse_byte_range(v, size) {
             Ok(r) => r,
@@ -2978,6 +2985,9 @@ async fn serve_finished(
         ci: 1,
     });
     resp.persist = false;
+    if let Some(etag) = etag.as_deref() {
+        resp.set("ETag", etag);
+    }
     if head {
         crate::socket_write_http_response(app, sock, &resp).await?;
         return Ok(());

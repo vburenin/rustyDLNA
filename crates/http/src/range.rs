@@ -1,5 +1,55 @@
 //! rustyDLNA handling for `Range: bytes=`.
 
+/// An opaque validator for a completed, opened original file. Change timestamps
+/// and physical identity prevent a same-size replacement from reusing a range
+/// belonging to an older file. This does not validate a growing media output.
+pub fn original_file_etag(metadata: &std::fs::Metadata) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    metadata.len().hash(&mut hash);
+    metadata.modified().ok()?.hash(&mut hash);
+    metadata.created().ok().hash(&mut hash);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.dev().hash(&mut hash);
+        metadata.ino().hash(&mut hash);
+        metadata.ctime().hash(&mut hash);
+        metadata.ctime_nsec().hash(&mut hash);
+    }
+    Some(format!("\"original-{:016x}\"", hash.finish()))
+}
+
+/// A finalized cache artifact is immutable until its completion stamp is
+/// rewritten. Cache eviction touches the media mtime on reads, so its validator
+/// uses the stamp's change identity plus the artifact's physical identity.
+pub fn completed_cache_etag(
+    metadata: &std::fs::Metadata,
+    stamp: &std::fs::Metadata,
+) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    original_file_etag(stamp)?.hash(&mut hash);
+    metadata.len().hash(&mut hash);
+    metadata.created().ok().hash(&mut hash);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.dev().hash(&mut hash);
+        metadata.ino().hash(&mut hash);
+    }
+    Some(format!("\"completed-{:016x}\"", hash.finish()))
+}
+
+/// If-Range requires a matching strong validator. Unknown dates, weak tags,
+/// and changed files fall back to a full response, never a mixed partial file.
+pub fn if_range_matches(if_range: Option<&str>, etag: Option<&str>) -> bool {
+    match if_range {
+        None => true,
+        Some(value) => etag.is_some_and(|etag| value.trim() == etag && !etag.starts_with("W/")),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteRange {
     /// Inclusive start.
@@ -182,5 +232,70 @@ mod tests {
                 assert_eq!(range_len(range), suffix.min(size));
             }
         }
+    }
+
+    #[test]
+    fn original_validator_detects_equal_size_and_mtime_replacement() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "rustydlna-validator-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let source = directory.join("source");
+        let replacement = directory.join("replacement");
+        std::fs::write(&source, b"old-bytes").unwrap();
+        let original = std::fs::metadata(&source).unwrap();
+        let tag = original_file_etag(&original).unwrap();
+        assert_eq!(
+            original_file_etag(&std::fs::metadata(&source).unwrap()),
+            Some(tag.clone())
+        );
+        assert!(if_range_matches(Some(&tag), Some(&tag)));
+        assert!(if_range_matches(None, Some(&tag)));
+        assert!(!if_range_matches(Some(&format!("W/{tag}")), Some(&tag)));
+        assert!(!if_range_matches(
+            Some("Wed, 01 Jan 2020 00:00:00 GMT"),
+            Some(&tag)
+        ));
+        std::fs::write(&replacement, b"new-bytes").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(original.modified().unwrap())
+            .unwrap();
+        std::fs::rename(&replacement, &source).unwrap();
+        let changed = original_file_etag(&std::fs::metadata(&source).unwrap()).unwrap();
+        assert_ne!(changed, tag);
+        assert!(!if_range_matches(Some(&tag), Some(&changed)));
+        let stamp_file = directory.join("completion-stamp");
+        std::fs::write(&stamp_file, b"synthetic-cache-key").unwrap();
+        let stamp_metadata = std::fs::metadata(&stamp_file).unwrap();
+        let cache_tag =
+            completed_cache_etag(&std::fs::metadata(&source).unwrap(), &stamp_metadata).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(
+            completed_cache_etag(&std::fs::metadata(&source).unwrap(), &stamp_metadata),
+            Some(cache_tag.clone()),
+            "Cache recency touches must not invalidate preserved download bytes"
+        );
+        std::fs::write(&stamp_file, b"new-completed-cache-key").unwrap();
+        assert_ne!(
+            completed_cache_etag(
+                &std::fs::metadata(&source).unwrap(),
+                &std::fs::metadata(&stamp_file).unwrap()
+            ),
+            Some(cache_tag)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

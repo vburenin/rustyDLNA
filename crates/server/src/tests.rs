@@ -3778,6 +3778,76 @@ fn original_get_and_two_ranges() {
     assert_eq!(past.status, 416);
 }
 
+#[test]
+fn original_download_if_range_reuses_only_the_same_opened_file() {
+    let mut app = testdata_app();
+    let tree = TestTree::new("download-validator");
+    let root = tree.path().join("media");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = root.join("synthetic-original.mkv");
+    std::fs::write(&source, b"synthetic-original-bytes").unwrap();
+    app.scan_cfg.media_dirs = vec![root];
+    let mut item = movie_fixture(&app);
+    item.detail_id = 9_100_003;
+    item.object_id = "synthetic-download-validator".into();
+    item.path = source.clone();
+    item.size = std::fs::metadata(&source).unwrap().len();
+    {
+        let mut catalog = app.catalog.write().unwrap();
+        catalog
+            .by_detail
+            .insert(item.detail_id, item.object_id.clone());
+        catalog.items.insert(item.object_id.clone(), item.clone());
+    }
+    let request = |range: Option<&str>, validator: Option<&str>| {
+        let range = range
+            .map(|value| format!("Range: {value}\r\n"))
+            .unwrap_or_default();
+        let validator = validator
+            .map(|value| format!("If-Range: {value}\r\n"))
+            .unwrap_or_default();
+        req(&format!(
+            "GET /web/download/{} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n{range}{validator}\r\n",
+            item.detail_id
+        ))
+    };
+    let full = app.handle(&request(None, None));
+    assert_eq!(full.status, 200);
+    let tag = resp_header(&full, "ETag")
+        .expect("completed original validator")
+        .to_owned();
+    let resumed = app.handle(&request(Some("bytes=10-"), Some(&tag)));
+    assert_eq!(resumed.status, 206);
+    assert_eq!(resumed.body, &full.body[10..]);
+    assert_eq!(resp_header(&resumed, "ETag"), Some(tag.as_str()));
+    let weak = app.handle(&request(Some("bytes=10-"), Some(&format!("W/{tag}"))));
+    assert_eq!(weak.status, 200);
+    assert_eq!(weak.body, full.body);
+    let ordinary_range = app.handle(&request(Some("bytes=10-"), None));
+    assert_eq!(
+        ordinary_range.status, 206,
+        "legacy web range requests retain their behavior"
+    );
+
+    // Replace the inode with equal-length bytes and preserve its mtime. A
+    // timestamp-and-size-only validator would incorrectly return mixed data.
+    let previous_modified = std::fs::metadata(&source).unwrap().modified().unwrap();
+    let replacement = tree.path().join("replacement.mkv");
+    std::fs::write(&replacement, b"synthetic-replaced-bytes").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&replacement)
+        .unwrap()
+        .set_modified(previous_modified)
+        .unwrap();
+    std::fs::rename(&replacement, &source).unwrap();
+    let changed = app.handle(&request(Some("bytes=10-"), Some(&tag)));
+    assert_eq!(changed.status, 200);
+    assert_eq!(changed.body, b"synthetic-replaced-bytes");
+    assert_ne!(resp_header(&changed, "ETag"), Some(tag.as_str()));
+    assert!(resp_header(&changed, "Content-Range").is_none());
+}
+
 #[cfg(unix)]
 #[test]
 fn original_get_opens_non_utf8_catalog_path_without_loss() {
