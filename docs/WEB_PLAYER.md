@@ -23,6 +23,10 @@ available, while Compatible is disabled and returns a structured error.
 
 ## Library and player behavior
 
+Library categories and playback routes use the canonical media kind, including
+Ogg audio and RealMedia video whose MIME types begin with `application/`.
+Embedded album covers remain artwork; they do not turn an audio file into video.
+
 The desktop top bar is 32 pixels tall, with a matching sticky-player offset.
 Touch devices retain larger header controls for reliable tapping.
 
@@ -402,7 +406,9 @@ playable fragment, pausing also suspends its playlist polling and media
 downloads until Play. An exact seek within a ten-second server bucket keeps
 its target pending until the corresponding fragment is buffered and the native
 media clock accepts that offset. A paused seek fetches only enough fragments
-to reach the target and stays paused; resumed and deep-linked starts apply the
+to finish the decoder's seek and stays paused. Audio priming can require the
+next fragment even when the target is already inside the buffered range;
+downloads continue through that handoff. Resumed and deep-linked starts apply the
 same offset before playback begins. Replacing the source discards its pending
 target. Seeking or deep-linking to the title's exact end shows Replay without
 opening a replacement bucket. The bounded generation heartbeat continues so resuming
@@ -602,7 +608,12 @@ stable playback-session ID to the selected title and a newer generation ID to
 each replacement source. The player waits for a short pause in rapid keyboard
 or timeline scrubbing; when the next generation arrives, the server cancels
 every older producer owned only by that playback session. Another browser or
-tab sharing an equivalent producer keeps it alive. Explicit cancellation also
+tab sharing an equivalent producer keeps it alive. The session registry retains
+at most 1,024 sessions for ten minutes of inactivity; expiration or eviction
+also removes that session's ownership from cached jobs. A shared job accepts at
+most 1,024 request owners, including callers without a session ID. Existing
+owners can reconnect at capacity; additional owners receive retryable busy.
+Explicit cancellation also
 records the generation before looking up its job, so a late media GET cannot
 restart work that was already abandoned. An unintentional dropped connection
 still gets a 30-second reconnect window, and reopening the same source attaches

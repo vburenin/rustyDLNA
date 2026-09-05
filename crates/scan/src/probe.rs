@@ -509,6 +509,11 @@ unsafe fn probe_avformat(
         }
         match (*par).codec_type {
             sys::AVMediaType::AVMEDIA_TYPE_VIDEO => {
+                // Cover art is extracted separately; it is not a playable
+                // video stream and must not determine media kind/capabilities.
+                if (*st).disposition & sys::AV_DISPOSITION_ATTACHED_PIC != 0 {
+                    continue;
+                }
                 let name = map_video((*par).codec_id);
                 if out.av.creator.is_none() && is_divx_tag((*par).codec_tag) {
                     out.av.creator = Some("DiVX".into());

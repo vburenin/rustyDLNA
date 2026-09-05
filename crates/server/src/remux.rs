@@ -39,6 +39,7 @@ const WEB_RECONNECT_GRACE: Duration = Duration::from_secs(30);
 // that the browser still owns.
 const WEB_ACTIVE_SESSION_LEASE: Duration = Duration::from_secs(2 * 60);
 const WEB_EPHEMERAL_RETENTION: Duration = Duration::from_secs(30);
+const MAX_WEB_PLAYBACK_SESSIONS: usize = 1024;
 const WEB_SESSION_RETENTION: Duration = Duration::from_secs(10 * 60);
 const WEB_PREPARATION_RETENTION: Duration = Duration::from_secs(2 * 60);
 // A replacement browser rendition must not fail admission while the producer
@@ -612,20 +613,35 @@ impl RemuxJob {
         Ok(file)
     }
 
-    fn add_web_request(&self, session_id: Option<u64>, request_id: Option<u64>) -> Option<u64> {
+    fn add_web_request(
+        &self,
+        session_id: Option<u64>,
+        request_id: Option<u64>,
+    ) -> Result<Option<u64>, String> {
+        let mut sessions = crate::lock_recover(&self.web_sessions);
+        let mut request_ids = crate::lock_recover(&self.web_request_ids);
         let replaced = session_id
             .zip(request_id)
-            .and_then(|(session_id, request_id)| {
-                crate::lock_recover(&self.web_sessions).insert(session_id, request_id)
-            });
-        let mut request_ids = crate::lock_recover(&self.web_request_ids);
+            .and_then(|(id, _)| sessions.get(&id).copied());
+        // Scoped owners are removed with the bounded global session registry.
+        // Legacy callers may omit a session; bound those owners too, while
+        // allowing existing owners and same-session replacements to reconnect.
+        if request_id.is_some_and(|id| !request_ids.contains(&id))
+            && replaced.is_none()
+            && request_ids.len() >= MAX_WEB_PLAYBACK_SESSIONS
+        {
+            return Err("transcode busy (too many playback owners)".into());
+        }
+        if let Some((session_id, request_id)) = session_id.zip(request_id) {
+            sessions.insert(session_id, request_id);
+        }
         if let Some(replaced) = replaced.filter(|replaced| Some(*replaced) != request_id) {
             request_ids.remove(&replaced);
         }
         if let Some(request_id) = request_id {
             request_ids.insert(request_id);
         }
-        replaced
+        Ok(replaced)
     }
 
     fn remove_web_request(&self, session_id: Option<u64>, request_id: u64) -> bool {
@@ -1563,6 +1579,43 @@ enum RemuxAttachment {
     Retiring(Arc<RemuxJob>),
 }
 
+// The caller holds the global session lock. Preserve the session -> job-map
+// lock order so expiration/eviction cannot race an attachment or cancellation.
+fn prune_web_playback_sessions(
+    app: &App,
+    sessions: &mut HashMap<u64, WebPlaybackSessionState>,
+    incoming: Option<u64>,
+) {
+    let mut removed = Vec::new();
+    sessions.retain(|id, state| {
+        let keep = state.at.elapsed() < WEB_SESSION_RETENTION;
+        if !keep {
+            removed.push(*id);
+        }
+        keep
+    });
+    if sessions.len() >= MAX_WEB_PLAYBACK_SESSIONS
+        && incoming.is_some_and(|id| !sessions.contains_key(&id))
+    {
+        if let Some(oldest) = sessions
+            .iter()
+            .min_by_key(|(_, state)| state.at)
+            .map(|(id, _)| *id)
+        {
+            sessions.remove(&oldest);
+            removed.push(oldest);
+        }
+    }
+    if !removed.is_empty() {
+        let jobs = crate::lock_recover(&app.remuxes);
+        for job in jobs.values().filter(|job| job.web) {
+            for session_id in &removed {
+                job.remove_web_session(*session_id);
+            }
+        }
+    }
+}
+
 fn attach_job_attempt(
     app: Arc<App>,
     spec: &RemuxJobSpec,
@@ -1575,16 +1628,7 @@ fn attach_job_attempt(
     let playback_sessions = if web {
         if let (Some(session_id), Some(request_id)) = (spec.web_session_id, spec.web_request_id) {
             let mut sessions = crate::lock_recover(&app.web_playback_sessions);
-            sessions.retain(|_, state| state.at.elapsed() < WEB_SESSION_RETENTION);
-            if sessions.len() >= 1024 && !sessions.contains_key(&session_id) {
-                if let Some(oldest) = sessions
-                    .iter()
-                    .min_by_key(|(_, state)| state.at)
-                    .map(|(session_id, _)| *session_id)
-                {
-                    sessions.remove(&oldest);
-                }
-            }
+            prune_web_playback_sessions(&app, &mut sessions, Some(session_id));
             match sessions.get_mut(&session_id) {
                 Some(state) if request_id < state.latest_request_id => {
                     return Err(WEB_REQUEST_CANCELLED.into());
@@ -1668,7 +1712,7 @@ fn attach_job_attempt(
     if let Some(job) = map.get(&spec.job_key) {
         let mut disconnect_deadline = crate::lock_recover(&job.disconnect_deadline);
         if job.err().is_none() && !job.cancelled.load(Ordering::Acquire) {
-            let replaced = job.add_web_request(spec.web_session_id, spec.web_request_id);
+            let replaced = job.add_web_request(spec.web_session_id, spec.web_request_id)?;
             if new_web_generation || !web {
                 if let Some(replaced) = replaced {
                     if Some(replaced) != spec.web_request_id {
@@ -2087,7 +2131,7 @@ fn keep_web_request_alive_for(
 ) -> bool {
     let playback_sessions = session_id.and_then(|session_id| {
         let mut sessions = crate::lock_recover(&app.web_playback_sessions);
-        sessions.retain(|_, state| state.at.elapsed() < WEB_SESSION_RETENTION);
+        prune_web_playback_sessions(app, &mut sessions, None);
         let state = sessions.get_mut(&session_id)?;
         if state.cancelled || state.latest_request_id != request_id {
             return None;
@@ -2182,16 +2226,7 @@ pub(crate) fn cancel_web_request(
 ) -> bool {
     let mut playback_sessions = session_id.map(|session_id| {
         let mut sessions = crate::lock_recover(&app.web_playback_sessions);
-        sessions.retain(|_, state| state.at.elapsed() < WEB_SESSION_RETENTION);
-        if sessions.len() >= 1024 && !sessions.contains_key(&session_id) {
-            if let Some(oldest) = sessions
-                .iter()
-                .min_by_key(|(_, state)| state.at)
-                .map(|(session_id, _)| *session_id)
-            {
-                sessions.remove(&oldest);
-            }
-        }
+        prune_web_playback_sessions(app, &mut sessions, Some(session_id));
         match sessions.get_mut(&session_id) {
             Some(state) if request_id >= state.latest_request_id => {
                 state.latest_request_id = request_id;
@@ -3453,6 +3488,69 @@ mod tests {
     }
 
     #[test]
+    fn cached_web_job_owners_follow_session_eviction_and_expiration() {
+        let dir = temp_dir("web-owner-bound");
+        let app = test_app(&dir, 1);
+        let (key, job) = completed_ephemeral_job(&app, &dir, 42);
+        let mut spec = job_spec(&dir, "unused", vec![]);
+        spec.job_key = key;
+        for id in 1..=(MAX_WEB_PLAYBACK_SESSIONS as u64 * 2 + 2) {
+            spec.web_session_id = Some(id);
+            spec.web_request_id = Some(id);
+            assert!(matches!(
+                attach_job_attempt(app.clone(), &spec, false).unwrap(),
+                RemuxAttachment::Ready(_)
+            ));
+            assert!(crate::lock_recover(&job.web_request_ids).len() <= MAX_WEB_PLAYBACK_SESSIONS);
+            assert!(crate::lock_recover(&job.web_sessions).len() <= MAX_WEB_PLAYBACK_SESSIONS);
+        }
+        assert!(!job.owns_web_request(None, 1));
+        assert!(!cancel_web_request(&app, 42, None, 1));
+        let newest = spec.web_request_id.unwrap();
+        assert!(keep_web_request_alive(&app, 42, Some(newest), newest));
+        {
+            let mut sessions = crate::lock_recover(&app.web_playback_sessions);
+            for (id, state) in sessions.iter_mut() {
+                if *id != newest {
+                    state.at = Instant::now() - WEB_SESSION_RETENTION;
+                }
+            }
+        }
+        assert!(keep_web_request_alive(&app, 42, Some(newest), newest));
+        assert_eq!(crate::lock_recover(&job.web_request_ids).len(), 1);
+        assert_eq!(crate::lock_recover(&job.web_sessions).len(), 1);
+        assert!(cancel_web_request(&app, 42, Some(newest), newest));
+        assert!(!job.has_web_requests());
+    }
+
+    #[test]
+    fn unscoped_web_job_owners_are_bounded_without_evicting_other_readers() {
+        let dir = temp_dir("unscoped-owner-bound");
+        let app = test_app(&dir, 1);
+        let (_, job) = completed_ephemeral_job(&app, &dir, 42);
+        for id in 0..MAX_WEB_PLAYBACK_SESSIONS as u64 {
+            job.add_web_request(None, Some(id)).unwrap();
+        }
+        let extra = MAX_WEB_PLAYBACK_SESSIONS as u64;
+        assert!(job.add_web_request(Some(extra), Some(extra)).is_err());
+        assert!(!job.owns_web_request(Some(extra), extra));
+        job.add_web_request(None, Some(0)).unwrap();
+        assert!(job.remove_web_request(None, 0));
+        job.add_web_request(Some(extra), Some(extra)).unwrap();
+        assert_eq!(
+            job.add_web_request(Some(extra), Some(extra + 1)).unwrap(),
+            Some(extra)
+        );
+        assert!(!job.owns_web_request(None, extra));
+        assert!(job.owns_web_request(Some(extra), extra + 1));
+        assert!(job.owns_web_request(None, 1));
+        assert_eq!(
+            crate::lock_recover(&job.web_request_ids).len(),
+            MAX_WEB_PLAYBACK_SESSIONS
+        );
+    }
+
+    #[test]
     fn hls_playlist_uses_fixed_resource_urls_and_strict_slices() {
         let request = HttpRequest::parse_headers(concat!(
             "GET /web/media/42.m3u8?mode=compatible&request=7&delivery=hls HTTP/1.1\r\n",
@@ -3551,7 +3649,7 @@ mod tests {
         let dir = temp_dir("web-resource-reattach");
         let app = test_app(&dir, 1);
         let (job_key, first) = completed_ephemeral_job(&app, &dir, 42);
-        first.add_web_request(Some(9), Some(77));
+        first.add_web_request(Some(9), Some(77)).unwrap();
         crate::lock_recover(&app.web_playback_sessions).insert(
             9,
             WebPlaybackSessionState {

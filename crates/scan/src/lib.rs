@@ -2256,6 +2256,7 @@ fn persist_prepared_probe(
         let fingerprint = merge_sidecar(cfg, path, &mut got.probe)?;
         db.set_detail_probe_sidecar_fingerprint(id, &fingerprint)?;
         replace_probe_on_detail(db, id, &got)?;
+        refresh_probed_media_kinds(db, cfg, id, &got)?;
         return Ok(true);
     }
     let mut probe = SourceProbe::default();
@@ -2277,6 +2278,49 @@ fn persist_prepared_probe(
         },
     )?;
     Ok(true)
+}
+
+// Stream backfill runs independently of file indexing at startup. Repair
+// MIME/classes and typed memberships alongside the probe, including aliases
+// whose stream metadata was refreshed from the same sidecar provenance.
+fn refresh_probed_media_kinds(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    id: i64,
+    got: &MediaProbe,
+) -> ScanResult<()> {
+    if got.probe.video.is_empty() && got.probe.audio.is_empty() {
+        return Ok(());
+    }
+    let fingerprint = db.detail_probe_sidecar_fingerprint(id)?;
+    for alias in db.inode_alias_stats(id)? {
+        cfg.check_cancelled()?;
+        let path = path_from_db(&alias.path);
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let name = display_os_name(name);
+        if !media_format_for_name(&name).is_some_and(|format| format.is_ambiguous())
+            || db.detail_probe_sidecar_fingerprint(alias.id)? != fingerprint
+        {
+            continue;
+        }
+        let Some(format) = resolved_media_format_with_hint(&name, Some(got), None) else {
+            continue;
+        };
+        if let Some((parent, title)) = db.update_detail_media_format(alias.id, format)? {
+            attach_objects(
+                db,
+                &parent,
+                alias.id,
+                &title,
+                format.upnp_class(),
+                alias.device,
+                alias.inode,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn merge_sidecar(cfg: &ScanConfig, path: &Path, probe: &mut SourceProbe) -> ScanResult<String> {
@@ -4133,27 +4177,23 @@ fn attach_objects(
     device: i64,
     inode: i64,
 ) -> ScanResult<()> {
-    if db.folder_has_inode_named(folder_id, device, inode, title)? {
-        let browse = db
-            .browse_object_for_detail(detail)?
-            .unwrap_or_else(|| format!("{folder_id}$0"));
-        if class.contains("video") {
-            attach_video_virtuals(db, detail, class, &browse)?;
-        } else if class.contains("audio") {
-            attach_audio_virtuals(db, detail, class, &browse)?;
-        } else if class.contains("image") {
-            attach_image_virtuals(db, detail, class, &browse)?;
+    let existing = if db.folder_has_inode_named(folder_id, device, inode, title)? {
+        db.browse_object_for_detail(detail)?
+    } else {
+        None
+    };
+    let object_id = if let Some(existing) = existing {
+        existing
+    } else {
+        match db.find_child_object(folder_id, title)? {
+            Some(oid) => match db.object_detail_id(&oid)? {
+                None => oid,
+                Some(did) if did == detail => oid,
+                // Same title, different file — never steal the other item's row.
+                Some(_) => allocate_child_id(db, folder_id)?,
+            },
+            None => allocate_child_id(db, folder_id)?,
         }
-        return Ok(());
-    }
-    let object_id = match db.find_child_object(folder_id, title)? {
-        Some(oid) => match db.object_detail_id(&oid)? {
-            None => oid,
-            Some(did) if did == detail => oid,
-            // Same title, different file — never steal the other item's row.
-            Some(_) => allocate_child_id(db, folder_id)?,
-        },
-        None => allocate_child_id(db, folder_id)?,
     };
     db.upsert_object(&object_id, folder_id, class, Some(detail), title, None)?;
     if class.contains("video") {

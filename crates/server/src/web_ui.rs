@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::web_caption::{caption_to_webvtt, BrowserCaptionError};
+use rusty_dlna_protocol::media_format::{media_kind_for_mime, MediaKind};
 use rusty_dlna_protocol::{
     caption_format_for_extension, CaptionWebVttConversion, CompactStreamMetadata,
 };
@@ -789,8 +790,11 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
                     return Some(WebEntry::Folder(folder));
                 }
                 catalog.items.get(object_id).and_then(|item| {
-                    (item.mime.starts_with("video/") || item.mime.starts_with("audio/"))
-                        .then_some(WebEntry::Media(item))
+                    matches!(
+                        media_kind_for_mime(&item.mime),
+                        Some(MediaKind::Video | MediaKind::Audio)
+                    )
+                    .then_some(WebEntry::Media(item))
                 })
             })
             .filter(|entry| normalized_query.is_empty() || entry.matches(&normalized_query))
@@ -814,8 +818,10 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
                         .filter(|object_id| {
                             catalog.containers.contains_key(*object_id)
                                 || catalog.items.get(*object_id).is_some_and(|item| {
-                                    item.mime.starts_with("video/")
-                                        || item.mime.starts_with("audio/")
+                                    matches!(
+                                        media_kind_for_mime(&item.mime),
+                                        Some(MediaKind::Video | MediaKind::Audio)
+                                    )
                                 })
                         })
                         .count();
@@ -1061,7 +1067,12 @@ fn continue_library(app: &App, req: &HttpRequest, params: &QueryParams) -> HttpR
     let entries = ids
         .iter()
         .filter_map(|id| catalog.get_item_by_detail(*id))
-        .filter(|item| item.mime.starts_with("video/") || item.mime.starts_with("audio/"))
+        .filter(|item| {
+            matches!(
+                media_kind_for_mime(&item.mime),
+                Some(MediaKind::Video | MediaKind::Audio)
+            )
+        })
         .map(|item| WebEntryDto::Media(Box::new(media_dto(app, item))))
         .collect::<Vec<_>>();
     generation_json_response(
@@ -1120,10 +1131,11 @@ fn memory_web_page<'a>(
         .values()
         .filter_map(|object_id| catalog.items.get(object_id))
         .filter(|item| {
-            (item.mime.starts_with("video/") || item.mime.starts_with("audio/"))
+            let media_kind = media_kind_for_mime(&item.mime);
+            matches!(media_kind, Some(MediaKind::Video | MediaKind::Audio))
                 && match kind {
-                    "video" => item.mime.starts_with("video/"),
-                    "audio" => item.mime.starts_with("audio/"),
+                    "video" => media_kind == Some(MediaKind::Video),
+                    "audio" => media_kind == Some(MediaKind::Audio),
                     _ => true,
                 }
         })
@@ -1317,7 +1329,7 @@ fn stream_metadata_complete(
     let Some(metadata) = metadata else {
         return false;
     };
-    let needs_timestamp_check = mime.starts_with("video/")
+    let needs_timestamp_check = media_kind_for_mime(mime) == Some(MediaKind::Video)
         && matches!(container, "mp4" | "mov")
         && matches!(video_codec, "h264" | "hevc");
     metadata.has_video_capabilities_marker()
@@ -1374,7 +1386,7 @@ fn browser_direct_codec_string(
     tracks: &[WebAudioTrack],
     original_audio_index: usize,
 ) -> Option<String> {
-    if !item.mime.starts_with("video/") {
+    if media_kind_for_mime(&item.mime) != Some(MediaKind::Video) {
         return (!item.probe.codec_string.is_empty()).then(|| item.probe.codec_string.clone());
     }
     // The scanner can retain an AAC RFC 6381 value even when the video codec
@@ -1471,7 +1483,7 @@ fn caption_dtos(item: &MediaItem) -> Vec<WebCaption> {
 }
 
 fn media_dto(app: &App, item: &MediaItem) -> WebMediaItem {
-    let media_kind = if item.mime.starts_with("video/") {
+    let media_kind = if media_kind_for_mime(&item.mime) == Some(MediaKind::Video) {
         "video"
     } else {
         "audio"
@@ -1662,7 +1674,10 @@ pub(crate) fn item(app: &App, req: &HttpRequest) -> HttpResponse {
         response.set("Cache-Control", "private, max-age=0, must-revalidate");
         return response;
     }
-    if !(item.mime.starts_with("video/") || item.mime.starts_with("audio/")) {
+    if !matches!(
+        media_kind_for_mime(&item.mime),
+        Some(MediaKind::Video | MediaKind::Audio)
+    ) {
         return api_error(
             415,
             "unsupported_media",
@@ -2029,7 +2044,7 @@ pub(crate) fn preview(app: &App, req: &HttpRequest) -> HttpResponse {
     let manifest_request = matches!(&request, TrickplayRequest::Manifest(_));
     let Some(item) = read_recover(&app.catalog)
         .get_item_by_detail(item_id)
-        .filter(|item| item.mime.starts_with("video/"))
+        .filter(|item| media_kind_for_mime(&item.mime) == Some(MediaKind::Video))
         .cloned()
     else {
         return preview_unavailable(item_id, manifest_request);
@@ -2393,7 +2408,10 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             Some("return_to_library"),
         );
     };
-    if !(item.mime.starts_with("video/") || item.mime.starts_with("audio/")) {
+    if !matches!(
+        media_kind_for_mime(&item.mime),
+        Some(MediaKind::Video | MediaKind::Audio)
+    ) {
         return api_error(
             415,
             "unsupported_media",
@@ -2761,7 +2779,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             None,
         );
     }
-    let is_video = item.mime.starts_with("video/");
+    let is_video = media_kind_for_mime(&item.mime) == Some(MediaKind::Video);
     let source = probe_to_source(
         &item.probe.container,
         &item.probe.video,
@@ -3186,7 +3204,7 @@ pub(crate) fn download(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRe
             Some("return_to_library"),
         );
     };
-    if !item.mime.starts_with("video/") {
+    if media_kind_for_mime(&item.mime) != Some(MediaKind::Video) {
         return api_error(
             415,
             "unsupported_media",
@@ -3215,7 +3233,7 @@ pub(crate) fn download(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRe
 }
 
 fn likely_browser_native(item: &MediaItem, source: &rusty_dlna_transcode::SourceMedia) -> bool {
-    if item.mime.starts_with("audio/") {
+    if media_kind_for_mime(&item.mime) == Some(MediaKind::Audio) {
         return item.mime == "audio/mpeg"
             || item.mime == "audio/aac"
             || (item.mime == "audio/mp4" && source.audio == rusty_dlna_transcode::AudioCodec::Aac);

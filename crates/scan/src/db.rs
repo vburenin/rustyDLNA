@@ -26,6 +26,18 @@ use crate::{
 fn register_web_order(conn: &Connection) -> rusqlite::Result<()> {
     use rusqlite::functions::FunctionFlags;
     conn.create_scalar_function(
+        "web_media_kind",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let mime: String = context.get(0)?;
+            Ok(
+                rusty_dlna_protocol::media_format::media_kind_for_mime(&mime)
+                    .map(|kind| kind.upnp_class()),
+            )
+        },
+    )?;
+    conn.create_scalar_function(
         "web_media_title_key",
         3,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
@@ -42,7 +54,7 @@ fn register_web_order(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-pub(crate) const STREAM_PROBE_REVISION: i64 = 5;
+pub(crate) const STREAM_PROBE_REVISION: i64 = 6;
 pub(crate) const SCAN_CATALOG_EPOCH_KEY: &str = "scan_catalog_epoch";
 
 fn parse_scan_catalog_epoch(value: Option<String>, column: usize) -> rusqlite::Result<u64> {
@@ -1662,9 +1674,9 @@ impl LibraryDb {
         take: usize,
     ) -> rusqlite::Result<CatalogQueryPage> {
         let mime = match kind {
-            WebMediaKind::All => "(d.MIME LIKE 'video/%' OR d.MIME LIKE 'audio/%')",
-            WebMediaKind::Video => "d.MIME LIKE 'video/%'",
-            WebMediaKind::Audio => "d.MIME LIKE 'audio/%'",
+            WebMediaKind::All => "web_media_kind(COALESCE(d.MIME, '')) IN ('item.videoItem', 'item.audioItem.musicTrack')",
+            WebMediaKind::Video => "web_media_kind(COALESCE(d.MIME, '')) = 'item.videoItem'",
+            WebMediaKind::Audio => "web_media_kind(COALESCE(d.MIME, '')) = 'item.audioItem.musicTrack'",
         };
         let order = match sort {
             WebMediaSort::Title => "web_media_title_key(COALESCE(d.COLLECTION_PATH, d.PATH, ''), COALESCE(d.MIME, ''), COALESCE(NULLIF(d.TITLE, ''), d.PATH, '')), d.ID",
@@ -2643,6 +2655,39 @@ impl LibraryDb {
             params![id, require_matching_probe_sidecar],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn update_detail_media_format(
+        &self,
+        id: i64,
+        format: rusty_dlna_protocol::media_format::ResolvedMediaFormat,
+    ) -> rusqlite::Result<Option<(String, String)>> {
+        let changed = self.conn.execute(
+            "UPDATE DETAILS SET MIME = ?2 WHERE ID = ?1 AND MIME IS NOT ?2",
+            params![id, format.mime],
+        )?;
+        if changed != 0 {
+            // Keep browse IDs, but remove membership in the previous typed
+            // trees. The scanner reattaches the current kind in this stage.
+            for root in [VIDEO_ID, MUSIC_ID, IMAGE_ID] {
+                self.delete_detail_under_root(id, root)?;
+            }
+            self.conn.execute(
+                "UPDATE OBJECTS SET CLASS = ?2 WHERE DETAIL_ID = ?1",
+                params![id, format.upnp_class()],
+            )?;
+        }
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.conn
+            .query_row(
+                "SELECT PARENT_ID, NAME FROM OBJECTS WHERE DETAIL_ID = ?1 AND REF_ID IS NULL
+             ORDER BY length(OBJECT_ID) ASC LIMIT 1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
     }
 
     pub fn details_missing_stream_meta(&self) -> rusqlite::Result<Vec<(i64, String)>> {
@@ -4499,6 +4544,16 @@ fn migrate_schema_inner(
             [STREAM_PROBE_REVISION],
         )?;
     }
+    if rev < 6 {
+        // Attached pictures were recorded as "other" video. Reprobe those
+        // rows in the private scan stage, including otherwise unchanged files.
+        tx.execute(
+            "UPDATE DETAILS SET STREAM_PROBE_REV =
+                 CASE WHEN STREAM_PROBE_REV >= 5
+                       AND COALESCE(VIDEO, '') NOT LIKE '%other%' THEN ?1 ELSE 0 END",
+            [STREAM_PROBE_REVISION],
+        )?;
+    }
     if rev < STREAM_PROBE_REVISION {
         tx.execute(
             "INSERT INTO SETTINGS (KEY, VALUE) VALUES ('stream_probe_rev', ?1)
@@ -5481,6 +5536,49 @@ mod query_tests {
     }
 
     #[test]
+    fn web_media_pages_include_every_admitted_audio_and_video_mime() {
+        use rusty_dlna_protocol::media_format::{MediaKind, MEDIA_FORMATS};
+        let db = LibraryDb::open_memory().unwrap();
+        let mut expected_audio = 0;
+        let mut expected_video = 0;
+        let mut id = 0;
+        for format in MEDIA_FORMATS {
+            for kind in [MediaKind::Audio, MediaKind::Video, MediaKind::Image] {
+                if !format.allows(kind) {
+                    continue;
+                }
+                let resolved = format.resolve(Some(kind));
+                id += 1;
+                expected_audio += usize::from(kind == MediaKind::Audio);
+                expected_video += usize::from(kind == MediaKind::Video);
+                db.conn
+                    .execute(
+                        "INSERT INTO DETAILS (ID, PATH, MIME) VALUES (?1, ?2, ?3)",
+                        params![
+                            id,
+                            format!("/media/{id}.{}", format.extension),
+                            resolved.mime
+                        ],
+                    )
+                    .unwrap();
+                db.conn.execute("INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID, NAME) VALUES (?1, '0', ?2, ?3, 'media')",
+                    params![id.to_string(), resolved.upnp_class(), id]).unwrap();
+            }
+        }
+        for (kind, total) in [
+            (WebMediaKind::All, expected_audio + expected_video),
+            (WebMediaKind::Audio, expected_audio),
+            (WebMediaKind::Video, expected_video),
+        ] {
+            let page = db
+                .query_web_media_page(kind, "", WebMediaSort::Title, 0, 100)
+                .unwrap();
+            assert_eq!(page.total as usize, total);
+            assert_eq!(page.object_ids.len(), total);
+        }
+    }
+
+    #[test]
     fn web_media_query_deduplicates_aliases_and_physical_files_before_paging() {
         let db = query_fixture();
         db.conn
@@ -5802,7 +5900,7 @@ mod query_tests {
         assert_eq!(timing_revision, 0);
         assert_eq!(
             db.setting("stream_probe_rev").unwrap().as_deref(),
-            Some("5")
+            Some("6")
         );
     }
 

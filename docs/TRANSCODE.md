@@ -47,6 +47,11 @@ Unset match fields are wildcards. `hdr = "dvhe.07"` is an alias for `dv-p7`.
 
 Empty `[[remap]]` list → every client, including Cast, gets the original.
 
+Browser stream mapping excludes attached pictures, so an audio file with a
+cover produces only audio. Video selection uses the first actual video stream.
+The scanner also excludes covers from video capabilities and refreshes affected
+stored probe records during reconciliation, preserving the artwork.
+
 The embedded web player is the exception to the DLNA remap decision: its
 dedicated `/web/media/` compatibility route uses an internal browser plan,
 not a `[[remap]]` rule, and selects its H.264 encoder through `web.encoder`.

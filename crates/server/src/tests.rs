@@ -6381,7 +6381,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .collect::<Vec<_>>();
     assert!(args.iter().any(|arg| arg == "libx264"), "{args:?}");
     assert!(args.iter().any(|arg| arg == "aac"), "{args:?}");
-    assert!(args.iter().any(|arg| arg == "0:v:0?"), "{args:?}");
+    assert!(args.iter().any(|arg| arg == "0:V:0?"), "{args:?}");
     assert!(
         args.windows(2)
             .any(|pair| pair == ["-init_hw_device", "vulkan=vk:0"]),
@@ -8732,6 +8732,70 @@ fn sony_bdp_get_remaps_mkv_to_divx() {
         xml.contains("MPEG_PS_NTSC") && xml.contains("DLNA.ORG_CI=1"),
         "extra CI=1 still uses original mkv mime: {xml}"
     );
+}
+
+#[test]
+fn web_application_mimes_support_library_item_and_playback_routes() {
+    let mut app = testdata_app();
+    app.db_pool = None;
+    app.scan_cfg.db_path = None;
+    for (mime, kind) in [
+        ("application/ogg", "audio"),
+        ("application/vnd.rn-realmedia", "video"),
+        ("application/vnd.rn-realmedia-vbr", "video"),
+    ] {
+        let id = {
+            let mut catalog = write_recover(&app.catalog);
+            let mut item = catalog
+                .items
+                .values()
+                .find(|item| item.path.ends_with("tagged.mp4"))
+                .unwrap()
+                .clone();
+            item.mime = mime.into();
+            item.title = "Application MIME fixture".into();
+            let id = item.detail_id;
+            catalog.items.clear();
+            catalog.by_detail.clear();
+            catalog.by_detail.insert(id, item.object_id.clone());
+            catalog.items.insert(item.object_id.clone(), item);
+            id
+        };
+        for filter in ["all", kind] {
+            let response = app.handle(&req(&get(
+                &format!("/api/web/library?view=library&kind={filter}"),
+                "Browser/1.0",
+            )));
+            assert_eq!(response.status, 200);
+            let json: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(json["total"], 1, "{mime}: {json}");
+            assert_eq!(json["entries"][0]["kind"], kind);
+        }
+        let detail = app.handle(&req(&get(&format!("/api/web/item/{id}"), "Browser/1.0")));
+        assert_eq!(detail.status, 200, "{mime}");
+        let direct = app.handle(&req(&get(
+            &format!("/web/media/{id}.mp4?mode=direct"),
+            "Browser/1.0",
+        )));
+        assert_eq!(
+            direct.status,
+            200,
+            "{mime}: {}",
+            String::from_utf8_lossy(&direct.body)
+        );
+        assert_eq!(resp_header(&direct, "Content-Type"), Some(mime));
+        let compatible = app.handle(&req(&get(
+            &format!("/web/media/{id}.mp4?mode=compatible"),
+            "Browser/1.0",
+        )));
+        assert_eq!(
+            compatible.status,
+            200,
+            "{mime}: {}",
+            String::from_utf8_lossy(&compatible.body)
+        );
+        assert!(compatible.remux_job.is_some());
+    }
 }
 
 #[test]

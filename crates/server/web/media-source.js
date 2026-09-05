@@ -146,7 +146,11 @@ export async function pumpMediaSource({
   let playlistReported = false;
   const needsSeekData = () => {
     const target = pendingSeek();
-    return target !== null && !bufferedSeekTarget(bufferedRanges(sourceBuffer), target);
+    // A target can be buffered while the decoder still needs the next audio
+    // packet or video frame to finish seeking. Playback waits for that seek,
+    // so waiting for play here would deadlock both sides of the handoff.
+    return target !== null && (!bufferedSeekTarget(bufferedRanges(sourceBuffer), target)
+      || player.seeking || player.readyState < HTMLMediaElement.HAVE_FUTURE_DATA);
   };
 
   while (!signal.aborted) {
@@ -188,7 +192,7 @@ export async function pumpMediaSource({
     for (const segmentUrl of playlist.segmentUrls) {
       if (appended.has(segmentUrl)) continue;
       // A paused exact seek may need several fragments within its ten-second
-      // server bucket. Stop as soon as its target is buffered, then wait for
+      // server bucket. Stop as soon as its seek can complete, then wait for
       // playback to resume; ordinary paused starts still fetch one fragment.
       if (appended.size > 0 && player.paused && !needsSeekData()) {
         await waitForMediaSourcePlayback(player, signal);
@@ -215,7 +219,10 @@ export async function pumpMediaSource({
     }
 
     if (playlist.ended) {
-      if (needsSeekData()) throw new Error("Media Source ended before the requested seek position.");
+      const target = pendingSeek();
+      if (target !== null && !bufferedSeekTarget(bufferedRanges(sourceBuffer), target)) {
+        throw new Error("Media Source ended before the requested seek position.");
+      }
       if (sourceBuffer.updating) await waitForMediaEvent(sourceBuffer, "updateend", signal);
       if (mediaSource.readyState === "open") mediaSource.endOfStream();
       return;

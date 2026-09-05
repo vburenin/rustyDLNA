@@ -130,7 +130,7 @@ pub enum BrowserQuality {
 }
 
 const BROWSER_TIMELINE_CACHE_REVISION: &str = "aligned-seek-v2";
-const BROWSER_CHAPTER_MAP_CACHE_REVISION: &str = "browser-no-chapters-v1";
+const BROWSER_STREAM_MAP_CACHE_REVISION: &str = "browser-stream-map-v2";
 const SDR_TONEMAP_CACHE_REVISION: &str = "sdr-tonemap-libplacebo-v2";
 const BROWSER_HDR_SOURCE_CACHE_REVISION: &str = "browser-hdr-source-v1";
 const BROWSER_AAC_FILTER_CACHE_REVISION: &str = "browser-aac-adtstoasc-v1";
@@ -915,7 +915,8 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
         src_path.into(),
         "-map".into(),
         if plan.action == RecodeAction::Browser {
-            "0:v:0?".into()
+            // Uppercase V excludes album covers and other attached pictures.
+            "0:V:0?".into()
         } else {
             "0:v:0".into()
         },
@@ -2751,7 +2752,7 @@ fn browser_cache_key_from_base(
     cache_key.push('-');
     cache_key.push_str(BROWSER_TIMELINE_CACHE_REVISION);
     cache_key.push('-');
-    cache_key.push_str(BROWSER_CHAPTER_MAP_CACHE_REVISION);
+    cache_key.push_str(BROWSER_STREAM_MAP_CACHE_REVISION);
     if browser_cache_uses_sdr_tonemap_revision(plan, options) {
         cache_key.push('-');
         cache_key.push_str(SDR_TONEMAP_CACHE_REVISION);
@@ -4646,7 +4647,7 @@ action = "audio-ac3"
                 "-ss",
                 "5",
                 "-map",
-                "0:v:0?",
+                "0:V:0?",
                 "-map",
                 "0:a:1?",
                 "-map_chapters",
@@ -5051,7 +5052,7 @@ action = "audio-ac3"
         assert_eq!(
             browser_cache_key_from_base("base".into(), &plan, options),
             concat!(
-                "base-aligned-seek-v2-browser-no-chapters-v1-",
+                "base-aligned-seek-v2-browser-stream-map-v2-",
                 "sdr-tonemap-libplacebo-v2-",
                 "browser-hdr-source-v1-browser-adaptive-h264-level-v1-start-120"
             )
@@ -5060,7 +5061,7 @@ action = "audio-ac3"
         assert_eq!(
             browser_cache_key_from_base("base".into(), &plan, options),
             concat!(
-                "base-aligned-seek-v2-browser-no-chapters-v1-",
+                "base-aligned-seek-v2-browser-stream-map-v2-",
                 "browser-hdr-source-v1-",
                 "browser-mixed-copy-seek-v2-start-120"
             )
@@ -5069,7 +5070,7 @@ action = "audio-ac3"
         assert_eq!(
             browser_cache_key_from_base("base".into(), &plan, options),
             concat!(
-                "base-aligned-seek-v2-browser-no-chapters-v1-",
+                "base-aligned-seek-v2-browser-stream-map-v2-",
                 "browser-hdr-source-v1-browser-nvenc-idr-v1-start-120"
             )
         );
@@ -5077,7 +5078,7 @@ action = "audio-ac3"
         assert_eq!(
             browser_cache_key_from_base("base".into(), &plan, options),
             concat!(
-                "base-aligned-seek-v2-browser-no-chapters-v1-",
+                "base-aligned-seek-v2-browser-stream-map-v2-",
                 "browser-hdr-source-v1-browser-cuda-download-v1-",
                 "browser-nvenc-idr-v1-start-120"
             )
@@ -5091,7 +5092,7 @@ action = "audio-ac3"
         assert_eq!(
             browser_cache_key_from_base("base".into(), &plan, sdr),
             concat!(
-                "base-aligned-seek-v2-browser-no-chapters-v1-",
+                "base-aligned-seek-v2-browser-stream-map-v2-",
                 "browser-nvenc-idr-v1"
             )
         );
@@ -5099,7 +5100,7 @@ action = "audio-ac3"
         assert_eq!(
             browser_cache_key_from_base("base".into(), &plan, mse),
             concat!(
-                "base-aligned-seek-v2-browser-no-chapters-v1-",
+                "base-aligned-seek-v2-browser-stream-map-v2-",
                 "browser-nvenc-idr-v1-browser-hls-v1"
             )
         );
@@ -5161,7 +5162,7 @@ action = "audio-ac3"
         assert_eq!(
             browser_cache_key_from_base("base".into(), &plan, sdr),
             concat!(
-                "base-aligned-seek-v2-browser-no-chapters-v1-",
+                "base-aligned-seek-v2-browser-stream-map-v2-",
                 "browser-nvenc-idr-v1-browser-data-saver-baseline-v1"
             )
         );
@@ -5212,7 +5213,7 @@ action = "audio-ac3"
             "",
             "-timeline-zero-v1",
             concat!(
-                "-aligned-seek-v2-browser-no-chapters-v1-",
+                "-aligned-seek-v2-browser-stream-map-v2-",
                 "sdr-tonemap-libplacebo-v2-",
                 "browser-hdr-source-v1-browser-aac-adtstoasc-v1-",
                 "browser-mixed-copy-seek-v2-start-120"
@@ -5241,7 +5242,7 @@ action = "audio-ac3"
     fn browser_cache_destination_hashes_full_key_into_a_bounded_filename() {
         let cache_key = concat!(
             "dfa68335bfd3d1fd5acab192100de1eb7c1b0d4c0dbf9903cb02195b1767213d",
-            "-aligned-seek-v2-browser-no-chapters-v1-sdr-tonemap-libplacebo-v2-",
+            "-aligned-seek-v2-browser-stream-map-v2-sdr-tonemap-libplacebo-v2-",
             "browser-hdr-source-v1-browser-cuda-download-v1-browser-nvenc-idr-v1-",
             "browser-data-saver-baseline-v1-browser-hls-v1"
         );

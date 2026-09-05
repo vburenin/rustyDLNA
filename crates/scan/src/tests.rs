@@ -80,6 +80,111 @@ fn seeded_virtual_views_match_rustydlna_contract() {
 }
 
 #[test]
+fn attached_cover_stays_audio_and_old_catalog_kind_is_repaired() {
+    let temp = TempPath::new("attached-audio-kind");
+    std::fs::create_dir_all(&temp).unwrap();
+    let poster = temp.join("cover.jpg");
+    std::fs::write(&poster, TINY_JPEG).unwrap();
+    let media = temp.join("song.mp4");
+    let mut command = std::process::Command::new("ffmpeg");
+    command
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=duration=1:sample_rate=48000",
+            "-i",
+        ])
+        .arg(&poster)
+        .args([
+            "-map",
+            "0:a",
+            "-map",
+            "1:v",
+            "-c:a",
+            "aac",
+            "-c:v",
+            "copy",
+            "-disposition:v",
+            "attached_pic",
+        ])
+        .arg(&media);
+    let output =
+        crate::probe::command_output_with_timeout(&mut command, std::time::Duration::from_secs(10))
+            .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let probe = crate::probe::probe_media(&media).unwrap();
+    assert!(probe.probe.video.is_empty());
+    assert_eq!(probe.probe.width, 0);
+    assert_eq!(probe.av.resolution, None);
+    assert_eq!(probe.probe.audio, "aac");
+    assert!(attached_pic_stream(&media).is_some());
+    let db_path = temp.join("files.db");
+    let cfg = ScanConfig {
+        media_dirs: vec![temp.clone()],
+        db_path: Some(db_path.clone()),
+        types: MediaTypes::all(),
+        ..Default::default()
+    };
+    let cat = scan(&cfg).unwrap();
+    let audio = cat.items.values().find(|item| item.path == media).unwrap();
+    let id = audio.detail_id;
+    assert_eq!(audio.mime, "audio/mp4");
+    assert!(audio.album_art > 0);
+    for startup_backfill in [false, true] {
+        let browse = {
+            let db = LibraryDb::open(&db_path).unwrap();
+            let browse = db.browse_object_for_detail(id).unwrap().unwrap();
+            db.connection().execute("UPDATE DETAILS SET MIME = 'video/mp4', VIDEO = 'other', STREAM_PROBE_REV = 5 WHERE ID = ?1", [id]).unwrap();
+            db.connection()
+                .execute(
+                    "UPDATE OBJECTS SET CLASS = 'item.videoItem' WHERE DETAIL_ID = ?1",
+                    [id],
+                )
+                .unwrap();
+            db.connection()
+                .execute(
+                    "UPDATE SETTINGS SET VALUE = '5' WHERE KEY = 'stream_probe_rev'",
+                    [],
+                )
+                .unwrap();
+            browse
+        };
+        let corrected = if startup_backfill {
+            let mut session = ScanSession::new(&cfg).unwrap();
+            let prepared = session.prepare_fill_missing_av_meta().unwrap();
+            session.publish(prepared).unwrap();
+            LibraryDb::open(&db_path).unwrap().load_catalog().unwrap()
+        } else {
+            scan(&cfg).unwrap()
+        };
+        let aliases: Vec<_> = corrected
+            .items
+            .values()
+            .filter(|item| item.detail_id == id)
+            .collect();
+        assert!(!aliases.is_empty());
+        assert!(aliases
+            .iter()
+            .all(|item| item.mime == "audio/mp4" && item.probe.video.is_empty()));
+        assert!(aliases.iter().any(|item| item.parent_id == MUSIC_ALL_ID));
+        assert!(!aliases.iter().any(|item| item.parent_id == VIDEO_ALL_ID));
+        let db = LibraryDb::open(&db_path).unwrap();
+        assert_eq!(
+            db.browse_object_for_detail(id).unwrap().as_deref(),
+            Some(browse.as_str())
+        );
+    }
+}
+
+#[test]
 fn text_named_mkv_is_not_viable() {
     let p = TempPath::new("not-video.mkv");
     std::fs::write(&p, b"this is a readme pretending to be a movie\n").unwrap();

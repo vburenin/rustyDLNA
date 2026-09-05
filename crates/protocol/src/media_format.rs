@@ -182,6 +182,19 @@ pub fn media_format_for_extension(extension: &str) -> Option<MediaFormat> {
         .find(|format| format.extension.eq_ignore_ascii_case(extension))
 }
 
+/// Classify admitted MIME types, including containers using application/*.
+pub fn media_kind_for_mime(mime: &str) -> Option<MediaKind> {
+    MEDIA_FORMATS.iter().find_map(|format| {
+        [
+            (format.video_mime, MediaKind::Video),
+            (format.audio_mime, MediaKind::Audio),
+            (format.image_mime, MediaKind::Image),
+        ]
+        .into_iter()
+        .find_map(|(candidate, kind)| (candidate == Some(mime)).then_some(kind))
+    })
+}
+
 pub fn media_format_for_name(name: &str) -> Option<MediaFormat> {
     let extension = name.rsplit_once('.')?.1;
     media_format_for_extension(extension)
@@ -217,6 +230,7 @@ mod tests {
                 if format.allows(kind) {
                     let resolved = format.resolve(Some(kind));
                     assert_ne!(resolved.mime, "application/octet-stream");
+                    assert_eq!(media_kind_for_mime(resolved.mime), Some(kind));
                     assert!(resolved.upnp_class().starts_with("item."));
                 }
             }
