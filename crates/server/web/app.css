@@ -11,6 +11,7 @@
   --danger: #ff6b72;
   --green: #55d68b;
   --focus: #77b7ff;
+  --topbar-height: 64px;
   font: 16px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
@@ -29,7 +30,7 @@ a { color: #c8def8; }
 [hidden] { display: none !important; }
 .sr-only { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
-.topbar { min-height: 64px; padding: .55rem clamp(.8rem, 3vw, 2rem); display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; align-items: center; gap: clamp(.6rem, 1.5vw, 1.25rem); border-bottom: 1px solid var(--line); background: rgba(11, 13, 15, .94); position: sticky; top: 0; z-index: 20; backdrop-filter: blur(16px); }
+.topbar { min-height: var(--topbar-height); padding: .55rem clamp(.8rem, 3vw, 2rem); display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; align-items: center; gap: clamp(.6rem, 1.5vw, 1.25rem); border-bottom: 1px solid var(--line); background: rgba(11, 13, 15, .94); position: sticky; top: 0; z-index: 20; backdrop-filter: blur(16px); }
 .brand { min-height: 44px; display: inline-flex; align-items: center; gap: .65rem; color: var(--text); text-decoration: none; }
 .brand-mark { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; background: var(--accent); }
 .brand-mark i { width: 0; height: 0; margin-left: 3px; border-block: 7px solid transparent; border-left: 11px solid var(--accent-text); }
@@ -51,7 +52,7 @@ main { width: min(1700px, 100%); margin: 0 auto; padding: clamp(.75rem, 2vw, 1.5
 main[data-layout="browse"] { width: min(2200px, 100%); grid-template-columns: minmax(0, 1fr); }
 main[data-layout="browse"] .media-grid { grid-template-columns: repeat(auto-fill, minmax(165px, 1fr)); }
 .player-panel, .library { min-width: 0; border: 1px solid var(--line); border-radius: .85rem; overflow: clip; background: rgba(20, 23, 26, .96); box-shadow: 0 18px 50px rgba(0,0,0,.24); }
-.player-panel { position: sticky; top: calc(64px + 1rem); }
+.player-panel { position: sticky; top: calc(var(--topbar-height) + 1rem); }
 .player-stage { position: relative; width: 100%; min-height: 0; display: grid; align-items: stretch; overflow: hidden; background: #030405; outline: none; }
 .media-viewport { position: relative; width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; grid-area: 1 / 1; place-items: center; overflow: hidden; background: #000; }
 .media-viewport video { width: 100%; height: 100%; min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; display: block; object-fit: contain; touch-action: manipulation; background: #000; }
@@ -100,7 +101,7 @@ main[data-layout="browse"] .media-grid { grid-template-columns: repeat(auto-fill
 .stream-options label, .autoplay-option { min-height: 44px; display: flex; align-items: center; gap: .45rem; }
 .autoplay-option { display: grid; grid-template-columns: 20px minmax(0, 1fr); font-size: .875rem; }
 .stream-options label { position: relative; padding: .4rem; border-radius: .45rem; cursor: pointer; }
-.stream-options input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.stream-options input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; z-index: 1; cursor: inherit; }
 .stream-options label:has(input:focus-visible) { outline: 3px solid var(--focus); outline-offset: 3px; }
 .stream-options input, .autoplay-option input { flex: 0 0 auto; }
 .stream-options span { min-width: 0; }
@@ -679,6 +680,18 @@ body.player-expanded .player-panel { z-index: 1000; overflow: visible; }
   #previous-button,
   #next-button,
   #stream-info-button { display: none; }
+}
+
+/* Compact mouse/keyboard chrome; touch devices retain their larger targets.
+   Keep the sticky player offset synchronized with the header. */
+@media (pointer: fine) and (hover: hover) {
+  :root { --topbar-height: 32px; }
+  .topbar { padding-block: 0; font-size: .875rem; }
+  .topbar .brand, .topbar .status-link { min-height: 30px; }
+  .topbar .brand-mark { width: 24px; height: 24px; }
+  .topbar .brand-mark i { border-block-width: 5px; border-left-width: 9px; }
+  .topbar .layout-switch { padding: 0; border-radius: .4rem; }
+  .topbar button { min-height: 28px; padding-block: 0; }
 }
 
 /* A phone in landscape has useful width but very little height. Keep Watch as

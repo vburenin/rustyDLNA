@@ -335,6 +335,32 @@ export function originalDownloadUrl(item) {
     ? item.download_url : null;
 }
 
+export function playbackProcessing(playback) {
+  if (playback.sourceMode === SOURCE_MODES.ORIGINAL) {
+    return { label: "Original file", description: "Playing the original file without server conversion." };
+  }
+  const negotiation = playback.streamNegotiation;
+  if (!negotiation || playback.sourceMode !== SOURCE_MODES.COMPATIBLE) {
+    return { label: "Prepared streaming", description: "Checking which streams can be copied without re-encoding." };
+  }
+  const hasVideo = playback.item?.kind === "video";
+  const hasAudio = playback.item?.kind === "audio" || Boolean(playback.item?.audio_codec
+    || playback.audioTracks?.length || playback.item?.audio_tracks?.length);
+  const convertsAudio = hasAudio && negotiation.audio !== "copy";
+  if (hasVideo && negotiation.video !== "copy") {
+    return {
+      label: "Re-encoding video",
+      description: `${negotiation.video === "repair" ? "Re-encoding video to repair frame timing." : "Re-encoding video for the browser or selected quality."} ${convertsAudio ? "Audio is also converted." : hasAudio ? "Audio is copied unchanged." : "The source has no audio."}`,
+    };
+  }
+  if (convertsAudio) {
+    return { label: "Converting audio", description: hasVideo
+      ? "Converting audio; video is copied unchanged without video quality loss."
+      : "Converting audio for browser playback. The source has no video." };
+  }
+  return { label: "Repackaging", description: "Copying the source streams into a streaming container without re-encoding or quality loss." };
+}
+
 export function nativeHlsHevcCopyEligible(item, quality, enabled) {
   // The server only advertises a video content type for remux-compatible
   // codecs/HDR. Keep that policy authoritative rather than duplicating it.
@@ -853,7 +879,7 @@ export function navigationUrl(href, navigation, rootFolderId) {
 const ERROR_MAP = Object.freeze({
   media_missing: ["This media file is no longer available.", ["retry", "return_to_library"]],
   unsupported_direct: ["Your browser cannot play the original file.", ["try_compatible"]],
-  transcode_disabled: ["Compatible playback is disabled on this server.", ["play_original"]],
+  transcode_disabled: ["Prepared streaming is disabled on this server.", ["play_original"]],
   transcode_busy: ["The server is preparing other media. Try again shortly.", ["retry"]],
   transcode_failed: ["The server could not prepare this title.", ["retry", "play_original"]],
   transcode_cancelled: ["Preparing this title was cancelled.", ["retry", "play_original"]],

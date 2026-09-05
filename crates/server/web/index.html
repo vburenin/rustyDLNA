@@ -87,7 +87,11 @@
               <button type="button" id="fit-button" aria-pressed="false" aria-label="Fill video frame">Fill frame</button>
               <button type="button" id="shortcut-help-button" aria-label="Keyboard shortcuts">Shortcuts</button>
             </div>
-            <fieldset id="stream-controls"><legend>Stream mode</legend><div class="stream-options"><label><input type="radio" name="stream-mode" value="auto" checked><span>Auto<small>Choose for this browser</small></span></label><label><input type="radio" name="stream-mode" value="direct"><span>Original<small>No conversion</small></span></label><label><input type="radio" name="stream-mode" value="compat"><span>Compatible<small>Prepare for this browser</small></span></label></div></fieldset>
+            <fieldset id="stream-controls"><legend>Playback mode</legend><div class="stream-options">
+              <label title="Prefer the original file. Prepare a stream when browser support, the selected audio track, or playback recovery requires it."><input type="radio" name="stream-mode" value="auto" aria-describedby="stream-auto-hint" checked><span>Automatic<small id="stream-auto-hint">Prefer original; convert when needed</small></span></label>
+              <label title="Play the original file without server conversion or automatic fallback. Unsupported files may not play."><input type="radio" name="stream-mode" value="direct" aria-describedby="stream-original-hint"><span>Original only<small id="stream-original-hint">No conversion; may not play</small></span></label>
+              <label title="Always use server-prepared streaming. Copy supported streams and re-encode only when needed or requested by your quality setting. This does not force video re-encoding."><input type="radio" name="stream-mode" value="compat" aria-describedby="stream-prepared-hint"><span>Prepared streaming<small id="stream-prepared-hint">Preserve compatible streams</small></span></label>
+            </div></fieldset>
             <div class="advanced-selects">
               <label for="quality-control"><span>Playback quality</span><select id="quality-control"><option value="auto">Auto</option></select></label>
               <label id="encoding-preset-option" for="encoding-preset-control" hidden><span>Encoding preset</span><select id="encoding-preset-control" aria-describedby="encoding-preset-hint"><option value="balanced">Balanced</option></select></label>
@@ -101,7 +105,7 @@
             <p class="dialog-hint" id="encoding-preset-hint" hidden></p>
             <div id="hevc-hls-option" hidden>
               <label class="autoplay-option"><input id="hevc-hls-control" type="checkbox" aria-describedby="hevc-hls-hint"> Try original HEVC with HLS</label>
-              <p class="dialog-hint" id="hevc-hls-hint">Experimental · Compatible + Auto only. Copies eligible video, converts audio; re-encodes if playback fails.</p>
+              <p class="dialog-hint" id="hevc-hls-hint">Experimental · Prepared streaming + Auto quality only. Copies eligible video, converts audio; re-encodes if playback fails.</p>
             </div>
             <label class="autoplay-option"><input id="autoplay-control" type="checkbox"> Automatically play next</label>
           </form>
@@ -110,7 +114,7 @@
         <dialog class="quality-dialog" id="quality-dialog" aria-labelledby="quality-dialog-title">
           <form method="dialog">
             <div class="dialog-heading"><h2 id="quality-dialog-title">Playback quality</h2><button class="dialog-close" value="close" aria-label="Close playback quality"><svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M6 6l12 12M18 6 6 18"></path></svg></button></div>
-            <p class="dialog-hint">Choosing a specific quality uses Compatible playback. Original plays the file unchanged.</p>
+            <p class="dialog-hint">Choosing a specific quality uses Prepared streaming. Original only plays the file unchanged.</p>
             <fieldset><legend class="sr-only">Choose playback quality</legend><div class="quality-options" id="quality-choices"></div></fieldset>
           </form>
         </dialog>
@@ -138,7 +142,7 @@
 
       <div class="player-message" id="player-message" hidden>
         <p id="player-message-text"></p>
-        <div id="player-message-actions"><button type="button" id="player-retry" hidden>Retry</button><button type="button" id="try-compatible" hidden>Try compatible</button><button type="button" id="play-original" hidden>Play original</button><button type="button" id="return-library" hidden>Return to library</button></div>
+        <div id="player-message-actions"><button type="button" id="player-retry" hidden>Retry</button><button type="button" id="try-compatible" hidden>Try prepared streaming</button><button type="button" id="play-original" hidden>Play original</button><button type="button" id="return-library" hidden>Return to library</button></div>
         <details id="technical-details" hidden><summary>Technical details</summary><pre id="technical-message"></pre></details>
       </div>
       <p class="sr-only" id="playback-live" role="status" aria-live="polite" aria-atomic="true"></p>

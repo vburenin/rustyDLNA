@@ -28,6 +28,7 @@ import {
   originalAudioTrackIndex,
   originalDownloadUrl,
   playbackControlLabel,
+  playbackProcessing,
   primaryVideoCodec,
   queueNeighbor,
   reconcileQualityPreference,
@@ -55,6 +56,24 @@ import {
 } from "./core.js";
 import { initialState, Store } from "./store.js";
 import { loadPreferences, progressDetails, progressSnapshot } from "./preferences.js";
+
+test("processing labels describe actual streams rather than the selected playback policy", () => {
+  const playback = { sourceMode: SOURCE_MODES.COMPATIBLE, item: { kind: "video", audio_codec: "aac" } };
+  assert.equal(playbackProcessing(playback).label, "Prepared streaming");
+  for (const [video, audio, label] of [
+    ["copy", "copy", "Repackaging"], ["copy", "transcode", "Converting audio"],
+    ["transcode", "copy", "Re-encoding video"], ["transcode", "transcode", "Re-encoding video"],
+    ["repair", "copy", "Re-encoding video"],
+  ]) {
+    assert.equal(playbackProcessing({ ...playback, streamNegotiation: { video, audio } }).label, label);
+  }
+  const encoded = { ...playback, streamNegotiation: { video: "transcode", audio: "transcode" } };
+  assert.match(playbackProcessing(encoded).description, /Audio is also converted/);
+  assert.equal(playbackProcessing({ ...encoded, sourceMode: SOURCE_MODES.ORIGINAL }).label, "Original file");
+  assert.equal(playbackProcessing({ ...encoded, item: { kind: "audio" } }).label, "Converting audio");
+  assert.equal(playbackProcessing({ ...playback, item: { kind: "audio" }, streamNegotiation: { video: "transcode", audio: "copy" } }).label, "Repackaging");
+  assert.equal(playbackProcessing({ ...playback, item: { kind: "video" }, streamNegotiation: { video: "copy", audio: "transcode" } }).label, "Repackaging");
+});
 
 test("original downloads use only the advertised same-origin download route", () => {
   assert.equal(originalDownloadUrl({ download_url: "/web/download/9" }), "/web/download/9");

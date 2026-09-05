@@ -26,6 +26,7 @@ import {
   negotiateCompatibleStreams,
   parseHlsMediaPlaylist,
   playbackControlLabel,
+  playbackProcessing,
   playbackError,
   primaryVideoCodec,
   queueNeighbor,
@@ -1096,7 +1097,7 @@ export class PlaybackController {
     this.#dom.timeline.setAttribute("aria-valuetext", timelineValueText(current, playback.duration));
     this.#dom.timeline.setAttribute("aria-busy", String(playback.status === "seeking"));
     this.#dom.timelineStatus.textContent = playback.status === "seeking"
-      ? `${timelineValueText(current, playback.duration)}. Starting a compatible stream.`
+      ? `${timelineValueText(current, playback.duration)}. Starting a prepared stream.`
       : timelineValueText(current, playback.duration);
     this.#dom.timelineCurrent.textContent = clockLabel(current);
     this.#dom.timelineDuration.textContent = playback.duration > 0 ? clockLabel(playback.duration) : "Unknown";
@@ -1120,7 +1121,9 @@ export class PlaybackController {
 
     this.#dom.playbackMode.hidden = !playback.sourceMode;
     this.#dom.playbackMode.classList.toggle("compat", playback.sourceMode === SOURCE_MODES.COMPATIBLE);
-    this.#dom.modeLabel.textContent = playback.sourceMode === SOURCE_MODES.COMPATIBLE ? "Compatible playback" : "Original file";
+    const processing = playbackProcessing(playback);
+    this.#dom.modeLabel.textContent = processing.label;
+    this.#dom.playbackMode.title = processing.description;
     this.#renderAudioTracks();
     this.#renderChapters();
     this.#renderCaptions();
@@ -1231,7 +1234,7 @@ export class PlaybackController {
     const segmentOffset = sourceMode === SOURCE_MODES.COMPATIBLE ? compatibleSegmentStart(start) : 0;
     const sourceMessage = message || (nativeHlsDelivery
       ? "Preparing Safari stream…"
-      : sourceMode === SOURCE_MODES.COMPATIBLE ? "Preparing compatible playback…" : null);
+      : sourceMode === SOURCE_MODES.COMPATIBLE ? "Preparing stream…" : null);
     this.#store.dispatch({
       type: "PLAYBACK_SOURCE",
       sessionId,
@@ -1391,7 +1394,7 @@ export class PlaybackController {
             ? {
               message: androidTranscodeEligible
                 ? "Preparing reliable Android stream…"
-                : "Preparing compatible stream…",
+                : "Preparing stream…",
             }
             : {}),
         },
@@ -1952,7 +1955,7 @@ export class PlaybackController {
         if (signal.aborted || sessionId !== this.#store.getState().playback.sessionId) return;
         const message = {
           queued: "Waiting for a transcode slot…",
-          starting: "Starting compatible playback…",
+          starting: "Starting prepared stream…",
           producing: "Preparing video…",
         }[payload.state];
         const stillPreparing = ["loading", "waiting", "seeking"]
@@ -2127,7 +2130,7 @@ export class PlaybackController {
         intent: playback.intent,
         forceSourceMode: SOURCE_MODES.COMPATIBLE,
         forceQuality: fallbackQuality,
-        message: "Switching to lower-bandwidth compatible playback…",
+        message: "Switching to a lower-bandwidth stream…",
         messageKind: "fallback",
       });
     }, ORIGINAL_BUFFER_STALL_MS);
@@ -2215,7 +2218,7 @@ export class PlaybackController {
       intent,
       message: busy
         ? "Waiting for a transcode slot…"
-        : "The previous stream was abandoned. Retrying compatible playback…",
+        : "The previous stream was abandoned. Retrying prepared streaming…",
       error: null,
     });
     this.#statusTimer = window.setTimeout(() => {
@@ -2232,7 +2235,7 @@ export class PlaybackController {
         forceStreamNegotiation: streamNegotiation,
         forceQuality: outputQuality,
         forceAndroidMediaSource,
-        message: busy ? "Waiting for a transcode slot…" : "Retrying compatible playback…",
+        message: busy ? "Waiting for a transcode slot…" : "Retrying prepared streaming…",
         messageKind: busy ? "queue" : "retry",
       });
     }, delay);
@@ -2284,7 +2287,7 @@ export class PlaybackController {
         start: this.globalTime() || start,
         intent,
         forceSourceMode: SOURCE_MODES.COMPATIBLE,
-        message: "Switching to compatible playback…",
+        message: "Switching to prepared streaming…",
         messageKind: "fallback",
       });
       return;
@@ -2397,7 +2400,7 @@ export class PlaybackController {
         },
         forceQuality: outputQuality,
         forceAndroidMediaSource: mediaSourceDelivery,
-        message: "Switching to SDR-compatible playback…",
+        message: "Switching to an SDR stream…",
         messageKind: "fallback",
       });
       return;
@@ -2443,7 +2446,7 @@ export class PlaybackController {
         forceSourceMode: SOURCE_MODES.COMPATIBLE,
         forceStreamNegotiation: portableNegotiation,
         forceQuality: outputQuality,
-        message: "Trying portable compatible playback…",
+        message: "Trying a more widely supported stream…",
         messageKind: "fallback",
       });
       return;
@@ -2468,7 +2471,7 @@ export class PlaybackController {
         forceSourceMode: SOURCE_MODES.COMPATIBLE,
         forceStreamNegotiation: streamNegotiation,
         forceQuality: saferQuality,
-        message: "Lowering compatible quality for this device…",
+        message: "Lowering streaming quality for this device…",
         messageKind: "fallback",
       });
       return;
@@ -2631,7 +2634,7 @@ export class PlaybackController {
       ? "Loading audio tracks…"
       : playback.audioTracksStatus === "error"
         ? "Audio-track details are unavailable."
-        : switchingUnavailable ? "Audio-track switching requires Compatible playback, which is disabled." : "";
+        : switchingUnavailable ? "Audio-track switching requires Prepared streaming, which is disabled." : "";
   }
 
   #renderChapters() {
@@ -3180,7 +3183,7 @@ export class PlaybackController {
       const playback = this.#store.getState().playback;
       if (playback.item) {
         this.#resetAutomaticTranscodeRecovery();
-        this.#loadSource(playback.item, { start: playback.currentTime, intent: "playing", forceSourceMode: SOURCE_MODES.COMPATIBLE, message: "Preparing compatible playback…" });
+        this.#loadSource(playback.item, { start: playback.currentTime, intent: "playing", forceSourceMode: SOURCE_MODES.COMPATIBLE, message: "Preparing stream…" });
       }
     });
     this.#dom.playOriginal.addEventListener("click", () => {
@@ -3587,7 +3590,7 @@ export class PlaybackController {
         message = "Loading media details.";
       } else if (playback.status === "loading") {
         message = playback.sourceMode === SOURCE_MODES.COMPATIBLE
-          ? "Preparing compatible playback."
+          ? "Preparing stream."
           : "Loading playback.";
       } else if (playback.status === "waiting") {
         message = "Playback is buffering.";

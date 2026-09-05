@@ -754,6 +754,42 @@ test("library tabs, player scoping, and overlay controls work", async ({ page })
   expect(errors).toEqual([]);
 });
 
+test("top bar stays compact on desktop and preserves touch targets", async ({ page, isMobile }) => {
+  await serveFixtureMedia(page);
+  await openLibrary(page);
+  const topbar = page.locator(".topbar");
+  const checkHeight = async () => {
+    const height = await topbar.evaluate((header) => header.getBoundingClientRect().height);
+    if (isMobile) expect(height).toBeGreaterThanOrEqual(44);
+    else expect(height).toBe(32);
+  };
+  await checkHeight();
+  await selectTaggedVideo(page);
+  for (const width of [300, 760, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await checkHeight();
+    await expect.poll(async () => {
+      await topbar.scrollIntoViewIfNeeded();
+      const controls = await topbar.locator("button, a").evaluateAll((elements) => elements
+        .filter((element) => element.checkVisibility()).map((element) => {
+          const rect = element.getBoundingClientRect();
+          const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+          return { height: rect.height, reachable: element === hit || element.contains(hit) };
+        }));
+      return controls.every((control) => control.height >= (isMobile ? 44 : 28) && control.reachable);
+    }).toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  }
+  await page.locator("#layout-browse").focus();
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#app-main")).toHaveAttribute("data-layout", "browse");
+  await expect(page.locator("#layout-browse")).toBeFocused();
+  if (!isMobile) {
+    expect(await page.locator("#player-panel").evaluate((panel) => getComputedStyle(panel).top)).toBe("48px");
+  }
+});
+
 test("compact settings keep two-column controls readable and touch-sized", async ({ page }, testInfo) => {
   await serveFixtureMedia(page);
   await openLibrary(page);
@@ -790,7 +826,20 @@ test("compact settings keep two-column controls readable and touch-sized", async
       await testInfo.attach(`compact-settings-${width}`, { path, contentType: "image/png" });
     }
   }
-  const automatic = dialog.getByRole("radio", { name: /^Auto / });
+  const automatic = dialog.getByRole("radio", { name: /^Automatic/ });
+  for (const [value, name, hint, tooltip] of [
+    ["auto", "Automatic", "Prefer original; convert when needed", /Prefer the original file/],
+    ["direct", "Original only", "No conversion; may not play", /without server conversion or automatic fallback/],
+    ["compat", "Prepared streaming", "Preserve compatible streams", /does not force video re-encoding/],
+  ]) {
+    const radio = dialog.locator(`input[name="stream-mode"][value="${value}"]`);
+    await expect(radio).toHaveAccessibleName(new RegExp(`^${name}`));
+    await expect(radio).toHaveAccessibleDescription(hint);
+    const card = radio.locator("..");
+    await card.hover();
+    await expect(card).toHaveAttribute("title", tooltip);
+    await expect(automatic).toBeChecked();
+  }
   await automatic.focus();
   await automatic.press("ArrowRight");
   const original = dialog.getByRole("radio", { name: /^Original / });
@@ -802,6 +851,9 @@ test("compact settings keep two-column controls readable and touch-sized", async
     expect(await original.evaluate((input) => getComputedStyle(input).opacity)).toBe("1");
     expect(await page.locator("#quality-control").evaluate((select) => getComputedStyle(select).appearance)).toBe("auto");
   }
+  const prepared = dialog.getByRole("radio", { name: /^Prepared streaming/ });
+  await prepared.check();
+  await expect(prepared).toBeChecked();
 });
 
 test("stream information downloads the current original without restarting playback", async ({ page }, testInfo) => {
@@ -1641,7 +1693,7 @@ test("forced Original and Compatible modes select the requested typed source", a
   await page.locator('#quality-choices input[value="uhd_high"]').check();
   await expect(page.locator("#quality-menu-button")).toHaveText("4K High");
   await expect(page.locator('input[name="stream-mode"][value="compat"]')).toBeChecked();
-  await expect(page.locator("#mode-label")).toHaveText("Compatible playback");
+  await expect(page.locator("#mode-label")).toHaveText("Re-encoding video");
   await expect.poll(() => requests.some((url) => url.searchParams.get("mode") === "compatible")).toBe(true);
   const compatible = requests.findLast((url) => url.searchParams.get("mode") === "compatible");
   expect(compatible?.searchParams.get("reason")).toBe("forced_compatible");
@@ -1901,7 +1953,8 @@ test("Auto converts MPEG-4 Part 2 when the browser only claims broad MP4 support
   expect(requests[0].searchParams.get("reason")).toBe("browser_support_uncertain");
   expect(requests[0].searchParams.get("video_mode")).toBe("transcode");
   expect(requests[0].searchParams.get("audio_mode")).toBe("copy");
-  await expect(page.locator("#mode-label")).toHaveText("Compatible playback");
+  await expect(page.locator("#mode-label")).toHaveText("Re-encoding video");
+  await expect(page.locator("#playback-mode")).toHaveAttribute("title", /Audio is copied unchanged/);
 });
 
 test("compatible canplay reports one generation-scoped startup timing event", async ({ page }) => {
@@ -2280,9 +2333,9 @@ test("compatible startup status is not duplicated and stream info explains an au
 
   await openLibrary(page);
   await selectTaggedVideo(page);
-  await expect(page.locator("#stage-progress-label")).toHaveText("Starting compatible playback…");
+  await expect(page.locator("#stage-progress-label")).toHaveText("Starting prepared stream…");
   await expect(page.locator("#player-message")).toBeHidden();
-  await expect(page.getByText("Starting compatible playback…", { exact: true })).toHaveCount(1);
+  await expect(page.getByText("Starting prepared stream…", { exact: true })).toHaveCount(1);
   await expect.poll(() => compatibleRequest?.searchParams.get("video_mode")).toBe("copy");
   expect(compatibleRequest.searchParams.get("audio_mode")).toBe("transcode");
 
@@ -2292,6 +2345,8 @@ test("compatible startup status is not duplicated and stream info explains an au
   await expect(page.locator("#source-stream-facts")).toContainText("HEVC");
   await expect(page.locator("#source-stream-facts")).toContainText("AC-3");
   await expect(page.locator("#stream-info-summary")).toContainText("video bitstream is copied unchanged");
+  await expect(page.locator("#mode-label")).toHaveText("Converting audio");
+  await expect(page.locator("#playback-mode")).toHaveAttribute("title", /video is copied unchanged/);
   await expect(page.locator("#output-stream-facts")).toContainText("no video re-encode");
   await expect(page.locator("#output-stream-facts")).toContainText("AAC");
   await expect(page.locator("#stream-diagnostic-facts")).toBeHidden();
@@ -4267,7 +4322,7 @@ test("Auto playback selects tagged English audio before the file default", async
   await expect.poll(() => requests.findLast((url) => url.searchParams.get("reason") === "preferred_audio")?.searchParams.get("mode")).toBe("compatible");
   const preferredRequest = requests.findLast((url) => url.searchParams.get("reason") === "preferred_audio");
   expect(preferredRequest.searchParams.get("audio")).toBe("1");
-  await expect(page.locator("#mode-label")).toHaveText("Compatible playback");
+  await expect(page.locator("#mode-label")).toHaveText(/^(Repackaging|Converting audio|Re-encoding video)$/);
 });
 
 test("disabled transcoding blocks forced recovery and audio-track switching", async ({ page }) => {
@@ -4295,7 +4350,7 @@ test("disabled transcoding blocks forced recovery and audio-track switching", as
   await openAdvancedPlayback(page);
   await expect(page.locator("#audio-track-controls")).toBeVisible();
   await expect(page.locator("#audio-track-controls")).toBeDisabled();
-  await expect(page.locator("#audio-track-status")).toContainText("Compatible playback, which is disabled");
+  await expect(page.locator("#audio-track-status")).toContainText("Prepared streaming, which is disabled");
   await page.locator("#audio-track-controls").evaluate((select) => {
     select.value = "1";
     select.dispatchEvent(new Event("change", { bubbles: true }));
@@ -4641,7 +4696,7 @@ test("repeated compatible seeks coalesce and audio switching preserves global ti
   expect(audioLayout.width).toBeLessThanOrEqual(audioLayout.columnWidth);
   expect(Math.abs(audioLayout.width - audioLayout.speedWidth)).toBeLessThanOrEqual(1);
   await page.locator('#advanced-playback-dialog button[value="close"]').click();
-  await expect(page.locator("#mode-label")).toHaveText("Compatible playback");
+  await expect(page.locator("#mode-label")).toHaveText(/^(Repackaging|Converting audio|Re-encoding video)$/);
 });
 
 test("compatible seeking holds the last video frame until replacement data is ready", async ({ page }) => {
@@ -5799,7 +5854,7 @@ test("direct failure stays visible until compatible media is playable", async ({
   });
   await openLibrary(page);
   await selectTaggedVideo(page);
-  await expect(page.locator("#mode-label")).toHaveText("Compatible playback");
+  await expect(page.locator("#mode-label")).toHaveText(/^(Repackaging|Converting audio|Re-encoding video)$/);
   await expect(page.locator("#player-message")).toBeHidden();
   await expect(page.locator("#technical-message")).not.toContainText("MediaItems");
 });
@@ -5837,7 +5892,7 @@ test("compatible seek while paused clears its busy description on metadata", asy
   }
   await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
   await expect(page.locator("#timeline")).toHaveAttribute("aria-busy", "false");
-  await expect(page.locator("#timeline-status")).not.toContainText("Starting a compatible stream");
+  await expect(page.locator("#timeline-status")).not.toContainText("Starting a prepared stream");
 });
 
 test("iPhone expands the in-page player instead of surrendering controls to native fullscreen", async ({ page }) => {
@@ -5937,7 +5992,7 @@ test("fullscreen controls remain reachable and Escape exits", async ({ page, bro
 
   await openAdvancedPlayback(page);
   await page.locator('input[name="stream-mode"][value="compat"]').check();
-  await expect(page.locator("#mode-label")).toHaveText("Compatible playback");
+  await expect(page.locator("#mode-label")).toHaveText(/^(Repackaging|Converting audio|Re-encoding video)$/);
   await page.locator('#advanced-playback-dialog button[value="close"]').click();
   await showPlayerControls(page);
   await page.locator("#fullscreen-button").click();

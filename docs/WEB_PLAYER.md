@@ -23,6 +23,21 @@ available, while Compatible is disabled and returns a structured error.
 
 ## Library and player behavior
 
+The desktop top bar is 32 pixels tall, with a matching sticky-player offset.
+Touch devices retain larger header controls for reliable tapping.
+
+Playback mode choices are **Automatic** (prefer the original; convert when
+needed), **Original only** (no conversion or automatic fallback), and
+**Prepared streaming** (server-prepared output that copies supported streams).
+Hovering a mode shows a native explanatory tooltip; brief descriptions stay
+visible and are associated with the radios for keyboard and screen-reader use.
+The playback indicator reports the actual operation: Original file,
+Repackaging, Converting audio, or Re-encoding video, with more detail on hover.
+It shows Prepared streaming while codec negotiation is pending. The internal
+Auto/Original/Compatible modes and saved preference values are unchanged;
+Prepared streaming does not force video re-encoding. Technical references to
+Compatible below refer to that same server-prepared delivery path.
+
 The flat library's Title sort groups explicitly numbered movie files by their
 canonical source collection folder, so genre symlink aliases share one group.
 The scanner captures a root-qualified, validated source identity in the catalog
@@ -115,7 +130,7 @@ remains visible. Long titles and metadata wrap within the dialog; exceptionally
 tall titles scroll independently so the close action stays reachable. Settings
 show selected stream modes, Loop, and Fill frame consistently. Stream modes
 include short explanations, and Playback quality explains that a specific
-quality switches to Compatible playback. Settings use a compact two-column
+quality switches to Prepared streaming. Settings use a compact two-column
 selector grid and a single row of stream modes (stacked on the narrowest
 screens), with 44-pixel control targets.
 Quality choices also use two columns where space permits. Stream information
@@ -271,18 +286,21 @@ their normal page-scrolling behavior outside editable controls.
 
 ## Stream modes and quality
 
-- **Auto** asks the browser about the indexed MIME and RFC 6381 codec string.
+- **Automatic** (internal Auto mode) asks the browser about the indexed MIME
+  and RFC 6381 codec string.
   It starts Original when the complete source is supported and retries once
   with Compatible if the media element still fails. When an exact video codec
   string is unavailable for a format that normally needs conversion, Auto does
   not treat the browser's broad container-only answer as proof that the video
   can decode. Compatible then negotiates the exact MP4 video and selected audio
   candidates independently.
-- **Original** serves the jailed source file with byte-range support. It keeps
+- **Original only** (internal Original mode) serves the jailed source file with
+  byte-range support. It keeps
   source quality, HDR/Dolby Vision metadata, and bitrate without transcoding or
   an encoder slot, but success depends on that
   browser and platform's container, video, and audio codecs.
-- **Compatible** produces a growing fragmented MP4. Each browser-supported
+- **Prepared streaming** (internal Compatible mode) produces a growing
+  fragmented MP4. Each browser-supported
   stream is copied; unsupported video normally becomes H.264 SDR and
   unsupported audio becomes AAC. Copied AAC is normalized for MP4 with
   `aac_adtstoasc` without
@@ -732,7 +750,7 @@ The title is not marked complete.
 A mobile or desktop browser that rejects a copied compatible codec with either a
 decode or source-support media error, the player retries once with portable
 H.264 video and AAC audio instead of repeating the rejected stream.
-Depending on the category, recovery offers Retry, Try compatible, Play
+Depending on the category, recovery offers Retry, Try prepared streaming, Play
 original, or Return to library. Raw helper output is never primary copy;
 limited technical details remain in a disclosure.
 
