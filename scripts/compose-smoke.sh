@@ -66,6 +66,27 @@ $COMPOSE exec -T rusty-dlna-smoke rusty-dlna --version \
     | grep -Fx "rusty-dlna ${RUSTY_DLNA_EXPECT_VERSION:-$PACKAGE_VERSION}"
 $COMPOSE exec -T rusty-dlna-smoke ffmpeg -version >/dev/null
 $COMPOSE exec -T rusty-dlna-smoke dovi_tool --version >/dev/null
+$COMPOSE exec -T rusty-dlna-smoke sh -ec '
+    echo "smoke: verified HTTPS package-download configuration"
+    test -s /etc/ssl/certs/ca-certificates.crt
+    awk '\''
+      /^URIs:/ {
+        sources++
+        for (i = 2; i <= NF; i++) if ($i !~ /^https:\/\//) invalid = 1
+      }
+      END { exit invalid || sources == 0 }
+    '\'' /etc/apt/sources.list.d/ubuntu.sources
+    config=$(apt-config dump)
+    for setting in \
+      '\''Acquire::http::Timeout "20";'\'' \
+      '\''Acquire::https::Timeout "20";'\'' \
+      '\''Acquire::https::CaInfo "/etc/ssl/certs/ca-certificates.crt";'\'' \
+      '\''Acquire::Retries "2";'\'' \
+      '\''APT::Update::Error-Mode "any";'\''
+    do
+        printf "%s\n" "$config" | grep -Fx "$setting"
+    done
+'
 $COMPOSE exec -T rusty-dlna-smoke \
     curl --fail --silent http://127.0.0.1:18200/rootDesc.xml \
     | grep -q '<friendlyName>rustyDLNA smoke</friendlyName>'

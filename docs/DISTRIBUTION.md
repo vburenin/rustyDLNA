@@ -33,6 +33,28 @@ The isolated Compose test runner uses the same digest-pinned toolchain image,
 checks the exact compiler build, and runs Cargo with `--locked`; it must not be
 used as a floating-toolchain compatibility test.
 
+All Ubuntu image stages fetch packages over HTTPS. The digest-pinned Rust
+image supplies the initial CA bundle until Ubuntu's `ca-certificates` package
+is installed; TLS verification and APT signature/hash checks remain enabled.
+Package downloads use 20-second connection/data timeouts and two retries,
+and an incomplete package-index update fails the build. These are per-download
+limits, not a deadline for the entire image build. The `dovi_tool` download
+also has connection/transfer timeouts and bounded retries.
+
+If the main archive endpoint is unavailable or returns inconsistent indexes,
+an amd64 build can select another Ubuntu archive host without changing package
+versions or trust settings, for example:
+
+```sh
+docker compose build --build-arg UBUNTU_ARCHIVE_HOST=us.archive.ubuntu.com
+```
+
+The default is `archive.ubuntu.com`. The override accepts only a hostname;
+the scheme stays HTTPS and the path stays `/ubuntu/`. Security updates still
+use `security.ubuntu.com`, and ARM's `ports.ubuntu.com` sources are unchanged
+apart from HTTPS. Do not disable signature, hash, or TLS checks to work around
+a mirror error.
+
 For local image builds, a matching release archive may be placed in
 `.docker-cache/dovi-tool/`. Archive files in that directory are excluded from
 Git but included in the Docker build context. The build verifies the pinned

@@ -4,10 +4,30 @@
 
 FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS build
 
+# The minimal Ubuntu image has no CA bundle yet. Bootstrap verified HTTPS
+# from the digest-pinned toolchain image; Ubuntu's ca-certificates package
+# replaces this bundle during installation. Never disable TLS verification.
+FROM ubuntu:resolute-20260811.1@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b AS ubuntu-base
+ARG UBUNTU_ARCHIVE_HOST=archive.ubuntu.com
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN case "$UBUNTU_ARCHIVE_HOST" in \
+        ''|*[!a-zA-Z0-9.-]*) echo "UBUNTU_ARCHIVE_HOST must be a hostname" >&2; exit 1 ;; \
+    esac \
+    && sed -i -e 's|http://|https://|g' \
+        -e "s|https://archive\\.ubuntu\\.com/|https://${UBUNTU_ARCHIVE_HOST}/|g" \
+        /etc/apt/sources.list.d/ubuntu.sources \
+    && printf '%s\n' \
+        'Acquire::http::Timeout "20";' \
+        'Acquire::https::Timeout "20";' \
+        'Acquire::https::CaInfo "/etc/ssl/certs/ca-certificates.crt";' \
+        'Acquire::Retries "2";' \
+        'APT::Update::Error-Mode "any";' \
+        > /etc/apt/apt.conf.d/80rusty-dlna-downloads
+
 # Build and run against the same FFmpeg 8 ABI. The official Rust toolchain is
 # copied into the Ubuntu builder so ffmpeg-sys-next links to libavformat 62,
 # rather than to Debian bookworm's incompatible libavformat 59.
-FROM ubuntu:resolute-20260811.1@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b AS app-build
+FROM ubuntu-base AS app-build
 
 COPY --from=build /usr/local/cargo /usr/local/cargo
 COPY --from=build /usr/local/rustup /usr/local/rustup
@@ -33,7 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-# The digest-pinned rust:1.97.1 image is the build toolchain. Do not copy the
+# The digest-pinned Rust image is the build toolchain. Do not copy the
 # host rust-toolchain file here: its rustfmt/clippy component request would
 # make a release build contact rustup and weaken offline reproducibility.
 COPY Cargo.toml Cargo.lock ./
@@ -66,7 +86,8 @@ RUN --mount=type=cache,id=rusty-dlna-dovi-tool,target=/var/cache/dovi-tool,shari
     else \
       archive_path="$cached_archive"; \
       if [ ! -f "$archive_path" ]; then \
-        curl -fsSLo "$archive_path.download" \
+        curl --connect-timeout 15 --max-time 120 --retry 2 --retry-max-time 300 \
+          -fsSLo "$archive_path.download" \
           "https://github.com/quietvoid/dovi_tool/releases/download/${DOVI_TOOL_VERSION}/$archive"; \
         echo "$dovi_sha  $archive_path.download" | sha256sum -c -; \
         mv "$archive_path.download" "$archive_path"; \
@@ -80,7 +101,7 @@ RUN --mount=type=cache,id=rusty-dlna-dovi-tool,target=/var/cache/dovi-tool,shari
 # Byte-for-byte fixture reproduction uses the same FFmpeg decoder/encoder as
 # production and the exact muxer that created the checked-in Matroska file.
 # Deterministic mkvmerge output is stable only within one muxer version.
-FROM ubuntu:resolute-20260811.1@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b AS fixture-tools
+FROM ubuntu-base AS fixture-tools
 
 ARG FIXTURE_FFMPEG_VERSION=7:8.0.1-3ubuntu2
 ARG FIXTURE_MKVTOOLNIX_VERSION=97.0-1build1
@@ -96,7 +117,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=app-build /opt/dovi/bin/dovi_tool /usr/local/bin/dovi_tool
 
-FROM ubuntu:resolute-20260811.1@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b
+FROM ubuntu-base
 
 ARG FFMPEG_VERSION=7:8.0.1-3ubuntu2
 ARG BUILD_VERSION=dev
