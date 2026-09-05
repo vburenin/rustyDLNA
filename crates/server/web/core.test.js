@@ -14,6 +14,7 @@ import {
   captionCueWindow,
   chooseSource,
   compatibleSegmentStart,
+  compatibleDecodeRecovery,
   clockLabel,
   compatibleVideoDimensions,
   directSourceSupported,
@@ -33,6 +34,7 @@ import {
   originalDownloadUrl,
   playbackAudioTrackIndex,
   playbackControlLabel,
+  playbackEndedEarly,
   playbackProcessing,
   primaryVideoCodec,
   queueNeighbor,
@@ -61,6 +63,53 @@ import {
 } from "./core.js";
 import { initialState, Store } from "./store.js";
 import { loadPreferences, progressDetails, progressSnapshot } from "./preferences.js";
+
+test("title completion tolerates rounded metadata but rejects truncated streams", () => {
+  assert.equal(playbackEndedEarly(40.4, 600), true);
+  assert.equal(playbackEndedEarly(595, 600), false);
+  assert.equal(playbackEndedEarly(599.8, 600), false);
+  assert.equal(playbackEndedEarly(600, 600), false);
+  assert.equal(playbackEndedEarly(30, 0), false);
+  assert.equal(playbackEndedEarly(30, Infinity), false);
+});
+
+test("codec recovery progresses from one reconnect through HDR and portable output", () => {
+  const original = { video: "copy", audio: "transcode", videoOutput: null };
+  const context = {
+    item: { kind: "video" }, negotiation: original, mediaCode: 3, producerState: "producing",
+    mediaSourceDelivery: true, mediaSourceRetry: false, hdrEncodingSupported: true,
+    androidMediaSourceSupported: false, profiles: [], quality: "uhd_high", preferredQuality: "uhd_high",
+  };
+  const reconnect = compatibleDecodeRecovery(context);
+  assert.equal(reconnect.streamNegotiation, original);
+  assert.equal(reconnect.mediaSourceRetry, true);
+  assert.equal(reconnect.preservePreviousTranscode, true);
+  const hdr = compatibleDecodeRecovery({ ...context, mediaSourceRetry: true });
+  assert.deepEqual(hdr.streamNegotiation, { ...original, video: "transcode", videoOutput: "hevc_hdr10" });
+  const portable = compatibleDecodeRecovery({
+    ...context, negotiation: hdr.streamNegotiation, mediaSourceRetry: true, hdrEncodingSupported: false,
+  });
+  assert.deepEqual(portable.streamNegotiation, { video: "transcode", audio: "transcode", videoOutput: "h264_sdr" });
+  assert.equal(portable.quality, "uhd_high");
+  assert.equal(compatibleDecodeRecovery({ ...context, negotiation: portable.streamNegotiation, hdrEncodingSupported: false }), null);
+  assert.equal(compatibleDecodeRecovery({ ...context, mediaCode: 2 }), null);
+});
+
+test("finishing playback settles time and intent atomically and ignores an old source", () => {
+  const store = new Store(initialState({}, {}));
+  store.dispatch({ type: "PLAYBACK_SELECT", sessionId: 1, item: { id: "1" }, duration: 600 });
+  store.dispatch({ type: "PLAYBACK_SOURCE", sessionId: 2, sourceMode: SOURCE_MODES.COMPATIBLE, start: 40, segmentOffset: 40, intent: "playing" });
+  store.dispatch({ type: "PLAYBACK_AUX", sessionId: 2, values: { pendingSeekTime: 47, previewTime: 600 } });
+  store.dispatch({ type: "PLAYBACK_FINISH", sessionId: 1 });
+  assert.equal(store.getState().playback.status, "loading");
+  store.dispatch({ type: "PLAYBACK_FINISH", sessionId: 2 });
+  const playback = store.getState().playback;
+  assert.equal(playback.status, "ended");
+  assert.equal(playback.intent, "paused");
+  assert.equal(playback.currentTime, 600);
+  assert.equal(playback.pendingSeekTime, null);
+  assert.equal(playback.previewTime, null);
+});
 
 test("caption cue windows follow the source timeline and clip crossing cues", () => {
   assert.deepEqual(captionCueWindow(90, 95, 0), { start: 90, end: 95 });

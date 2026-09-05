@@ -61,6 +61,10 @@ compatibility decisions as rustyDLNA's own contract.
 - `crates/server/web/library.js`: Library loading, paging, search, and history.
 - `crates/server/web/player.js`: Playback session, source negotiation, controls,
   seeking, recovery, audio tracks, and Media Session integration.
+- `crates/server/web/source-selection.js`: Browser capability probes, their
+  bounded cache, and source/delivery selection without UI state mutations.
+- `crates/server/web/playback-source.js`: One source's abort signal, listeners,
+  polling/startup timers, telemetry, and shared in-flight recovery.
 - `crates/server/web/captions.js`: Caption selection, source-scoped text tracks,
   and cue alignment with the current media timeline.
 - `crates/server/web/media-source.js`: MediaSource playlist delivery, bounded

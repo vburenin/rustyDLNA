@@ -2620,6 +2620,9 @@ test("MPEG-4 Part 2 timing damage requests normal transcoding instead of unsuppo
 test("a premature copied Compatible end resumes with portable codecs", async ({ page, browserName }) => {
   test.skip(browserName !== "chromium", "the premature native end was observed in Chromium");
   await usePreference(page, "stream", "compat");
+  await page.route("**/api/web/transcode/*", (route) => route.fulfill({
+    json: { schema_version: 2, state: "producing", retry_after_seconds: null },
+  }));
   await page.addInitScript(() => {
     const sources = new WeakMap();
     HTMLMediaElement.prototype.play = () => Promise.resolve();
@@ -2681,6 +2684,9 @@ test("a premature encoded HEVC end resumes at the same 4K quality with portable 
   test.skip(testInfo.project.name !== "chromium", "the premature native end was observed in desktop Chromium");
   await usePreference(page, "stream", "compat");
   await usePreference(page, "quality", "uhd_high");
+  await page.route("**/api/web/transcode/*", (route) => route.fulfill({
+    json: { schema_version: 2, state: "producing", retry_after_seconds: null },
+  }));
   await page.addInitScript(() => {
     const sources = new WeakMap();
     HTMLMediaElement.prototype.play = () => Promise.resolve();
@@ -4326,6 +4332,8 @@ test("Auto playback selects tagged English audio before the file default", async
 });
 
 test("disabled transcoding blocks forced recovery and audio-track switching", async ({ page }) => {
+  // Inject the failure into an active source after inspecting its controls.
+  await page.addInitScript(() => { HTMLMediaElement.prototype.play = () => Promise.resolve(); });
   await usePreference(page, "stream", "direct");
   const requests = [];
   await serveFixtureMedia(page, (url) => requests.push(url));
@@ -5028,6 +5036,8 @@ test("caption Escape closes the popup before expanded playback and restores focu
 });
 
 test("captions survive source restarts but reset for a different title", async ({ page }) => {
+  // Keep the short fixture active while inspecting source-scoped text tracks.
+  await page.addInitScript(() => { HTMLMediaElement.prototype.play = () => Promise.resolve(); });
   await usePreference(page, "caption", "legacy-index");
   await serveFixtureMedia(page);
   await page.goto("/?view=video");
@@ -5522,7 +5532,11 @@ test("queue snapshot crosses pagination, auto-advances, and survives navigation"
   await page.goto("/?view=video");
   await page.getByRole("button", { name: /^Play Queue 60\b/ }).click();
   await expect(page.locator("#next-button")).toHaveAttribute("title", "Next: Queue 61");
-  await page.locator("#video-player").dispatchEvent("ended");
+  await page.locator("#video-player").evaluate((video) => {
+    Object.defineProperty(video, "currentTime", { configurable: true, value: 600 });
+    video.dispatchEvent(new Event("ended"));
+    delete video.currentTime;
+  });
   await expect(page.locator("#now-playing-title")).toHaveText("Queue 61");
   await page.getByRole("tab", { name: "Folders" }).click();
   // Finish replacing the large grid before positioning the player controls.
@@ -6901,6 +6915,8 @@ test("mobile timeline has an enlarged thumb and accepts edge touches", async ({ 
 
 test("Android fullscreen double taps seek without accidental play or pause", async ({ page, isMobile }) => {
   test.skip(!isMobile, "Android fullscreen touch behavior belongs to mobile Chromium");
+  // Install the gesture clock before the short fixture can finish its source.
+  await page.addInitScript(() => { HTMLMediaElement.prototype.play = () => Promise.resolve(); });
   await usePreference(page, "stream", "direct");
   await serveFixtureMedia(page);
   await page.route("**/api/web/library?**", async (route) => {
@@ -6947,6 +6963,7 @@ test("Android fullscreen double taps seek without accidental play or pause", asy
     window.__touchSeekTest = {
       state: () => ({ currentTime, pauseCalls, playCalls }),
     };
+    player.dispatchEvent(new Event("playing"));
   });
   const bounds = await video.boundingBox();
   const tap = (x) => page.touchscreen.tap(x, bounds.y + bounds.height / 2);

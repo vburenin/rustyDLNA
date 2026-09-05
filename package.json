@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test:web-unit": "node --test crates/server/web/core.test.js",
+    "test:web-unit": "node --test crates/server/web/*.test.js",
     "test:web-browser": "playwright test",
     "test:web": "npm run test:web-unit && npm run test:web-browser"
   },

@@ -308,6 +308,36 @@ function reduce(state, action) {
           ...(action.pip !== undefined ? { pip: action.pip } : {}),
         },
       };
+    case "PLAYBACK_SOURCE_READY":
+      if (action.sessionId !== state.playback.sessionId) return state;
+      return {
+        ...state,
+        playback: {
+          ...state.playback,
+          outputQuality: action.plan.outputQuality,
+          streamNegotiation: action.plan.streamNegotiation,
+          nativeHlsDelivery: action.plan.nativeHlsDelivery,
+          mediaSourceDelivery: action.plan.mediaSourceDelivery,
+          pendingSeekTime: action.pendingSeekTime,
+          ...(action.message !== undefined ? { message: action.message } : {}),
+        },
+      };
+    case "PLAYBACK_FINISH":
+      if (action.sessionId !== state.playback.sessionId) return state;
+      return {
+        ...state,
+        playback: {
+          ...state.playback,
+          status: "ended",
+          intent: "paused",
+          currentTime: state.playback.duration,
+          previewTime: null,
+          pendingSeekTime: null,
+          autoplayBlocked: false,
+          message: null,
+          error: null,
+        },
+      };
     case "PLAYBACK_STATUS":
       if (action.sessionId !== state.playback.sessionId || !PLAYBACK_STATES.includes(action.status)) return state;
       return {

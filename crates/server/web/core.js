@@ -901,6 +901,54 @@ export function playbackError(code, technical = "") {
   return { code, message, actions: [...actions], technical };
 }
 
+export function playbackEndedEarly(currentTime, duration) {
+  return Number.isFinite(currentTime) && Number.isFinite(duration) && duration > 0
+    && currentTime + Math.max(5, duration * 0.001) < duration;
+}
+
+// Ordered codec recovery. Each step either reuses a rendition once, removes an
+// advisory codec choice, or lowers Auto quality. Generation retries have their
+// own title-scoped budget below; this function does not spend or reset it.
+export function compatibleDecodeRecovery({
+  item, negotiation, mediaCode, producerState, mediaSourceDelivery, mediaSourceRetry,
+  hdrEncodingSupported, androidMediaSourceSupported, profiles, quality, preferredQuality,
+}) {
+  if (![3, 4].includes(mediaCode)) return null;
+  const fallback = (streamNegotiation, message, values = {}) => ({
+    streamNegotiation, quality, message, messageKind: "fallback", ...values,
+  });
+  if (mediaSourceDelivery && !mediaSourceRetry && ["producing", "ready"].includes(producerState)
+    && (negotiation?.video === "copy" || negotiation?.videoOutput === "hevc_hdr10")) {
+    return fallback(negotiation, "Reconnecting to the HEVC stream…", {
+      mediaSourceRetry: true, preservePreviousTranscode: true, messageKind: "retry",
+    });
+  }
+  if (mediaSourceDelivery && hdrEncodingSupported) {
+    return fallback({ ...negotiation, video: "transcode", videoOutput: "hevc_hdr10" },
+      "Re-encoding the stream to preserve HDR…");
+  }
+  const portable = { ...negotiation, video: "transcode", audio: "transcode", videoOutput: "h264_sdr" };
+  if (negotiation?.videoOutput === "hevc_hdr10") {
+    return fallback(portable, "Switching to an SDR stream…");
+  }
+  if (!mediaSourceDelivery && item.kind === "video"
+    && negotiation?.video === "transcode" && androidMediaSourceSupported) {
+    return fallback(negotiation, "Switching to reliable Android playback…");
+  }
+  const repairEncoder = String(item?.repair_video_encoder || "").toLowerCase();
+  if (negotiation?.video === "copy" || negotiation?.audio === "copy"
+    || (negotiation?.video === "repair" && repairEncoder === "hevc_nvenc")) {
+    return fallback(portable, "Trying a more widely supported stream…");
+  }
+  const portableVideo = negotiation?.video === "transcode"
+    || (negotiation?.video === "repair" && ["libx264", "h264_nvenc"].includes(repairEncoder));
+  const saferQuality = portableVideo && negotiation?.audio === "transcode"
+    ? automaticCompatibleRecoveryProfile(profiles, quality, preferredQuality) : null;
+  return saferQuality
+    ? fallback(negotiation, "Lowering streaming quality for this device…", { quality: saferQuality })
+    : null;
+}
+
 export function apiErrorCategory(error) {
   if (error?.code === "media_missing") return "media_missing";
   if (error?.code === "transcode_disabled") return "transcode_disabled";

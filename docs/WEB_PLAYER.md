@@ -780,12 +780,21 @@ output type through Media Source receives bounded fragmented-MP4 resources
 rather than a native growing-file response. The same path is used for supported
 copied HEVC with converted AAC. AI-upscaled H.264 therefore does not depend on
 the native media loader following a growing file indefinitely.
-An early `ended` event on a non-portable Compatible stream is treated as a
-failed advisory codec or delivery path. Media Source first reopens the same
+An early `ended` event on any Compatible stream, including fully transcoded
+H.264/AAC, enters the same recovery path as a decoder or media-resource failure.
+The player checks the producer state and retains the actual position. Media
+Source first reopens the same
 HEVC/HDR plan once at the observed position. A repeatedly failing copied-HEVC
 plan then uses the independently keyed HEVC HDR10 encoder when supported; only
 a failure of that path continues at the same quality with portable H.264/AAC.
-The title is not marked complete.
+If recovery fails or exhausts its budget, playback stops with an error and
+retains resume progress. An interrupted title is never marked complete,
+looped, or advanced to the next queue entry. Completion allows for rounded
+duration metadata within five seconds or 0.1% of the title's duration,
+whichever is greater.
+Explicitly seeking to the end stops the source and shows Replay. Seeking
+backward from there creates a new source at the chosen position, paused until
+Play is pressed. This also applies to a deep link whose start is the end.
 A mobile or desktop browser that rejects a copied compatible codec with either a
 decode or source-support media error, the player retries once with portable
 H.264 video and AAC audio instead of repeating the rejected stream.
@@ -809,7 +818,7 @@ used in item, media, caption, preview, and transcode-status URLs.
 |---|---|
 | `/` | Player, or status page when the player is disabled |
 | `/web/app.css` | Embedded stylesheet |
-| `/web/{app,api,core,library,player,preferences,store}.js` | Embedded ES modules |
+| `/web/{app,api,core,library,player,preferences,store,captions,media-source,playback-source,source-selection}.js` | Embedded ES modules |
 | `/api/web/library` | Versioned folder, flat-library, or bounded Continue Watching hydration page, plus server root, capabilities, generation, and item DTOs |
 | `/api/web/item/{id}` | One item; `enrich=1` explicitly probes legacy stream metadata |
 | `/api/web/transcode/{id}?session={session_id}&request={generation_id}` | GET returns generation-scoped `queued`, `starting`, `producing`, `ready`, `cancelled`, or `failed` state plus optional `produced_seconds` measured from complete output-fragment timestamps; POST with a bounded startup `event` records the current generation's server-clock timing; DELETE records and cancels an abandoned generation |
@@ -900,9 +909,21 @@ healthy, runs that smoke test, and leaves the DLNA service untouched.
 
 ## Browser support and verification
 
+Playback implementation has three owners. `source-selection.js` reads a state
+snapshot and browser capabilities to choose the stream and delivery plan; it
+owns the bounded cache of completed capability probes. Native Safari selection
+remains synchronous to retain user activation. `playback-source.js` owns one
+source's abort signal, media listeners, polling/startup timers, telemetry, and
+shared in-flight recovery. Cancelling it invalidates queued callbacks and
+stops its timers. `player.js` coordinates user actions and rendering, including
+seek/retry delays that outlive the source being replaced. `store.js` publishes
+the negotiated plan and completion as atomic transitions, and pure recovery
+decisions live in `core.js`. See [the ownership decision](adr/0002-playback-source-ownership.md).
+
 The automated behavior suite runs desktop Chromium, Firefox, and WebKit plus a
 mobile Chromium viewport. It covers source selection/fallback and error
-recovery, session cancellation, seeks, fullscreen controls, keyboard scoping,
+recovery, truncated-stream completion, backward seeks after an explicit end,
+session cancellation, seeks, fullscreen controls, keyboard scoping,
 responsive/touch layout, captions, audio tracks, resume, queue pagination,
 infinite scrolling and focus preservation, history/search/catalog-generation
 races, reduced motion, expanded iPhone playback, wake-lock lifecycle, and axe accessibility

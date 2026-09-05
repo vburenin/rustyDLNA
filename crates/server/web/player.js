@@ -1,42 +1,39 @@
+import { PlaybackSource } from "./playback-source.js";
+import {
+  SourceSelector, supportsNativeHlsDelivery, androidMediaSourceType,
+  copiedHevcHdrEncodingFallbackType, displayHdrSupport, nativeHlsVideoOutput,
+} from "./source-selection.js";
 import { pumpMediaSource } from "./media-source.js";
 import { CaptionController } from "./captions.js";
 import {
   aiUpscaleQualityAvailable,
   apiErrorCategory,
-  automaticCompatibleRecoveryProfile,
+  compatibleDecodeRecovery,
   audioTrackLabel,
   bufferedSeekTarget,
-  chooseSource,
   clockLabel,
   compatibleVideoDimensions,
   compatibleSegmentStart,
-  directSourceSupported,
   doubleTapSeekDelta,
   fullscreenAction,
-  hdrDisplaySupport,
-  hdrVideoOutputCandidate,
-  isAndroidDevice,
   isApplePhoneDevice,
   itemDuration,
   initialCompatibleRecovery,
   nextCompatibleRetry,
   isAppleMobileDevice,
-  isSafariBrowser,
   mediaDetails,
   nativeHlsQualityProfile,
   nativeHlsHevcCopyEligible,
   encodingPreset,
   originalDownloadUrl,
-  negotiateCompatibleStreams,
   playbackAudioTrackIndex,
   playbackControlLabel,
   playbackProcessing,
   playbackError,
-  primaryVideoCodec,
+  playbackEndedEarly,
   queueNeighbor,
   resumePosition,
   saferCompatibleQualityProfile,
-  selectedAudioRequiresCompatible,
   seekTarget,
   sourceApplicableQualityProfiles,
   sourceAwareQualityProfileLabel,
@@ -72,107 +69,6 @@ const NATIVE_HLS_STARTUP_STALL_MS = 12_000;
 const MAX_COMPATIBLE_SOURCE_RELOADS = 1;
 const MAX_HELD_VIDEO_FRAME_PIXELS = 4_194_304;
 const MAX_DECODED_TRICKPLAY_SHEETS = 2;
-const MAX_MEDIA_CAPABILITY_CACHE_ENTRIES = 64;
-const ANDROID_MEDIA_SOURCE_TYPES = Object.freeze([
-  'video/mp4; codecs="avc1.42c01f,mp4a.40.2"',
-  'video/mp4; codecs="avc1.42e01f,mp4a.40.2"',
-]);
-
-function supportsNativeHlsDelivery(player) {
-  if (!isAppleMobileDevice(navigator) && !isSafariBrowser(navigator)) return false;
-  try {
-    return player.canPlayType("application/vnd.apple.mpegurl") !== "";
-  } catch (_) {
-    return false;
-  }
-}
-
-function androidMediaSourceType() {
-  if (!isAndroidDevice(navigator)
-    || typeof globalThis.MediaSource !== "function"
-    || typeof globalThis.MediaSource.isTypeSupported !== "function") return null;
-  return ANDROID_MEDIA_SOURCE_TYPES.find((contentType) => {
-    try {
-      return globalThis.MediaSource.isTypeSupported(contentType);
-    } catch (_) {
-      return false;
-    }
-  }) || null;
-}
-
-function advertisedMediaSourceType(videoOutputs, outputId) {
-  if (typeof globalThis.MediaSource !== "function"
-    || typeof globalThis.MediaSource.isTypeSupported !== "function") return null;
-  const contentType = videoOutputs?.find((output) => output?.id === outputId)?.mse_content_type;
-  if (!contentType) return null;
-  try {
-    return globalThis.MediaSource.isTypeSupported(contentType) ? contentType : null;
-  } catch (_) {
-    return null;
-  }
-}
-
-function copiedHevcHdrEncodingFallbackType(capabilities, streamNegotiation) {
-  if (streamNegotiation?.video !== "copy"
-    || !streamNegotiation?.outputVideoProbe?.supported
-    || !streamNegotiation?.outputVideoContentType) return null;
-  return advertisedMediaSourceType(capabilities?.video_outputs, "hevc_hdr10");
-}
-
-function displayHdrSupport() {
-  return hdrDisplaySupport(typeof globalThis.matchMedia === "function"
-    ? (query) => globalThis.matchMedia(query)
-    : null);
-}
-
-function nativeHlsVideoOutput(item, capabilities) {
-  const candidate = hdrVideoOutputCandidate(
-    item,
-    capabilities?.video_outputs,
-  );
-  if (!candidate) return "h264_sdr";
-  // Safari can return an empty canPlayType result for both exact Main-10 and
-  // generic hvc1 strings even though AVFoundation accepts that codec in native
-  // HLS. This path is already restricted to native Apple HLS, so treat the
-  // capability API as advisory and let a real media error trigger the bounded,
-  // same-quality H.264 SDR recovery.
-  return candidate.id;
-}
-
-function copiedAndroidMediaSourceType(item) {
-  if (!isAndroidDevice(navigator)
-    || !["h264", "hevc"].includes(primaryVideoCodec(item?.video_codec))
-    || typeof globalThis.MediaSource !== "function"
-    || typeof globalThis.MediaSource.isTypeSupported !== "function") return null;
-  const match = /^video\/mp4\s*;\s*codecs\s*=\s*"([^"]+)"$/i.exec(String(item?.video_content_type || ""));
-  const videoCodec = match?.[1]?.split(",", 1)[0]?.trim();
-  if (!/^(?:avc1|hvc1)\./i.test(videoCodec || "")) return null;
-  const contentType = `video/mp4; codecs="${videoCodec},mp4a.40.2"`;
-  try {
-    return globalThis.MediaSource.isTypeSupported(contentType) ? contentType : null;
-  } catch (_) {
-    return null;
-  }
-}
-
-function copiedHevcMediaSourceType(item, streamNegotiation) {
-  if (isAndroidDevice(navigator)
-    || isAppleMobileDevice(navigator)
-    || streamNegotiation?.video !== "copy"
-    || streamNegotiation?.audio !== "transcode"
-    || typeof globalThis.MediaSource !== "function"
-    || typeof globalThis.MediaSource.isTypeSupported !== "function") return null;
-  const match = /^video\/mp4\s*;\s*codecs\s*=\s*"([^"]+)"$/i.exec(String(item?.video_content_type || ""));
-  const videoCodec = match?.[1]?.split(",", 1)[0]?.trim();
-  if (!/^hvc1\./i.test(videoCodec || "")) return null;
-  const contentType = `video/mp4; codecs="${videoCodec},mp4a.40.2"`;
-  try {
-    return globalThis.MediaSource.isTypeSupported(contentType) ? contentType : null;
-  } catch (_) {
-    return null;
-  }
-}
-
 function currentFullscreenElement() {
   return document.fullscreenElement
     || document.webkitFullscreenElement
@@ -270,7 +166,7 @@ export class PlaybackController {
   #dom;
   #session = 0;
   #playbackSession = 0;
-  #sourceController = null;
+  #source = null;
   #mediaSourceObjectUrl = null;
   #trickplayController = null;
   #trickplayManifest = null;
@@ -285,10 +181,7 @@ export class PlaybackController {
   #touchTapTimer = null;
   #suppressVideoClickUntil = 0;
   #seekGestureFeedbackTimer = null;
-  #statusTimer = null;
-  #startupTimer = null;
-  #canplayReportedSession = null;
-  #playingReportedSession = null;
+  #retryTimer = null;
   #announceTimer = null;
   #announcementKey = "";
   #wakeLock = null;
@@ -311,9 +204,8 @@ export class PlaybackController {
   #audioRenderKey = "";
   #chapterRenderKey = "";
   #streamInfoRenderInputs = [];
-  #capabilityCache = new Map();
+  #sourceSelector = new SourceSelector();
   #compatibleRecovery = initialCompatibleRecovery();
-  #compatibleSourceReloads = 0;
   #nativeHlsSuspendedSession = null;
   #progressWriter;
   #onReturnLibrary;
@@ -419,6 +311,7 @@ export class PlaybackController {
   globalTime() {
     const playback = this.#store.getState().playback;
     const player = this.activePlayer();
+    if (!this.#source) return playback.currentTime;
     if (playback.pendingSeekTime !== null) return playback.pendingSeekTime;
     const local = Number.isFinite(player?.currentTime) ? player.currentTime : 0;
     if (playback.sourceMode === SOURCE_MODES.COMPATIBLE) {
@@ -445,7 +338,6 @@ export class PlaybackController {
         start: 0,
         intent: "playing",
         forceSourceMode: playback.sourceMode,
-        forceAndroidMediaSource: playback.mediaSourceDelivery,
       });
       return;
     }
@@ -469,7 +361,7 @@ export class PlaybackController {
       status: playback.status,
       intent: "playing",
     });
-    await this.#attemptPlay(playback.sessionId, player);
+    await this.#attemptPlay(this.#source);
   }
 
   seekTo(value) {
@@ -479,16 +371,20 @@ export class PlaybackController {
     const target = seekTarget(value, playback.duration);
     this.#resetAutomaticTranscodeRecovery();
     if (target >= playback.duration) {
-      // End is an explicit finished position, not a new seek bucket. Detach
-      // stale media events before pause can repaint it or overwrite the clock.
-      this.#cancelSource();
-      this.activePlayer().pause();
-      this.#store.dispatch({
-        type: "PLAYBACK_TIME", sessionId: playback.sessionId,
-        currentTime: playback.duration, duration: playback.duration,
+      this.#finishPlayback();
+      return;
+    }
+    if (!this.#source && playback.status !== "seeking") {
+      // Explicit completion detaches the source, including its event listeners.
+      // A subsequent seek creates a full session at the requested position.
+      void this.#loadSource(playback.item, {
+        start: target,
+        intent: playback.intent,
+        forceSourceMode: playback.sourceMode,
+        forceStreamNegotiation: playback.streamNegotiation,
+        forceQuality: playback.outputQuality,
+        messageKind: "seek",
       });
-      this.#store.dispatch({ type: "PLAYBACK_STATUS", sessionId: playback.sessionId, status: "ended", intent: "paused", message: null });
-      clearProgress(playback.item.id);
       return;
     }
     if (playback.sourceMode !== SOURCE_MODES.COMPATIBLE) {
@@ -525,11 +421,19 @@ export class PlaybackController {
         forceSourceMode: SOURCE_MODES.COMPATIBLE,
         forceStreamNegotiation: playback.streamNegotiation,
         forceQuality: playback.outputQuality,
-        forceAndroidMediaSource: playback.mediaSourceDelivery,
         message: `Starting at ${clockLabel(target)}…`,
         messageKind: "seek",
       });
     }, COMPATIBLE_SEEK_DEBOUNCE_MS);
+  }
+
+  #finishPlayback() {
+    const { playback } = this.#store.getState();
+    this.#cancelSource();
+    this.activePlayer().pause();
+    this.#releaseHeldVideoFrame();
+    this.#store.dispatch({ type: "PLAYBACK_FINISH", sessionId: playback.sessionId });
+    clearProgress(playback.item.id);
   }
 
   #resetTouchGestures() {
@@ -1012,283 +916,75 @@ export class PlaybackController {
     this.#renderMessage();
   }
 
-  async #loadSource(item, {
-    start = 0,
-    intent = "paused",
-    forceSourceMode = null,
-    forceStreamNegotiation = null,
-    forceQuality = null,
-    forceAndroidMediaSource = false,
-    mediaSourceRetry = false,
-    preservePreviousTranscode = false,
-    message = null,
-    messageKind = null,
-  } = {}) {
+  async #loadSource(item, options = {}) {
+    const { start = 0, intent = "paused", preservePreviousTranscode = false, message, messageKind, mediaSourceRetry = false } = options;
     this.#holdVideoFrame();
     this.#cancelSource({ cancelTranscode: !preservePreviousTranscode });
     this.#nativeHlsSuspendedSession = null;
     const state = this.#store.getState();
-    const negotiationEpoch = state.server.negotiationEpoch;
-    const requestedMode = state.preferences.streamMode;
     const player = item.kind === "audio" ? this.#dom.audio : this.#dom.video;
-    // Exact browser capability results remain authoritative for codecs such as
-    // HEVC. A broad container-only answer cannot validate an indexed video
-    // codec that the server already knows normally needs conversion.
-    const directSupport = directSourceSupported(
-      item,
-      (contentType) => player.canPlayType(contentType),
-    );
-    const selected = chooseSource({
-      requestedMode,
-      forcedMode: forceSourceMode,
-      directSupport,
-      transcoding: state.server.capabilities.transcoding,
-      requiresCompatibleAudio: selectedAudioRequiresCompatible(
-        state.playback.audioTracks,
-        state.playback.selectedAudio,
-      ),
+    const plan = this.#sourceSelector.prepare(item, state, player, options);
+    const source = new PlaybackSource({
+      item, player, plan, start, messageKind, mediaSourceRetry,
+      sessionId: ++this.#session,
+      playbackSessionId: this.#playbackSession,
+      requestedMode: state.preferences.streamMode,
+      segmentOffset: plan.sourceMode === SOURCE_MODES.COMPATIBLE ? compatibleSegmentStart(start) : 0,
     });
-    if (selected.blocked) {
-      const sessionId = ++this.#session;
-      const pip = this.#rebindPiPSourceSession(item, sessionId);
-      this.#store.dispatch({
-        type: "PLAYBACK_SOURCE",
-        sessionId,
-        sourceMode: selected.mode,
-        sourceReason: selected.reason,
-        segmentOffset: 0,
-        start,
-        intent,
-        pip,
-      });
-      this.#resetMediaElement(player);
-      this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId, error: playbackError(selected.blocked) });
-      return;
-    }
-    const sessionId = ++this.#session;
-    const pip = this.#rebindPiPSourceSession(item, sessionId);
-    const playbackSessionId = this.#playbackSession;
-    const controller = new AbortController();
-    this.#sourceController = controller;
-    const sourceMode = selected.mode;
-    const advertisedProfiles = state.server.capabilities.quality_profiles || [];
-    const selectedEncodingPreset = encodingPreset(
-      state.preferences.encodingPreset, state.server.capabilities.encoding_presets || [],
-    );
-    const requestedOutputQuality = sourceMode === SOURCE_MODES.COMPATIBLE
-      && forceQuality
-      && advertisedProfiles.some((profile) => profile?.id === forceQuality)
-      ? forceQuality
-      : sourceMode === SOURCE_MODES.COMPATIBLE ? state.preferences.quality : null;
-    const preferredOutputQuality = sourceMode === SOURCE_MODES.COMPATIBLE
-      ? sourceBoundedQualityProfile(
-        advertisedProfiles,
-        requestedOutputQuality,
-        item,
-        state.server.capabilities.ai_upscale,
-      )
-      : null;
-    const nativeHlsAvailable = sourceMode === SOURCE_MODES.COMPATIBLE
-      && item.kind === "video"
-      && supportsNativeHlsDelivery(player);
-    let nativeHlsDelivery = nativeHlsAvailable;
-    const copyNativeHlsHevc = nativeHlsDelivery && !forceStreamNegotiation
-      && nativeHlsHevcCopyEligible(item, preferredOutputQuality, state.preferences.hevcHlsCopy);
-    const androidTranscodeEligible = sourceMode === SOURCE_MODES.COMPATIBLE
-      && item.kind === "video"
-      && isAndroidDevice(navigator);
-    const androidMediaSourceSupport = androidTranscodeEligible ? androidMediaSourceType() : null;
-    let mediaSourceType = forceAndroidMediaSource ? androidMediaSourceSupport : null;
-    let mediaSourceDelivery = false;
-    // A forced Android MSE retry does not itself require a lower-quality
-    // encode: a supported copied H.264/HEVC stream must remain at Auto so the
-    // server can honor video_mode=copy. The Android negotiation below lowers
-    // quality only when it actually switches video to the portable encoder.
-    let outputQuality = nativeHlsDelivery && !copyNativeHlsHevc
-      && forceStreamNegotiation?.video !== "copy"
-      ? nativeHlsQualityProfile(
-        advertisedProfiles,
-        preferredOutputQuality,
-        isAppleMobileDevice(navigator),
-      )
-      : preferredOutputQuality;
-    const segmentOffset = sourceMode === SOURCE_MODES.COMPATIBLE ? compatibleSegmentStart(start) : 0;
-    const sourceMessage = message || (nativeHlsDelivery
-      ? "Preparing Safari stream…"
-      : sourceMode === SOURCE_MODES.COMPATIBLE ? "Preparing stream…" : null);
+    this.#source = source;
     this.#store.dispatch({
       type: "PLAYBACK_SOURCE",
-      sessionId,
-      sourceMode,
-      sourceReason: selected.reason,
-      outputQuality,
-      nativeHlsDelivery,
-      encodingPreset: selectedEncodingPreset,
-      mediaSourceDelivery,
-      segmentOffset,
-      start,
-      intent,
-      message: sourceMessage,
-      pip,
+      ...plan,
+      sessionId: source.sessionId,
+      segmentOffset: source.segmentOffset,
+      start, intent,
+      message: message || (plan.nativeHlsDelivery ? "Preparing Safari stream…"
+        : plan.sourceMode === SOURCE_MODES.COMPATIBLE ? "Preparing stream…" : null),
+      pip: this.#rebindPiPSourceSession(item, source.sessionId),
     });
-
-    const inactive = item.kind === "audio" ? this.#dom.video : this.#dom.audio;
-    this.#resetMediaElement(inactive);
+    this.#resetMediaElement(item.kind === "audio" ? this.#dom.video : this.#dom.audio);
     this.#resetMediaElement(player);
-    this.#captions.attach(item.captions || [], { segmentOffset, signal: controller.signal });
+    if (plan.blocked) {
+      this.#failSource(source, playbackError(plan.blocked));
+      return;
+    }
+    this.#captions.attach(item.captions || [], { segmentOffset: source.segmentOffset, signal: source.signal });
     player.playbackRate = state.preferences.rate;
     player.volume = state.preferences.volume / 100;
     player.muted = state.preferences.muted;
-    // Native looping would replay only the tail of a source opened by a
-    // compatible seek. Its ended handler restarts the complete title instead.
-    player.loop = state.preferences.loop && sourceMode === SOURCE_MODES.ORIGINAL;
+    // Compatible looping must restart the whole title, not just its seek tail.
+    player.loop = state.preferences.loop && plan.sourceMode === SOURCE_MODES.ORIGINAL;
     player.disableRemotePlayback = false;
     player.removeAttribute("disableremoteplayback");
-    const valid = () => this.#store.getState().playback.sessionId === sessionId && !controller.signal.aborted;
-    let streamNegotiation = null;
-    if (sourceMode === SOURCE_MODES.COMPATIBLE) {
-      if (nativeHlsDelivery) {
-        // Native Apple HLS uses only synchronous codec/display checks so an
-        // advisory promise cannot consume transient playback activation before
-        // AVFoundation has attached the playlist URL. A forced negotiation is
-        // an active recovery decision and must not be replaced by another HDR
-        // capability check after the rendition has already failed to decode.
-        streamNegotiation = forceStreamNegotiation || {
-          video: copyNativeHlsHevc ? "copy" : "transcode",
-          audio: "transcode",
-          videoOutput: copyNativeHlsHevc ? null : nativeHlsVideoOutput(item, state.server.capabilities),
-          hdrDisplay: displayHdrSupport(),
-        };
-      } else if (forceStreamNegotiation) {
-        streamNegotiation = forceStreamNegotiation;
-      } else {
-        const playback = this.#store.getState().playback;
-        const selectedTrack = playback.audioTracks.find((track) => Number(track.index) === Number(playback.selectedAudio));
-        const mediaCapabilities = navigator.mediaCapabilities;
-        streamNegotiation = await negotiateCompatibleStreams({
-          item,
-          track: selectedTrack,
-          quality: outputQuality,
-          qualityProfile: advertisedProfiles.find((profile) => profile?.id === outputQuality),
-          videoOutputs: state.server.capabilities.video_outputs || [],
-          aiUpscale: state.server.capabilities.ai_upscale,
-          hdrDisplay: displayHdrSupport(),
-          canPlayType: (contentType) => player.canPlayType(contentType),
-          decodingInfo: typeof mediaCapabilities?.decodingInfo === "function"
-            ? (configuration) => this.#decodingInfo(configuration)
-            : null,
-        });
-      }
-      if (!valid()) return;
-      // The user can pause or resume while the advisory probes are pending.
-      intent = this.#store.getState().playback.intent;
-      if (this.#store.getState().server.negotiationEpoch !== negotiationEpoch) {
-        return this.#loadSource(item, {
-          start,
-          intent,
-          forceSourceMode,
-          forceQuality,
-          forceAndroidMediaSource,
-          mediaSourceRetry,
-          preservePreviousTranscode,
-          message,
-          messageKind,
-        });
-      }
-      if (androidTranscodeEligible) {
-        const copiedMediaSourceSupport = streamNegotiation?.video === "copy"
-          ? copiedAndroidMediaSourceType(item)
-          : null;
-        const selectedTrack = this.#store.getState().playback.audioTracks
-          .find((track) => Number(track.index) === Number(this.#store.getState().playback.selectedAudio));
-        const copiedAac = streamNegotiation?.audio === "copy"
-          && String(selectedTrack?.codec || item.audio_codec || "").toLowerCase() === "aac";
-        const advertisedHdrMediaSourceSupport = streamNegotiation?.videoOutput === "hevc_hdr10"
-          ? advertisedMediaSourceType(
-            state.server.capabilities.video_outputs,
-            streamNegotiation.videoOutput,
-          )
-          : null;
-        if (streamNegotiation?.videoOutput === "hevc_hdr10"
-          && !advertisedHdrMediaSourceSupport) {
-          streamNegotiation = {
-            ...streamNegotiation,
-            video: "transcode",
-            videoOutput: "h264_sdr",
-          };
-        }
-        mediaSourceType = copiedMediaSourceSupport
-          || advertisedHdrMediaSourceSupport
-          || androidMediaSourceSupport;
-        if (mediaSourceType) {
-          // Android's native loader can leave growing fragmented MP4 attached
-          // without ever decoding it. Use finite MSE resources for every
-          // compatible video. Preserve supported H.264/HEVC video and AAC;
-          // otherwise select the portable H.264/AAC pair before requesting.
-          streamNegotiation = {
-            ...streamNegotiation,
-            video: copiedMediaSourceSupport ? "copy" : "transcode",
-            audio: copiedAac ? "copy" : "transcode",
-            videoOutput: advertisedHdrMediaSourceSupport ? "hevc_hdr10" : "h264_sdr",
-          };
-          if (!copiedMediaSourceSupport
-            && !advertisedHdrMediaSourceSupport
-            && outputQuality === "auto") {
-            outputQuality = saferCompatibleQualityProfile(advertisedProfiles, outputQuality)
-              || outputQuality;
-          }
-          mediaSourceDelivery = true;
-        }
-      }
-      const copiedHevcMediaSourceSupport = !nativeHlsDelivery && copiedHevcMediaSourceType(item, streamNegotiation);
-      if (copiedHevcMediaSourceSupport) {
-        mediaSourceType = copiedHevcMediaSourceSupport;
-        mediaSourceDelivery = true;
-      }
-      const encodedMediaSourceSupport = !nativeHlsDelivery
-        && streamNegotiation?.video === "transcode"
-        && ["h264_sdr", "hevc_hdr10"].includes(streamNegotiation?.videoOutput)
-        ? advertisedMediaSourceType(
-          state.server.capabilities.video_outputs,
-          streamNegotiation.videoOutput,
-        )
-        : null;
-      if (encodedMediaSourceSupport) {
-        // A native Chromium media loader can treat the currently available
-        // tail of a growing fragmented MP4 as EOF after a compatible seek.
-        // Feed encoded output through fixed complete fragments whenever the
-        // browser accepts its exact SourceBuffer type. This also bounds the
-        // amount of output produced ahead of playback; a browser without that
-        // exact support retains the portable native MP4 fallback.
-        mediaSourceType = encodedMediaSourceSupport;
-        mediaSourceDelivery = true;
-      }
-      this.#store.dispatch({
-        type: "PLAYBACK_AUX",
-        sessionId,
-        values: {
-          streamNegotiation,
-          nativeHlsDelivery,
-          mediaSourceDelivery,
-          pendingSeekTime: mediaSourceDelivery && start > segmentOffset ? start : null,
-          outputQuality,
-          ...(mediaSourceDelivery && !message
-            ? {
-              message: androidTranscodeEligible
-                ? "Preparing reliable Android stream…"
-                : "Preparing stream…",
-            }
-            : {}),
-        },
+    const resolved = this.#sourceSelector.resolve(plan, item, state, player);
+    source.plan = resolved instanceof Promise ? await resolved : resolved;
+    if (!source.active) return;
+    if (this.#store.getState().server.negotiationEpoch !== state.server.negotiationEpoch) {
+      return this.#loadSource(item, {
+        ...options, intent: this.#store.getState().playback.intent, forceStreamNegotiation: null,
       });
     }
+    this.#store.dispatch({
+      type: "PLAYBACK_SOURCE_READY", sessionId: source.sessionId, plan: source.plan,
+      pendingSeekTime: source.plan.mediaSourceDelivery && start > source.segmentOffset ? start : null,
+      message: !message && source.plan.mediaSourceDelivery
+        ? source.plan.androidTranscodeEligible ? "Preparing reliable Android stream…" : "Preparing stream…"
+        : undefined,
+    });
+    this.#attachSource(source, this.#bindSourceEvents(source));
+  }
+
+  #bindSourceEvents(source) {
+    const { item, player, sessionId, start, segmentOffset, requestedMode, messageKind } = source;
+    const { sourceMode, outputQuality, streamNegotiation, mediaSourceDelivery } = source.plan;
+    const valid = () => source.active;
+    const state = this.#store.getState();
     const status = (next, values = {}) => {
       if (valid()) this.#store.dispatch({ type: "PLAYBACK_STATUS", sessionId, status: next, ...values });
     };
-    const listen = (name, handler) => player.addEventListener(name, handler, { signal: controller.signal });
+    const listen = (name, handler) => source.listen(name, handler);
     listen("loadstart", () => status("loading"));
     listen("play", () => {
-      if (!valid()) return;
       this.#restartSuspendedNativeHls(this.#store.getState().playback);
     });
     listen("waiting", () => {
@@ -1297,12 +993,7 @@ export class PlaybackController {
         && requestedMode === STREAM_MODES.AUTO
         && state.server.capabilities.transcoding
         && item.kind === "video") {
-        this.#scheduleOriginalBufferRecovery({
-          sessionId,
-          item,
-          start,
-          signal: controller.signal,
-        });
+        this.#scheduleOriginalBufferRecovery(source);
       }
     });
     listen("seeking", () => { if (sourceMode === SOURCE_MODES.ORIGINAL) status("seeking", { message: "Seeking…" }); });
@@ -1323,7 +1014,7 @@ export class PlaybackController {
       return true;
     };
     listen("seeked", () => {
-      if (!valid() || !applyPendingSeek()) return;
+      if (!applyPendingSeek()) return;
       if (mediaSourceDelivery) {
         void readyToPlay();
       } else if (sourceMode === SOURCE_MODES.ORIGINAL) {
@@ -1332,7 +1023,6 @@ export class PlaybackController {
       }
     });
     listen("loadedmetadata", () => {
-      if (!valid()) return;
       if (mediaSourceDelivery) {
         applyPendingSeek();
       } else if (sourceMode === SOURCE_MODES.ORIGINAL && start > 0) {
@@ -1345,36 +1035,24 @@ export class PlaybackController {
       if (messageKind === "seek") status("loading", { message: null });
     });
     listen("durationchange", () => {
-      if (!valid()) return;
       this.#store.dispatch({ type: "PLAYBACK_TIME", sessionId, currentTime: this.globalTime(), duration: itemDuration(item, player.duration) });
     });
     listen("loadeddata", () => {
-      if (!valid() || !applyPendingSeek()) return;
+      if (!applyPendingSeek()) return;
       if (sourceMode === SOURCE_MODES.COMPATIBLE) this.#clearStartupTimer();
       this.#releaseHeldVideoFrame();
     });
     const readyToPlay = async () => {
-      if (!valid() || !applyPendingSeek()) return;
+      if (!applyPendingSeek()) return;
       if (sourceMode === SOURCE_MODES.COMPATIBLE) this.#clearStartupTimer();
       this.#releaseHeldVideoFrame();
       this.#startTrickplayPreload();
-      if (sourceMode === SOURCE_MODES.COMPATIBLE
-        && this.#canplayReportedSession !== sessionId) {
-        this.#canplayReportedSession = sessionId;
-        void this.#api.reportTranscodeCanPlay(
-          item.id,
-          sessionId,
-          playbackSessionId,
-          controller.signal,
-        ).catch(() => {
-          // Startup telemetry is best-effort and never changes playback.
-        });
-      }
+      this.#reportStartup(source, "canplay");
       if (player.paused) {
         const playback = this.#store.getState().playback;
         status("paused", { autoplayBlocked: playback.autoplayBlocked, message: null });
         if (playback.intent === "playing") {
-          await this.#attemptPlay(sessionId, player);
+          await this.#attemptPlay(source);
         }
       } else {
         // canplay can recur after a buffer interruption. Do not paint an
@@ -1384,20 +1062,7 @@ export class PlaybackController {
     };
     listen("canplay", readyToPlay);
     listen("playing", () => {
-      if (!valid()) return;
-      if (sourceMode === SOURCE_MODES.COMPATIBLE
-        && this.#playingReportedSession !== sessionId) {
-        this.#playingReportedSession = sessionId;
-        void this.#api.reportTranscodeStartup(
-          item.id,
-          sessionId,
-          playbackSessionId,
-          "playing",
-          controller.signal,
-        ).catch(() => {
-          // Startup telemetry is best-effort and never changes playback.
-        });
-      }
+      this.#reportStartup(source, "playing");
       if (document.visibilityState === "visible"
         && this.#nativeHlsSuspendedSession === sessionId) {
         this.#nativeHlsSuspendedSession = null;
@@ -1408,7 +1073,7 @@ export class PlaybackController {
       status("playing", { autoplayBlocked: false, intent: "playing", message: null });
     });
     listen("pause", () => {
-      if (!valid() || player.ended) return;
+      if (player.ended) return;
       const playback = this.#store.getState().playback;
       if (!["loading", "waiting", "seeking", "error"].includes(playback.status)) {
         // Locking a device or backgrounding a browser pauses its media element
@@ -1422,7 +1087,7 @@ export class PlaybackController {
       this.#progressWriter.flush();
     });
     listen("timeupdate", () => {
-      if (!valid() || !applyPendingSeek()) return;
+      if (!applyPendingSeek()) return;
       const global = sourceMode === SOURCE_MODES.COMPATIBLE ? segmentOffset + player.currentTime : player.currentTime;
       this.#store.dispatch({ type: "PLAYBACK_TIME", sessionId, currentTime: global, duration: itemDuration(item, player.duration) });
       // A seek while paused is still valuable resume state, and some engines do
@@ -1431,64 +1096,21 @@ export class PlaybackController {
       this.#updateMediaSessionPosition();
     });
     listen("ratechange", () => {
-      if (!valid() || !Number.isFinite(player.playbackRate)) return;
+      if (!Number.isFinite(player.playbackRate)) return;
       this.#setPreference("rate", player.playbackRate);
     });
     listen("volumechange", () => {
-      if (!valid()) return;
       this.#setPreference("volume", Math.round(player.volume * 100));
       this.#setPreference("muted", player.muted);
     });
     listen("ended", () => {
-      if (!valid()) return;
       const playback = this.#store.getState().playback;
       const duration = playback.duration;
       const currentTime = this.globalTime();
-      const endTolerance = Math.max(5, duration * 0.001);
-      const prematureCompatibleEnd = sourceMode === SOURCE_MODES.COMPATIBLE
-        && duration > 0
-        && currentTime + endTolerance < duration;
-      const portableCompatibleStream = streamNegotiation?.video === "transcode"
-        && streamNegotiation?.audio === "transcode"
-        && streamNegotiation?.videoOutput === "h264_sdr";
-      if (prematureCompatibleEnd && !portableCompatibleStream) {
-        if (mediaSourceDelivery && !mediaSourceRetry) {
-          this.#loadSource(item, {
-            start: currentTime,
-            intent: playback.intent,
-            forceSourceMode: SOURCE_MODES.COMPATIBLE,
-            forceStreamNegotiation: streamNegotiation,
-            forceQuality: outputQuality,
-            forceAndroidMediaSource: mediaSourceDelivery,
-            mediaSourceRetry: true,
-            preservePreviousTranscode: true,
-            message: "Reconnecting to the HEVC stream…",
-            messageKind: "retry",
-          });
-          return;
-        }
-        const hdrEncodingFallback = mediaSourceDelivery
-          && copiedHevcHdrEncodingFallbackType(
-            state.server.capabilities,
-            streamNegotiation,
-          );
-        this.#loadSource(item, {
-          start: currentTime,
-          intent: playback.intent,
-          forceSourceMode: SOURCE_MODES.COMPATIBLE,
-          forceStreamNegotiation: {
-            ...streamNegotiation,
-            video: "transcode",
-            ...(hdrEncodingFallback ? {} : { audio: "transcode" }),
-            videoOutput: hdrEncodingFallback ? "hevc_hdr10" : "h264_sdr",
-          },
-          forceQuality: outputQuality,
-          forceAndroidMediaSource: Boolean(hdrEncodingFallback),
-          message: hdrEncodingFallback
-            ? "Re-encoding the stream to preserve HDR…"
-            : "Continuing with portable playback…",
-          messageKind: "fallback",
-        });
+      if (sourceMode === SOURCE_MODES.COMPATIBLE && playbackEndedEarly(currentTime, duration)) {
+        // An exhausted media resource is not proof that the title finished.
+        // Use the same bounded recovery as fetch/append and decoder failures.
+        void this.#handleMediaError(source, new Error("The prepared stream ended before the title finished."));
         return;
       }
       if (sourceMode === SOURCE_MODES.COMPATIBLE && this.#store.getState().preferences.loop) {
@@ -1498,29 +1120,24 @@ export class PlaybackController {
           forceSourceMode: SOURCE_MODES.COMPATIBLE,
           forceStreamNegotiation: streamNegotiation,
           forceQuality: outputQuality,
-          forceAndroidMediaSource: mediaSourceDelivery,
         });
         return;
       }
-      this.#store.dispatch({ type: "PLAYBACK_TIME", sessionId, currentTime: duration, duration });
-      status("ended", { intent: "paused", message: null });
-      clearProgress(item.id);
+      this.#finishPlayback();
       if (this.#store.getState().preferences.autoplay) this.playRelative(1);
     });
     listen("error", () => {
-      if (!valid()) return;
       this.#invalidateWakeLockSession();
-      this.#handleMediaError(
-        sessionId,
-        item,
-        sourceMode,
-        start,
-        streamNegotiation,
-        null,
-        mediaSourceRetry,
-      );
+      void this.#handleMediaError(source);
     });
 
+    return { applyPendingSeek, readyToPlay };
+  }
+
+  #attachSource(source, { applyPendingSeek, readyToPlay }) {
+    const { item, player, sessionId, playbackSessionId, segmentOffset, requestedMode } = source;
+    const { sourceMode, outputQuality, streamNegotiation, nativeHlsDelivery, mediaSourceDelivery } = source.plan;
+    const state = this.#store.getState();
     const params = new URLSearchParams();
     let sourceUrl = item.source_url;
     if (sourceMode === SOURCE_MODES.COMPATIBLE) {
@@ -1528,15 +1145,15 @@ export class PlaybackController {
       params.set("audio", String(this.#store.getState().playback.selectedAudio));
       params.set("start", String(segmentOffset));
       params.set("quality", outputQuality);
-      if (selectedEncodingPreset !== "balanced" && streamNegotiation.video !== "copy") {
-        params.set("encoding_preset", selectedEncodingPreset);
+      if (source.plan.encodingPreset !== "balanced" && streamNegotiation.video !== "copy") {
+        params.set("encoding_preset", source.plan.encodingPreset);
       }
       params.set("video_mode", streamNegotiation.video);
       if (streamNegotiation.video === "transcode") {
         params.set("video_output", streamNegotiation.videoOutput || "h264_sdr");
       }
       params.set("audio_mode", streamNegotiation.audio);
-      params.set("reason", selected.reason);
+      params.set("reason", source.plan.sourceReason);
       params.set("request", String(sessionId));
       params.set("session", String(playbackSessionId));
       if (nativeHlsDelivery) params.set("delivery", "hls");
@@ -1544,23 +1161,14 @@ export class PlaybackController {
       sourceUrl = `${item.fallback_url}${item.fallback_url.includes("?") ? "&" : "?"}${params}`;
       if (nativeHlsDelivery || mediaSourceDelivery) sourceUrl = sourceUrl.replace(/\.mp4(?=\?)/, ".m3u8");
     } else {
-      params.set("reason", selected.reason);
+      params.set("reason", source.plan.sourceReason);
       params.set("request", String(sessionId));
       sourceUrl = `${item.source_url}${item.source_url.includes("?") ? "&" : "?"}${params}`;
     }
-    this.#compatibleSourceReloads = 0;
     let playerSourceUrl = sourceUrl;
     if (mediaSourceDelivery) {
-      playerSourceUrl = this.#startMediaSourceDelivery({
-        player,
+      playerSourceUrl = this.#startMediaSourceDelivery(source, {
         playlistUrl: new URL(sourceUrl, window.location.href).href,
-        contentType: mediaSourceType,
-        sessionId,
-        playbackSessionId,
-        item,
-        start,
-        streamNegotiation,
-        mediaSourceRetry,
         pendingSeek: () => {
           const target = this.#store.getState().playback.pendingSeekTime;
           return target === null ? null : target - segmentOffset;
@@ -1569,76 +1177,36 @@ export class PlaybackController {
           if (this.#store.getState().playback.pendingSeekTime !== null
             && applyPendingSeek() && player.readyState >= 3) void readyToPlay();
         },
-        signal: controller.signal,
-        valid,
       });
     } else {
       player.src = sourceUrl;
       player.load();
     }
     if (sourceMode === SOURCE_MODES.COMPATIBLE) {
-      this.#pollTranscodeState({
-        item,
-        sessionId,
-        playbackSessionId,
-        player,
-        sourceUrl: playerSourceUrl,
-        start,
-        streamNegotiation,
-        nativeHlsDelivery,
-        mediaSourceDelivery,
-        signal: controller.signal,
-      });
+      this.#pollTranscodeState(source, playerSourceUrl);
     } else if (requestedMode === STREAM_MODES.AUTO
       && state.server.capabilities.transcoding
       && item.kind === "video") {
-      this.#scheduleOriginalBufferRecovery({
-        sessionId,
-        item,
-        start,
-        signal: controller.signal,
-      });
+      this.#scheduleOriginalBufferRecovery(source);
     }
     // A title selection or resume begins in a user event handler. Ask the
     // browser to play while that activation is still available; Safari may
     // reject a first play delayed until canplay even though the user tapped a
     // Play control. The canplay listener retries only while intent remains
     // playing and the media element is still paused.
-    if (intent === "playing") void this.#attemptPlay(sessionId, player);
+    if (this.#store.getState().playback.intent === "playing") void this.#attemptPlay(source);
   }
 
-  #startMediaSourceDelivery({
-    player,
-    playlistUrl,
-    contentType,
-    sessionId,
-    playbackSessionId,
-    item,
-    start,
-    streamNegotiation,
-    mediaSourceRetry,
-    pendingSeek,
-    onBuffered,
-    signal,
-    valid,
-  }) {
+  #startMediaSourceDelivery(source, { playlistUrl, pendingSeek, onBuffered }) {
+    const { player, signal } = source;
+    const contentType = source.plan.mediaSourceType;
     const mediaSource = new MediaSource();
     const objectUrl = URL.createObjectURL(mediaSource);
     this.#mediaSourceObjectUrl = objectUrl;
     player.disableRemotePlayback = true;
     player.src = objectUrl;
     player.load();
-    const reportStartup = (event) => {
-      void this.#api.reportTranscodeStartup(
-        item.id,
-        sessionId,
-        playbackSessionId,
-        event,
-        signal,
-      ).catch(() => {
-        // Startup telemetry is best-effort and never changes playback.
-      });
-    };
+    const reportStartup = (event) => this.#reportStartup(source, event);
     pumpMediaSource({
       player,
       mediaSource,
@@ -1650,32 +1218,16 @@ export class PlaybackController {
       onBuffered,
     })
       .catch((error) => {
-        if (signal.aborted || error?.name === "AbortError" || !valid()) return;
-        // Media Source fetch/append failures need the same producer-status,
-        // busy retry, codec fallback, and lower-quality recovery used by a
-        // native media-element error. Treat a live producer's append failure
-        // as a decode error; queued/cancelled producer state still wins.
-        this.#handleMediaError(
-          sessionId,
-          item,
-          SOURCE_MODES.COMPATIBLE,
-          start,
-          streamNegotiation,
-          error,
-          mediaSourceRetry,
-        ).catch((recoveryError) => {
-          if (!valid()) return;
-          this.#store.dispatch({
-            type: "PLAYBACK_ERROR",
-            sessionId,
-            error: playbackError(
-              "transcode_failed",
-              recoveryError?.message || error?.message || "Media Source delivery failed",
-            ),
-          });
-        });
+        if (error?.name !== "AbortError") void this.#handleMediaError(source, error);
       });
     return objectUrl;
+  }
+
+  #reportStartup(source, event) {
+    if (source.plan.sourceMode !== SOURCE_MODES.COMPATIBLE) return;
+    source.reportOnce(event, () => this.#api.reportTranscodeStartup(
+      source.item.id, source.sessionId, source.playbackSessionId, event, source.signal,
+    ));
   }
 
   #rebindPiPSourceSession(item, sessionId) {
@@ -1690,39 +1242,9 @@ export class PlaybackController {
     return active;
   }
 
-  #decodingInfo(configuration) {
-    const key = JSON.stringify(configuration);
-    if (this.#capabilityCache.has(key)) {
-      const cached = this.#capabilityCache.get(key);
-      // Refresh insertion order so the bounded map behaves as a small LRU.
-      this.#capabilityCache.delete(key);
-      this.#capabilityCache.set(key, cached);
-      return Promise.resolve(cached);
-    }
-    // Cache only completed probes. A browser promise that never settles is
-    // timed out by negotiation and must not poison every later title with the
-    // same codec configuration.
-    return navigator.mediaCapabilities.decodingInfo(configuration).then((result) => {
-      while (this.#capabilityCache.size >= MAX_MEDIA_CAPABILITY_CACHE_ENTRIES) {
-        this.#capabilityCache.delete(this.#capabilityCache.keys().next().value);
-      }
-      this.#capabilityCache.set(key, result);
-      return result;
-    });
-  }
-
-  #pollTranscodeState({
-    item,
-    sessionId,
-    playbackSessionId,
-    player,
-    sourceUrl,
-    start,
-    streamNegotiation,
-    nativeHlsDelivery,
-    mediaSourceDelivery,
-    signal,
-  }) {
+  #pollTranscodeState(source, sourceUrl) {
+    const { item, sessionId, playbackSessionId, signal } = source;
+    const { mediaSourceDelivery } = source.plan;
     const poll = async () => {
       const current = this.#store.getState().playback;
       if (signal.aborted || sessionId !== current.sessionId
@@ -1746,7 +1268,7 @@ export class PlaybackController {
           this.#store.dispatch({ type: "PLAYBACK_STATUS", sessionId, status: "loading", message });
         } else if (payload.state === "failed") {
           if (this.#fallbackNativeHlsCopy(sessionId)) return;
-          this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId, error: playbackError("transcode_failed", "The transcode producer failed.") });
+          this.#failSource(source, playbackError("transcode_failed", "The transcode producer failed."));
           return;
         } else if (payload.state === "cancelled") {
           const playback = this.#store.getState().playback;
@@ -1758,24 +1280,14 @@ export class PlaybackController {
             streamNegotiation: playback.streamNegotiation,
             retryAfterSeconds: payload.retry_after_seconds,
           })) return;
-          this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId, error: playbackError("transcode_cancelled") });
+          this.#failSource(source, playbackError("transcode_cancelled"));
           return;
         }
         if (stillPreparing
           && item.kind === "video"
           && !mediaSourceDelivery
           && ["producing", "ready"].includes(payload.state)) {
-          this.#scheduleCompatibleStartupRecovery({
-            sessionId,
-            item,
-            player,
-            sourceUrl,
-            start,
-            streamNegotiation,
-            nativeHlsDelivery,
-            mediaSourceDelivery,
-            signal,
-          });
+          this.#scheduleCompatibleStartupRecovery(source, sourceUrl);
         }
       } catch (error) {
         if (error?.name === "AbortError" || signal.aborted
@@ -1788,7 +1300,7 @@ export class PlaybackController {
           .includes(this.#store.getState().playback.status);
         if (stillPreparing && ["media_missing", "transcode_busy", "transcode_failed", "transcode_cancelled", "offline", "network"].includes(category)) {
           if (category === "transcode_failed" && this.#fallbackNativeHlsCopy(sessionId)) return;
-          this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId, error: playbackError(category, error?.technical || "") });
+          this.#failSource(source, playbackError(category, error?.technical || ""));
           return;
         }
       }
@@ -1798,25 +1310,16 @@ export class PlaybackController {
       const delay = ["loading", "waiting", "seeking"].includes(latest.status)
         ? TRANSCODE_PREPARING_POLL_MS
         : TRANSCODE_ACTIVE_POLL_MS;
-      this.#statusTimer = window.setTimeout(poll, delay);
+      source.setTimer("poll", poll, delay);
     };
     poll();
   }
 
-  #scheduleCompatibleStartupRecovery({
-    sessionId,
-    item,
-    player,
-    sourceUrl,
-    start,
-    streamNegotiation,
-    nativeHlsDelivery,
-    mediaSourceDelivery,
-    signal,
-  }) {
-    if (this.#startupTimer !== null || signal.aborted || player.readyState >= 2) return;
-    this.#startupTimer = window.setTimeout(() => {
-      this.#startupTimer = null;
+  #scheduleCompatibleStartupRecovery(source, sourceUrl) {
+    const { sessionId, item, player, start, signal } = source;
+    const { streamNegotiation, nativeHlsDelivery, mediaSourceDelivery } = source.plan;
+    if (source.hasTimer("startup") || !source.active || player.readyState >= 2) return;
+    source.setTimer("startup", () => {
       const playback = this.#store.getState().playback;
       if (signal.aborted
         || sessionId !== playback.sessionId
@@ -1834,13 +1337,12 @@ export class PlaybackController {
           forceSourceMode: SOURCE_MODES.COMPATIBLE,
           forceStreamNegotiation: streamNegotiation,
           forceQuality: playback.outputQuality,
-          forceAndroidMediaSource: true,
           message: "Switching to reliable Android playback…",
           messageKind: "fallback",
         });
         return;
       }
-      if (this.#compatibleSourceReloads >= MAX_COMPATIBLE_SOURCE_RELOADS) {
+      if (source.reloads >= MAX_COMPATIBLE_SOURCE_RELOADS) {
         this.#scheduleCompatibleRetry({
           sessionId,
           item,
@@ -1850,7 +1352,7 @@ export class PlaybackController {
         });
         return;
       }
-      this.#compatibleSourceReloads += 1;
+      source.reloads += 1;
       this.#store.dispatch({
         type: "PLAYBACK_STATUS",
         sessionId,
@@ -1890,10 +1392,10 @@ export class PlaybackController {
     return true;
   }
 
-  #scheduleOriginalBufferRecovery({ sessionId, item, start, signal }) {
-    if (this.#startupTimer !== null || signal.aborted) return;
-    this.#startupTimer = window.setTimeout(() => {
-      this.#startupTimer = null;
+  #scheduleOriginalBufferRecovery(source) {
+    const { sessionId, item, start, signal } = source;
+    if (source.hasTimer("startup") || !source.active) return;
+    source.setTimer("startup", () => {
       const state = this.#store.getState();
       const { playback, preferences, server } = state;
       if (signal.aborted
@@ -1919,8 +1421,7 @@ export class PlaybackController {
   }
 
   #clearStartupTimer() {
-    if (this.#startupTimer !== null) window.clearTimeout(this.#startupTimer);
-    this.#startupTimer = null;
+    this.#source?.clearTimer("startup");
   }
 
   #markNativeHlsSuspended() {
@@ -1974,7 +1475,6 @@ export class PlaybackController {
     const target = this.#store.getState().playback.currentTime || start;
     const playback = this.#store.getState().playback;
     const outputQuality = playback.outputQuality;
-    const forceAndroidMediaSource = playback.mediaSourceDelivery;
     const requestedDelay = Math.max(250, Number(retryAfterSeconds || 1) * 1_000);
     const delay = busy
       ? Math.min(5_000, Math.max(requestedDelay, 250 * (2 ** Math.min(4, recovery.busyRetries - 1))))
@@ -1990,8 +1490,8 @@ export class PlaybackController {
         : "The previous stream was abandoned. Retrying prepared streaming…",
       error: null,
     });
-    this.#statusTimer = window.setTimeout(() => {
-      this.#statusTimer = null;
+    this.#retryTimer = window.setTimeout(() => {
+      this.#retryTimer = null;
       if (this.#compatibleRecovery.pendingSession === sessionId) {
         this.#compatibleRecovery = { ...this.#compatibleRecovery, pendingSession: null };
       }
@@ -2003,7 +1503,6 @@ export class PlaybackController {
         forceSourceMode: SOURCE_MODES.COMPATIBLE,
         forceStreamNegotiation: streamNegotiation,
         forceQuality: outputQuality,
-        forceAndroidMediaSource,
         message: busy ? "Waiting for a transcode slot…" : "Retrying prepared streaming…",
         messageKind: busy ? "queue" : "retry",
       });
@@ -2011,40 +1510,48 @@ export class PlaybackController {
     return true;
   }
 
-  async #attemptPlay(sessionId, player) {
-    if (this.#store.getState().playback.pendingSeekTime !== null) return;
+  async #attemptPlay(source) {
+    if (!source?.active || this.#store.getState().playback.pendingSeekTime !== null) return;
+    const { sessionId, player } = source;
     try {
       await player.play();
     } catch (error) {
-      if (sessionId !== this.#store.getState().playback.sessionId) return;
+      if (!source.active) return;
       if (error?.name === "NotAllowedError") {
         this.#store.dispatch({
-          type: "PLAYBACK_STATUS",
-          sessionId,
-          status: "paused",
-          intent: "paused",
-          autoplayBlocked: true,
-          message: null,
+          type: "PLAYBACK_STATUS", sessionId, status: "paused", intent: "paused",
+          autoplayBlocked: true, message: null,
         });
       } else if (error?.name !== "AbortError") {
-        this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId, error: playbackError("unknown", error?.message || "play() failed") });
+        // play() rejection and the media error describe the same failure.
+        // Let their shared recovery query the producer before terminating.
+        if (player.error || error?.name === "NotSupportedError") {
+          void this.#handleMediaError(source, error);
+        } else {
+          this.#failSource(source, playbackError("unknown", error?.message || "play() failed"));
+        }
       }
     }
   }
 
-  async #handleMediaError(
-    sessionId,
-    item,
-    sourceMode,
-    start,
-    streamNegotiation,
-    deliveryError = null,
-    mediaSourceRetry = false,
-  ) {
-    if (sessionId !== this.#store.getState().playback.sessionId) return;
-    const signal = this.#sourceController?.signal;
-    const current = () => !signal?.aborted
-      && sessionId === this.#store.getState().playback.sessionId;
+  #handleMediaError(source, deliveryError = null) {
+    return source.recover(() => this.#recoverSource(source, deliveryError))
+      .catch((error) => this.#failSource(source, playbackError("transcode_failed", error?.message)));
+  }
+
+  #failSource(source, error) {
+    if (!source.active) return;
+    this.#cancelSource();
+    source.player.pause();
+    this.#releaseHeldVideoFrame();
+    this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId: source.sessionId, error });
+  }
+
+  async #recoverSource(source, deliveryError) {
+    const { sessionId, item, start, signal } = source;
+    const { sourceMode, streamNegotiation } = source.plan;
+    const mediaSourceRetry = source.mediaSourceRetry;
+    const current = () => source.active;
     let intent = this.#store.getState().playback.intent;
     const preferences = this.#store.getState().preferences;
     const capabilities = this.#store.getState().server.capabilities;
@@ -2111,138 +1618,19 @@ export class PlaybackController {
     intent = this.#store.getState().playback.intent;
     if (([3, 4].includes(mediaCode) || producerState === "failed")
       && this.#fallbackNativeHlsCopy(sessionId)) return;
-    const mediaSourceDelivery = this.#store.getState().playback.mediaSourceDelivery;
-    const retryableHevcMediaSource = sourceMode === SOURCE_MODES.COMPATIBLE
-      && mediaSourceDelivery
-      && !mediaSourceRetry
-      && [3, 4].includes(mediaCode)
-      && ["producing", "ready"].includes(producerState)
-      && (streamNegotiation?.video === "copy"
-        || streamNegotiation?.videoOutput === "hevc_hdr10");
-    if (retryableHevcMediaSource) {
+    const recovery = sourceMode === SOURCE_MODES.COMPATIBLE ? compatibleDecodeRecovery({
+      item, negotiation: streamNegotiation, mediaCode, producerState, mediaSourceRetry,
+      mediaSourceDelivery: source.plan.mediaSourceDelivery,
+      hdrEncodingSupported: Boolean(copiedHevcHdrEncodingFallbackType(capabilities, streamNegotiation)),
+      androidMediaSourceSupported: Boolean(androidMediaSourceType()),
+      profiles: capabilities.quality_profiles, quality: outputQuality, preferredQuality: preferences.quality,
+    }) : null;
+    if (recovery) {
       this.#loadSource(item, {
-        start: this.globalTime() || start,
-        intent,
-        forceSourceMode: SOURCE_MODES.COMPATIBLE,
-        forceStreamNegotiation: streamNegotiation,
-        forceQuality: outputQuality,
-        forceAndroidMediaSource: mediaSourceDelivery,
-        mediaSourceRetry: true,
-        preservePreviousTranscode: true,
-        message: "Reconnecting to the HEVC stream…",
-        messageKind: "retry",
-      });
-      return;
-    }
-    const copiedHevcHdrEncodingFallback = sourceMode === SOURCE_MODES.COMPATIBLE
-      && mediaSourceDelivery
-      && [3, 4].includes(mediaCode)
-      && copiedHevcHdrEncodingFallbackType(capabilities, streamNegotiation);
-    if (copiedHevcHdrEncodingFallback) {
-      this.#loadSource(item, {
-        start: this.globalTime() || start,
-        intent,
-        forceSourceMode: SOURCE_MODES.COMPATIBLE,
-        forceStreamNegotiation: {
-          ...streamNegotiation,
-          video: "transcode",
-          videoOutput: "hevc_hdr10",
-        },
-        forceQuality: outputQuality,
-        forceAndroidMediaSource: true,
-        message: "Re-encoding the stream to preserve HDR…",
-        messageKind: "fallback",
-      });
-      return;
-    }
-    if (sourceMode === SOURCE_MODES.COMPATIBLE
-      && [3, 4].includes(mediaCode)
-      && streamNegotiation?.videoOutput === "hevc_hdr10") {
-      this.#loadSource(item, {
-        start: this.globalTime() || start,
-        intent,
-        forceSourceMode: SOURCE_MODES.COMPATIBLE,
-        forceStreamNegotiation: {
-          ...streamNegotiation,
-          video: "transcode",
-          audio: "transcode",
-          videoOutput: "h264_sdr",
-        },
-        forceQuality: outputQuality,
-        forceAndroidMediaSource: mediaSourceDelivery,
-        message: "Switching to an SDR stream…",
-        messageKind: "fallback",
-      });
-      return;
-    }
-    if (sourceMode === SOURCE_MODES.COMPATIBLE
-      && [3, 4].includes(mediaCode)
-      && !mediaSourceDelivery
-      && item.kind === "video"
-      && streamNegotiation?.video === "transcode"
-      && androidMediaSourceType()) {
-      this.#loadSource(item, {
-        start: this.globalTime() || start,
-        intent,
-        forceSourceMode: SOURCE_MODES.COMPATIBLE,
-        forceStreamNegotiation: streamNegotiation,
-        forceQuality: outputQuality,
-        forceAndroidMediaSource: true,
-        message: "Switching to reliable Android playback…",
-        messageKind: "fallback",
-      });
-      return;
-    }
-    // Capability APIs are advisory. If copied media or an HEVC repair selected
-    // from those APIs reaches a live producer but fails decoding or is rejected
-    // as an unsupported source, retry once with portable H.264/AAC before
-    // presenting a terminal MediaError.
-    const advisoryHevcRepair = streamNegotiation?.video === "repair"
-      && String(item?.repair_video_encoder || "").toLowerCase() === "hevc_nvenc";
-    if (sourceMode === SOURCE_MODES.COMPATIBLE
-      && [3, 4].includes(mediaCode)
-      && (streamNegotiation?.video === "copy"
-        || streamNegotiation?.audio === "copy"
-        || advisoryHevcRepair)) {
-      const portableNegotiation = {
-        ...streamNegotiation,
-        video: "transcode",
-        audio: "transcode",
-        videoOutput: "h264_sdr",
-      };
-      this.#loadSource(item, {
-        start: this.globalTime() || start,
-        intent,
-        forceSourceMode: SOURCE_MODES.COMPATIBLE,
-        forceStreamNegotiation: portableNegotiation,
-        forceQuality: outputQuality,
-        message: "Trying a more widely supported stream…",
-        messageKind: "fallback",
-      });
-      return;
-    }
-    const portableVideo = streamNegotiation?.video === "transcode"
-      || (streamNegotiation?.video === "repair"
-        && ["libx264", "h264_nvenc"].includes(String(item?.repair_video_encoder || "").toLowerCase()));
-    const saferQuality = sourceMode === SOURCE_MODES.COMPATIBLE
-      && [3, 4].includes(mediaCode)
-      && portableVideo
-      && streamNegotiation?.audio === "transcode"
-      ? automaticCompatibleRecoveryProfile(
-        capabilities.quality_profiles,
-        outputQuality,
-        preferences.quality,
-      )
-      : null;
-    if (saferQuality) {
-      this.#loadSource(item, {
-        start: this.globalTime() || start,
-        intent,
-        forceSourceMode: SOURCE_MODES.COMPATIBLE,
-        forceStreamNegotiation: streamNegotiation,
-        forceQuality: saferQuality,
-        message: "Lowering streaming quality for this device…",
-        messageKind: "fallback",
+        start: this.globalTime() || start, intent, forceSourceMode: SOURCE_MODES.COMPATIBLE,
+        forceStreamNegotiation: recovery.streamNegotiation, forceQuality: recovery.quality,
+        mediaSourceRetry: recovery.mediaSourceRetry, preservePreviousTranscode: recovery.preservePreviousTranscode,
+        message: recovery.message, messageKind: recovery.messageKind,
       });
       return;
     }
@@ -2264,7 +1652,7 @@ export class PlaybackController {
     if (sessionId !== this.#store.getState().playback.sessionId) return;
     const technical = deliveryError?.message
       || (mediaCode ? `MediaError code ${mediaCode}` : "Media element error");
-    this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId, error: playbackError(code, technical) });
+    this.#failSource(source, playbackError(code, technical));
   }
 
   async #prepareSelection(item, signal) {
@@ -2337,7 +1725,6 @@ export class PlaybackController {
       start,
       intent,
       forceSourceMode: SOURCE_MODES.COMPATIBLE,
-      forceAndroidMediaSource: playback.mediaSourceDelivery,
       message: "Changing audio track…",
       messageKind: "audio",
     });
@@ -2840,7 +2227,6 @@ export class PlaybackController {
           forceSourceMode: SOURCE_MODES.COMPATIBLE,
           forceQuality: playback.outputQuality,
           forceStreamNegotiation: playback.streamNegotiation,
-          forceAndroidMediaSource: playback.mediaSourceDelivery,
           message: "Changing encoding preset…",
         });
       }
@@ -2875,7 +2261,6 @@ export class PlaybackController {
           intent: playback.intent,
           forceSourceMode: playback.sourceMode,
           forceQuality: playback.outputQuality,
-          forceAndroidMediaSource: playback.mediaSourceDelivery,
         });
       }
     });
@@ -3051,7 +2436,6 @@ export class PlaybackController {
       start: this.globalTime(),
       intent: playback.intent,
       forceSourceMode: quality !== "auto" ? SOURCE_MODES.COMPATIBLE : null,
-      forceAndroidMediaSource: playback.mediaSourceDelivery,
       message: "Changing playback quality…",
     });
   }
@@ -3071,7 +2455,7 @@ export class PlaybackController {
     const playback = this.#store.getState().playback;
     this.#invalidateWakeLockSession();
     const abandonedRequest = cancelTranscode
-      && this.#sourceController
+      && this.#source
       && playback.sourceMode === SOURCE_MODES.COMPATIBLE
       && playback.item
       ? {
@@ -3081,15 +2465,14 @@ export class PlaybackController {
       }
       : null;
     this.#progressWriter.flush();
-    this.#sourceController?.abort();
-    this.#sourceController = null;
+    this.#source?.cancel();
+    this.#source = null;
     if (playback.pendingSeekTime !== null) {
       this.#store.dispatch({ type: "PLAYBACK_AUX", sessionId: playback.sessionId, values: { pendingSeekTime: null } });
     }
     this.#api.abortItem();
-    if (this.#statusTimer !== null) window.clearTimeout(this.#statusTimer);
-    this.#statusTimer = null;
-    this.#clearStartupTimer();
+    if (this.#retryTimer !== null) window.clearTimeout(this.#retryTimer);
+    this.#retryTimer = null;
     this.#cancelSeekTimer();
     if (!keepElement) this.#resetMediaElement(this.activePlayer());
     if (abandonedRequest) {

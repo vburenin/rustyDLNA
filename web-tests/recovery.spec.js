@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { expect, test } from "@playwright/test";
 
@@ -11,7 +13,7 @@ const item = {
   captions: [], chapters: [], video_codec: "h264", width: 160, height: 90,
 };
 
-async function syntheticLibrary(page, entry = item) {
+async function syntheticLibrary(page, entry = item, entries = [entry]) {
   const contentType = entry.audio_tracks.length
     ? 'video/mp4; codecs="avc1.42C00A,mp4a.40.2"' : 'video/mp4; codecs="avc1.42C00A"';
   const capabilities = {
@@ -20,7 +22,7 @@ async function syntheticLibrary(page, entry = item) {
   };
   await page.route("**/api/web/library?**", (route) => route.fulfill({ json: {
     schema_version: 2, server_name: "Recovery", root_folder_id: "0", capabilities,
-    library_state: "ready", entries: [entry], total: 1, offset: 0, generation: 1, has_more: false,
+    library_state: "ready", entries, total: entries.length, offset: 0, generation: 1, has_more: false,
   } }));
   await page.route("**/api/web/item/*", (route) => route.fulfill({ json: {
     schema_version: 2, id: entry.id, item: entry, audio_tracks: entry.audio_tracks, chapters: [],
@@ -300,5 +302,118 @@ for (const entryPoint of ["seek", "deep link"]) {
     await page.locator("#play-button").evaluate((button) => button.click());
     await expect(page.locator("#player-stage")).toHaveClass(/is-playing/);
     expect(await page.locator("video").evaluate((video) => video.currentTime)).toBeLessThan(2);
+  });
+}
+
+async function originalVideoFixture() {
+  const directory = await mkdtemp(join(tmpdir(), "rustydlna-original-seek-"));
+  try {
+    const path = join(directory, "original.mp4");
+    await execFileAsync("ffmpeg", [
+      "-nostdin", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=25",
+      "-t", "12", "-an", "-c:v", "libx264", "-profile:v", "baseline", "-g", "25",
+      "-movflags", "+faststart", path,
+    ], { timeout: 10_000, maxBuffer: 1024 * 1024 });
+    return await readFile(path);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+for (const entryPoint of ["seek", "deep link"]) {
+  test(`Original playback seeks backward from an explicit end reached by ${entryPoint}`, async ({ page }) => {
+    await syntheticLibrary(page, { ...item, duration_seconds: 12 });
+    const media = await originalVideoFixture();
+    await page.route("**/media/1.mp4?**", (route) => {
+      const range = /^bytes=(\d+)-(\d*)$/.exec(route.request().headers().range || "");
+      const start = range ? Number(range[1]) : 0;
+      const end = range?.[2] ? Math.min(Number(range[2]), media.length - 1) : media.length - 1;
+      return route.fulfill({
+        status: range ? 206 : 200, contentType: "video/mp4", body: media.subarray(start, end + 1),
+        headers: { "Accept-Ranges": "bytes", ...(range ? { "Content-Range": `bytes ${start}-${end}/${media.length}` } : {}) },
+      });
+    });
+    await page.addInitScript(() => localStorage.setItem("rustydlna.stream", "direct"));
+    if (entryPoint === "seek") {
+      await selectFixture(page);
+      await seek(page, 12);
+    } else {
+      await page.goto("/?view=video&item=1&t=12");
+    }
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Replay");
+    await seek(page, 5);
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+    await expect.poll(() => page.locator("video").evaluate((video) => video.currentTime)).toBeCloseTo(5, 1);
+    expect(await page.locator("video").evaluate((video) => video.paused)).toBe(true);
+    await page.locator("#play-button").evaluate((button) => button.click());
+    await expect(page.locator("#player-stage")).toHaveClass(/is-playing/);
+    await expect.poll(async () => Number(await page.locator("#timeline").inputValue())).toBeGreaterThanOrEqual(5);
+    await expect.poll(() => page.locator("video").evaluate((video) => video.currentTime)).toBeGreaterThan(5.1);
+    // A second pause exercises the replacement source's event listeners.
+    await page.locator("#play-button").evaluate((button) => button.click());
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+  });
+}
+
+for (const producerState of ["failed", "producing"]) {
+  test(`a truncated portable stream with a ${producerState} producer preserves progress and stops without advancing the queue`, async ({ page }) => {
+    await syntheticLibrary(page, item, [item, { ...item, id: "2", title: "Next fixture" }]);
+    await page.addInitScript(() => {
+      localStorage.setItem("rustydlna.stream", "compat");
+      localStorage.setItem("rustydlna.autoplay", "true");
+      localStorage.setItem("rustydlna.webProgress.v1", JSON.stringify({
+        1: { position: 40, duration: 600, updated: Date.now() },
+      }));
+      HTMLMediaElement.prototype.canPlayType = () => "";
+      if (globalThis.MediaSource) Object.defineProperty(MediaSource, "isTypeSupported", { value: () => false });
+      Object.defineProperty(navigator, "mediaCapabilities", { value: {
+        decodingInfo: async () => ({ supported: false, smooth: false, powerEfficient: false }),
+      } });
+    });
+    let checksAfterEnd = 0;
+    const initialQueries = new Set();
+    await page.route("**/api/web/transcode/*", async (route) => {
+      const requestId = new URL(route.request().url()).searchParams.get("request");
+      if (route.request().method() === "GET" && !initialQueries.has(requestId)) {
+        initialQueries.add(requestId);
+        return route.fulfill({ json: { schema_version: 2, state: "producing" } });
+      }
+      const ended = route.request().method() === "GET"
+        && await page.locator("video").evaluate((video) => video.ended);
+      if (ended) {
+        checksAfterEnd += 1;
+        // Duplicate media failures while the producer query is pending must
+        // share recovery, without consuming retries before a new source loads.
+        await page.locator("video").evaluate((video) => {
+          video.dispatchEvent(new Event("error"));
+          video.dispatchEvent(new Event("ended"));
+        });
+      }
+      await route.fulfill({ json: { schema_version: 2, state: ended ? producerState : "producing" } });
+    });
+    const media = await readFile(new URL("../testdata/library/video/tagged.mp4", import.meta.url));
+    const requests = [];
+    await page.route("**/web/media/*", async (route) => {
+      requests.push(new URL(route.request().url()));
+      await route.fulfill({ contentType: "video/mp4", body: media });
+    });
+    await page.goto("/?view=video");
+    await page.getByRole("button", { name: "Play Recovery fixture" }).click();
+    await expect(page.locator("#queue-position")).toHaveText("Item 1 of 2");
+    await page.locator("#resume-button").click();
+    await expect(page.locator("#player-message")).toContainText("The server could not prepare this title.");
+    const expectedGenerations = producerState === "failed" ? 1 : 4;
+    expect(checksAfterEnd).toBeGreaterThan(0);
+    // Native loaders may request a URL several times (for example for ranges).
+    // Count prepared generations, whose retry budget is shared across errors.
+    expect(new Set(requests.map((url) => url.searchParams.get("request"))).size).toBe(expectedGenerations);
+    expect(requests[0].searchParams.get("video_mode")).toBe("transcode");
+    expect(requests[0].searchParams.get("audio_mode")).toBe("transcode");
+    await expect(page.locator("#timeline")).not.toHaveValue("600");
+    await expect(page.locator("#queue-position")).toHaveText("Item 1 of 2");
+    await expect(page.locator("#now-playing-title")).toHaveText("Recovery fixture");
+    const progress = await page.evaluate(() => JSON.parse(localStorage.getItem("rustydlna.webProgress.v1") || "{}")[1]);
+    expect(progress?.position).toBe(40);
+    expect(progress?.duration).toBe(600);
   });
 }

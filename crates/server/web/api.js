@@ -171,10 +171,6 @@ export class WebApi {
     return responseJson(response);
   }
 
-  async reportTranscodeCanPlay(id, requestId, sessionId, signal = null) {
-    return this.reportTranscodeStartup(id, requestId, sessionId, "canplay", signal);
-  }
-
   async cancelTranscode(id, requestId, sessionId = null) {
     const params = new URLSearchParams({ request: String(requestId) });
     if (sessionId !== null) params.set("session", String(sessionId));

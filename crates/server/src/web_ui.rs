@@ -20,6 +20,8 @@ const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
 const API_JS: &str = include_str!("../web/api.js");
 const MEDIA_SOURCE_JS: &str = include_str!("../web/media-source.js");
+const PLAYBACK_SOURCE_JS: &str = include_str!("../web/playback-source.js");
+const SOURCE_SELECTION_JS: &str = include_str!("../web/source-selection.js");
 const CAPTIONS_JS: &str = include_str!("../web/captions.js");
 const CORE_JS: &str = include_str!("../web/core.js");
 const LIBRARY_JS: &str = include_str!("../web/library.js");
@@ -597,6 +599,8 @@ pub(crate) fn asset(app: &App, path: &str) -> HttpResponse {
         "/web/app.js" => ("text/javascript; charset=utf-8", APP_JS),
         "/web/api.js" => ("text/javascript; charset=utf-8", API_JS),
         "/web/media-source.js" => ("text/javascript; charset=utf-8", MEDIA_SOURCE_JS),
+        "/web/playback-source.js" => ("text/javascript; charset=utf-8", PLAYBACK_SOURCE_JS),
+        "/web/source-selection.js" => ("text/javascript; charset=utf-8", SOURCE_SELECTION_JS),
         "/web/captions.js" => ("text/javascript; charset=utf-8", CAPTIONS_JS),
         "/web/core.js" => ("text/javascript; charset=utf-8", CORE_JS),
         "/web/library.js" => ("text/javascript; charset=utf-8", LIBRARY_JS),
