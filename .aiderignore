@@ -1,0 +1,22 @@
+# Agent context exclusions; shared source for all three installed ignore files.
+# Ignore support varies by harness. These patterns are not access controls.
+.env
+.env.*
+!.env.example
+**/*.pem
+**/*.key
+**/secrets/**
+**/credentials/**
+node_modules/
+dist/
+build/
+target/
+vendor/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+coverage/
+.nyc_output/
+.git/

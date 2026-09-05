@@ -1,0 +1,10 @@
+---
+description: Point agents at AGENTS.md as the canonical project contract
+alwaysApply: true
+---
+
+# Agents pointer
+
+Read and follow `AGENTS.md` at the repo root for decision policy, stack commands, boundaries, and Definition of Done (`scripts/agent-verify.sh`).
+
+Keep harness rules thin — do not fork a second novel here.

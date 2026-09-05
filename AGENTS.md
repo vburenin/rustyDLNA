@@ -4,6 +4,22 @@ This file applies to the entire repository. rustyDLNA is a standalone DLNA / UPn
 media server. Describe protocol behavior, object IDs, renderer handling, and
 compatibility decisions as rustyDLNA's own contract.
 
+## Decision policy
+# why: proceed within the user's authorized scope without repeated approvals
+- Default: **decide and proceed**. Prefer a reasonable choice over asking.
+- Reuse authorization already given. Ask before destructive actions, changes to security guarantees, or public API / schema breaks only when outside that scope; routine fixes and tests should proceed.
+- If blocked, state the blocker in one line and the smallest unblock ask.
+- Definition of Done: configured checks in `./scripts/agent-verify.sh` pass. Report failures, unconfigured checks, and skips honestly; a skip is not a pass.
+
+## Stack
+
+- Rust 1.97.1 / edition 2021 Cargo workspace; embedded HTML/CSS/JavaScript;
+  Node/Playwright browser tests; Python 3.10+ and shell operator/validation tools.
+- Package managers: Cargo (`Cargo.lock`) and npm (`package-lock.json`). Python
+  tools use the standard library and require no PyPI packages.
+- Command working directories, sources, and CI prerequisites are recorded in
+  `docs/INDEX.md`. The server and full quality gate require Linux.
+
 ## Project index
 
 ### Workspace crates
@@ -83,6 +99,8 @@ frontend build or runtime asset directory.
 
 ### Authoritative documentation
 
+- `docs/INDEX.md`: Documentation index, command sources, and runtime prerequisites.
+- `docs/architecture.md`: Architecture overview and links to detailed contracts.
 - `README.md`: Product overview, supported use, and quick start.
 - `docs/COMPATIBILITY.md`: Supported product surface and intentional exclusions.
 - `docs/PROTOCOL_CONTRACT.md`: Subtle protocol and media-library invariants.
@@ -111,6 +129,7 @@ work in an issue.
   storage as part of ordinary development or tests unless explicitly asked.
 - Keep generated output out of Git: `target/`, `fuzz/target/`, `node_modules/`,
   Playwright reports, caches, databases, and local configuration stay untracked.
+- Match existing style and naming; avoid unrelated formatting changes.
 - Prefer the smallest change that owns the behavior at the right layer. Avoid
   duplicating protocol constants, codec tables, route parsing, or policy across
   crates.
@@ -223,7 +242,18 @@ work in an issue.
   historical source-lineage framing and comparisons that do not help a user or
   maintainer operate the current implementation.
 
+## Boundaries
+# why: autonomy without foot-guns
+- Do not commit secrets, `.env`, or credentials.
+- Do not force-push, rewrite shared history, or delete protected branches.
+- Do not run destructive prod commands unless explicitly requested.
+- Do not expand scope into unrelated refactors.
+- Respect context exclusions (`.aiignore`, `.cursorignore`, `.aiderignore`); support varies by harness and they are not access controls.
+
 ## Verification
+
+The shared agent entrypoint is `./scripts/agent-verify.sh`. It invokes
+`scripts/check.sh` once and preserves the canonical gate's checks and failures.
 
 Run the narrowest relevant checks while iterating, then expand according to
 risk. The canonical full gate is:
@@ -264,3 +294,15 @@ Before handing off a change:
 4. Confirm tests did not alter tracked fixtures or create accidental artifacts.
 5. Summarize behavior changed, validation performed, and whether changes are
    committed or pushed.
+
+## Agent workflow
+
+- Read this file and `docs/INDEX.md` before non-trivial work; follow applicable
+  nested instructions and harness overrides.
+- Keep harness files (`CLAUDE.md`, Cursor rules, and Copilot instructions) as
+  imports or pointers to this contract.
+- For larger changes, use `docs/plans/_template.md` as an issue outline, following
+  the existing policy that future work belongs in issues.
+- Record significant lasting decisions in `docs/adr/` using `0001-template.md`;
+  keep current behavior in the authoritative product guides.
+- PRs should summarize the change and validation, linking relevant issues or ADRs.

@@ -1,3 +1,9 @@
+# AI / agent local artifacts (keep shared Aider config and ignore files tracked)
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v*/
+.lscr/
+
 /target
 /.docker-cache/dovi-tool/*
 !/.docker-cache/dovi-tool/.gitkeep
