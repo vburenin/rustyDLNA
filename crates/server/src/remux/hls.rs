@@ -190,6 +190,15 @@ impl Index {
         self.init_end.is_some() && (self.fragments.len() > after || complete)
     }
 
+    pub(super) fn produced_duration_seconds(&self) -> Option<f64> {
+        let seconds = self
+            .fragments
+            .iter()
+            .map(|fragment| fragment.duration)
+            .sum::<f64>();
+        (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+    }
+
     pub(super) fn playlist(&self, init_uri: &str, segment_uri: &str) -> Result<String, String> {
         if self.segments.is_empty() {
             return Err("fragmented MP4 has no complete media segments".into());
@@ -714,6 +723,7 @@ mod tests {
         index.update(&path, true).unwrap();
         assert_eq!(index.segments.len(), 2);
         assert_eq!(index.fragments.len(), 3);
+        assert_eq!(index.produced_duration_seconds(), Some(3.0));
         assert_eq!(index.segments[0].duration, 2.0);
         assert_eq!(index.segments[1].duration, 1.0);
         let playlist = index
@@ -805,9 +815,11 @@ mod tests {
         assert!(!index.has_playable_segment());
         assert!(!index.has_startup_buffer(false));
         assert!(index.has_mse_startup_buffer(false));
+        assert_eq!(index.produced_duration_seconds(), Some(2.0));
         file.write_all(&fixture[final_moof..]).unwrap();
         file.flush().unwrap();
         index.update(&path, false).unwrap();
+        assert_eq!(index.produced_duration_seconds(), Some(3.0));
         assert!(index.has_playable_segment());
         assert!(index.has_startup_buffer(false));
         assert!(!index

@@ -274,6 +274,7 @@ struct WebTranscodeStatus {
     request_id: Option<u64>,
     state: &'static str,
     retry_after_seconds: Option<u64>,
+    produced_seconds: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -2286,12 +2287,16 @@ pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
     } else {
         crate::remux::web_job_state(app, id, request_id)
     };
+    let produced_seconds = (!cancelled)
+        .then(|| crate::remux::web_job_produced_seconds(app, id, request_id))
+        .flatten();
     let mut response = json_response(&WebTranscodeStatus {
         schema_version: WEB_SCHEMA_VERSION,
         item_id: id.into(),
         request_id,
         state,
         retry_after_seconds,
+        produced_seconds,
     });
     if let Some(retry_after) = retry_after_seconds {
         response.set("Retry-After", retry_after);

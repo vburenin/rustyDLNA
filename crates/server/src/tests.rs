@@ -6454,6 +6454,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     let transcode_status: serde_json::Value =
         serde_json::from_slice(&transcode_status.body).unwrap();
     assert_eq!(transcode_status["state"], "idle");
+    assert!(transcode_status["produced_seconds"].is_null());
     let scoped_status = app.handle(&req(&get(
         &format!("/api/web/transcode/{}?request=77", dvp7.detail_id),
         "Browser/1.0",

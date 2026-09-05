@@ -773,7 +773,7 @@ used in item, media, caption, preview, and transcode-status URLs.
 | `/web/{app,api,core,library,player,preferences,store}.js` | Embedded ES modules |
 | `/api/web/library` | Versioned folder, flat-library, or bounded Continue Watching hydration page, plus server root, capabilities, generation, and item DTOs |
 | `/api/web/item/{id}` | One item; `enrich=1` explicitly probes legacy stream metadata |
-| `/api/web/transcode/{id}?session={session_id}&request={generation_id}` | GET returns generation-scoped `queued`, `starting`, `producing`, `ready`, `cancelled`, or `failed` state; POST with a bounded startup `event` records the current generation's server-clock timing; DELETE records and cancels an abandoned generation |
+| `/api/web/transcode/{id}?session={session_id}&request={generation_id}` | GET returns generation-scoped `queued`, `starting`, `producing`, `ready`, `cancelled`, or `failed` state plus optional `produced_seconds` measured from complete output-fragment timestamps; POST with a bounded startup `event` records the current generation's server-clock timing; DELETE records and cancels an abandoned generation |
 | `/web/download/{id}` | Original video as an attachment, with byte ranges and the source filename |
 | `/web/media/{id}.mp4?mode=direct` | Original jailed media with byte ranges |
 | `/web/media/{id}.mp4?...` | Compatible stream with validated audio track, start, quality, negotiated `video_mode`/`video_output`/`audio_mode`, reason, playback session, and generation parameters |

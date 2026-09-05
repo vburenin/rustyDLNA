@@ -1953,6 +1953,28 @@ pub(crate) fn web_job_state(
     }
 }
 
+/// Return the exact media time represented by complete fragments currently
+/// available from a web-compatible producer. Parsing is incremental and only
+/// happens when a client asks for status, so ordinary media delivery does not
+/// gain a polling cost.
+pub(crate) fn web_job_produced_seconds(
+    app: &App,
+    detail_id: i64,
+    request_id: Option<u64>,
+) -> Option<f64> {
+    let job = {
+        let jobs = crate::lock_recover(&app.remuxes);
+        jobs.values()
+            .find(|job| job.detail_id == detail_id && job.matches_web_request(request_id))
+            .cloned()
+    }?;
+    let complete = matches!(job.state(), RemuxState::Complete);
+    let path = if complete { &job.dest } else { &job.part };
+    let mut index = crate::lock_recover(&job.hls_index);
+    index.update(path, complete).ok()?;
+    index.produced_duration_seconds()
+}
+
 fn keep_web_request_alive_for(
     app: &App,
     detail_id: i64,
