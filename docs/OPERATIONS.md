@@ -390,3 +390,22 @@ host filesystem read-only except for the cache, restarts on failure, and gives
 graceful shutdown 45 seconds before systemd kills remaining processes. Hardware
 encoding needs a reviewed override for the required `/dev/dri` device and group;
 do not disable the other protections wholesale.
+
+## Soak validation
+
+The scheduled GitHub Actions soak runs for five hours, leaving time for setup
+and report upload within the [six-hour hosted job limit](https://docs.github.com/en/actions/reference/limits).
+Manual workflow runs accept 1–18000 seconds. Each cycle exercises the isolated
+socket suite and checks process, thread, descriptor, memory, database, and cache
+bounds. The workflow retains `soak-report.tsv` with the source fingerprint,
+completed cycles, and measured resource peaks.
+
+For a continuous 24-hour run, use a Linux development host with the prerequisites
+in [the command reference](INDEX.md#runtime-and-ci-prerequisites):
+
+```sh
+SOAK_SECONDS=86400 SOAK_REPORT=/tmp/rustydlna-soak-report.tsv scripts/soak.sh
+```
+
+Keep the source tree unchanged during the run. The script uses temporary test
+libraries and isolated ports; it does not exercise the live media library.

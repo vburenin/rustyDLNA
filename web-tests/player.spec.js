@@ -2827,6 +2827,9 @@ test("an unsupported copied rendition retries portable codecs then a mobile-safe
   await usePreference(page, "stream", "compat");
   await disableFragmentedDelivery(page);
   await page.addInitScript(() => {
+    // Keep the 0.4-second fixture from ending and disposing its source before
+    // this test injects each decoder failure, including on slower CI runners.
+    HTMLMediaElement.prototype.play = () => Promise.resolve();
     const original = HTMLMediaElement.prototype.canPlayType;
     HTMLMediaElement.prototype.canPlayType = function negotiatedCanPlayType(contentType) {
       if (String(contentType).includes("hvc1.")) return "probably";

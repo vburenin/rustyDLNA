@@ -1,4 +1,4 @@
-name: 24-hour soak
+name: Scheduled soak
 
 on:
   schedule:
@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: Soak duration in seconds
+        description: Soak duration in seconds (1–18000; hosted runner limit)
         required: false
-        default: "86400"
+        default: "18000"
 
 permissions:
   contents: read
@@ -20,14 +20,23 @@ concurrency:
 jobs:
   soak:
     runs-on: ubuntu-24.04
-    timeout-minutes: 1500
+    # Hosted jobs stop after six hours. Leave time for setup and evidence upload.
+    timeout-minutes: 330
+    env:
+      SOAK_SECONDS: ${{ inputs.seconds || '18000' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Validate hosted soak duration
+        shell: bash
+        run: |
+          if [[ ! "$SOAK_SECONDS" =~ ^[1-9][0-9]{0,4}$ ]] || (( SOAK_SECONDS > 18000 )); then
+            echo "::error::Soak duration must be an integer from 1 to 18000 seconds. Use scripts/soak.sh locally for longer runs."
+            exit 2
+          fi
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavcodec-dev libavformat-dev libavutil-dev libswscale-dev ffmpeg curl time
       - run: rustup toolchain install 1.97.1 --profile minimal && rustup default 1.97.1
       - name: Scan/browse/event/remux/restart soak
         env:
-          SOAK_SECONDS: ${{ inputs.seconds || '86400' }}
           SOAK_REPORT: soak-report.tsv
         run: scripts/soak.sh
       - name: Publish summary
