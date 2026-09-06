@@ -341,8 +341,11 @@ transcode outputs, Kodi bookmarks, and the persisted UUID file. A `uuid =` in
 the mounted TOML is kept, so clients still see the same UDN. The shipped live
 Compose file uses this managed volume. A custom bind mount at
 `/var/cache/rusty-dlna` is operator-owned: normal restart volume initialization
-does not inspect it, and `--clean` refuses to delete it. Validate its uid/gid
-10001 ownership and delete its host files yourself. Raise
+does not inspect it, and `--clean` refuses to delete it. A named cache volume
+with local bind `driver_opts` is the same class of host path: Compose still
+reports a volume, but `volume rm` would leave the files on disk, so `--clean`
+refuses rather than pretending the catalog is gone. Validate uid/gid 10001
+ownership and delete those host files yourself. Raise
 `RUSTY_DLNA_START_TIMEOUT` if the first rescan takes longer than 120 seconds
 to become healthy.
 

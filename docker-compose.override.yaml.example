@@ -15,3 +15,15 @@ services:
       # - /path/to/realpath:/path/to/realpath:ro
       # Optional: local identity (uuid, advertise_ip, remaps)
       # - ./rusty-dlna.live.toml:/etc/rusty-dlna.toml:ro
+
+# Optional: keep the named cache volume (restart.sh ownership init still
+# works) but store it on a host path such as a ZFS dataset. --clean refuses
+# to wipe bind-backed data; delete the host files yourself.
+# volumes:
+#   rusty-dlna-cache:
+#     name: rusty-dlna-cache
+#     driver: local
+#     driver_opts:
+#       type: none
+#       o: bind
+#       device: /storage/pool/rusty-dlna-cache

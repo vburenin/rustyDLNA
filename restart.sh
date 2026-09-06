@@ -14,7 +14,8 @@ Rebuild and restart the live rusty-dlna container.
             Removes files.db, artwork, derived images, transcode cache,
             Kodi bookmarks, and the persisted UUID file. The configured
             name (RUSTY_DLNA_CACHE_VOLUME) is kept; Compose recreates a
-            labeled empty volume. Bind-mounted caches are refused.
+            labeled empty volume. Bind mounts and bind-backed named
+            volumes are refused; delete those host files yourself.
             A uuid= in the mounted TOML is kept.
 
   -h, --help   Show this help.
@@ -67,6 +68,12 @@ cache_mount_field() {
         "$CONTAINER" 2>/dev/null || true
 }
 
+cache_volume_bind_device() {
+    docker volume inspect \
+        --format '{{if .Options}}{{index .Options "device"}}{{end}}' \
+        "$CACHE_VOLUME" 2>/dev/null || true
+}
+
 docker compose config --quiet
 docker compose build
 
@@ -86,6 +93,11 @@ if [[ "$CLEAN" -eq 1 ]]; then
         docker compose rm --force rusty-dlna
     fi
     if docker volume inspect "$CACHE_VOLUME" >/dev/null 2>&1; then
+        bind_device=$(cache_volume_bind_device)
+        if [[ -n "$bind_device" ]]; then
+            echo "refusing --clean: $CACHE_VOLUME is bind-backed at $bind_device; delete those host files yourself" >&2
+            exit 2
+        fi
         echo "discarding cache volume $CACHE_VOLUME (catalog, UUID file, bookmarks, transcode cache)"
         docker volume rm "$CACHE_VOLUME"
     else
