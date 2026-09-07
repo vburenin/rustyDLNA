@@ -13,7 +13,6 @@ import { clearProgress, progressDetails, progressSnapshot, savePreference } from
 
 const CONTINUE_BATCH_SIZE = 100;
 const MAX_CONTINUE_ITEMS = 500;
-const LIBRARY_PAGE_SIZE = 24;
 const MAX_ACTIVE_ARTWORK = 4;
 
 export class LibraryController {
@@ -24,15 +23,12 @@ export class LibraryController {
   #onNavigate;
   #request = 0;
   #searchTimer = null;
-  #queueController = null;
   #continueController = null;
   #continueProgress = null;
   #liveMessage = "";
-  #pagingObserver = null;
-  #pagingFrame = null;
-  #pagingActive = false;
-  #pagingNeedsExit = false;
-  #artworkObserver = null;
+  #artworkFrame = null;
+  #gridObserver = null;
+  #gridWidth = -1;
   #artworkQueue = new Set();
   #artworkRequests = new Map();
 
@@ -43,7 +39,6 @@ export class LibraryController {
     this.#onSelect = onSelect;
     this.#onNavigate = onNavigate;
     this.#bind();
-    this.#setupInfiniteScroll();
     this.#setupArtworkLoading();
   }
 
@@ -52,7 +47,7 @@ export class LibraryController {
     this.#dom.searchInput.value = navigation.query;
     this.#dom.sortControl.value = navigation.sort;
     this.syncTabs();
-    return this.load({ reset: true });
+    return this.load();
   }
 
   cancelPendingSearch() {
@@ -74,32 +69,19 @@ export class LibraryController {
       const target = navigationUrl(window.location.href, state.navigation, state.server.rootFolderId);
       history === "replace" ? window.history.replaceState({}, "", target) : window.history.pushState({}, "", target);
     }
-    return this.load({ reset: true, focusAfterLoad });
+    return this.load({ focusAfterLoad });
   }
 
-  async load({ reset = false, focusAfterLoad = false } = {}) {
-    const state = this.#store.getState();
-    if (!reset && (state.library.status === "loading_more" || !state.library.hasMore)) return;
-    if (reset) this.#pagingNeedsExit = false;
-    const append = !reset;
-    const appendFrom = state.library.entries.length;
-    const appendAnchor = append ? this.#captureAppendAnchor() : null;
+  async load({ focusAfterLoad = false } = {}) {
     const requestId = ++this.#request;
-    this.#store.dispatch({ type: "LIBRARY_LOADING", append, requestId });
+    this.#store.dispatch({ type: "LIBRARY_LOADING", requestId });
     const current = this.#store.getState();
-    this.render({ preserveCards: append });
+    this.render();
     if (current.navigation.view !== "continue") this.#continueProgress = null;
-    const offset = reset ? 0 : current.library.offset;
-    const generation = reset ? null : current.library.generation;
     try {
       const payload = current.navigation.view === "continue"
         ? await this.#continueWatchingPage(current.navigation.query)
-        : await this.#api.library(current.navigation, {
-          offset,
-          limit: LIBRARY_PAGE_SIZE,
-          generation,
-          replace: reset,
-        });
+        : await this.#api.librarySnapshot(current.navigation);
       if (requestId !== this.#request) return;
       const preferredQuality = this.#store.getState().preferences.quality;
       const quality = reconcileQualityPreference(
@@ -110,40 +92,29 @@ export class LibraryController {
         savePreference("quality", quality);
         this.#store.dispatch({ type: "PREFERENCE", name: "quality", value: quality });
       }
-      this.#store.dispatch({ type: "LIBRARY_SUCCESS", append, requestId, payload });
+      this.#store.dispatch({ type: "LIBRARY_SUCCESS", requestId, payload });
       if (current.navigation.view === "folders" && !current.navigation.folder) {
         this.#store.dispatch({ type: "NAVIGATE", navigation: { folder: payload.root_folder_id } });
       }
-      this.render({ appendFrom: append ? appendFrom : null });
-      if (appendAnchor) this.#restoreAppendAnchor(appendAnchor, requestId);
-      if (append) {
-        // Appending a page can move the sentinel without producing an
-        // IntersectionObserver exit in WebKit. Re-arm from the new geometry
-        // so the next real approach to the end can request another page.
-        this.#pagingNeedsExit = false;
-        this.#schedulePagingCheck();
-      }
+      this.render();
       if (focusAfterLoad) {
         this.#dom.libraryPanel.focus({ preventScroll: true });
       }
     } catch (error) {
       if (error?.name === "AbortError" || requestId !== this.#request) return;
       this.#store.dispatch({ type: "LIBRARY_ERROR", requestId, error });
-      this.render({ preserveCards: append });
+      this.render();
     }
   }
 
-  render({ preserveCards = false, appendFrom = null } = {}) {
+  render() {
     const state = this.#store.getState();
     const { library, navigation, server, playback } = state;
     document.title = playback.item ? `${playback.item.title} · ${server.name}` : `${server.name} · Library`;
     this.#dom.serverName.textContent = server.name;
     this.#dom.serverState.dataset.state = server.state;
     this.#dom.libraryRetryTop.hidden = library.status !== "error";
-    this.#dom.loading.hidden = !["loading", "loading_more"].includes(library.status);
-    this.#dom.loadingLabel.textContent = library.status === "loading_more"
-      ? "Loading more…"
-      : "Loading library…";
+    this.#dom.loading.hidden = library.status !== "loading";
     this.#dom.libraryEmpty.hidden = !["ready", "error"].includes(library.status)
       || (library.status === "ready" && library.total > 0);
     this.#dom.libraryRetry.hidden = library.status !== "error";
@@ -156,10 +127,9 @@ export class LibraryController {
       this.#dom.libraryEmptyDetail.textContent = friendlyLibraryError(library.error);
       this.#dom.libraryCount.textContent = "Library unavailable";
       this.#dom.libraryPanel.setAttribute("aria-busy", "false");
-      this.#syncInfiniteScroll(library);
       return;
     }
-    this.#dom.libraryPanel.setAttribute("aria-busy", String(["loading", "loading_more"].includes(library.status)));
+    this.#dom.libraryPanel.setAttribute("aria-busy", String(library.status === "loading"));
     this.#dom.libraryCount.textContent = library.status === "loading" ? "Connecting…" : `${library.total} ${noun}`;
     this.#dom.libraryEmptyTitle.textContent = navigation.query ? `No results for “${navigation.query}”`
       : navigation.view === "continue" ? "Nothing to continue yet" : "No media found";
@@ -170,16 +140,13 @@ export class LibraryController {
       ? `${library.total} ${library.total === 1 ? "result" : "results"} for “${navigation.query}”`
       : `${library.total} ${noun}`;
     this.renderBreadcrumbs();
-    if (!preserveCards) this.renderCards({ appendFrom });
+    this.renderCards();
     this.syncTabs();
-    this.#syncInfiniteScroll(library);
   }
 
   #announceState(library, server, noun) {
     let message = "";
-    if (library.status === "loading_more") {
-      message = "Loading more library items.";
-    } else if (library.status === "loading") {
+    if (library.status === "loading") {
       message = server.state === "connecting" ? "Connecting to the library." : "Loading the library.";
     } else if (library.status === "error") {
       message = "The library is unavailable. Check the server connection and try again.";
@@ -277,46 +244,57 @@ export class LibraryController {
     });
   }
 
-  renderCards({ appendFrom = null } = {}) {
+  renderCards() {
     const { library, playback, navigation } = this.#store.getState();
-    if (appendFrom === null) {
-      this.#artworkObserver?.disconnect();
-      this.#artworkQueue.clear();
-      // Detached images may never emit load/error. Release their admission
-      // slots explicitly so a slow old view cannot starve the current one.
-      for (const cancel of this.#artworkRequests.values()) cancel();
-      this.#dom.grid.replaceChildren();
-    }
-    const entries = appendFrom === null ? library.entries : library.entries.slice(appendFrom);
-    for (const entry of entries) {
+    this.#artworkQueue.clear();
+    // Detached images may never emit load/error. Release their admission
+    // slots explicitly so a slow old view cannot starve the current one.
+    for (const cancel of this.#artworkRequests.values()) cancel();
+    const fragment = document.createDocumentFragment();
+    const columns = getComputedStyle(this.#dom.grid).gridTemplateColumns.split(" ").length;
+    this.#dom.grid.style.setProperty("--library-columns", columns);
+    const chunkSize = library.entries.length >= 500
+      && CSS.supports("content-visibility", "auto") ? columns * 8 : 0;
+    const appendCard = (parent, card) => {
+      if (!chunkSize) {
+        parent.append(card);
+        return;
+      }
+      let chunk = parent.lastElementChild;
+      if (!chunk?.classList.contains("media-chunk") || chunk.children.length >= chunkSize) {
+        chunk = document.createElement("div");
+        chunk.className = "media-chunk";
+        parent.append(chunk);
+      }
+      chunk.append(card);
+    };
+    for (const entry of library.entries) {
       const card = entry.entry_type === "folder" ? this.#folderCard(entry) : this.#mediaCard(entry);
       if (entry.entry_type === "media" && String(entry.id) === String(playback.item?.id)) card.classList.add("playing");
       const collection = navigation.view === "library" && navigation.sort === "title"
         ? entry.collection : null;
       if (collection?.id && collection.title) {
-        let section = this.#dom.grid.lastElementChild;
+        let section = fragment.lastElementChild;
         if (section?.dataset.collectionId !== collection.id) {
           section = document.createElement("section");
           section.className = "collection-group";
           section.dataset.collectionId = collection.id;
           const heading = document.createElement("h3");
-          heading.id = `collection-${this.#dom.grid.children.length}`;
+          heading.id = `collection-${fragment.children.length}`;
           heading.className = "collection-heading";
           heading.textContent = collection.title;
           section.setAttribute("aria-labelledby", heading.id);
           section.append(heading);
-          this.#dom.grid.append(section);
+          fragment.append(section);
         }
-        section.append(card);
+        appendCard(section, card);
       } else {
-        this.#dom.grid.append(card);
+        appendCard(fragment, card);
       }
     }
-    // IntersectionObserver delivery is advisory: WebKit can omit the initial
-    // callback while a large grid is appended under load. Seed the same
-    // bounded queue from actual post-layout geometry so visible artwork never
-    // remains permanently blank.
-    window.requestAnimationFrame(() => this.#queueNearbyArtwork());
+    this.#dom.grid.replaceChildren(fragment);
+    this.#gridWidth = -1;
+    this.#scheduleArtwork();
   }
 
   markCurrent(itemId) {
@@ -378,7 +356,6 @@ export class LibraryController {
       image.fetchPriority = "low";
       image.alt = "";
       image.dataset.src = item.art_url;
-      this.#observeArtwork(image);
       art.append(image);
     }
     const fallback = document.createElement("span");
@@ -495,125 +472,84 @@ export class LibraryController {
   }
 
   snapshotQueue() {
-    this.#queueController?.abort();
-    const controller = new AbortController();
-    this.#queueController = controller;
-    const state = this.#store.getState();
-    const requestId = state.queue.requestId + 1;
-    const context = { ...state.navigation };
-    const generation = state.library.generation;
-    const entries = state.library.entries.filter((entry) => entry.entry_type === "media");
-    this.#store.dispatch({ type: "QUEUE_LOADING", entries, generation, requestId });
-    if (!state.library.hasMore) {
-      this.#store.dispatch({ type: "QUEUE_SUCCESS", entries, generation, requestId });
-      if (this.#queueController === controller) this.#queueController = null;
-      return;
-    }
-    this.#completeQueue(
-      context,
-      generation,
-      state.library.offset,
-      state.library.total,
-      entries,
-      controller,
-      requestId,
-    );
-  }
-
-  async #completeQueue(context, generation, offset, total, initial, controller, requestId) {
-    const entries = [...initial];
-    const current = () => this.#queueController === controller
-      && !controller.signal.aborted
-      && this.#store.getState().queue.requestId === requestId;
-    try {
-      while (offset < total) {
-        const payload = await this.#api.library(context, {
-          offset,
-          limit: 200,
-          generation,
-          replace: false,
-          signal: controller.signal,
-        });
-        if (!current()) return;
-        entries.push(...payload.entries.filter((entry) => entry.entry_type === "media"));
-        const advanced = payload.entries.length;
-        if (advanced === 0) break;
-        offset += advanced;
-      }
-      if (current()) this.#store.dispatch({ type: "QUEUE_SUCCESS", entries, generation, requestId });
-    } catch (error) {
-      if (error?.name === "AbortError" || !current()) return;
-      this.#store.dispatch({ type: "QUEUE_ERROR", error, requestId });
-    } finally {
-      if (this.#queueController === controller) this.#queueController = null;
-    }
-  }
-
-  #setupInfiniteScroll() {
-    if (typeof window.IntersectionObserver === "function") {
-      this.#pagingObserver = new IntersectionObserver((entries) => {
-        const intersecting = entries.some((entry) => entry.isIntersecting);
-        if (!intersecting) {
-          this.#pagingNeedsExit = false;
-          return;
-        }
-        if (this.#pagingNeedsExit || !this.#nextPageIsNear()) return;
-        this.#pagingNeedsExit = true;
-        void this.load({ reset: false });
-      }, { rootMargin: "800px 0px" });
-    } else {
-      const schedule = () => this.#schedulePagingCheck();
-      window.addEventListener("scroll", schedule, { passive: true });
-      window.addEventListener("resize", schedule);
-    }
-    const rearm = () => {
-      if (this.#store.getState().library.status !== "ready") return;
-      this.#pagingNeedsExit = false;
-      // Input events arrive before their default scroll. The animation-frame
-      // check observes the resulting position and also covers WebKit missing
-      // a sentinel intersection callback.
-      this.#schedulePagingCheck();
-    };
-    window.addEventListener("wheel", rearm, { passive: true });
-    window.addEventListener("touchmove", rearm, { passive: true });
-    window.addEventListener("pointerdown", rearm, { passive: true });
-    window.addEventListener("keydown", rearm);
+    const { library } = this.#store.getState();
+    this.#store.dispatch({
+      type: "QUEUE_REPLACE",
+      entries: library.entries.filter((entry) => entry.entry_type === "media"),
+      generation: library.generation,
+    });
   }
 
   #setupArtworkLoading() {
-    if (typeof window.IntersectionObserver !== "function") return;
-    this.#artworkObserver = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        if (entry.isIntersecting) this.#artworkQueue.add(entry.target);
-        else this.#artworkQueue.delete(entry.target);
-      }
-      this.#drainArtworkQueue();
-    }, { rootMargin: "400px 0px" });
+    const schedule = () => this.#scheduleArtwork();
+    // Capture also covers the independently scrolling landscape library.
+    window.addEventListener("scroll", schedule, { passive: true, capture: true });
+    window.addEventListener("resize", schedule);
+    this.#dom.grid.addEventListener("contentvisibilityautostatechange", schedule);
+    if (typeof window.ResizeObserver === "function") {
+      this.#gridObserver = new ResizeObserver((entries) => {
+        if (entries.some((entry) => entry.contentRect.width !== this.#gridWidth)) schedule();
+      });
+      this.#gridObserver.observe(this.#dom.grid);
+    }
   }
 
-  #observeArtwork(image) {
-    if (this.#artworkObserver) {
-      this.#artworkObserver.observe(image);
-      return;
-    }
-    this.#artworkQueue.add(image);
-    window.queueMicrotask(() => this.#drainArtworkQueue());
+  #scheduleArtwork() {
+    if (this.#artworkFrame !== null) return;
+    this.#artworkFrame = window.requestAnimationFrame(() => {
+      this.#artworkFrame = null;
+      this.#sizeChunks();
+      this.#queueNearbyArtwork();
+    });
+  }
+
+  #sizeChunks() {
+    const width = this.#dom.grid.getBoundingClientRect().width;
+    if (!width || width === this.#gridWidth) return;
+    this.#gridWidth = width;
+    this.#dom.grid.style.setProperty("--library-columns",
+      getComputedStyle(this.#dom.grid).gridTemplateColumns.split(" ").length);
+    const chunks = [...this.#dom.grid.querySelectorAll(".media-chunk")];
+    // Measure each batch once at this width before letting the browser skip
+    // offscreen rendering. Exact reserved heights keep the scrollbar stable.
+    for (const chunk of chunks) chunk.classList.remove("sized");
+    const heights = chunks.map((chunk) => chunk.getBoundingClientRect().height);
+    chunks.forEach((chunk, index) => {
+      chunk.style.setProperty("--chunk-height", `${heights[index]}px`);
+      chunk.classList.add("sized");
+    });
   }
 
   #queueNearbyArtwork() {
-    const margin = 400;
-    for (const image of this.#dom.grid.querySelectorAll("img[data-src]")) {
-      const bounds = image.getBoundingClientRect();
-      if (bounds.bottom >= -margin && bounds.top <= window.innerHeight + margin) {
-        this.#artworkQueue.add(image);
+    this.#artworkQueue.clear();
+    const visit = (parent) => {
+      for (const element of parent.children) {
+        if (element.classList.contains("collection-group")) {
+          // The non-subgrid fallback uses display: contents and has no box.
+          visit(element);
+          continue;
+        }
+        const bounds = element.getBoundingClientRect();
+        if (bounds.width <= 0 || bounds.height <= 0
+          || bounds.bottom < -400 || bounds.top > window.innerHeight + 400) continue;
+        if (element.classList.contains("media-card")) {
+          const image = element.querySelector("img[data-src]");
+          if (image) this.#artworkQueue.add(image);
+        } else if (element.classList.contains("media-chunk")) {
+          visit(element);
+        }
       }
-    }
+    };
+    // Skip distant batches without reading geometry inside skipped subtrees.
+    visit(this.#dom.grid);
     this.#drainArtworkQueue();
   }
 
   #drainArtworkQueue() {
     for (const image of this.#artworkQueue) {
-      if (!image.isConnected || !image.dataset.src) this.#artworkQueue.delete(image);
+      const bounds = image.closest(".media-card").getBoundingClientRect();
+      if (!image.isConnected || !image.dataset.src || bounds.width <= 0 || bounds.height <= 0
+        || bounds.bottom < -400 || bounds.top > window.innerHeight + 400) this.#artworkQueue.delete(image);
     }
     while (this.#artworkRequests.size < MAX_ACTIVE_ARTWORK && this.#artworkQueue.size > 0) {
       const viewportCenter = window.innerHeight / 2;
@@ -625,7 +561,6 @@ export class LibraryController {
         return leftDistance - rightDistance;
       })[0];
       this.#artworkQueue.delete(image);
-      this.#artworkObserver?.unobserve(image);
       this.#startArtwork(image);
     }
   }
@@ -665,86 +600,13 @@ export class LibraryController {
     });
   }
 
-  #captureAppendAnchor() {
-    let element = document.activeElement;
-    const focusedBounds = element?.getBoundingClientRect();
-    const focused = this.#dom.grid.contains(element)
-      && focusedBounds.bottom > 0 && focusedBounds.top < window.innerHeight;
-    if (!focused) {
-      element = [...this.#dom.grid.querySelectorAll(".media-card")].find((card) => {
-        const bounds = card.getBoundingClientRect();
-        return bounds.bottom > 0 && bounds.top < window.innerHeight;
-      });
-    }
-    if (!element) return null;
-    return { element, focused, top: element.getBoundingClientRect().top };
-  }
-
-  #restoreAppendAnchor(anchor, requestId) {
-    const restore = () => {
-      if (!anchor.element.isConnected
-        || this.#store.getState().library.requestId !== requestId) return;
-      const delta = anchor.element.getBoundingClientRect().top - anchor.top;
-      if (Math.abs(delta) > 0.5) window.scrollBy({ top: delta, left: 0, behavior: "auto" });
-      if (anchor.focused) {
-        const bounds = anchor.element.getBoundingClientRect();
-        if (bounds.bottom <= 0 || bounds.top >= window.innerHeight) {
-          anchor.element.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "auto" });
-        }
-      }
-    };
-    restore();
-    window.requestAnimationFrame(() => {
-      restore();
-      window.requestAnimationFrame(restore);
-    });
-  }
-
-  #syncInfiniteScroll(library) {
-    const enabled = ["ready", "loading_more"].includes(library.status) && library.hasMore;
-    this.#dom.loadMoreSentinel.hidden = !enabled;
-    if (this.#pagingObserver) {
-      if (enabled && !this.#pagingActive) {
-        this.#pagingObserver.observe(this.#dom.loadMoreSentinel);
-        this.#pagingActive = true;
-      } else if (!enabled && this.#pagingActive) {
-        this.#pagingObserver.unobserve(this.#dom.loadMoreSentinel);
-        this.#pagingActive = false;
-      }
-    } else if (enabled && !this.#pagingActive) {
-      this.#pagingActive = true;
-      this.#schedulePagingCheck();
-    } else if (!enabled) {
-      this.#pagingActive = false;
-    }
-  }
-
-  #schedulePagingCheck() {
-    if (this.#pagingFrame !== null) return;
-    this.#pagingFrame = window.requestAnimationFrame(() => {
-      this.#pagingFrame = null;
-      if (!this.#nextPageIsNear()) return;
-      if (this.#pagingNeedsExit) return;
-      this.#pagingNeedsExit = true;
-      void this.load({ reset: false });
-    });
-  }
-
-  #nextPageIsNear() {
-    const state = this.#store.getState();
-    if (state.library.status !== "ready" || !state.library.hasMore
-      || this.#dom.loadMoreSentinel.hidden) return false;
-    const bounds = this.#dom.loadMoreSentinel.getBoundingClientRect();
-    return bounds.top <= window.innerHeight + 800 && bounds.bottom >= -800;
-  }
-
   #bind() {
     this.#dom.libraryClearSearch.addEventListener("click", () => {
       this.navigate({ query: "" }, { history: "replace", focusAfterLoad: false });
       this.#dom.searchInput.focus();
     });
-    this.#dom.libraryRetry.addEventListener("click", () => this.load({ reset: true }));
-    this.#dom.libraryRetryTop.addEventListener("click", () => this.load({ reset: true }));
+    this.#dom.libraryRetry.addEventListener("click", () => this.load());
+    this.#dom.libraryRetryTop.addEventListener("click", () => this.load());
     this.#dom.searchInput.addEventListener("input", () => {
       this.cancelPendingSearch();
       this.#searchTimer = window.setTimeout(() => {

@@ -125,8 +125,6 @@ const dom = {
   libraryRetry: required("library-retry"),
   libraryClearSearch: required("library-clear-search"),
   loading: required("loading"),
-  loadingLabel: required("loading-label"),
-  loadMoreSentinel: required("load-more-sentinel"),
 };
 
 if (dom.tabs.length !== 5) {

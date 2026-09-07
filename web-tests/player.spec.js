@@ -5550,106 +5550,50 @@ test("queue snapshot crosses pagination, auto-advances, and survives navigation"
   await expect(page.locator("#now-playing-title")).toHaveText("Queue 60");
 });
 
-test("a stale queue page cannot replace a newer queue snapshot", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name === "mobile-chromium", "the browser-independent queue race is covered by the desktop projects");
+test("a late metadata batch cannot replace a newly selected library view", async ({ page }) => {
   await page.addInitScript(() => {
-    Object.defineProperty(window, "IntersectionObserver", {
-      configurable: true,
-      value: class {
-        observe() {}
-        unobserve() {}
-        disconnect() {}
-      },
-    });
     const nativeFetch = window.fetch.bind(window);
-    let releaseFirst;
-    const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
-    let tailRequests = 0;
-    let firstResponseSettled = false;
-    window.__queueRace = {
-      count: () => tailRequests,
-      releaseFirst: () => releaseFirst(),
-      firstResponseSettled: () => firstResponseSettled,
-    };
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    window.__metadataRace = { waiting: false, settled: false, release: () => release() };
     window.fetch = async (input, options = {}) => {
       const url = new URL(typeof input === "string" ? input : input.url, document.baseURI);
-      if (url.pathname === "/api/web/library"
-        && url.searchParams.get("offset") === "60"
-        && url.searchParams.get("limit") !== "200") {
-        // Clicking the last card can also trigger ordinary infinite paging.
-        // Hold it so both selections must take an incomplete queue snapshot.
-        await firstGate;
-      }
-      if (url.pathname === "/api/web/library"
-        && url.searchParams.get("offset") === "60"
-        && url.searchParams.get("limit") === "200") {
-        // Deliberately ignore AbortSignal so the controller/epoch guards, rather
-        // than fetch cancellation, must reject the stale completion.
+      if (url.pathname === "/api/web/library" && url.searchParams.get("offset") === "200") {
+        // Exercise the request epoch even if transport cancellation is ignored.
         const response = await nativeFetch(input, { ...options, signal: undefined });
-        const payload = await response.json();
-        const requestOrdinal = ++tailRequests;
-        payload.entries[0].title = requestOrdinal === 1 ? "Stale queue tail" : "Current queue tail";
-        payload.entries[0].file_name = `${payload.entries[0].title}.mp4`;
-        if (requestOrdinal === 1) await firstGate;
-        const wrappedResponse = new Response(JSON.stringify(payload), {
-          status: response.status,
-          headers: { "Content-Type": "application/json" },
-        });
-        if (requestOrdinal === 1) {
-          return Promise.resolve(wrappedResponse).finally(() => { firstResponseSettled = true; });
-        }
-        return wrappedResponse;
+        window.__metadataRace.waiting = true;
+        await held;
+        window.__metadataRace.settled = true;
+        return response;
       }
       return nativeFetch(input, options);
     };
   });
-  await serveFixtureMedia(page);
   let firstPayload = null;
   await page.route("**/api/web/library?**", async (route) => {
     const url = new URL(route.request().url());
-    if (url.searchParams.get("view") !== "library" || url.searchParams.get("kind") !== "video") {
-      return route.fallback();
-    }
-    const offset = Number(url.searchParams.get("offset") || 0);
-    if (!firstPayload) {
-      const response = await route.fetch();
-      firstPayload = await response.json();
-    }
+    if (url.searchParams.get("kind") !== "video") return route.fallback();
+    if (!firstPayload) firstPayload = await (await route.fetch()).json();
     const base = firstPayload.entries.find((entry) => entry.entry_type === "media");
-    const make = (index) => ({
-      ...base,
-      id: String(BigInt(base.id) + 20_000n + BigInt(index)),
-      title: `Queue race ${index}`,
-      file_name: `queue-race-${index}.mp4`,
-    });
-    const entries = offset === 0
-      ? Array.from({ length: 60 }, (_, index) => make(index + 1))
-      : offset === 60 ? [make(61)] : [];
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        ...firstPayload,
-        offset,
-        limit: 60,
-        total: 61,
-        has_more: offset + entries.length < 61,
-        entries,
-      }),
-    });
+    const offset = Number(url.searchParams.get("offset") || 0);
+    const entries = Array.from({ length: Math.min(200, 201 - offset) }, (_, index) => ({
+      ...base, id: String(20000 + offset + index), title: `Old view ${offset + index}`, art_url: null,
+    }));
+    await route.fulfill({ json: {
+      ...firstPayload, entries, offset, limit: 200, total: 201, has_more: offset === 0,
+    } });
   });
-
   await page.goto("/?view=video");
-  const last = page.getByRole("button", { name: /^Play Queue race 60\b/ });
-  await last.click();
-  await expect.poll(() => page.evaluate(() => window.__queueRace.count())).toBe(1);
-  await last.click();
-  await expect.poll(() => page.evaluate(() => window.__queueRace.count())).toBe(2);
-  await expect(page.locator("#next-button")).toHaveAttribute("title", "Next: Current queue tail");
-
-  await page.evaluate(() => window.__queueRace.releaseFirst());
-  await expect.poll(() => page.evaluate(() => window.__queueRace.firstResponseSettled())).toBe(true);
-  await expect(page.locator("#next-button")).toHaveAttribute("title", "Next: Current queue tail");
+  await expect.poll(() => page.evaluate(() => window.__metadataRace.waiting)).toBe(true);
+  await expect(page.locator(".media-card")).toHaveCount(0);
+  await page.getByRole("tab", { name: "Audio", exact: true }).click();
+  await expect(page.locator(".media-card.audio").first()).toBeVisible();
+  const titles = await page.locator(".card-title").allTextContents();
+  await page.evaluate(() => window.__metadataRace.release());
+  await expect.poll(() => page.evaluate(() => window.__metadataRace.settled)).toBe(true);
+  await expect(page.locator(".card-title")).toHaveText(titles);
+  await expect(page.locator(".media-card.video")).toHaveCount(0);
+  await expect(page.locator("#loading")).toBeHidden();
 });
 
 test("already-complete broken artwork shows the fallback and releases its loading slots", async ({ page }) => {
@@ -5710,178 +5654,85 @@ test("slow artwork from an abandoned view cannot block the current view", async 
   }
 });
 
-test("infinite scroll loads each bounded page once and stops at the catalog end", async ({ page }) => {
-  let firstPayload = null;
-  const requestedOffsets = [];
-  let artworkActive = 0;
-  let artworkMaximum = 0;
-  let artworkRequests = 0;
-  let releaseArtwork;
-  const artworkGate = new Promise((resolve) => { releaseArtwork = resolve; });
-  await page.route(/\/(?:AlbumArt|Resized|Thumbnails)\//, async (route) => {
-    artworkActive += 1;
-    artworkRequests += 1;
-    artworkMaximum = Math.max(artworkMaximum, artworkActive);
-    await artworkGate;
-    await route.fulfill({ status: 404, contentType: "image/jpeg", body: "" });
-    artworkActive -= 1;
-  });
-  await page.route("**/api/web/library?**", async (route) => {
-    const url = new URL(route.request().url());
-    if (url.searchParams.get("view") !== "library" || url.searchParams.get("kind") !== "video") {
-      return route.fallback();
+for (const withoutObserver of [false, true]) {
+  test(`the complete list stays stable while only nearby posters load${withoutObserver ? " without IntersectionObserver" : ""}`, async ({ page }) => {
+    if (withoutObserver) {
+      await page.addInitScript(() => { window.IntersectionObserver = undefined; });
     }
-    const offset = Number(url.searchParams.get("offset") || 0);
-    requestedOffsets.push(offset);
-    if (!firstPayload) {
-      const response = await route.fetch();
-      firstPayload = await response.json();
+    let firstPayload = null;
+    const requestedOffsets = [];
+    let artworkActive = 0;
+    let artworkMaximum = 0;
+    const artworkRequests = [];
+    let releaseArtwork;
+    const artworkGate = new Promise((resolve) => { releaseArtwork = resolve; });
+    await page.route("**/AlbumArt/snapshot-*.jpg", async (route) => {
+      artworkActive += 1;
+      artworkRequests.push(route.request().url());
+      artworkMaximum = Math.max(artworkMaximum, artworkActive);
+      await artworkGate;
+      await route.fulfill({
+        contentType: "image/svg+xml",
+        body: '<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900"><rect width="1600" height="900" fill="navy"/></svg>',
+      }).catch(() => {});
+      artworkActive -= 1;
+    });
+    await page.route("**/api/web/library?**", async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get("kind") !== "video") return route.fallback();
+      const offset = Number(url.searchParams.get("offset") || 0);
+      requestedOffsets.push(offset);
+      if (!firstPayload) firstPayload = await (await route.fetch()).json();
+      const base = firstPayload.entries.find((entry) => entry.entry_type === "media");
+      const entries = Array.from({ length: Math.min(24, 49 - offset) }, (_, index) => ({
+        ...base,
+        id: String(30000 + offset + index),
+        title: `Snapshot ${offset + index + 1}`,
+        art_url: `/AlbumArt/snapshot-${offset + index + 1}.jpg`,
+      }));
+      await route.fulfill({ json: {
+        ...firstPayload, entries, offset, limit: 24, total: 49, has_more: offset + entries.length < 49,
+      } });
+    });
+    try {
+      await page.goto("/?view=video", { waitUntil: "domcontentloaded" });
+      // Every card and the final scrollbar extent exist before any scrolling.
+      await expect(page.locator("[data-media-id]")).toHaveCount(49);
+      expect(requestedOffsets).toEqual([0, 24, 48]);
+      await expect.poll(() => artworkRequests.length).toBe(4);
+      await expect(page.locator('.media-card img').last()).not.toHaveAttribute("src");
+      const firstArtwork = page.locator(".media-card img").first();
+      await expect(firstArtwork).toHaveAttribute("decoding", "async");
+      await expect(firstArtwork).toHaveAttribute("fetchpriority", "low");
+      const firstCard = page.locator(".media-card").first();
+      await firstCard.evaluate((card) => { card.dataset.preserved = "yes"; });
+      const last = page.getByRole("button", { name: /^Play Snapshot 49\b/ });
+      await last.scrollIntoViewIfNeeded();
+      await last.focus();
+      const geometry = () => page.evaluate(() => ({
+        top: scrollY, height: document.documentElement.scrollHeight,
+        cardTop: document.querySelector('[data-media-id="30048"]').getBoundingClientRect().top,
+      }));
+      const before = await geometry();
+      releaseArtwork();
+      await expect.poll(() => page.locator('.media-card img').last().evaluate((image) => image.complete && image.naturalWidth > 0)).toBe(true);
+      await expect.poll(() => artworkActive).toBe(0);
+      const after = await geometry();
+      expect(Math.abs(after.top - before.top)).toBeLessThanOrEqual(1);
+      expect(Math.abs(after.cardTop - before.cardTop)).toBeLessThanOrEqual(1);
+      expect(after.height).toBe(before.height);
+      await expect(last).toBeFocused();
+      await expect(firstCard).toHaveAttribute("data-preserved", "yes");
+      expect(artworkMaximum).toBeLessThanOrEqual(4);
+      expect(artworkRequests.length).toBeLessThan(49);
+      expect(requestedOffsets).toEqual([0, 24, 48]);
+    } finally {
+      releaseArtwork();
     }
-    const base = firstPayload.entries.find((entry) => entry.entry_type === "media");
-    const make = (index) => ({
-      ...base,
-      id: String(BigInt(base.id) + 30_000n + BigInt(index)),
-      title: `Infinite ${index}`,
-      file_name: `infinite-${index}.mp4`,
-      art_url: `/AlbumArt/infinite-${index}.jpg`,
-    });
-    const pageSize = offset === 48 ? 1 : 24;
-    const entries = offset <= 48
-      ? Array.from({ length: pageSize }, (_, index) => make(offset + index + 1))
-      : [];
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        ...firstPayload,
-        offset,
-        limit: 24,
-        total: 49,
-        has_more: offset + entries.length < 49,
-        entries,
-      }),
-    });
   });
+}
 
-  await page.goto("/?view=video", { waitUntil: "domcontentloaded" });
-  await expect(page.locator("[data-media-id]")).toHaveCount(24);
-  await expect(page.locator("#load-more")).toHaveCount(0);
-  const sentinel = page.locator("#load-more-sentinel");
-  await expect(sentinel).toBeAttached();
-  const firstArtwork = page.locator(".media-card img").first();
-  // The application admits nearby images itself; offscreen images must stay
-  // unrequested regardless of the browser's native lazy-loading heuristic.
-  expect(await page.locator('.media-card img[src]').count()).toBeLessThanOrEqual(4);
-  await expect(page.locator('.media-card img').last()).not.toHaveAttribute("src");
-  await expect(firstArtwork).toHaveAttribute("decoding", "async");
-  await expect(firstArtwork).toHaveAttribute("fetchpriority", "low");
-
-  const lastInitialCard = page.getByRole("button", { name: /^Play Infinite 24\b/ });
-  await lastInitialCard.evaluate((card) => {
-    document.getElementById("load-more-sentinel").scrollIntoView({ block: "end" });
-    card.focus({ preventScroll: true });
-  });
-  await expect(page.locator("[data-media-id]")).toHaveCount(48);
-  await expect(lastInitialCard).toBeFocused();
-  await expect.poll(() => lastInitialCard.evaluate((card) => {
-    const bounds = card.getBoundingClientRect();
-    return bounds.bottom > 0 && bounds.top < window.innerHeight;
-  })).toBe(true);
-  expect(requestedOffsets).toEqual([0, 24]);
-
-  await lastInitialCard.scrollIntoViewIfNeeded();
-  await page.mouse.wheel(0, 1);
-  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-  await page.evaluate(() => document.getElementById("load-more-sentinel").scrollIntoView({ block: "end" }));
-  await expect(page.locator("[data-media-id]")).toHaveCount(49);
-  await expect(sentinel).toBeHidden();
-  expect(requestedOffsets).toEqual([0, 24, 48]);
-  await expect.poll(() => artworkRequests).toBe(4);
-  expect(artworkMaximum).toBeLessThanOrEqual(4);
-  releaseArtwork();
-  await page.waitForTimeout(100);
-  await expect.poll(() => artworkActive).toBe(0);
-});
-
-test("paging continues when WebKit omits the sentinel exit after appending cards", async ({ page }) => {
-  await page.addInitScript(() => {
-    let pagingCallback = null;
-    let sentinel = null;
-    window.__sparsePagingObserver = {
-      intersect() {
-        pagingCallback?.([{ target: sentinel, isIntersecting: true }]);
-      },
-    };
-    Object.defineProperty(window, "IntersectionObserver", {
-      configurable: true,
-      value: class SparseIntersectionObserver {
-        constructor(nextCallback, options = {}) {
-          this.paging = options.rootMargin === "800px 0px";
-          if (this.paging) pagingCallback = nextCallback;
-        }
-
-        observe(target) {
-          if (this.paging && target.id === "load-more-sentinel") sentinel = target;
-        }
-
-        unobserve() {}
-        disconnect() {}
-      },
-    });
-  });
-  let firstPayload = null;
-  const requestedOffsets = [];
-  await page.route("**/api/web/library?**", async (route) => {
-    const url = new URL(route.request().url());
-    if (url.searchParams.get("view") !== "library" || url.searchParams.get("kind") !== "video") {
-      return route.fallback();
-    }
-    const offset = Number(url.searchParams.get("offset") || 0);
-    requestedOffsets.push(offset);
-    if (!firstPayload) {
-      const response = await route.fetch();
-      firstPayload = await response.json();
-    }
-    const base = firstPayload.entries.find((entry) => entry.entry_type === "media");
-    const count = offset === 48 ? 1 : 24;
-    const entries = Array.from({ length: count }, (_, index) => ({
-      ...base,
-      id: String(BigInt(base.id) + 50_000n + BigInt(offset + index)),
-      title: `Sparse observer ${offset + index + 1}`,
-      art_url: null,
-    }));
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        ...firstPayload,
-        offset,
-        limit: 24,
-        total: 49,
-        has_more: offset + entries.length < 49,
-        entries,
-      }),
-    });
-  });
-
-  await page.goto("/?view=video", { waitUntil: "domcontentloaded" });
-  await expect(page.locator("[data-media-id]")).toHaveCount(24);
-  await page.locator("#load-more-sentinel").evaluate((sentinel) => {
-    sentinel.scrollIntoView({ block: "end" });
-    window.__sparsePagingObserver.intersect();
-  });
-  await expect(page.locator("[data-media-id]")).toHaveCount(48);
-  expect(requestedOffsets).toEqual([0, 24]);
-  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-  await page.locator("#load-more-sentinel").evaluate((sentinel) => {
-    sentinel.scrollIntoView({ block: "end" });
-    window.dispatchEvent(new WheelEvent("wheel", { deltaY: 1 }));
-  });
-  await expect(page.locator("[data-media-id]")).toHaveCount(49);
-  expect(requestedOffsets).toEqual([0, 24, 48]);
-});
-
-test("a generation change during infinite scroll is recoverable without duplicate cards", async ({ page }) => {
+test("a generation change while loading metadata is recoverable without partial cards", async ({ page }) => {
   await page.addInitScript(() => {
     Object.defineProperty(window, "IntersectionObserver", {
       configurable: true,
@@ -5909,18 +5760,18 @@ test("a generation change during infinite scroll is recoverable without duplicat
     const response = await route.fetch();
     const payload = await response.json();
     if (!generationChanged && offset === 0) {
-      payload.total += 1;
+      payload.limit = payload.entries.length;
+      payload.total = payload.entries.length + 1;
       payload.has_more = true;
     }
     await route.fulfill({ response, json: payload });
   });
   await page.goto("/?view=video");
   await generationChangeRequested;
-  await expect.poll(() => page.locator("[data-media-id]").count()).toBeGreaterThan(0);
-  const before = await page.locator("[data-media-id]").count();
+  await expect(page.locator("[data-media-id]")).toHaveCount(0);
   releaseGenerationChange();
   await expect(page.locator("#server-state")).toHaveAttribute("data-state", "error");
-  expect(await page.locator("[data-media-id]").count()).toBe(before);
+  await expect(page.locator("[data-media-id]")).toHaveCount(0);
   await page.locator("#library-retry").click();
   await expect(page.locator("#server-state")).toHaveAttribute("data-state", /ready|empty/);
   const ids = await page.locator("[data-media-id]").evaluateAll((cards) => cards.map((card) => card.dataset.mediaId));
@@ -7101,7 +6952,7 @@ test("stage keyboard focus pins visible controls and keeps Play reachable", asyn
 });
 
 
-test("movie collection groups continue across pages and end before standalone cards", async ({ page }) => {
+test("movie collections join metadata batches and end before standalone cards", async ({ page }) => {
   let initial = null;
   await page.route("**/api/web/library?**", async (route) => {
     const url = new URL(route.request().url());
@@ -7122,13 +6973,13 @@ test("movie collection groups continue across pages and end before standalone ca
     } });
   });
   await page.goto("/?view=video");
-  await expect(page.locator("[data-media-id]")).toHaveCount(24);
+  await expect(page.locator("[data-media-id]")).toHaveCount(27);
   await expect(page.getByRole("heading", { name: "Briar Saga" })).toHaveCount(1);
   const collection = page.getByRole("region", { name: "Briar Saga" });
-  await expect(collection.locator(".media-card")).toHaveCount(23);
+  await expect(collection.locator(".media-card")).toHaveCount(25);
   const firstCard = collection.locator(".media-card").first();
   await firstCard.evaluate((card) => { card.dataset.preserved = "yes"; });
-  await page.locator("#load-more-sentinel").scrollIntoViewIfNeeded();
+  await page.locator("[data-media-id]").last().scrollIntoViewIfNeeded();
   await expect(page.locator("[data-media-id]")).toHaveCount(27);
   await expect(collection.locator(".media-card")).toHaveCount(25);
   await expect(page.getByRole("heading", { name: "Briar Saga" })).toHaveCount(1);
@@ -7149,6 +7000,6 @@ test("movie collection groups continue across pages and end before standalone ca
   widths = await cardWidths();
   expect(Math.abs(widths.grouped - widths.standalone)).toBeLessThanOrEqual(1);
   await page.locator("#sort-control").selectOption("date_desc");
-  await expect(page.locator("[data-media-id]")).toHaveCount(24);
+  await expect(page.locator("[data-media-id]")).toHaveCount(27);
   await expect(page.locator(".collection-group")).toHaveCount(0);
 });

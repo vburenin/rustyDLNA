@@ -81,6 +81,55 @@ export class WebApi {
     return responseJson(response);
   }
 
+  async librarySnapshot(navigation) {
+    this.abortLibrary();
+    const controller = new AbortController();
+    this.#libraryController = controller;
+    const { signal } = controller;
+    try {
+      const first = await this.library(navigation, { limit: 200, replace: false, signal });
+      signal.throwIfAborted();
+      const { total, limit, generation } = first;
+      const validate = (page, offset) => {
+        signal.throwIfAborted();
+        if (page.generation !== generation || page.total !== total) {
+          throw new ApiError("The library changed while loading.", { code: "catalog_changed" });
+        }
+        if (!Number.isSafeInteger(total) || total < 0
+          || !Number.isSafeInteger(limit) || limit < 1 || limit > 200
+          || page.offset !== offset || !Array.isArray(page.entries)
+          || page.entries.length !== Math.min(limit, total - offset)
+          || page.has_more !== (offset + page.entries.length < total)) {
+          throw new ApiError("The server returned an incomplete library page.", { code: "invalid_page" });
+        }
+      };
+      validate(first, 0);
+      const pages = [first.entries];
+      let nextOffset = limit;
+      // Keep requests bounded while collecting one generation before publishing
+      // the grid. Scrolling then changes only which posters need to be loaded.
+      const worker = async () => {
+        while (nextOffset < total) {
+          signal.throwIfAborted();
+          const offset = nextOffset;
+          nextOffset += limit;
+          const page = await this.library(navigation, { offset, limit, generation, replace: false, signal });
+          validate(page, offset);
+          pages[offset / limit] = page.entries;
+        }
+      };
+      const workers = Math.max(0, Math.min(4, Math.ceil(total / limit) - 1));
+      await Promise.all(Array.from({ length: workers }, worker));
+      signal.throwIfAborted();
+      return { ...first, entries: pages.flat(), limit: total, has_more: false };
+    } catch (error) {
+      controller.abort();
+      throw error;
+    } finally {
+      if (this.#libraryController === controller) this.#libraryController = null;
+    }
+  }
+
   async continueItems(ids, { generation = null, signal = null } = {}) {
     const params = new URLSearchParams({
       view: "continue",

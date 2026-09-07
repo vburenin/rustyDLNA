@@ -52,8 +52,6 @@ export function initialState(navigation, preferences) {
       entries: [],
       breadcrumbs: [],
       total: 0,
-      offset: 0,
-      hasMore: false,
       generation: null,
       error: null,
       requestId: 0,
@@ -127,15 +125,15 @@ function reduce(state, action) {
         server: { ...state.server, state: state.server.state === "ready" ? "ready" : "connecting" },
         library: {
           ...state.library,
-          status: action.append ? "loading_more" : "loading",
+          status: "loading",
           error: null,
           requestId: action.requestId,
-          ...(action.append ? {} : { entries: [], offset: 0, hasMore: false }),
+          entries: [],
         },
       };
     case "LIBRARY_SUCCESS": {
       if (action.requestId !== state.library.requestId) return state;
-      const entries = action.append ? [...state.library.entries, ...action.payload.entries] : action.payload.entries;
+      const entries = action.payload.entries;
       const capabilities = action.payload.capabilities || {};
       const negotiationChanged = negotiationCapabilityKey(capabilities)
         !== negotiationCapabilityKey(state.server.capabilities);
@@ -155,8 +153,6 @@ function reduce(state, action) {
           entries,
           breadcrumbs: action.payload.breadcrumbs || [],
           total: action.payload.total,
-          offset: action.payload.offset + action.payload.entries.length,
-          hasMore: action.payload.has_more,
           generation: action.payload.generation,
           error: null,
         },

@@ -22,7 +22,7 @@ async function syntheticLibrary(page, entry = item, entries = [entry]) {
   };
   await page.route("**/api/web/library?**", (route) => route.fulfill({ json: {
     schema_version: 2, server_name: "Recovery", root_folder_id: "0", capabilities,
-    library_state: "ready", entries, total: entries.length, offset: 0, generation: 1, has_more: false,
+    library_state: "ready", entries, total: entries.length, offset: 0, limit: 200, generation: 1, has_more: false,
   } }));
   await page.route("**/api/web/item/*", (route) => route.fulfill({ json: {
     schema_version: 2, id: entry.id, item: entry, audio_tracks: entry.audio_tracks, chapters: [],

@@ -64,7 +64,7 @@ screen width; Watch presents the player together with the library. A page withou
 selected item starts in Browse, while a link to an item starts in Watch.
 Selecting a card also switches to Watch. Switching back to Browse keeps the
 current media element and playback session alive, so returning through the Now
-playing title does not reload or restart the source. Search, folder, paging,
+playing title does not reload or restart the source. Search, folder, loaded list,
 selection, playback, and each mode's scroll position remain intact while the
 presentation changes. Close player stops the current title, cancels any
 compatible job, and returns to Browse with the library focused. It remains on
@@ -112,12 +112,23 @@ with a centered folder icon and item count.
 Artwork uses four concurrent loading slots; leaving a view releases its pending
 images so a slow response cannot block artwork in the new view.
 
-Selecting an item takes a snapshot of the complete active folder/search order,
-including later API pages. Previous and Next use that snapshot even after
-library navigation. Queue position is shown next to Now playing. Optional
-auto-advance is off by default and can be enabled under Advanced playback. Each
-asynchronous queue snapshot has its own request epoch, so a late page or error
-from an abandoned snapshot cannot replace the current queue.
+The browser loads all metadata for the current folder or search before displaying
+its cards. It assembles one catalog generation using batches of up to 200 entries
+and at most four concurrent requests. The complete list stays in browser memory;
+scrolling loads only nearby posters and does not insert cards or adjust the scroll
+position. Changing views cancels unfinished metadata requests, and a failed batch
+offers Retry without exposing an incomplete list.
+For lists of at least 500 entries, browsers supporting `content-visibility`
+skip offscreen rendering in batches of cards. Each batch reserves its measured
+height, recalculated when the library width changes; titles remain available
+to browser Find and assistive technology. Poster images occupy reserved space
+and do not change card geometry as they arrive.
+
+Selecting an item takes the complete active folder/search order directly from
+that in-memory list. Previous and Next use that snapshot even after library
+navigation, without additional queue requests. Queue position is shown next to
+Now playing. Optional auto-advance is off by default and can be enabled under
+Advanced playback.
 
 The player uses one custom control surface for Original and Compatible media.
 The close control, timeline, transport, volume, captions, audio and chapter
@@ -842,27 +853,25 @@ a complete offline movie.
 Browse parameters are `view=folders|library`, `folder`,
 `kind=all|video|audio`, `q`, `sort=title|date_desc|episode`, `offset`,
 `limit`, and `generation`. The server default page is 60 and the maximum is
-200; the interactive browser library requests 24 items at a time so card JSON,
-layout, and lazy artwork cannot monopolize the next scrolling interaction.
+200; the browser collects the complete current view in batches of up to 200,
+with at most four requests in flight, before publishing the list.
 Media DTOs include a nullable `collection` with an opaque directory `id`, a
 folder `title`, and numeric `sequence`. Collection ordering happens before
 pagination in both SQLite and the in-memory fallback.
 Passing the first page's generation on later pages gives stable pagination; a
 catalog change returns `409 catalog_changed` rather than mixing snapshots.
-The browser requests the next bounded page automatically when the end of the
-loaded grid approaches the viewport. Appended cards keep existing card focus
-and scroll context intact. Paging re-arms from post-append geometry and from a
-bounded animation-frame check after wheel, touch, pointer, or keyboard input,
-so a missing WebKit sentinel-exit callback cannot strand later pages. Card
-artwork is lazy, asynchronously decoded, and explicitly lower priority than
+Metadata loading is independent of scrolling. A view change aborts the whole
+load, and stale responses cannot replace a newer view. Card artwork is lazy,
+asynchronously decoded, and explicitly lower priority than
 library API traffic. The UI serves versioned
 scanner artwork directly with a one-day private browser cache; a deployment
 that prepares 360x540 posters therefore performs no request-time resize. At
 most four near-viewport artwork requests run at once, and quickly skipped cards
-leave the queue before they consume server capacity. Browsers without
-`IntersectionObserver` use the same
-generation-safe paging path through bounded scroll checks, and a catalog change
-offers a full refresh instead of displaying pages from different generations.
+leave the queue before they consume server capacity. The browser checks nearby
+posters at most once per animation frame after scrolling, resizing, or revealing
+an offscreen batch, without depending on `IntersectionObserver`. A catalog change
+offers a full refresh without displaying an incomplete list or mixing pages from
+different generations.
 The flat view performs at most three total SQLite snapshot attempts, uses
 deterministic ordering, and only materializes the requested page. Continue
 Watching takes one browser-local progress snapshot, keeps at most the 500
@@ -924,8 +933,8 @@ The automated behavior suite runs desktop Chromium, Firefox, and WebKit plus a
 mobile Chromium viewport. It covers source selection/fallback and error
 recovery, truncated-stream completion, backward seeks after an explicit end,
 session cancellation, seeks, fullscreen controls, keyboard scoping,
-responsive/touch layout, captions, audio tracks, resume, queue pagination,
-infinite scrolling and focus preservation, history/search/catalog-generation
+responsive/touch layout, captions, audio tracks, resume, complete queue snapshots,
+stable scrolling and lazy posters, history/search/catalog-generation
 races, reduced motion, expanded iPhone playback, wake-lock lifecycle, and axe accessibility
 checks. Headless Linux WebKit lacks a working element Fullscreen API, so that
 one API exercise is skipped there; its native video-fullscreen fallback is
