@@ -202,7 +202,7 @@ fn require_fixture_library() {
     require_fixture_library_at(&workspace().join("testdata/library"));
 }
 
-fn testdata_app() -> App {
+pub(super) fn testdata_app() -> App {
     let root = workspace();
     let test_tree = TestTree::new("fixtures");
     require_fixture_library();
@@ -3461,7 +3461,7 @@ fn req_from(headers: &str, body: &[u8]) -> HttpRequest {
     r
 }
 
-async fn raw_connection(app: Arc<App>, bytes: &[u8], close_write: bool) -> Vec<u8> {
+pub(super) async fn raw_connection(app: Arc<App>, bytes: &[u8], close_write: bool) -> Vec<u8> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3897,7 +3897,6 @@ fn original_get_opens_non_utf8_catalog_path_without_loss() {
 fn assert_head_has_no_payload(r: &HttpResponse) {
     assert!(r.body.is_empty(), "HEAD retained an in-memory body");
     assert!(r.file_range.is_none(), "HEAD retained a file stream");
-    assert!(r.remux_job.is_none(), "HEAD retained a remux stream");
     let wire = r.bytes_wire("test", "Thu, 01 Jan 1970 00:00:00 GMT");
     let split = wire
         .windows(4)
@@ -3986,6 +3985,10 @@ fn head_suppresses_every_media_payload_without_changing_metadata() {
             )))
     };
     assert_eq!(transcode.status, 200);
+    assert!(
+        transcode.remux_job.is_some(),
+        "HEAD must reach remux serving"
+    );
     assert_head_has_no_payload(&transcode);
 
     let art = movie.album_art;

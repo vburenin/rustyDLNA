@@ -2339,6 +2339,20 @@ pub async fn wait_ready(job: &Arc<RemuxJob>) -> Result<PathBuf, String> {
     }
 }
 
+// Deferred remux responses bypass the route handler's HEAD body suppression,
+// including errors raised during admission, readiness and range handling.
+async fn write_remux_response(
+    app: &App,
+    sock: &mut tokio::net::TcpStream,
+    mut response: HttpResponse,
+    head: bool,
+) -> std::io::Result<bool> {
+    if head {
+        response.body.clear();
+    }
+    crate::socket_write_http_response(app, sock, &response).await
+}
+
 pub async fn serve_remux(
     app: &Arc<App>,
     sock: &mut tokio::net::TcpStream,
@@ -2398,7 +2412,7 @@ pub async fn serve_remux(
                 response.set("Retry-After", "1");
                 response
             };
-            crate::socket_write_http_response(app, sock, &err).await?;
+            write_remux_response(app, sock, err, head).await?;
             return Ok(());
         }
     };
@@ -2435,7 +2449,7 @@ pub async fn serve_remux(
                     "compatible media generation failed",
                 )
             };
-            crate::socket_write_http_response(app, sock, &err).await?;
+            write_remux_response(app, sock, err, head).await?;
             return Ok(());
         }
     };
@@ -2569,7 +2583,7 @@ async fn serve_fragment_playlist(
                     "superseded fragment playlist request cancelled"
                 );
                 let response = crate::web_ui::transcode_stream_error(409, "transcode_cancelled");
-                crate::socket_write_http_response(app, sock, &response).await?;
+                write_remux_response(app, sock, response, head).await?;
                 return Ok(());
             }
             _ => {}
@@ -2619,7 +2633,7 @@ async fn serve_fragment_playlist(
                         );
                         let response =
                             crate::web_ui::transcode_stream_error(409, "transcode_cancelled");
-                        crate::socket_write_http_response(app, sock, &response).await?;
+                        write_remux_response(app, sock, response, head).await?;
                         return Ok(());
                     }
                     _ => {}
@@ -2642,7 +2656,7 @@ async fn serve_fragment_playlist(
                     );
                     let response =
                         crate::web_ui::transcode_stream_error(409, "transcode_cancelled");
-                    crate::socket_write_http_response(app, sock, &response).await?;
+                    write_remux_response(app, sock, response, head).await?;
                     return Ok(());
                 }
                 return Err(error.into());
@@ -2672,7 +2686,7 @@ async fn serve_fragment_playlist(
     if !head {
         response.body = playlist.into_bytes();
     }
-    crate::socket_write_http_response(app, sock, &response).await?;
+    write_remux_response(app, sock, response, head).await?;
     Ok(())
 }
 
@@ -2728,7 +2742,7 @@ async fn serve_hls_resource(
                 "superseded compatible media resource request cancelled"
             );
             let response = crate::web_ui::transcode_stream_error(409, "transcode_cancelled");
-            crate::socket_write_http_response(app, sock, &response).await?;
+            write_remux_response(app, sock, response, head).await?;
             return Ok(());
         }
         return Err(error.into());
@@ -2741,7 +2755,7 @@ async fn serve_hls_resource(
             "superseded compatible media resource request cancelled"
         );
         let response = crate::web_ui::transcode_stream_error(409, "transcode_cancelled");
-        crate::socket_write_http_response(app, sock, &response).await?;
+        write_remux_response(app, sock, response, head).await?;
         return Ok(());
     }
     if current_len_async(job).await? < slice_end {
@@ -2753,7 +2767,7 @@ async fn serve_hls_resource(
             Ok(range) => range,
             Err(RangeError::Invalid) => {
                 let err = HttpResponse::html(400, "Bad Request", "invalid HLS resource range");
-                crate::socket_write_http_response(app, sock, &err).await?;
+                write_remux_response(app, sock, err, head).await?;
                 return Ok(());
             }
             Err(RangeError::Unsatisfiable) => {
@@ -2763,7 +2777,7 @@ async fn serve_hls_resource(
                     "range past HLS resource",
                 );
                 err.set("Content-Range", format!("bytes */{length}"));
-                crate::socket_write_http_response(app, sock, &err).await?;
+                write_remux_response(app, sock, err, head).await?;
                 return Ok(());
             }
         },
@@ -2790,10 +2804,10 @@ async fn serve_hls_resource(
     response.set("Cache-Control", "no-store");
     response.persist = false;
     if head {
-        crate::socket_write_http_response(app, sock, &response).await?;
+        write_remux_response(app, sock, response, head).await?;
         return Ok(());
     }
-    if !crate::socket_write_http_response(app, sock, &response).await? {
+    if !write_remux_response(app, sock, response, head).await? {
         return Ok(());
     }
     if let Err(error) = stream_growing(app, sock, job, start, Some(end)).await {
@@ -2964,7 +2978,7 @@ async fn serve_finished(
             Err(RangeError::Invalid) => {
                 tracing::error!(path = %req.path, range = v, "invalid Range");
                 let err = HttpResponse::html(400, "Bad Request", "invalid range");
-                crate::socket_write_http_response(app, sock, &err).await?;
+                write_remux_response(app, sock, err, head).await?;
                 return Ok(());
             }
             Err(RangeError::Unsatisfiable) => {
@@ -2972,7 +2986,7 @@ async fn serve_finished(
                 let mut err =
                     HttpResponse::html(416, "Requested Range Not Satisfiable", "range past EOF");
                 err.set("Content-Range", format!("bytes */{size}"));
-                crate::socket_write_http_response(app, sock, &err).await?;
+                write_remux_response(app, sock, err, head).await?;
                 return Ok(());
             }
         },
@@ -2996,10 +3010,10 @@ async fn serve_finished(
         resp.set("ETag", etag);
     }
     if head {
-        crate::socket_write_http_response(app, sock, &resp).await?;
+        write_remux_response(app, sock, resp, head).await?;
         return Ok(());
     }
-    if !crate::socket_write_http_response(app, sock, &resp).await? {
+    if !write_remux_response(app, sock, resp, head).await? {
         return Ok(());
     }
     stream_growing(app, sock, job, start, Some(end)).await?;
@@ -3021,7 +3035,7 @@ async fn serve_growing(
             Err(_) => {
                 tracing::error!(path = %req.path, range = v, "invalid Range on growing remux");
                 let err = HttpResponse::html(400, "Bad Request", "invalid range");
-                crate::socket_write_http_response(app, sock, &err).await?;
+                write_remux_response(app, sock, err, head).await?;
                 return Ok(());
             }
         },
@@ -3064,7 +3078,7 @@ async fn serve_growing(
                 "compatible media range is unavailable",
             )
         };
-        crate::socket_write_http_response(app, sock, &resp).await?;
+        write_remux_response(app, sock, resp, head).await?;
         return Ok(());
     }
     let have = current_len_async(job).await?;
@@ -3075,7 +3089,7 @@ async fn serve_growing(
             "range past remux output",
         );
         resp.set("Content-Range", format!("bytes */{have}"));
-        crate::socket_write_http_response(app, sock, &resp).await?;
+        write_remux_response(app, sock, resp, head).await?;
         return Ok(());
     }
     let end = requested_end.unwrap_or(have - 1).min(have - 1);
@@ -3087,7 +3101,7 @@ async fn serve_growing(
         "Content-Length",
         end.saturating_sub(start).saturating_add(1),
     );
-    let valid_wire = crate::socket_write_http_response(app, sock, &resp).await?;
+    let valid_wire = write_remux_response(app, sock, resp, head).await?;
     if valid_wire && !head {
         stream_growing(app, sock, job, start, Some(end)).await?;
     }
@@ -3102,7 +3116,7 @@ async fn serve_open_growing(
     head: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let resp = live_transcode_response(mime);
-    let valid_wire = crate::socket_write_http_response(app, sock, &resp).await?;
+    let valid_wire = write_remux_response(app, sock, resp, head).await?;
     if head || !valid_wire {
         return Ok(());
     }
@@ -4666,6 +4680,169 @@ mod tests {
             .position(|window| window == b"\r\n\r\n")
             .expect("HTTP header terminator");
         &bytes[split + 4..]
+    }
+
+    fn compatible_connection_fixture() -> (Arc<App>, Arc<RemuxJob>, String, Vec<u8>) {
+        let app = Arc::new(crate::tests::testdata_app());
+        let id = crate::read_recover(&app.catalog)
+            .items
+            .values()
+            .find(|item| item.path.ends_with("tagged.mp4"))
+            .expect("tagged video fixture")
+            .detail_id;
+        let url = format!(
+            "/web/media/{id}.mp4?mode=compatible&quality=auto&video_mode=copy&audio_mode=copy&session=41&request=42"
+        );
+        let request = HttpRequest::parse_headers(&format!(
+            "GET {url} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n\r\n"
+        ))
+        .unwrap();
+        let spec = app.handle(&request).remux_job.expect("compatible job");
+        // Register deterministic output under the real route's job identity;
+        // HTTP requests still pass through parsing, routing and remux admission.
+        let payload: Vec<u8> = (0..FIRST_BYTES).map(|index| (index % 251) as u8).collect();
+        let mut job = growing_test_job(&app.cache_dir, id, &payload);
+        let fixture = Arc::get_mut(&mut job).unwrap();
+        let part = cache_part(&spec.dest);
+        std::fs::rename(&fixture.part, &part).unwrap();
+        fixture.part = part;
+        fixture.dest = spec.dest.clone();
+        fixture.web = true;
+        fixture.web_spec = Some(spec.clone());
+        fixture
+            .add_web_request(spec.web_session_id, spec.web_request_id)
+            .unwrap();
+        crate::lock_recover(&app.remuxes).insert(spec.job_key, job.clone());
+        (app, job, url, payload)
+    }
+
+    async fn compatible_connection_wire(
+        app: &Arc<App>,
+        url: &str,
+        method: &str,
+        range: Option<&str>,
+    ) -> Vec<u8> {
+        let range = range.map_or_else(String::new, |range| format!("Range: {range}\r\n"));
+        let request = format!(
+            "{method} {url} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nConnection: close\r\n{range}\r\n"
+        );
+        crate::tests::raw_connection(app.clone(), request.as_bytes(), false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_compatible_head_through_connection_reports_final_length() {
+        let (app, job, url, payload) = compatible_connection_fixture();
+        std::fs::rename(&job.part, &job.dest).unwrap();
+        job.transition(RemuxState::Complete);
+
+        for method in ["HEAD", "GET"] {
+            for (range, expected, status) in [
+                (None, payload.as_slice(), "200 OK"),
+                (Some("bytes=0-7"), &payload[..8], "206 Partial Content"),
+            ] {
+                let bytes = compatible_connection_wire(&app, &url, method, range).await;
+                let headers =
+                    String::from_utf8_lossy(&bytes[..bytes.len() - wire_body(&bytes).len()]);
+                assert!(
+                    headers.starts_with(&format!("HTTP/1.1 {status}\r\n")),
+                    "{headers}"
+                );
+                assert!(
+                    headers.contains("\r\nContent-Type: video/mp4\r\n"),
+                    "{headers}"
+                );
+                assert!(
+                    headers.contains(&format!("\r\nContent-Length: {}\r\n", expected.len())),
+                    "{method} {range:?}: {headers}"
+                );
+                assert!(
+                    headers.contains("\r\nAccept-Ranges: bytes\r\n"),
+                    "{headers}"
+                );
+                if range.is_some() {
+                    assert!(
+                        headers.contains(&format!(
+                            "\r\nContent-Range: bytes 0-7/{}\r\n",
+                            payload.len()
+                        )),
+                        "{headers}"
+                    );
+                }
+                assert_eq!(
+                    wire_body(&bytes),
+                    if method == "HEAD" { &[] } else { expected }
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compatible_head_through_connection_suppresses_range_error_bodies() {
+        let (app, job, url, payload) = compatible_connection_fixture();
+        for complete in [false, true] {
+            if complete {
+                std::fs::rename(&job.part, &job.dest).unwrap();
+                job.transition(RemuxState::Complete);
+            }
+            for (range, status) in [
+                ("bytes=invalid".to_owned(), "400 Bad Request"),
+                (
+                    format!("bytes={}-", payload.len()),
+                    "416 Requested Range Not Satisfiable",
+                ),
+            ] {
+                // A growing producer can still satisfy a range beyond its current end.
+                if !complete && status.starts_with("416") {
+                    continue;
+                }
+                for method in ["HEAD", "GET"] {
+                    let bytes = compatible_connection_wire(&app, &url, method, Some(&range)).await;
+                    let headers = String::from_utf8_lossy(&bytes);
+                    assert!(
+                        headers.starts_with(&format!("HTTP/1.1 {status}\r\n")),
+                        "{headers}"
+                    );
+                    assert_eq!(wire_body(&bytes).is_empty(), method == "HEAD", "{headers}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn growing_compatible_head_through_connection_keeps_length_unknown() {
+        let (app, job, url, payload) = compatible_connection_fixture();
+        for range in [None, Some("bytes=0-")] {
+            let bytes = compatible_connection_wire(&app, &url, "HEAD", range).await;
+            let headers = String::from_utf8_lossy(&bytes);
+            assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers}");
+            assert!(
+                !headers.to_ascii_lowercase().contains("content-length:"),
+                "{headers}"
+            );
+            assert!(
+                !headers.to_ascii_lowercase().contains("transfer-encoding:"),
+                "{headers}"
+            );
+            assert!(wire_body(&bytes).is_empty());
+            assert_eq!(job.state(), RemuxState::Growing);
+        }
+        for method in ["HEAD", "GET"] {
+            let bytes = compatible_connection_wire(&app, &url, method, Some("bytes=0-7")).await;
+            let headers = String::from_utf8_lossy(&bytes);
+            assert!(
+                headers.starts_with("HTTP/1.1 206 Partial Content\r\n"),
+                "{headers}"
+            );
+            assert!(headers.contains("\r\nContent-Length: 8\r\n"), "{headers}");
+            assert!(
+                headers.contains("\r\nContent-Range: bytes 0-7/*\r\n"),
+                "{headers}"
+            );
+            assert_eq!(
+                wire_body(&bytes),
+                if method == "HEAD" { &[] } else { &payload[..8] }
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

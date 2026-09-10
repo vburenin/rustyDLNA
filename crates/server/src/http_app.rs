@@ -812,10 +812,10 @@ impl App {
         }
         if method.eq_ignore_ascii_case("HEAD") {
             resp.body.clear();
-            // The accept loop sends these payloads after `bytes_wire`, so a
-            // HEAD response must suppress them explicitly as well.
+            // The connection handler sends file ranges after `bytes_wire`.
             resp.file_range = None;
-            resp.remux_job = None;
+            // Keep remux dispatch: its HEAD-aware serving resolves the current
+            // output length and ranges without sending media bytes.
         }
         if resp.status >= 400 && r != HttpRoute::Soap {
             tracing::error!(

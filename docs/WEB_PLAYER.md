@@ -846,6 +846,10 @@ weak tag, or unsupported date validator returns the complete current file.
 Finalized compatible cache artifacts also advertise a validator based on their
 completion stamp and physical file identity; touching cache recency does not
 change it. Outputs without a completion stamp have no resume validator.
+HEAD on the same compatible rendition URL reports the exact `Content-Length`
+once output is complete, with the same range headers as GET and no response
+body. While output is growing, an ordinary HEAD omits `Content-Length`;
+a ranged HEAD may report the snapshot length with an unknown total (`/*`).
 Growing compatible output does not advertise a stable validator. Its partial
 responses with an unknown total describe a snapshot and must not be treated as
 a complete offline movie.
