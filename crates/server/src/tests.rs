@@ -5116,6 +5116,7 @@ fn remux_finished_range_and_stale_rebuild() {
         ai_upscale_shader_file: None,
         dest: dest.clone(),
         args: vec!["ffmpeg".into(), "-version".into()],
+        hardware_fallback_args: None,
         fallback_args: None,
         continue_after_disconnect: true,
         cacheable: true,
@@ -6888,6 +6889,41 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
             && arg.contains("libplacebo=apply_dolbyvision=true")
     }));
 
+    for hdr in ["hdr10", "dv-p8"] {
+        {
+            let mut catalog = app.catalog.write().unwrap();
+            let object_id = catalog.by_detail[&dvp7.detail_id].clone();
+            catalog.items.get_mut(&object_id).unwrap().probe.hdr = hdr.into();
+        }
+        let response = app.handle(&req(&get(
+            &format!(
+                "/web/media/{}.mp4?quality=low_360&reason=native_ios",
+                dvp7.detail_id
+            ),
+            "Native iOS/1.0",
+        )));
+        let spec = response.remux_job.expect("iPhone SDR download job");
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|pair| pair == ["-hwaccel", "vulkan"]));
+        assert!(spec.cache_key.contains("browser-vulkan-tonemap-v1"));
+        let hardware = spec.hardware_fallback_args.as_ref().expect("CUDA fallback");
+        assert!(hardware.windows(2).any(|pair| pair == ["-hwaccel", "cuda"]));
+        assert!(hardware
+            .windows(2)
+            .any(|pair| pair == ["-c:v", "h264_nvenc"]));
+        let software = spec.fallback_args.as_ref().expect("portable fallback");
+        assert!(software.windows(2).any(|pair| pair == ["-c:v", "libx264"]));
+        assert!(!software.iter().any(|arg| arg == "-hwaccel"));
+        for args in [&spec.args, hardware, software] {
+            assert!(args.windows(2).any(|pair| pair == ["-maxrate", "800k"]));
+            assert!(args.iter().any(|arg| arg
+                .to_string_lossy()
+                .contains("libplacebo=apply_dolbyvision=true")));
+            assert!(!args.iter().any(|arg| arg == "-readrate"));
+        }
+    }
     {
         let mut catalog = app.catalog.write().unwrap();
         let object_id = catalog.by_detail[&dvp7.detail_id].clone();

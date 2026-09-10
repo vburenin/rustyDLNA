@@ -67,8 +67,16 @@ signaling color metadata partway through the stream; the browser cache identity
 includes this output-pipeline revision. NVENC browser output decodes H.264 in
 software because that avoids the costly CUDA download/re-upload path and reaches
 the first fragmented-MP4 segment sooner while sustaining faster-than-playback
-output. HEVC sources keep CUDA decode to bound CPU cost, including the HDR
-tone-map path. The Profile 7 to browser HDR10 path instead decodes its base
+output. H.264 SDR conversions of HEVC HDR10 and Dolby Vision Profile 8 use
+Vulkan video decode on the same device as libplacebo. Full-resolution decoded
+frames stay on that device through tone mapping and scaling; only the bounded
+SDR output is downloaded for NVENC. This avoids the full-resolution CUDA-to-host
+download and host-to-Vulkan upload that can limit offline download throughput.
+If Vulkan cannot start before playable output is available, the job retries
+CUDA decode with NVENC, then the portable software encoder. All attempts share
+the original cancellation and runtime budget, and fallback output is not cached
+under the primary Vulkan identity. Other HEVC paths retain CUDA decode.
+The Profile 7 to browser HDR10 path instead decodes its base
 layer in software because CUDA does not reliably expose that dual-layer input,
 then uses NVENC for the output. Auto-profile
 H.264 output lets the encoder derive the lowest valid H.264 level from the

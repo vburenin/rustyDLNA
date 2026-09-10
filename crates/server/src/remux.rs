@@ -1066,16 +1066,23 @@ fn spawn_ffmpeg(
                 deadline,
                 &app,
             );
-            let primary_failed = matches!(&result, Ok((status, _)) if !status.success());
-            if primary_failed
-                && !job.cancelled.load(Ordering::Acquire)
-                && current_len(&job) < FIRST_BYTES
-            {
-                if let Some(fallback) = spec.fallback_args.as_ref() {
+            for (fallback, kind) in [
+                (spec.hardware_fallback_args.as_ref(), "alternate hardware"),
+                (spec.fallback_args.as_ref(), "portable encoders"),
+            ] {
+                let failed = matches!(&result, Ok((status, _)) if !status.success());
+                if !failed
+                    || job.cancelled.load(Ordering::Acquire)
+                    || current_len(&job) >= FIRST_BYTES
+                {
+                    break;
+                }
+                if let Some(fallback) = fallback {
                     tracing::warn!(
                         id,
                         dest = %dest.display(),
-                        "negotiated compatible output failed; retrying with portable encoders"
+                        kind,
+                        "negotiated compatible output failed; retrying fallback"
                     );
                     cleanup_intermediates(&part);
                     job.transition(RemuxState::Starting);
@@ -3340,6 +3347,7 @@ mod tests {
             ai_upscale_shader_file: None,
             dest: dir.join(format!("{key}.mp4")),
             args: command.into_iter().map(Into::into).collect(),
+            hardware_fallback_args: None,
             fallback_args: None,
             continue_after_disconnect: true,
             cacheable: true,
@@ -4941,6 +4949,7 @@ mod tests {
                 src.as_os_str().to_os_string(),
                 part.as_os_str().to_os_string(),
             ],
+            hardware_fallback_args: None,
             fallback_args: None,
             continue_after_disconnect: true,
             cacheable: true,
@@ -4976,6 +4985,7 @@ mod tests {
                 src.as_os_str().to_os_string(),
                 part.as_os_str().to_os_string(),
             ],
+            hardware_fallback_args: None,
             fallback_args: None,
             continue_after_disconnect: true,
             cacheable: true,
@@ -5516,6 +5526,44 @@ mod tests {
         assert!(!stamp.exists());
         assert!(!cache_is_fresh_for_key(&dest, &cache_key));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hardware_fallback_precedes_portable_output_and_never_stamps_primary_cache() {
+        for hardware_succeeds in [true, false] {
+            let dir = temp_dir("hardware-fallback-chain");
+            let app = test_app(&dir, 1);
+            let mut spec = job_spec(
+                &dir,
+                "hardware-fallback-chain",
+                vec!["sh".into(), "-c".into(), "exit 1".into()],
+            );
+            let dest = spec.dest.clone();
+            let part = cache_part(&dest);
+            let copy = vec![
+                "cp".into(),
+                spec.src.as_os_str().to_owned(),
+                part.as_os_str().to_owned(),
+            ];
+            let fail = vec!["sh".into(), "-c".into(), "exit 1".into()];
+            spec.hardware_fallback_args = Some(if hardware_succeeds {
+                copy.clone()
+            } else {
+                fail.clone()
+            });
+            spec.fallback_args = Some(if hardware_succeeds { fail } else { copy });
+            let expected = std::fs::read(&spec.src).unwrap();
+            let key = spec.cache_key.clone();
+            let stamp = rusty_dlna_transcode::cache_stamp_path(&dest);
+            std::fs::write(&stamp, &key).unwrap();
+            let job = attach(app.clone(), spec).unwrap();
+            wait_for_terminal_cleanup(&app, &job);
+            assert_eq!(job.state(), RemuxState::Complete);
+            assert_eq!(std::fs::read(&dest).unwrap(), expected);
+            assert!(!stamp.exists());
+            assert!(!cache_is_fresh_for_key(&dest, &key));
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]

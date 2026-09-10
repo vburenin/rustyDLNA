@@ -2917,7 +2917,11 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             source.hdr,
         )
     } else {
-        rusty_dlna_transcode::browser_hardware_decode(video_encoder, source.video_codec)
+        rusty_dlna_transcode::browser_sdr_hardware_decode(
+            video_encoder,
+            source.video_codec,
+            source.hdr,
+        )
     };
     let plan = TranscodePlan {
         decision: Decision::Recode,
@@ -3116,6 +3120,11 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         )
     };
     let args = transcode_args(&plan);
+    let hardware_fallback_args = (plan.hardware_decode == HardwareDecode::Vulkan).then(|| {
+        let mut fallback = plan.clone();
+        fallback.hardware_decode = HardwareDecode::Cuda;
+        transcode_args(&fallback)
+    });
     let fallback_args =
         if (is_video && plan.video_encoder != "libx264") || plan.audio != AudioAction::ToAac {
             let mut fallback = plan.clone();
@@ -3164,6 +3173,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         ai_upscale_shader_file: ai_upscale_profile.map(|profile| Arc::clone(&profile.shader_file)),
         dest: destination,
         args,
+        hardware_fallback_args,
         fallback_args,
         continue_after_disconnect: false,
         cacheable: start_seconds == 0,

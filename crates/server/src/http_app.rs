@@ -2200,6 +2200,7 @@ impl App {
                     ai_upscale_shader_file: None,
                     dest: dest.clone(),
                     args,
+                    hardware_fallback_args: None,
                     fallback_args,
                     continue_after_disconnect: self.cfg.transcode.continue_after_disconnect,
                     cacheable: true,

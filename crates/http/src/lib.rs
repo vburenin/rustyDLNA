@@ -465,6 +465,9 @@ pub struct RemuxJobSpec {
     pub ai_upscale_shader_file: Option<std::sync::Arc<std::fs::File>>,
     pub dest: std::path::PathBuf,
     pub args: Vec<std::ffi::OsString>,
+    /// Alternate hardware path tried before portable encoders when the primary
+    /// device cannot start, and only before playable bytes are published.
+    pub hardware_fallback_args: Option<Vec<std::ffi::OsString>>,
     /// Optional portable command used when negotiated stream copying or a
     /// hardware producer fails before emitting a playable first fragment.
     pub fallback_args: Option<Vec<std::ffi::OsString>>,

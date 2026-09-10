@@ -70,6 +70,8 @@ pub enum HardwareDecode {
     #[default]
     None,
     Cuda,
+    /// Vulkan video decode feeding the browser's libplacebo SDR tone mapper.
+    Vulkan,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -137,6 +139,7 @@ const BROWSER_AAC_FILTER_CACHE_REVISION: &str = "browser-aac-adtstoasc-v1";
 const BROWSER_HEVC_TAG_CACHE_REVISION: &str = "browser-hevc-hvc1-v1";
 const BROWSER_MIXED_COPY_SEEK_CACHE_REVISION: &str = "browser-mixed-copy-seek-v2";
 const BROWSER_CUDA_DOWNLOAD_CACHE_REVISION: &str = "browser-cuda-download-v1";
+const BROWSER_VULKAN_TONEMAP_CACHE_REVISION: &str = "browser-vulkan-tonemap-v1";
 const BROWSER_ADAPTIVE_H264_LEVEL_CACHE_REVISION: &str = "browser-adaptive-h264-level-v1";
 const BROWSER_NVENC_IDR_CACHE_REVISION: &str = "browser-nvenc-idr-v1";
 const BROWSER_DATA_SAVER_BASELINE_CACHE_REVISION: &str = "browser-data-saver-baseline-v1";
@@ -538,6 +541,24 @@ pub fn browser_hardware_decode(video_encoder: &str, source_video: VideoCodec) ->
     }
 }
 
+/// Keep single-layer HDR HEVC frames on the tone mapper's Vulkan device.
+/// Other browser paths retain their established decode policy. In particular,
+/// HDR-preserving output does not use libplacebo and must keep CUDA decode.
+pub fn browser_sdr_hardware_decode(
+    video_encoder: &str,
+    source_video: VideoCodec,
+    source_hdr: HdrKind,
+) -> HardwareDecode {
+    if video_encoder == "h264_nvenc"
+        && source_video == VideoCodec::Hevc
+        && matches!(source_hdr, HdrKind::Hdr10 | HdrKind::DolbyVisionProfile8)
+    {
+        HardwareDecode::Vulkan
+    } else {
+        browser_hardware_decode(video_encoder, source_video)
+    }
+}
+
 /// Select decode hardware for a browser HDR10 encode.
 ///
 /// Dolby Vision Profile 7 carries an enhancement layer that CUDA decode does
@@ -902,12 +923,17 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
         "-y".into(),
         "-nostdin".into(),
     ];
-    if plan.hardware_decode == HardwareDecode::Cuda {
+    let decode_device = match plan.hardware_decode {
+        HardwareDecode::Cuda => Some("cuda"),
+        HardwareDecode::Vulkan => Some("vulkan"),
+        HardwareDecode::None => None,
+    };
+    if let Some(device) = decode_device {
         a.extend([
             "-hwaccel".into(),
-            "cuda".into(),
+            device.into(),
             "-hwaccel_output_format".into(),
-            "cuda".into(),
+            device.into(),
         ]);
     }
     a.extend([
@@ -1152,15 +1178,18 @@ fn apply_browser_sdr_tonemap(
         .iter()
         .position(|argument| argument == "-i")
         .expect("ffmpeg browser command must include an input");
-    args.splice(
-        input..input,
-        [
-            OsString::from("-init_hw_device"),
-            OsString::from("vulkan=vk:0"),
-            OsString::from("-filter_hw_device"),
-            OsString::from("vk"),
-        ],
-    );
+    let mut device_args = vec![
+        OsString::from("-init_hw_device"),
+        OsString::from("vulkan=vk:0"),
+        OsString::from("-filter_hw_device"),
+        OsString::from("vk"),
+    ];
+    if hardware_decode == HardwareDecode::Vulkan {
+        // Decode and filter on the same named device, without a source-sized
+        // CUDA download followed by a Vulkan upload through system memory.
+        device_args.extend(["-hwaccel_device".into(), "vk".into()]);
+    }
+    args.splice(input..input, device_args);
 
     // libplacebo consumes the Dolby Vision RPU side data and maps the result
     // to ordinary BT.709 SDR. Profile 5 has no HDR10-compatible base-layer
@@ -1182,6 +1211,7 @@ fn apply_browser_sdr_tonemap(
         quality.max_height()
     );
     let filter = match hardware_decode {
+        HardwareDecode::Vulkan => format!("{libplacebo},hwdownload,format=yuv420p"),
         HardwareDecode::Cuda => {
             format!("hwdownload,format=p010le,hwupload,{libplacebo},hwdownload,format=yuv420p")
         }
@@ -1250,6 +1280,7 @@ fn apply_browser_ai_upscale(
         quality.max_height()
     );
     let filter = match hardware_decode {
+        HardwareDecode::Vulkan => format!("{libplacebo},hwdownload,format=yuv420p"),
         HardwareDecode::Cuda => {
             // Browser AI upscale is admitted only for 8-bit input. CUDA
             // exposes those decoded frames as semiplanar NV12, and
@@ -2776,6 +2807,10 @@ fn browser_cache_key_from_base(
     if plan.hardware_decode == HardwareDecode::Cuda && plan.video_encoder != "copy" {
         cache_key.push('-');
         cache_key.push_str(BROWSER_CUDA_DOWNLOAD_CACHE_REVISION);
+    }
+    if plan.hardware_decode == HardwareDecode::Vulkan && policy.apply_sdr_tonemap {
+        cache_key.push('-');
+        cache_key.push_str(BROWSER_VULKAN_TONEMAP_CACHE_REVISION);
     }
     if plan.browser_quality == Some(BrowserQuality::Auto)
         && matches!(plan.video_encoder.as_str(), "h264_nvenc" | "libx264")
@@ -4553,6 +4588,78 @@ action = "audio-ac3"
                 "libx264"
             );
         }
+    }
+
+    #[test]
+    fn browser_vulkan_tonemap_keeps_frames_on_one_device_and_owns_cache_identity() {
+        for hdr in [HdrKind::Hdr10, HdrKind::DolbyVisionProfile8] {
+            let mut plan = TranscodePlan {
+                action: RecodeAction::Browser,
+                video_encoder: "h264_nvenc".into(),
+                hardware_decode: browser_sdr_hardware_decode("h264_nvenc", VideoCodec::Hevc, hdr),
+                browser_quality: Some(BrowserQuality::Low360),
+                ..TranscodePlan::default()
+            };
+            assert_eq!(plan.hardware_decode, HardwareDecode::Vulkan);
+            let options = BrowserOutputOptions {
+                encoding_preset: BrowserEncodingPreset::Balanced,
+                source_video: Some(VideoCodec::Hevc),
+                selected_audio: AudioCodec::Aac,
+                source_hdr: hdr,
+                start_seconds: 60,
+                hls: false,
+            };
+            let args =
+                browser_ffmpeg_os_args(Path::new("in.mkv"), Path::new("out.mp4"), &plan, options);
+            for pair in [
+                ["-hwaccel", "vulkan"],
+                ["-hwaccel_output_format", "vulkan"],
+                ["-hwaccel_device", "vk"],
+                ["-filter_hw_device", "vk"],
+                ["-c:v", "h264_nvenc"],
+                ["-color_trc", "bt709"],
+            ] {
+                assert!(args.windows(2).any(|args| args == pair));
+            }
+            let filter = args[args.iter().position(|arg| arg == "-vf").unwrap() + 1]
+                .to_str()
+                .unwrap();
+            assert!(filter.starts_with("libplacebo=apply_dolbyvision=true:"));
+            assert!(filter.contains("w='min(iw,640)':h='min(ih,360)'"));
+            assert!(filter.ends_with(",hwdownload,format=yuv420p"));
+            assert!(!filter.contains("hwupload"));
+            let key = browser_cache_key_from_base("source".into(), &plan, options);
+            assert!(key.contains(BROWSER_VULKAN_TONEMAP_CACHE_REVISION));
+            plan.hardware_decode = HardwareDecode::Cuda;
+            let fallback_key = browser_cache_key_from_base("source".into(), &plan, options);
+            assert_ne!(key, fallback_key);
+            assert!(!fallback_key.contains(BROWSER_VULKAN_TONEMAP_CACHE_REVISION));
+        }
+        for hdr in [
+            HdrKind::Sdr,
+            HdrKind::DolbyVisionProfile5,
+            HdrKind::DolbyVisionProfile7,
+            HdrKind::DolbyVisionOther,
+        ] {
+            assert_eq!(
+                browser_sdr_hardware_decode("h264_nvenc", VideoCodec::Hevc, hdr),
+                HardwareDecode::Cuda
+            );
+        }
+        for encoder in ["libx264", "copy"] {
+            assert_eq!(
+                browser_sdr_hardware_decode(encoder, VideoCodec::Hevc, HdrKind::Hdr10),
+                HardwareDecode::None
+            );
+        }
+        assert_eq!(
+            browser_sdr_hardware_decode("h264_nvenc", VideoCodec::H264, HdrKind::Hdr10),
+            HardwareDecode::None
+        );
+        assert_eq!(
+            browser_hdr_hardware_decode("hevc_nvenc", VideoCodec::Hevc, HdrKind::Hdr10),
+            HardwareDecode::Cuda
+        );
     }
 
     #[test]
