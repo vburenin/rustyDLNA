@@ -77,6 +77,7 @@ fn browser_ai_upscale_is_descriptor_backed_and_exactly_sdr_gated() {
         item.probe.width = 1280;
         item.probe.height = 720;
         item.probe.frame_rate = "24000/1001".into();
+        item.duration = Some("00:02:00".into());
     }
 
     let upscaled = app.handle(&req(&get(
@@ -121,6 +122,37 @@ fn browser_ai_upscale_is_descriptor_backed_and_exactly_sdr_gated() {
         .iter()
         .any(|arg| arg.to_string_lossy().contains("min(iw,1920)")));
     assert_ne!(native.cache_key, upscaled.cache_key);
+
+    // The iOS client's saved 1080p choice is a ceiling for a 720p source,
+    // including streaming and seek restarts that carry no download_audio.
+    // The browser control above must still select its explicit AI upscale.
+    for (extension, delivery) in [("mp4", ""), ("m3u8", "&delivery=hls")] {
+        for start in [0, 30] {
+            let response = app.handle(&req(&get(
+                &format!(
+                    "/web/media/{}.{extension}?mode=compatible&quality=full_hd&video_mode=transcode&audio_mode=transcode&reason=native_ios&start={start}{delivery}",
+                    tagged.detail_id
+                ),
+                "Native/1.0",
+            )));
+            assert_eq!(response.status, 200);
+            let native = response.remux_job.expect("native capped playback");
+            assert!(
+                native.ai_upscale_shader_file.is_none(),
+                "{extension}, start={start}"
+            );
+            assert_ne!(native.cache_key, upscaled.cache_key);
+            for args in std::iter::once(&native.args).chain(native.fallback_args.as_ref()) {
+                assert!(args
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().contains("min(iw,1920)")));
+                assert!(args.windows(2).any(|pair| pair == ["-maxrate", "8000k"]));
+                assert!(!args
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().contains("custom_shader_path")));
+            }
+        }
+    }
 
     {
         let mut catalog = write_recover(&app.catalog);
@@ -180,6 +212,161 @@ fn browser_ai_upscale_is_descriptor_backed_and_exactly_sdr_gated() {
         .expect("ordinary over-envelope browser job")
         .ai_upscale_shader_file
         .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_1080p_ceiling_produces_720p_media_for_streaming_and_downloads() {
+    use rusty_dlna_helper::{
+        CaptureConfig, CaptureRetention, SupervisedCommand, SupervisedOutcome,
+    };
+
+    fn media_tool(command: &mut std::process::Command) -> Vec<u8> {
+        let outcome = SupervisedCommand::new(command)
+            .capture_stdout(CaptureConfig::new(64 * 1024, CaptureRetention::Head))
+            .capture_stderr(CaptureConfig::new(64 * 1024, CaptureRetention::Tail))
+            .run_until(
+                Instant::now() + Duration::from_secs(30),
+                Duration::from_millis(20),
+                || std::ops::ControlFlow::<()>::Continue(()),
+            )
+            .unwrap();
+        let SupervisedOutcome::Exited(output) = outcome else {
+            panic!("synthetic media tool timed out");
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    let tree = TestTree::new("native-quality-ceiling");
+    let library = tree.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let source = library.join("Synthetic Ceiling.mp4");
+    media_tool(
+        std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=1280x720:rate=12",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-t",
+                "2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&source),
+    );
+    let cfg = Config {
+        media_dir: vec![library.display().to_string()],
+        cache_dir: Some(tree.path().join("cache").display().to_string()),
+        db_dir: Some(tree.path().join("database").display().to_string()),
+        rescan_secs: 0,
+        transcode: TranscodeCfg {
+            enable: true,
+            max_jobs: 1,
+            ..TranscodeCfg::default()
+        },
+        ..Config::default()
+    };
+    let mut app = App::from_config(cfg, 18200, 11900, tree.path());
+    *write_recover(&app.catalog) = scan(&app.scan_cfg).unwrap();
+    let item = read_recover(&app.catalog)
+        .items
+        .values()
+        .find(|item| item.path.ends_with("Synthetic Ceiling.mp4"))
+        .unwrap()
+        .clone();
+    assert_eq!((item.probe.width, item.probe.height), (1280, 720));
+    let shader_path = tree.path().join("synthetic-upscale.glsl");
+    std::fs::write(
+        &shader_path,
+        b"//!HOOK LUMA\n//!BIND HOOKED\nvec4 hook(){return HOOKED_tex(HOOKED_pos);}\n",
+    )
+    .unwrap();
+    app.ai_upscale_profiles.push(BrowserAiUpscaleProfile {
+        name: "fsrcnnx-16".into(),
+        shader_file: Arc::new(std::fs::File::open(shader_path).unwrap()),
+        shader_sha256: "d".repeat(64),
+        max_source_width: 1920,
+        max_source_height: 1080,
+        max_source_pixels_per_second: 52_000_000,
+    });
+    let app = Arc::new(app);
+    for (extension, extra) in [
+        ("mp4", ""),
+        ("m3u8", "&delivery=hls"),
+        ("mp4", "&download_audio=selected"),
+    ] {
+        let response = app.handle(&req(&get(
+            &format!("/web/media/{}.{extension}?mode=compatible&quality=full_hd&video_mode=transcode&audio_mode=transcode&reason=native_ios{extra}", item.detail_id),
+            "Native/1.0",
+        )));
+        assert_eq!(response.status, 200);
+        let spec = response.remux_job.expect("real native encode");
+        assert!(spec.ai_upscale_shader_file.is_none());
+        let job = crate::remux::attach(Arc::clone(&app), spec).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let state = lock_recover(&job.state).clone();
+                if matches!(
+                    state,
+                    crate::remux::RemuxState::Complete
+                        | crate::remux::RemuxState::Failed(_)
+                        | crate::remux::RemuxState::Cancelled
+                ) {
+                    break state;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if result.is_err() {
+            crate::remux::cancel_all(&app);
+            crate::remux::wait_for_shutdown(&app, Duration::from_secs(5)).await;
+        }
+        assert_eq!(
+            result.expect("native encoder completed"),
+            crate::remux::RemuxState::Complete
+        );
+        let probe = media_tool(
+            std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "json",
+                ])
+                .arg(&job.dest),
+        );
+        let probe: serde_json::Value = serde_json::from_slice(&probe).unwrap();
+        assert_eq!(probe["streams"][0]["width"], 1280, "{extension}{extra}");
+        assert_eq!(probe["streams"][0]["height"], 720, "{extension}{extra}");
+        media_tool(
+            std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&job.dest)
+                .args(["-f", "null", "-"]),
+        );
+        crate::remux::wait_for_shutdown(&app, Duration::from_secs(5)).await;
+    }
 }
 
 fn require_fixture_library_at(library: &Path) {

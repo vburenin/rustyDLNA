@@ -2809,8 +2809,13 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         item.probe.width,
         item.probe.height,
     );
-    let requests_ai_upscale =
-        download_audio.is_none() && is_video && quality_requests_upscale(quality, &source);
+    // The native iOS contract uses quality as a ceiling for both playback and
+    // downloads. Its existing request marker also covers installed clients and
+    // seek/fallback generations that do not carry download_audio.
+    let requests_ai_upscale = download_audio.is_none()
+        && fallback_reason != "native_ios"
+        && is_video
+        && quality_requests_upscale(quality, &source);
     let ai_upscale_profile = if requests_ai_upscale {
         let source_pixel_rate =
             source_pixel_rate(source.width, source.height, &item.probe.frame_rate);

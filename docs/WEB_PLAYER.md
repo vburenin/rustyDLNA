@@ -910,8 +910,16 @@ the mapping. Video uses the selected profile's resolution and video bitrate
 limits, and native download requests disable AI enlargement. Smaller source
 dimensions are retained. These outputs have a distinct cache identity.
 
-Requests without `download_audio` retain the web player's existing audio and
-upscale negotiation. Native audio choices can exceed the profile's stereo
+The native iOS request marker `reason=native_ios` also treats quality as a
+maximum for ordinary MP4/HLS playback, including seek and fallback generations:
+a 720p source with `quality=full_hd` stays 720p while retaining the 1080p
+profile's video bitrate limit. It never selects the browser's AI upscaler.
+This applies to installed native clients without requiring a new query field.
+AI and ordinary capped encodes have separate cache identities, so previously
+upscaled browser output cannot satisfy these native requests.
+
+Other requests without `download_audio` retain the web player's existing audio
+and upscale negotiation. Native audio choices can exceed the profile's stereo
 bandwidth estimate: `max_video_kbps` describes the video budget; copied or
 additional audio contributes separately. MP4 delivery still omits embedded
 subtitles; clients can store advertised caption sidecars alongside it.
