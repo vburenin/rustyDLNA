@@ -446,6 +446,18 @@ pub struct TranscodePlan {
     /// Descriptor-backed libplacebo shader selected for an explicit SDR-only
     /// upscale. The shader bytes are represented by `shader_sha256`.
     pub browser_ai_upscale: Option<BrowserAiUpscale>,
+    /// Native offline MP4 audio, in output order. Browser streaming retains
+    /// its existing single-track contract when this is absent.
+    pub download_audio: Option<Vec<DownloadAudioTrack>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadAudioTrack {
+    pub index: usize,
+    pub copy: bool,
+    pub aac: bool,
+    pub channels: u32,
+    pub default: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -472,6 +484,7 @@ impl Default for TranscodePlan {
             audio_index: 0,
             browser_quality: None,
             browser_ai_upscale: None,
+            download_audio: None,
         }
     }
 }
@@ -777,6 +790,7 @@ fn plan_from_rule(
             audio_index: 0,
             browser_quality: None,
             browser_ai_upscale: None,
+            download_audio: None,
         },
         RecodeAction::Hdr10 => TranscodePlan {
             decision: Decision::Recode,
@@ -804,6 +818,7 @@ fn plan_from_rule(
             audio_index: 0,
             browser_quality: None,
             browser_ai_upscale: None,
+            download_audio: None,
         },
         RecodeAction::AudioAc3 => TranscodePlan {
             decision: Decision::Recode,
@@ -818,6 +833,7 @@ fn plan_from_rule(
             audio_index: 0,
             browser_quality: None,
             browser_ai_upscale: None,
+            download_audio: None,
         },
         RecodeAction::Browser => TranscodePlan::default(),
     }
@@ -946,9 +962,14 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
         } else {
             "0:v:0".into()
         },
-        "-map".into(),
-        audio_map_arg(plan),
     ]);
+    if let Some(tracks) = &plan.download_audio {
+        for track in tracks {
+            a.extend(["-map".into(), format!("0:a:{}", track.index)]);
+        }
+    } else {
+        a.extend(["-map".into(), audio_map_arg(plan)]);
+    }
     if plan.action == RecodeAction::Browser {
         // FFmpeg otherwise maps input chapters into MP4 as an additional text
         // track. Browser output declares only its selected video and audio
@@ -1089,19 +1110,45 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
             a.extend(["-force_key_frames".into(), "expr:gte(t,n_forced*2)".into()]);
         }
     }
-    match plan.audio {
-        AudioAction::Copy => a.extend(["-c:a".into(), "copy".into()]),
-        AudioAction::ToAc3 => a.extend(["-c:a".into(), "ac3".into(), "-b:a".into(), "640k".into()]),
-        AudioAction::ToAac => {
-            let audio_kbps = plan.browser_quality.map_or(256, BrowserQuality::audio_kbps);
+    if let Some(tracks) = &plan.download_audio {
+        for (index, track) in tracks.iter().enumerate() {
             a.extend([
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                format!("{audio_kbps}k"),
+                format!("-c:a:{index}"),
+                if track.copy { "copy" } else { "aac" }.into(),
             ]);
-            if plan.browser_quality.is_some() {
-                a.extend(["-ac".into(), "2".into()]);
+            if !track.copy {
+                let channels = track.channels.clamp(1, 8);
+                a.extend([
+                    format!("-ac:a:{index}"),
+                    channels.to_string(),
+                    format!("-b:a:{index}"),
+                    format!("{}k", (channels * 96).clamp(128, 768)),
+                ]);
+            } else if track.aac {
+                a.extend([format!("-bsf:a:{index}"), "aac_adtstoasc".into()]);
+            }
+            a.extend([
+                format!("-disposition:a:{index}"),
+                if track.default { "default" } else { "0" }.into(),
+            ]);
+        }
+    } else {
+        match plan.audio {
+            AudioAction::Copy => a.extend(["-c:a".into(), "copy".into()]),
+            AudioAction::ToAc3 => {
+                a.extend(["-c:a".into(), "ac3".into(), "-b:a".into(), "640k".into()])
+            }
+            AudioAction::ToAac => {
+                let audio_kbps = plan.browser_quality.map_or(256, BrowserQuality::audio_kbps);
+                a.extend([
+                    "-c:a".into(),
+                    "aac".into(),
+                    "-b:a".into(),
+                    format!("{audio_kbps}k"),
+                ]);
+                if plan.browser_quality.is_some() {
+                    a.extend(["-ac".into(), "2".into()]);
+                }
             }
         }
     }
@@ -1473,7 +1520,7 @@ fn browser_ffmpeg_os_args_with_readrate_catchup(
             plan.browser_quality.unwrap_or(BrowserQuality::Auto),
         );
     }
-    if policy.filter_copied_aac {
+    if policy.filter_copied_aac && plan.download_audio.is_none() {
         let output = args.len().saturating_sub(1);
         args.splice(
             output..output,
@@ -2844,6 +2891,17 @@ fn browser_cache_key_from_base(
         cache_key.push('-');
         cache_key.push_str(&lowercase_hex(&identity.finalize()));
     }
+    if let Some(tracks) = &plan.download_audio {
+        let mut identity = Sha256::new();
+        for track in tracks {
+            identity.update(format!(
+                "{}:{}:{}:{}:{};",
+                track.index, track.copy, track.aac, track.channels, track.default
+            ));
+        }
+        cache_key.push_str("-native-download-audio-v1-");
+        cache_key.push_str(&lowercase_hex(&identity.finalize()));
+    }
     if options.start_seconds > 0 {
         cache_key.push_str(&format!("-start-{}", options.start_seconds));
     }
@@ -3040,6 +3098,7 @@ pub fn hdr10_fallback_plan(from: &TranscodePlan) -> TranscodePlan {
         audio_index: from.audio_index,
         browser_quality: from.browser_quality,
         browser_ai_upscale: None,
+        download_audio: from.download_audio.clone(),
     }
 }
 
@@ -4986,6 +5045,144 @@ action = "audio-ac3"
             );
         }
         assert_eq!(BrowserEncodingPreset::parse("unknown"), None);
+    }
+
+    #[test]
+    fn native_download_encodes_a_capped_movie_with_surround_and_another_language() {
+        let tmp = tool_test_dir("native-download");
+        let source = tmp.join("source.mkv");
+        let output = tmp.join("offline.mp4");
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut generate: Vec<OsString> = [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=12",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=5.1:sample_rate=48000",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000",
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-map",
+            "2:a",
+            "-t",
+            "2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a:0",
+            "ac3",
+            "-c:a:1",
+            "flac",
+            "-metadata:s:a:0",
+            "language=eng",
+            "-metadata:s:a:1",
+            "language=fra",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        generate.push(source.as_os_str().to_owned());
+        run_cmd_controlled(&generate, deadline(), &cancelled, None).unwrap();
+        let plan = TranscodePlan {
+            action: RecodeAction::Browser,
+            video_encoder: "libx264".into(),
+            audio: AudioAction::ToAac,
+            browser_quality: Some(BrowserQuality::FullHd),
+            download_audio: Some(vec![
+                DownloadAudioTrack {
+                    index: 0,
+                    copy: true,
+                    aac: false,
+                    channels: 6,
+                    default: false,
+                },
+                DownloadAudioTrack {
+                    index: 1,
+                    copy: false,
+                    aac: false,
+                    channels: 1,
+                    default: true,
+                },
+            ]),
+            ..TranscodePlan::default()
+        };
+        let options = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::FastStart,
+            source_video: Some(VideoCodec::H264),
+            selected_audio: AudioCodec::Other,
+            source_hdr: HdrKind::Sdr,
+            start_seconds: 0,
+            hls: false,
+        };
+        let args = browser_ffmpeg_os_args(&source, &output, &plan, options);
+        run_cmd_controlled(&args, deadline(), &cancelled, None).unwrap();
+        let probe = |selection: &str, entries: &str| {
+            let mut args: Vec<OsString> = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                selection,
+                "-show_entries",
+                entries,
+                "-of",
+                "csv=p=0",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+            args.push(output.as_os_str().to_owned());
+            String::from_utf8(
+                run_cmd_capture_controlled(&args, deadline(), &cancelled, None).unwrap(),
+            )
+            .unwrap()
+        };
+        let video = probe("v:0", "stream=codec_name,width,height");
+        assert_eq!(
+            video.trim().split(',').collect::<Vec<_>>(),
+            ["h264", "320", "180"]
+        );
+        let audio = probe(
+            "a",
+            "stream=codec_name,channels:stream_disposition=default:stream_tags=language",
+        );
+        let audio: Vec<_> = audio
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| line.trim_end_matches(',').split(',').collect::<Vec<_>>())
+            .collect();
+        assert_eq!(
+            audio,
+            vec![vec!["ac3", "6", "0", "eng"], vec!["aac", "1", "1", "fra"]]
+        );
+        let decode = vec![
+            "ffmpeg".into(),
+            "-v".into(),
+            "error".into(),
+            "-i".into(),
+            output.into_os_string(),
+            "-map".into(),
+            "0".into(),
+            "-f".into(),
+            "null".into(),
+            "-".into(),
+        ];
+        run_cmd_controlled(&decode, deadline(), &cancelled, None).unwrap();
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]

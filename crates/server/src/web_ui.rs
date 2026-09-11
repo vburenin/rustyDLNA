@@ -87,7 +87,7 @@ const WEB_SCHEMA_VERSION: u8 = 2;
 // Change when a browser API representation can differ without a catalog
 // generation change. This keeps conditional requests from reusing capability
 // or media metadata cached from an older rustyDLNA build.
-const WEB_API_CACHE_REVISION: u8 = 6;
+const WEB_API_CACHE_REVISION: u8 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WebItemId(i64);
@@ -132,6 +132,7 @@ struct WebCapabilities {
     encoding_presets: Vec<WebEncodingPreset>,
     video_outputs: Vec<WebVideoOutput>,
     ai_upscale: Option<WebAiUpscaleCapability>,
+    native_downloads: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -364,6 +365,7 @@ struct WebMediaItem {
     transcode_likely: bool,
     compatible_video_encoder: String,
     repair_video_encoder: String,
+    prepared_video_outputs: Vec<&'static str>,
 }
 
 #[derive(Clone, Serialize)]
@@ -483,6 +485,7 @@ fn web_capabilities(app: &App) -> WebCapabilities {
             })
             .collect(),
         video_outputs,
+        native_downloads: app.cfg.transcode.enable,
         ai_upscale: (!app.ai_upscale_profiles.is_empty()).then(|| WebAiUpscaleCapability {
             label: "AI upscale",
             max_scale: 2,
@@ -1615,6 +1618,13 @@ fn media_dto(app: &App, item: &MediaItem) -> WebMediaItem {
         transcode_likely: !likely_browser_native(item, &source),
         compatible_video_encoder,
         repair_video_encoder,
+        prepared_video_outputs: if !app.cfg.transcode.enable {
+            vec![]
+        } else if native_hdr10_available(app, item, &source) {
+            vec!["h264_sdr", "hevc_hdr10"]
+        } else {
+            vec!["h264_sdr"]
+        },
     }
 }
 
@@ -2438,6 +2448,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         "video_mode",
         "video_output",
         "audio_mode",
+        "download_audio",
         "delivery",
         "hls_offset",
         "hls_length",
@@ -2691,6 +2702,12 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             )
         }
     };
+    let download_audio = match params.get("download_audio") {
+        None => None,
+        Some(value @ ("selected" | "all")) if delivery == "mp4" && start_seconds == 0 => Some(value),
+        _ => return api_error(400, "invalid_download_audio",
+            "Native downloads require MP4, a zero start position, and selected or all audio tracks.", false, None),
+    };
     let fallback_reason = params.get("reason").unwrap_or("unspecified");
     if fallback_reason.is_empty()
         || fallback_reason.len() > 64
@@ -2792,7 +2809,8 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         item.probe.width,
         item.probe.height,
     );
-    let requests_ai_upscale = is_video && quality_requests_upscale(quality, &source);
+    let requests_ai_upscale =
+        download_audio.is_none() && is_video && quality_requests_upscale(quality, &source);
     let ai_upscale_profile = if requests_ai_upscale {
         let source_pixel_rate =
             source_pixel_rate(source.width, source.height, &item.probe.frame_rate);
@@ -2813,16 +2831,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
     } else {
         None
     };
-    let hevc_hdr10_available = is_video
-        && app.cfg.web.encoder == "h264_nvenc"
-        && source.video_codec == rusty_dlna_transcode::VideoCodec::Hevc
-        && item.probe.bit_depth > 8
-        && matches!(
-            source.hdr,
-            rusty_dlna_transcode::HdrKind::Hdr10
-                | rusty_dlna_transcode::HdrKind::DolbyVisionProfile7
-                | rusty_dlna_transcode::HdrKind::DolbyVisionProfile8
-        );
+    let hevc_hdr10_available = is_video && native_hdr10_available(app, &item, &source);
     if requested_video_output == BrowserVideoOutput::HevcHdr10 && !hevc_hdr10_available {
         return api_error(
             400,
@@ -2892,6 +2901,36 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
     } else {
         false
     };
+    let native_audio = if let Some(selection) = download_audio {
+        if selection == "all" && tracks.len() > 32 {
+            return api_error(
+                400,
+                "too_many_audio_tracks",
+                "This movie has too many audio tracks for an offline copy.",
+                false,
+                None,
+            );
+        }
+        Some(
+            tracks
+                .iter()
+                .filter(|track| selection == "all" || track.index == audio_index)
+                .map(|track| rusty_dlna_transcode::DownloadAudioTrack {
+                    index: track.index,
+                    copy: browser_can_remux_audio(&track.codec),
+                    aac: track.codec.eq_ignore_ascii_case("aac"),
+                    channels: if track.channels == 0 {
+                        2
+                    } else {
+                        track.channels
+                    },
+                    default: track.index == audio_index,
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
     let repair_video_encoder = repair_video_requested.then(|| {
         rusty_dlna_transcode::browser_repair_video_encoder(
             &app.cfg.web.encoder,
@@ -2943,6 +2982,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             model: profile.name.clone(),
             shader_sha256: profile.shader_sha256.clone(),
         }),
+        download_audio: native_audio,
     };
     let browser_options = rusty_dlna_transcode::BrowserOutputOptions {
         encoding_preset,
@@ -3338,6 +3378,22 @@ fn browser_audio_content_type(codec: &str) -> Option<String> {
 
 fn browser_can_remux_audio(codec: &str) -> bool {
     browser_audio_content_type(codec).is_some()
+}
+
+fn native_hdr10_available(
+    app: &App,
+    item: &MediaItem,
+    source: &rusty_dlna_transcode::SourceMedia,
+) -> bool {
+    app.cfg.web.encoder == "h264_nvenc"
+        && source.video_codec == rusty_dlna_transcode::VideoCodec::Hevc
+        && item.probe.bit_depth > 8
+        && matches!(
+            source.hdr,
+            rusty_dlna_transcode::HdrKind::Hdr10
+                | rusty_dlna_transcode::HdrKind::DolbyVisionProfile7
+                | rusty_dlna_transcode::HdrKind::DolbyVisionProfile8
+        )
 }
 
 fn serve_original(

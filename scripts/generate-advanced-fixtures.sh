@@ -37,7 +37,7 @@ X264=(-c:v libx264 -preset ultrafast -pix_fmt yuv420p -x264-params threads=1:loo
     -f lavfi -i 'testsrc2=size=64x36:rate=5:duration=0.4' \
     -map_metadata -1 -frames:v 2 -an -c:v libx265 -preset ultrafast -pix_fmt yuv420p10le \
     -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc \
-    -x265-params 'pools=1:frame-threads=1:wpp=0:log-level=error:keyint=1:min-keyint=1:scenecut=0:repeat-headers=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50):max-cll=1000,400' \
+    -x265-params 'pools=1:frame-threads=1:wpp=0:log-level=error:keyint=1:min-keyint=1:scenecut=0:repeat-headers=1:colorprim=9:transfer=16:colormatrix=9:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50):max-cll=1000,400' \
     "$OUTPUT/hdr10-mastering.mkv"
 
 # Audio precedes video globally, two different audio codecs follow distinct

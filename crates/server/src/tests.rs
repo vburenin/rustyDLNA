@@ -104,6 +104,24 @@ fn browser_ai_upscale_is_descriptor_backed_and_exactly_sdr_gated() {
             .to_string_lossy()
             .contains("custom_shader_path=/proc/self/fd/5"))));
 
+    // Native downloads use the same ceiling without opting into the browser's
+    // explicitly requested neural enlargement, even on an AI-enabled server.
+    let native = app.handle(&req(&get(
+        &format!(
+            "/web/media/{}.mp4?quality=full_hd&video_mode=transcode&download_audio=all",
+            tagged.detail_id
+        ),
+        "Native/1.0",
+    )));
+    assert_eq!(native.status, 200);
+    let native = native.remux_job.expect("native capped download");
+    assert!(native.ai_upscale_shader_file.is_none());
+    assert!(native
+        .args
+        .iter()
+        .any(|arg| arg.to_string_lossy().contains("min(iw,1920)")));
+    assert_ne!(native.cache_key, upscaled.cache_key);
+
     {
         let mut catalog = write_recover(&app.catalog);
         let object_id = catalog.by_detail[&tagged.detail_id].clone();
@@ -732,7 +750,7 @@ fn web_item_samples_item_and_generation_under_one_catalog_snapshot() {
     assert_eq!(json["item"]["title"], old_title);
     assert_eq!(
         resp_header(&response, "ETag"),
-        Some(format!("W/\"web-v2-r6-{old_generation}-item-{detail_id}\"").as_str())
+        Some(format!("W/\"web-v2-r7-{old_generation}-item-{detail_id}\"").as_str())
     );
     done_rx.recv().unwrap().unwrap();
     publisher.join().unwrap();
@@ -5665,8 +5683,8 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     )));
     assert_eq!(folders.status, 200);
     let folders_etag = resp_header(&folders, "ETag").unwrap().to_owned();
-    assert!(folders_etag.starts_with("W/\"web-v2-r6-"), "{folders_etag}");
-    let stale_capability_etag = folders_etag.replacen("-r6-", "-r5-", 1);
+    assert!(folders_etag.starts_with("W/\"web-v2-r7-"), "{folders_etag}");
+    let stale_capability_etag = folders_etag.replacen("-r7-", "-r6-", 1);
     let stale_conditional = req(&format!(
         "GET /api/web/library?view=folders&folder=64&offset=0&limit=200 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\nIf-None-Match: {stale_capability_etag}\r\n\r\n"
     ));
@@ -6811,6 +6829,29 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     assert_eq!(accelerated_outputs.len(), 2);
     assert_eq!(accelerated_outputs[1]["id"], "hevc_hdr10");
     assert_eq!(accelerated_outputs[1]["dynamic_range"], "hdr");
+
+    let native_capabilities = app.handle(&req(&get(
+        &format!("/api/web/item/{}", dvp7.detail_id),
+        "Native/1.0",
+    )));
+    let native_capabilities: serde_json::Value =
+        serde_json::from_slice(&native_capabilities.body).unwrap();
+    assert_eq!(
+        native_capabilities["item"]["prepared_video_outputs"],
+        serde_json::json!(["h264_sdr", "hevc_hdr10"])
+    );
+
+    for invalid in [
+        "download_audio=unknown",
+        "download_audio=all&start=1",
+        "download_audio=all&delivery=hls",
+    ] {
+        let response = app.handle(&req(&get(
+            &format!("/web/media/{}.mp4?{invalid}", dvp7.detail_id),
+            "Native/1.0",
+        )));
+        assert_eq!(response.status, 400);
+    }
 
     let hdr10_output = app.handle(&req(&get(
         &format!(

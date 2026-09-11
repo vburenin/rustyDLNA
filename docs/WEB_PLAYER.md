@@ -898,6 +898,30 @@ the source through the same configured-root confinement used by original
 playback. Responses use a bounded, header-safe UTF-8 attachment filename,
 `private, no-store`, and byte ranges so browsers can resume a large download.
 
+### Native offline copies
+
+Schema 2 capabilities advertise `native_downloads` when compatible output is
+enabled. Native clients can add `download_audio=selected` or `download_audio=all`
+to a compatible MP4 request starting at zero. The existing `audio` index selects
+the preferred/default track. All-track requests are bounded to 32 audio tracks.
+Supported AAC, AC-3, E-AC-3 and MP3 are copied; other audio is encoded as AAC
+with one to eight channels. Language metadata and the chosen default survive
+the mapping. Video uses the selected profile's resolution and video bitrate
+limits, and native download requests disable AI enlargement. Smaller source
+dimensions are retained. These outputs have a distinct cache identity.
+
+Requests without `download_audio` retain the web player's existing audio and
+upscale negotiation. Native audio choices can exceed the profile's stereo
+bandwidth estimate: `max_video_kbps` describes the video budget; copied or
+additional audio contributes separately. MP4 delivery still omits embedded
+subtitles; clients can store advertised caption sidecars alongside it.
+
+Each video DTO also advertises source-specific `prepared_video_outputs`.
+`hevc_hdr10` is included only when the configured encoder and the probed source
+qualify for that existing HDR output contract; otherwise clients may request
+`h264_sdr`, retain the original, or explain why their HDR requirement cannot be
+met. This list is additive and does not replace browser capability probing.
+
 ### Browser-only gateway
 
 `docker-compose.web.yaml` runs a separate `rusty-web` nginx container in front
