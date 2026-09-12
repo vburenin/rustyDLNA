@@ -12,6 +12,7 @@ pub mod date;
 pub mod http_syntax;
 pub mod isolation;
 pub mod media_format;
+pub mod media_input;
 pub mod object_id;
 pub mod paths;
 pub mod persist;

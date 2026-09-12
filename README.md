@@ -116,7 +116,9 @@ cache. The shipped defaults reserve 128 MiB free, cap on-demand JPEGs at
 library and for simultaneous remap jobs. Details are in
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
-Optional Compatible playback and `[[remap]]` jobs need FFmpeg on the host.
+Optional Compatible playback and `[[remap]]` jobs need FFmpeg and FFprobe 6 or
+newer on the host. Media helpers use the seekable `fd` protocol to prevent
+containers from opening secondary files or network resources.
 `libx264` is the CPU path. An NVIDIA GPU with NVENC, exposed through the
 NVIDIA Container Toolkit (`web.encoder = "h264_nvenc"`), is the fast path for
 browser encodes and HDR tone mapping; if that path cannot start, the job falls

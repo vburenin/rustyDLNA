@@ -8,6 +8,13 @@ use std::path::Path;
 use std::ptr;
 
 extern "C" {
+    fn rusty_dlna_confined_avio(
+        context: *mut sys::AVFormatContext,
+        fd: i32,
+    ) -> *mut sys::AVIOContext;
+    fn rusty_dlna_free_confined_avio(io: *mut *mut sys::AVIOContext);
+    #[cfg(test)]
+    fn rusty_dlna_confined_denied_opens(io: *mut sys::AVIOContext) -> u32;
     fn rusty_dlna_codec_side_data(
         parameters: *mut sys::AVCodecParameters,
         kind: sys::AVPacketSideDataType,
@@ -16,18 +23,6 @@ extern "C" {
 }
 use std::sync::Once;
 use std::time::{Duration, Instant};
-
-fn path_cstring(path: &Path) -> Option<std::ffi::CString> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        std::ffi::CString::new(path.as_os_str().as_bytes()).ok()
-    }
-    #[cfg(not(unix))]
-    {
-        std::ffi::CString::new(path.to_string_lossy().as_bytes()).ok()
-    }
-}
 
 use ffmpeg_sys_next as sys;
 use rusty_dlna_protocol::{
@@ -211,18 +206,8 @@ pub fn probe_media_with_cancellation(
         path = %path_s,
         "libav exploring"
     );
-    let Some(path_c) = path_cstring(path) else {
-        tracing::warn!(
-            target: "rusty_dlna",
-            file,
-            path = %path_s,
-            "libav probe failed (path is not a C string)"
-        );
-        return None;
-    };
-    // SAFETY: `path_c` is NUL-terminated for the entire call. The helper owns
-    // and closes every libav allocation it creates before returning.
-    let got = unsafe { probe_avformat(path_c.as_ptr(), timeout, cancellation) };
+    // SAFETY: the format owner keeps the descriptor and interrupt state live.
+    let got = unsafe { probe_avformat(path, timeout, cancellation) };
     match &got {
         Some(m) => tracing::debug!(
             target: "rusty_dlna",
@@ -413,43 +398,176 @@ unsafe extern "C" fn interrupt_expired(opaque: *mut libc::c_void) -> libc::c_int
     i32::from(deadline.cancellation.is_cancelled() || Instant::now() >= deadline.expires)
 }
 
+struct ConfinedFormat {
+    ctx: *mut sys::AVFormatContext,
+    io: *mut sys::AVIOContext,
+    _file: File,
+    deadline: Box<ProbeDeadline>,
+}
+
+impl ConfinedFormat {
+    fn allocate(path: &Path, timeout: Duration, cancellation: &CancellationToken) -> Option<Self> {
+        use std::os::fd::AsRawFd;
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let file = File::open(path).ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let expires = checked_helper_deadline(timeout)?;
+        let mut deadline = Box::new(ProbeDeadline {
+            expires,
+            cancellation: cancellation.clone(),
+        });
+        // SAFETY: every allocation is stored in this owner before a fallible
+        // operation; Drop closes the format before its AVIO, file and callback.
+        unsafe {
+            let ctx = sys::avformat_alloc_context();
+            if ctx.is_null() {
+                return None;
+            }
+            (*ctx).interrupt_callback = sys::AVIOInterruptCB {
+                callback: Some(interrupt_expired),
+                opaque: (&mut *deadline as *mut ProbeDeadline).cast(),
+            };
+            let io = rusty_dlna_confined_avio(ctx, file.as_raw_fd());
+            let owner = Self {
+                ctx,
+                io,
+                _file: file,
+                deadline,
+            };
+            if io.is_null() {
+                return None;
+            }
+            Some(owner)
+        }
+    }
+
+    fn open(path: &Path, timeout: Duration, cancellation: &CancellationToken) -> Option<Self> {
+        let mut owner = Self::allocate(path, timeout, cancellation)?;
+        // SAFETY: this owner retains all pointers through open and discovery.
+        unsafe {
+            let mut opts = ptr::null_mut();
+            let whitelist =
+                std::ffi::CString::new(rusty_dlna_protocol::media_input::MEDIA_DEMUXER_WHITELIST)
+                    .ok()?;
+            sys::av_dict_set(
+                &mut opts,
+                c"format_whitelist".as_ptr(),
+                whitelist.as_ptr(),
+                0,
+            );
+            // Custom AVIO needs no URL protocol. Also block secondary reads
+            // from a demuxer that neglects the format's io_open callback.
+            sys::av_dict_set(
+                &mut opts,
+                c"protocol_whitelist".as_ptr(),
+                c"none".as_ptr(),
+                0,
+            );
+            sys::av_dict_set(&mut opts, c"probesize".as_ptr(), c"50000000".as_ptr(), 0);
+            sys::av_dict_set(
+                &mut opts,
+                c"analyzeduration".as_ptr(),
+                c"15000000".as_ptr(),
+                0,
+            );
+            let result =
+                sys::avformat_open_input(&mut owner.ctx, ptr::null(), ptr::null_mut(), &mut opts);
+            sys::av_dict_free(&mut opts);
+            if result < 0 || owner.ctx.is_null() {
+                return None;
+            }
+            let format = (*owner.ctx).iformat;
+            if format.is_null()
+                || rusty_dlna_protocol::media_input::media_container_for_demuxer(c_str(
+                    (*format).name,
+                ))
+                .is_none()
+            {
+                return None;
+            }
+            if sys::avformat_find_stream_info(owner.ctx, ptr::null_mut()) < 0 || owner.expired() {
+                return None;
+            }
+            Some(owner)
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.deadline.cancellation.is_cancelled() || Instant::now() >= self.deadline.expires
+    }
+}
+
+/// Used during revision upgrades to distinguish a recognized unsupported
+/// demuxer from transient I/O/decoder failures. Probing only reads the custom
+/// AVIO's bytes; it never executes a demuxer's header/resource-opening code.
+pub(crate) fn media_input_is_explicitly_unsupported(
+    path: &Path,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> bool {
+    init_libav();
+    let Some(owner) = ConfinedFormat::allocate(path, timeout, cancellation) else {
+        return false;
+    };
+    // Probe both file-backed and AVFMT_NOFILE input classes against at most
+    // 1 MiB, without invoking any demuxer's read_header/resource-opening code.
+    // SAFETY: the zero-padded buffer remains live while the pure format probes
+    // inspect it. Returned format descriptors have process lifetime.
+    unsafe {
+        const BYTES: usize = 1024 * 1024;
+        let mut bytes = vec![0; BYTES + sys::AVPROBE_PADDING_SIZE as usize];
+        let read = sys::avio_read(owner.io, bytes.as_mut_ptr(), BYTES as i32);
+        if read <= 0 || owner.expired() {
+            return false;
+        }
+        let data = sys::AVProbeData {
+            // Recent libav versions require a matching filename or MIME
+            // before recognizing HLS. Supply the hint only for its signature.
+            filename: if bytes.starts_with(b"#EXTM3U") {
+                c"input.m3u8".as_ptr()
+            } else {
+                c"".as_ptr()
+            },
+            buf: bytes.as_mut_ptr(),
+            buf_size: read,
+            mime_type: ptr::null(),
+        };
+        [0, 1].into_iter().any(|opened| {
+            let mut score = 0;
+            let format = sys::av_probe_input_format3(&data, opened, &mut score);
+            !format.is_null()
+                && score >= sys::AVPROBE_SCORE_EXTENSION
+                && rusty_dlna_protocol::media_input::media_container_for_demuxer(c_str(
+                    (*format).name,
+                ))
+                .is_none()
+        }) && !owner.expired()
+    }
+}
+
+impl Drop for ConfinedFormat {
+    fn drop(&mut self) {
+        // SAFETY: these pointers are uniquely owned, including when open_input
+        // has already freed and nulled the format on failure. Custom IO is not
+        // owned by libavformat and must be freed after close_input.
+        unsafe {
+            sys::avformat_close_input(&mut self.ctx);
+            rusty_dlna_free_confined_avio(&mut self.io);
+        }
+    }
+}
+
 unsafe fn probe_avformat(
-    url: *const libc::c_char,
+    path: &Path,
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> Option<MediaProbe> {
-    let expires = checked_helper_deadline(timeout)?;
-    let mut opts: *mut sys::AVDictionary = ptr::null_mut();
-    let k1 = c"probesize";
-    let v1 = c"50000000";
-    let k2 = c"analyzeduration";
-    let v2 = c"15000000";
-    sys::av_dict_set(&mut opts, k1.as_ptr(), v1.as_ptr(), 0);
-    sys::av_dict_set(&mut opts, k2.as_ptr(), v2.as_ptr(), 0);
-
-    let mut deadline = Box::new(ProbeDeadline {
-        expires,
-        cancellation: cancellation.clone(),
-    });
-    let mut ctx = sys::avformat_alloc_context();
-    if ctx.is_null() {
-        sys::av_dict_free(&mut opts);
-        return None;
-    }
-    (*ctx).interrupt_callback = sys::AVIOInterruptCB {
-        callback: Some(interrupt_expired),
-        opaque: (&mut *deadline as *mut ProbeDeadline).cast(),
-    };
-    let err = sys::avformat_open_input(&mut ctx, url, ptr::null_mut(), &mut opts);
-    sys::av_dict_free(&mut opts);
-    if err < 0 || ctx.is_null() {
-        if !ctx.is_null() {
-            sys::avformat_close_input(&mut ctx);
-        }
-        return None;
-    }
-    let _ = sys::avformat_find_stream_info(ctx, ptr::null_mut());
-
+    let owner = ConfinedFormat::open(path, timeout, cancellation)?;
+    let ctx = owner.ctx;
     let mut out = MediaProbe {
         probe: SourceProbe {
             container: String::new(),
@@ -475,7 +593,9 @@ unsafe fn probe_avformat(
     };
     let fmt = (*ctx).iformat;
     if !fmt.is_null() {
-        out.probe.container = map_format(c_str((*fmt).name));
+        out.probe.container =
+            rusty_dlna_protocol::media_input::media_container_for_demuxer(c_str((*fmt).name))?
+                .into();
     }
     fill_tags_from_dictionary(&mut out.tags, (*ctx).metadata);
 
@@ -655,7 +775,9 @@ unsafe fn probe_avformat(
         &out.chapters,
     );
 
-    sys::avformat_close_input(&mut ctx);
+    if owner.expired() {
+        return None;
+    }
 
     if out.probe.container.is_empty() && out.probe.video.is_empty() && out.av.duration.is_none() {
         return None;
@@ -944,31 +1066,6 @@ fn is_divx_tag(tag: u32) -> bool {
     )
 }
 
-fn map_format(name: &str) -> String {
-    if name.starts_with("matroska") {
-        return "mkv".into();
-    }
-    if name.contains("mp4") || name.contains("mov") || name.contains("ismv") {
-        return "mp4".into();
-    }
-    if name.contains("avi") {
-        return "avi".into();
-    }
-    if name.contains("mpegts") {
-        return "mpeg-ts".into();
-    }
-    if name.contains("mpeg") || name.contains("vob") || name.contains("svcd") {
-        return "mpeg".into();
-    }
-    if name.contains("flv") {
-        return "flv".into();
-    }
-    if name.contains("asf") || name.contains("wmv") {
-        return "asf".into();
-    }
-    "mkv".into()
-}
-
 fn push_unique(out: &mut Vec<String>, name: String) {
     if name.is_empty() {
         return;
@@ -1053,34 +1150,11 @@ fn attached_picture_with_cancellation(
     cancellation: &CancellationToken,
 ) -> Option<AttachedPicture> {
     init_libav();
-    let path_c = path_cstring(path)?;
-    let expires = checked_helper_deadline(timeout)?;
-    // SAFETY: the CString and boxed deadline remain live while libav uses
-    // their pointers. Stream and packet pointers are read only while their
-    // format context remains open. Packet copies are bounded before allocation,
-    // and each successful context allocation is closed on every return path.
+    let owner = ConfinedFormat::open(path, timeout, cancellation)?;
+    let ctx = owner.ctx;
+    // SAFETY: the format owner keeps stream and packet pointers valid and
+    // closes the context after the bounded packet copy finishes.
     unsafe {
-        let mut deadline = Box::new(ProbeDeadline {
-            expires,
-            cancellation: cancellation.clone(),
-        });
-        let mut ctx = sys::avformat_alloc_context();
-        if ctx.is_null() {
-            return None;
-        }
-        (*ctx).interrupt_callback = sys::AVIOInterruptCB {
-            callback: Some(interrupt_expired),
-            opaque: (&mut *deadline as *mut ProbeDeadline).cast(),
-        };
-        if sys::avformat_open_input(&mut ctx, path_c.as_ptr(), ptr::null_mut(), ptr::null_mut()) < 0
-            || ctx.is_null()
-        {
-            if !ctx.is_null() {
-                sys::avformat_close_input(&mut ctx);
-            }
-            return None;
-        }
-        let _ = sys::avformat_find_stream_info(ctx, ptr::null_mut());
         let nb = (*ctx).nb_streams as isize;
         let mut found = None;
         for i in 0..nb {
@@ -1115,7 +1189,9 @@ fn attached_picture_with_cancellation(
                 break;
             }
         }
-        sys::avformat_close_input(&mut ctx);
+        if owner.expired() {
+            return None;
+        }
         found
     }
 }
@@ -1143,44 +1219,14 @@ pub fn extract_attached_pic_with_limits_result(
     timeout: Duration,
     max_alloc_bytes: u64,
 ) -> std::io::Result<bool> {
-    let Some(picture) = attached_picture_with_cancellation(
-        src,
+    let file = File::open(src)?;
+    extract_attached_pic_file_with_limits_cancelled_result(
+        &file,
+        dest,
         timeout,
         max_alloc_bytes,
         &CancellationToken::default(),
-    ) else {
-        return Ok(false);
-    };
-    if let Some(jpeg) = picture.jpeg {
-        return with_atomic_image_destination(dest, |temporary| {
-            std::fs::write(temporary, jpeg)?;
-            Ok(true)
-        });
-    }
-    with_atomic_image_destination(dest, |temporary| {
-        let mut command = std::process::Command::new("ffmpeg");
-        command
-            .args([
-                "-nostdin",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-max_alloc",
-            ])
-            .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
-            .arg("-i")
-            .arg(src)
-            .args([
-                "-map",
-                &format!("0:{}", picture.stream_index),
-                "-frames:v",
-                "1",
-                "-an",
-            ])
-            .arg(temporary);
-        command_status_with_timeout(&mut command, timeout).map(|status| status.success())
-    })
+    )
 }
 
 pub(crate) fn extract_attached_pic_file_with_limits_cancelled_result(
@@ -1216,7 +1262,8 @@ pub(crate) fn extract_attached_pic_file_with_limits_cancelled_result(
                 "-max_alloc",
             ])
             .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
-            .args(["-i", "/proc/self/fd/3"])
+            .args(rusty_dlna_protocol::media_input::inherited_media_input_options(3))
+            .args(["-i", "fd:"])
             .args([
                 "-map",
                 &format!("0:{}", picture.stream_index),
@@ -1257,38 +1304,8 @@ pub fn scale_jpeg_with_options_result(
     timeout: Duration,
     max_alloc_bytes: u64,
 ) -> std::io::Result<bool> {
-    if w == 0 || h == 0 {
-        return Ok(false);
-    }
-    let vf = format!("scale={w}:{h}:force_original_aspect_ratio=decrease");
-    with_atomic_image_destination(dest, |temporary| {
-        let mut command = std::process::Command::new("ffmpeg");
-        command
-            .args([
-                "-nostdin",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-max_alloc",
-            ])
-            .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
-            .arg("-threads")
-            .arg("1")
-            .arg("-i")
-            .arg(src)
-            .args([
-                "-frames:v",
-                "1",
-                "-vf",
-                &vf,
-                "-q:v",
-                &quality.clamp(2, 31).to_string(),
-                "-an",
-            ])
-            .arg(temporary);
-        command_status_with_timeout(&mut command, timeout).map(|status| status.success())
-    })
+    let file = File::open(src)?;
+    scale_jpeg_file_with_options_result(&file, dest, w, h, quality, timeout, max_alloc_bytes)
 }
 
 /// Descriptor-backed resize used after rooted authorization. The descriptor
@@ -1341,7 +1358,9 @@ pub fn scale_jpeg_file_with_options_cancelled_result(
                 "-max_alloc",
             ])
             .arg(control.max_alloc_bytes.max(16 * 1024 * 1024).to_string())
-            .args(["-threads", "1", "-i", "/proc/self/fd/3"])
+            .args(["-threads", "1"])
+            .args(rusty_dlna_protocol::media_input::inherited_media_input_options(3))
+            .args(["-i", "fd:"])
             .args([
                 "-frames:v",
                 "1",
@@ -1398,42 +1417,19 @@ pub fn generate_video_thumb_with_limits_result(
     timeout: Duration,
     max_alloc_bytes: u64,
 ) -> std::io::Result<bool> {
-    if width == 0 {
-        return Ok(false);
-    }
-    let filter = if filmstrip {
-        let cell = (width / 4).max(1);
-        format!("fps=1/600,scale={cell}:-2,tile=4x1")
-    } else {
-        format!("scale={width}:-2")
-    };
-    let frames = if filmstrip { "4" } else { "1" };
-    with_atomic_image_destination(dest, |temporary| {
-        let mut command = std::process::Command::new("ffmpeg");
-        command
-            .args([
-                "-nostdin",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-max_alloc",
-            ])
-            .arg(max_alloc_bytes.max(16 * 1024 * 1024).to_string())
-            .args(["-threads", "1", "-ss", "1", "-i"])
-            .arg(src)
-            .args([
-                "-frames:v",
-                frames,
-                "-vf",
-                &filter,
-                "-q:v",
-                &quality.clamp(2, 31).to_string(),
-                "-an",
-            ])
-            .arg(temporary);
-        command_status_with_timeout(&mut command, timeout).map(|status| status.success())
-    })
+    let file = File::open(src)?;
+    generate_video_thumb_file_with_limits_cancelled_result(
+        &file,
+        dest,
+        width,
+        quality,
+        filmstrip,
+        MediaHelperControl {
+            timeout,
+            max_alloc_bytes,
+            cancellation: &CancellationToken::default(),
+        },
+    )
 }
 
 pub(crate) fn generate_video_thumb_file_with_limits_cancelled_result(
@@ -1466,7 +1462,9 @@ pub(crate) fn generate_video_thumb_file_with_limits_cancelled_result(
                 "-max_alloc",
             ])
             .arg(control.max_alloc_bytes.max(16 * 1024 * 1024).to_string())
-            .args(["-threads", "1", "-ss", "1", "-i", "/proc/self/fd/3"])
+            .args(["-threads", "1", "-ss", "1"])
+            .args(rusty_dlna_protocol::media_input::inherited_media_input_options(3))
+            .args(["-i", "fd:"])
             .args([
                 "-frames:v",
                 frames,
@@ -1599,7 +1597,11 @@ fn command_output_supervised(
         .capture_stdout(capture)
         .capture_stderr(capture);
     if let Some(source) = source {
-        runner = runner.inherit_file_at(source, 3)?;
+        use std::os::fd::AsRawFd;
+        // Open the already-authorized inode with an independent cursor. The fd
+        // protocol seeks on its descriptor, unlike opening a /proc URL in-child.
+        let independent = File::open(format!("/proc/self/fd/{}", source.as_raw_fd()))?;
+        runner = runner.inherit_file_at(&independent, 3)?;
     }
     let deadline = checked_helper_deadline(timeout).ok_or_else(|| {
         std::io::Error::new(
@@ -1709,6 +1711,145 @@ mod tests {
 
         fn deref(&self) -> &Self::Target {
             &self.0
+        }
+    }
+
+    #[test]
+    fn supported_mov_drefs_are_denied_by_custom_io_and_fd_helpers() {
+        use std::os::fd::AsRawFd;
+        fn atom(kind: &[u8; 4], contents: &[u8]) -> Vec<u8> {
+            let mut bytes = u32::try_from(contents.len() + 8)
+                .unwrap()
+                .to_be_bytes()
+                .to_vec();
+            bytes.extend_from_slice(kind);
+            bytes.extend_from_slice(contents);
+            bytes
+        }
+        fn replace_drefs(bytes: &[u8], dref: &[u8]) -> Vec<u8> {
+            let mut replaced = Vec::new();
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let size =
+                    u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                let kind: &[u8; 4] = bytes[offset + 4..offset + 8].try_into().unwrap();
+                let content = &bytes[offset + 8..offset + size];
+                if kind == b"dref" {
+                    replaced.extend_from_slice(dref);
+                } else if matches!(kind, b"moov" | b"trak" | b"mdia" | b"minf" | b"dinf") {
+                    replaced.extend(atom(kind, &replace_drefs(content, dref)));
+                } else {
+                    replaced.extend_from_slice(&bytes[offset..offset + size]);
+                }
+                offset += size;
+            }
+            replaced
+        }
+        let temp = crate::tests::TempPath::new("mov-dref-boundary");
+        std::fs::create_dir_all(&*temp).unwrap();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/library/video/tagged.mp4");
+        let sentinel = temp.join("outside.mp4");
+        std::fs::copy(&fixture, &sentinel).unwrap();
+        let mut accesses = inotify::Inotify::init().unwrap();
+        accesses
+            .watches()
+            .add(
+                &sentinel,
+                inotify::WatchMask::OPEN | inotify::WatchMask::ACCESS,
+            )
+            .unwrap();
+        // MOV's Macintosh alias record is a supported external-track dref.
+        // Force its normal optional external-reference feature on below, so
+        // this exercises the nested-open boundary, independent of the format
+        // allowlist and the MOV demuxer's default enable_drefs=false setting.
+        let path = sentinel.as_os_str().as_encoded_bytes();
+        let mut alias = vec![0; 154];
+        alias.extend_from_slice(&2u16.to_be_bytes());
+        alias.extend_from_slice(&u16::try_from(path.len()).unwrap().to_be_bytes());
+        alias.extend_from_slice(path);
+        if !path.len().is_multiple_of(2) {
+            alias.push(0);
+        }
+        alias.extend_from_slice(&[0xff, 0xff, 0, 0]);
+        let mut dref = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        dref.extend(atom(b"alis", &alias));
+        let movie = replace_drefs(&std::fs::read(fixture).unwrap(), &atom(b"dref", &dref));
+        let input = temp.join("external.mov");
+        std::fs::write(&input, movie).unwrap();
+        let file = File::open(&input).unwrap();
+        init_libav();
+        // SAFETY: this reproduces the same custom-AVIO owner as production,
+        // with two MOV options enabled solely to force nested-open attempts.
+        // The descriptor, deadline and AVIO live through open/discovery/drop.
+        unsafe {
+            let mut deadline = Box::new(ProbeDeadline {
+                expires: Instant::now() + Duration::from_secs(2),
+                cancellation: CancellationToken::default(),
+            });
+            let ctx = sys::avformat_alloc_context();
+            assert!(!ctx.is_null());
+            (*ctx).interrupt_callback = sys::AVIOInterruptCB {
+                callback: Some(interrupt_expired),
+                opaque: (&mut *deadline as *mut ProbeDeadline).cast(),
+            };
+            let io = rusty_dlna_confined_avio(ctx, file.as_raw_fd());
+            assert!(!io.is_null());
+            let mut owner = ConfinedFormat {
+                ctx,
+                io,
+                _file: file,
+                deadline,
+            };
+            let mut opts = ptr::null_mut();
+            sys::av_dict_set(&mut opts, c"enable_drefs".as_ptr(), c"1".as_ptr(), 0);
+            sys::av_dict_set(&mut opts, c"use_absolute_path".as_ptr(), c"1".as_ptr(), 0);
+            // No protocol allowlist here: prove the custom callback itself
+            // denies the supported MOV demuxer's nested file open.
+            let result =
+                sys::avformat_open_input(&mut owner.ctx, ptr::null(), ptr::null_mut(), &mut opts);
+            sys::av_dict_free(&mut opts);
+            if result >= 0 {
+                let _ = sys::avformat_find_stream_info(owner.ctx, ptr::null_mut());
+            }
+            assert!(
+                rusty_dlna_confined_denied_opens(io) > 0,
+                "MOV open result: {result}"
+            );
+        }
+        for tool in ["ffprobe", "ffmpeg"] {
+            let file = File::open(&input).unwrap();
+            let mut command = std::process::Command::new(tool);
+            command
+                .args([
+                    "-v",
+                    "error",
+                    "-enable_drefs",
+                    "1",
+                    "-use_absolute_path",
+                    "1",
+                ])
+                .args(rusty_dlna_protocol::media_input::inherited_media_input_options(3))
+                .args(["-i", "fd:"]);
+            if tool == "ffprobe" {
+                command.args(["-show_entries", "stream=codec_name"]);
+            } else {
+                command.args(["-nostdin", "-frames:v", "1", "-f", "null", "-"]);
+            }
+            let output = command_output_supervised_for_file(
+                &mut command,
+                &file,
+                Duration::from_secs(2),
+                &CancellationToken::default(),
+            )
+            .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("not on whitelist"), "{tool}: {stderr}");
+        }
+        let mut events = [0; 4096];
+        match accesses.read_events(&mut events) {
+            Ok(mut events) => assert!(events.next().is_none(), "outside MOV dref was opened"),
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
         }
     }
 

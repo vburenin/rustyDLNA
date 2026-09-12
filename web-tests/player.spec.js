@@ -7003,3 +7003,68 @@ test("movie collections join metadata batches and end before standalone cards", 
   await expect(page.locator("[data-media-id]")).toHaveCount(27);
   await expect(page.locator(".collection-group")).toHaveCount(0);
 });
+
+test("Android MSE timeout retries with real decodable fragments and cancels the abandoned request", async ({ page, browserName }) => {
+  test.skip(browserName !== "chromium", "Actual Android MSE decoding uses Chromium; deterministic deadline coverage runs on every project");
+  const fixture = await fragmentedCompatibleFixture();
+  const { initEnd } = fragmentedMp4Layout(fixture);
+  await usePreference(page, "stream", "compat");
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "userAgent", { configurable: true,
+      value: "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/134.0.0.0 Mobile Safari/537.36" });
+    const original = window.fetch;
+    window.__mseHeldRequest = { started: false, aborted: false, request: null };
+    window.fetch = (input, options) => {
+      const url = new URL(input, location.href);
+      if (url.searchParams.get("delivery") === "mse" && !window.__mseHeldRequest.started) {
+        Object.assign(window.__mseHeldRequest, { started: true, request: url.searchParams.get("request") });
+        options.signal.addEventListener("abort", () => { window.__mseHeldRequest.aborted = true; }, { once: true });
+        return new Promise(() => {});
+      }
+      return original(input, options);
+    };
+  });
+  await page.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    for (const item of payload.entries || []) {
+      if (item.entry_type !== "media" || item.kind !== "video") continue;
+      Object.assign(item, { video_codec: "other", video_content_type: null, codec_string: null,
+        audio_codec: "ac3", stream_metadata_complete: true,
+        audio_tracks: [{ index: 0, codec: "ac3", channels: 6, default: true, content_type: 'audio/mp4; codecs="ac-3"' }] });
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  const cancelled = [];
+  await page.route("**/api/web/transcode/*", (route) => {
+    if (route.request().method() === "DELETE") cancelled.push(new URL(route.request().url()).searchParams.get("request"));
+    return route.fulfill({ json: { schema_version: 2, state: "ready", retry_after_seconds: 0.25 } });
+  });
+  await page.route("**/web/media/*?**", async (route) => {
+    const url = new URL(route.request().url());
+    const delivery = url.searchParams.get("delivery");
+    if (delivery !== "mse") {
+      return route.fulfill({ contentType: "video/mp4", body: delivery === "mse_init"
+        ? fixture.subarray(0, initEnd) : fixture.subarray(initEnd) });
+    }
+    const init = new URL(url); init.pathname = init.pathname.replace(/\.m3u8$/, ".mp4");
+    init.searchParams.set("delivery", "mse_init"); init.searchParams.set("hls_offset", "0"); init.searchParams.set("hls_length", String(initEnd));
+    const fragment = new URL(init); fragment.pathname = fragment.pathname.replace(/\.mp4$/, ".m4s");
+    fragment.searchParams.set("delivery", "mse_segment"); fragment.searchParams.set("hls_offset", String(initEnd));
+    fragment.searchParams.set("hls_length", String(fixture.byteLength - initEnd));
+    return route.fulfill({ contentType: "application/vnd.apple.mpegurl",
+      body: `#EXTM3U\n#EXT-X-MAP:URI="${init}"\n#EXTINF:2,\n${fragment}\n` });
+  });
+  await openLibrary(page);
+  await page.clock.install();
+  await selectTaggedVideo(page);
+  await expect.poll(() => page.evaluate(() => window.__mseHeldRequest.started)).toBe(true);
+  await page.clock.fastForward(121_000);
+  await expect.poll(() => page.evaluate(() => window.__mseHeldRequest.aborted)).toBe(true);
+  await expect.poll(() => cancelled.length).toBe(1);
+  await page.clock.fastForward(1_000);
+  await expect.poll(() => page.locator("#video-player").evaluate((player) => player.videoWidth)).toBeGreaterThan(0);
+  expect(cancelled).toContain(await page.evaluate(() => window.__mseHeldRequest.request));
+  await expect(page.locator("#player-message[role=alert]")).toBeHidden();
+  await page.locator("#video-player").evaluate((player) => player.pause());
+});

@@ -166,7 +166,14 @@ where
             continue;
         }
         total = total.saturating_add(metadata.len());
-        let used = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        // Completed media is immutable under its validation stamp. Successful
+        // reads touch only stamp mtime; unstamped output retains its creation age.
+        let used = match std::fs::symlink_metadata(rusty_dlna_transcode::cache_stamp_path(&path)) {
+            Ok(stamp) if stamp.is_file() => stamp.modified()?,
+            Ok(_) => metadata.modified()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => metadata.modified()?,
+            Err(error) => return Err(error),
+        };
         if !protected.contains(&path)
             && now.duration_since(used).unwrap_or_default() > max_age
             && std::fs::remove_file(&path).is_ok()
@@ -446,7 +453,7 @@ mod tests {
         std::fs::write(&stamp, b"stamp").unwrap();
         std::fs::OpenOptions::new()
             .write(true)
-            .open(&output)
+            .open(&stamp)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH)
             .unwrap();

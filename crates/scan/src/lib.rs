@@ -2515,18 +2515,25 @@ pub fn probe_stream_identity(path: &Path) -> Option<SourceProbe> {
             "-analyzeduration",
             "4000000",
             "-show_entries",
-            "stream=codec_type,codec_name,color_transfer:stream_side_data=dv_profile",
+            "format=format_name:stream=codec_type,codec_name,color_transfer:stream_side_data=dv_profile",
             "-of",
             "default=noprint_wrappers=1",
         ])
-        .arg(path);
-    let out =
-        crate::probe::command_output_with_timeout(&mut command, std::time::Duration::from_secs(30))
-            .ok()?;
+        .args(rusty_dlna_protocol::media_input::inherited_media_input_options(3))
+        .args(["-i", "fd:"]);
+    let file = std::fs::File::open(path).ok()?;
+    let out = crate::probe::command_output_supervised_for_file(
+        &mut command,
+        &file,
+        std::time::Duration::from_secs(30),
+        &CancellationToken::default(),
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
+    let mut container = None;
     let mut video = String::new();
     let mut audio = String::new();
     let mut color_transfer = String::new();
@@ -2537,6 +2544,9 @@ pub fn probe_stream_identity(path: &Path) -> Option<SourceProbe> {
             continue;
         };
         match k {
+            "format_name" => {
+                container = rusty_dlna_protocol::media_input::media_container_for_demuxer(v.trim())
+            }
             "codec_type" => last_type = v.trim(),
             "codec_name" => {
                 let name = v.trim();
@@ -2558,13 +2568,8 @@ pub fn probe_stream_identity(path: &Path) -> Option<SourceProbe> {
     if video.is_empty() && audio.is_empty() && dv_profile.is_none() {
         return None;
     }
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("mkv");
     let mut p = SourceProbe::default();
-    p.container = match ext {
-        "mp4" | "m4v" => "mp4".into(),
-        "avi" => "avi".into(),
-        _ => "mkv".into(),
-    };
+    p.container = container?.into();
     p.video = match video.as_str() {
         "h264" | "avc" => "h264".into(),
         "mpeg2video" | "mpeg2" => "mpeg2".into(),
@@ -2916,6 +2921,23 @@ fn fill_missing_av_meta_with_db(
                     last_raw_probe = Some((physical, got.clone()));
                     got
                 };
+                cfg.check_cancelled()?;
+                let unsupported = if got.is_none() {
+                    let _probe_permit = acquire_scan_helper(cfg)?;
+                    probe::media_input_is_explicitly_unsupported(
+                        &opened.proc_path(),
+                        cfg.external_command_timeout,
+                        &cfg.cancellation,
+                    )
+                } else {
+                    false
+                };
+                if unsupported {
+                    cfg.check_cancelled()?;
+                    db.remove_path_and_symlink_aliases(&row.path)?;
+                    filled += 1;
+                    continue;
+                }
                 cfg.check_cancelled()?;
                 persist_prepared_probe(db, cfg, &live, row.id, got)?;
                 filled += 1;
@@ -3952,6 +3974,28 @@ fn index_one_file_with_artwork(
     let format_probe = prepared
         .and_then(|prepared| prepared.probe.as_ref())
         .or(eager_probe.as_ref());
+    let needs_input_check = prepared.is_some_and(|prepared| prepared.probe_attempted)
+        || inode_source.as_ref().is_none_or(|source| {
+            source.stream_probe_rev < db::STREAM_PROBE_REVISION
+                || source.size != current_physical.size
+                || source.timestamp < current_physical.timestamp
+        });
+    let unsupported = if format_probe.is_none() && needs_input_check {
+        let _probe_permit = acquire_scan_helper(cfg)?;
+        probe::media_input_is_explicitly_unsupported(
+            &stable_path,
+            cfg.external_command_timeout,
+            &cfg.cancellation,
+        )
+    } else {
+        false
+    };
+    if unsupported {
+        cfg.check_cancelled()?;
+        db.remove_path_and_symlink_aliases(&path_to_db(path))?;
+        return Ok(false);
+    }
+    cfg.check_cancelled()?;
     let Some(format) = resolved_media_format_with_hint(
         &name,
         format_probe,

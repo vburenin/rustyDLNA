@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: 22.19.0
       - name: Pinned Rust toolchain
-        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy && rustup default 1.97.1
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy && rustup default 1.98.1
       - name: Full quality gate
         run: scripts/check.sh
       - name: Global media-helper load limits
@@ -40,7 +40,7 @@ jobs:
           node-version: 22.19.0
           cache: npm
       - name: Pinned Rust toolchain
-        run: rustup toolchain install 1.97.1 --profile minimal && rustup default 1.97.1
+        run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
       - name: Install locked web dependencies and browsers
         run: |
           npm ci
@@ -99,7 +99,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - run: rustup toolchain install 1.97.1 --profile minimal && rustup default 1.97.1
+      - run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
       - run: cargo install cargo-audit --version 0.22.2 --locked && cargo install cargo-deny --version 0.20.2 --locked && cargo install cargo-machete --version 0.9.2 --locked
       - run: cargo audit --deny warnings
       - run: cargo deny check
@@ -111,7 +111,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: System dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavformat-dev iproute2 tcpdump curl
-      - run: rustup toolchain install 1.97.1 --profile minimal && rustup default 1.97.1
+      - run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
       - run: cargo build --locked -p rusty-dlna
       - name: Two-interface namespace discovery
         env:
@@ -131,7 +131,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavformat-dev ffmpeg
-      - run: rustup toolchain install 1.97.1 --profile minimal --component llvm-tools-preview && rustup default 1.97.1
+      - run: rustup toolchain install 1.98.1 --profile minimal --component llvm-tools-preview && rustup default 1.98.1
       - run: cargo install cargo-llvm-cov --version 0.9.0 --locked
       - name: Workspace and targeted coverage floors
         run: |

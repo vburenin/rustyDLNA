@@ -1,3 +1,6 @@
+mod validation;
+pub(super) use validation::validate_finished;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};

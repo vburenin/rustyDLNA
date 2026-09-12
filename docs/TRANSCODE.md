@@ -271,7 +271,7 @@ Transcoded GETs while the `.part` file is growing:
 - No `Content-Length`, no `Accept-Ranges`
 - TimeSeek without Range is still 406
 
-After ffprobe validates and atomically publishes the finished cache, GET/HEAD
+After structural validation and atomic publication of the finished cache, GET/HEAD
 uses `DLNA.ORG_OP=01`, `Content-Length`, `Accept-Ranges: bytes`, and normal
 single-range 206/416 behavior. This distinction is derived from job state, not
 from the DIDL resource advertisement.
@@ -281,9 +281,74 @@ decoding only after capture, applies the configured wall-clock deadline, and
 terminates/reaps the process group on cancellation or shutdown. Persisted
 per-stream descriptors retain both the source stream index and the audio
 ordinal used in `0:a:N`; repeated codecs therefore do not collapse selection.
-Successful output must pass a bounded ffprobe check before `.part` is renamed.
-Failed verification deletes the incomplete output and leaves no reusable
-cache entry.
+Successful output passes structural fragmented-MP4 validation before `.part`
+is renamed and before the job becomes Complete. The validator shares the
+streaming index's bounded box readers but checks every requested audio/video
+track, codec initialization (including AVC/HEVC parameter sets, VP9/AV1
+configuration and MPEG audio/video descriptors), fragment
+sequence, sample sizes and offsets, and per-track decode timestamps. Every
+sample extent must lie inside a complete media-data box; tracks without samples,
+initialization-only files, truncated boxes, wrong codecs and missing tail fragments
+are rejected. It reads box metadata and skips media payloads, without decoding
+the movie or opening another media helper.
+
+Decode timestamps may differ by at most 2 ms between consecutive fragments of a
+track. Initial muxer priming may shift the decode start by 250 ms; composition
+reordering is bounded to 2 seconds. The longest output audio/video track must
+reach the known overall source duration minus the requested seek, allowing a 5% shortfall
+with a 50 ms minimum and 1 second maximum for container rounding. Output
+may exceed that duration by 1.25 seconds for priming and final samples; a seek
+that copies video permits up to 10 seconds of preceding-keyframe preroll plus
+1 second of final-sample tolerance. Short positive-duration media retains these
+subsecond checks. Source tracks can legitimately have very different lengths:
+the Dolby Vision fixture contains 10.803 seconds of video and 0.4 seconds of
+audio. The catalog records overall duration, not individual track endings, so
+the validator checks every track's samples, start, continuity and upper time
+bound but compares minimum expected coverage against the longest track only.
+It cannot prove that a shorter track reached its individual source ending.
+When the catalog has no overall duration, structural and per-track continuity
+checks still apply, but no source-coverage comparison is possible. These checks
+prove structural completeness within those tolerances; they do not claim full
+bitstream decoding or detect corruption inside payloads.
+
+Non-browser remuxing preserves one QuickTime text chapter track when an
+audio/video track explicitly references it through `tref/chap`. Its initialization,
+sample extents, continuity and upper time bound are validated too. Chapters may
+begin later than playback and do not establish the minimum audio/video coverage.
+Other non-media tracks and unreferenced text tracks are rejected.
+
+Validation admits at most 33 audio/video tracks (32 audio plus video) and one
+referenced chapter track, 200,000 top-level boxes, 32 million samples,
+4 MiB per initialization/fragment metadata box and 256 MiB of aggregate metadata.
+Only one metadata box and its bounded nested descriptors are retained at a time.
+Cancellation/deadline checkpoints run between boxes, track runs and every 4,096
+samples. Verification, quota checking and publication share the remaining
+original job deadline and `transcode.verify_timeout_secs`; verification never
+starts a fresh job budget. A reproducible 60-second, 64×64 H.264/AAC fixture
+checks the metadata-only cost in `remux::validation_tests`: 4,254 samples,
+123 top-level boxes and 35,185 metadata bytes out of 1,005,058 output bytes on
+FFmpeg 6.1, with approximately 1–2 ms validation on the development host. These
+figures describe that small fixture, not a throughput guarantee for all movies.
+
+The pinned output inode, length, modification time and change time are checked
+before and after validation, before rename, and around stamp publication. The
+versioned validation stamp also binds the completed output identity, rejecting
+older stamps and metadata-visible replacement or modification. These metadata
+checks assume the configured cache remains private to the server and trusted
+operator; they are not authenticated payload integrity and cannot distinguish a
+same-length rewrite with restored modification time within one tick of the
+filesystem change time. Cancellation is serialized with the final Complete
+transition. Failed verification or publication removes staging output and any
+unpublished final file/stamp.
+Growing-fragment delivery continues to use its existing incremental index while
+the producer is running.
+
+Finished GET/HEAD requests update the completion stamp's modification time for
+cache recency, preserving the validated media's timestamps and stamp contents.
+Age and quota eviction use that recency time, falling back to the media's age
+for unstamped output. Resume validators include the immutable media identity and
+stable stamp identity, so ordinary reads retain both reusable-cache status and
+the same `ETag`; changed media still invalidates both.
 
 Cache identities include the effective codec, audio, browser-quality, HDR
 preservation, Dolby Vision, source, and tool-version inputs. Tool versions are

@@ -5313,6 +5313,7 @@ fn remux_finished_range_and_stale_rebuild() {
     ));
 
     let spec = RemuxJobSpec {
+        output_expectation: None,
         detail_id: dvp7.detail_id,
         web_session_id: None,
         web_request_id: None,

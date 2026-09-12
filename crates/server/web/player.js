@@ -9,6 +9,7 @@ import {
   aiUpscaleQualityAvailable,
   apiErrorCategory,
   compatibleDecodeRecovery,
+  mediaSourceStallReason,
   audioTrackLabel,
   bufferedSeekTarget,
   clockLabel,
@@ -1174,6 +1175,9 @@ export class PlaybackController {
           return target === null ? null : target - segmentOffset;
         },
         onBuffered: () => {
+          const now = performance.now();
+          source.mseProgress.preparationAt = now;
+          source.mseProgress.firstFragmentAt ??= now;
           if (this.#store.getState().playback.pendingSeekTime !== null
             && applyPendingSeek() && player.readyState >= 3) void readyToPlay();
         },
@@ -1207,6 +1211,7 @@ export class PlaybackController {
     player.src = objectUrl;
     player.load();
     const reportStartup = (event) => this.#reportStartup(source, event);
+    this.#monitorMediaSource(source);
     pumpMediaSource({
       player,
       mediaSource,
@@ -1221,6 +1226,48 @@ export class PlaybackController {
         if (error?.name !== "AbortError") void this.#handleMediaError(source, error);
       });
     return objectUrl;
+  }
+
+  #monitorMediaSource(source) {
+    const now = performance.now();
+    const progress = source.mseProgress = {
+      startedAt: now, preparationAt: now, playbackAt: now,
+      firstFragmentAt: null, hasFrame: false, seeking: false,
+      currentTime: source.player.currentTime, producedSeconds: 0,
+    };
+    const tick = () => {
+      const playback = this.#store.getState().playback;
+      if (!source.active || playback.sessionId !== source.sessionId
+        || ["ended", "error"].includes(playback.status)) return;
+      const now = performance.now();
+      const player = source.player;
+      const seeking = player.seeking || playback.pendingSeekTime !== null;
+      if (seeking && !progress.seeking) {
+        progress.startedAt = now;
+        progress.preparationAt = now;
+      }
+      progress.seeking = seeking;
+      if (((playback.intent !== "playing" || playback.autoplayBlocked) && !seeking)
+        || document.visibilityState === "hidden") {
+        // Pausing/background suspension is intentional. Resume gets the full
+        // grace without resetting the selected title's finite retry budget.
+        progress.startedAt = now;
+        progress.preparationAt = now;
+        progress.playbackAt = now;
+        if (progress.firstFragmentAt !== null) progress.firstFragmentAt = now;
+      } else {
+        if (Math.abs(player.currentTime - progress.currentTime) > 0.001) {
+          progress.currentTime = player.currentTime;
+          progress.playbackAt = now;
+        }
+        if (seeking || !progress.hasFrame) progress.playbackAt = now;
+        if (player.readyState >= 2 && !seeking) progress.hasFrame = true;
+        const reason = mediaSourceStallReason({ ...progress, now, seeking });
+        if (reason) void this.#handleMediaError(source, new Error(`Media Source ${reason} timed out.`));
+      }
+      source.setTimer("media-progress", tick, 1_000);
+    };
+    source.setTimer("media-progress", tick, 1_000);
   }
 
   #reportStartup(source, event) {
@@ -1257,6 +1304,11 @@ export class PlaybackController {
           signal,
         );
         if (signal.aborted || sessionId !== this.#store.getState().playback.sessionId) return;
+        if (source.mseProgress && Number.isFinite(payload.produced_seconds)
+          && payload.produced_seconds > source.mseProgress.producedSeconds) {
+          source.mseProgress.producedSeconds = payload.produced_seconds;
+          source.mseProgress.preparationAt = performance.now();
+        }
         const message = {
           queued: "Waiting for a transcode slot…",
           starting: "Starting prepared stream…",

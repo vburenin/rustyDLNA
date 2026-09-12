@@ -3,6 +3,7 @@
 set -eu
 
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
+python3 "$ROOT/scripts/rust-pins.py" check
 TAG=${1:-${GITHUB_REF_NAME:-}}
 VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml" | head -n 1)
 RUST_VERSION=$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' "$ROOT/Cargo.toml" | head -n 1)

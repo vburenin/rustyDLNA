@@ -88,8 +88,16 @@ fn ffprobe_has_av_stream(path: &Path, timeout: std::time::Duration) -> Option<bo
             "-of",
             "csv=p=0",
         ])
-        .arg(path);
-    let out = crate::probe::command_output_with_timeout(&mut command, timeout).ok()?;
+        .args(rusty_dlna_protocol::media_input::inherited_media_input_options(3))
+        .args(["-i", "fd:"]);
+    let file = std::fs::File::open(path).ok()?;
+    let out = crate::probe::command_output_supervised_for_file(
+        &mut command,
+        &file,
+        timeout,
+        &crate::CancellationToken::default(),
+    )
+    .ok()?;
     if !out.status.success() {
         return Some(false);
     }
@@ -113,8 +121,10 @@ fn ffprobe_file_has_av_stream(file: &std::fs::File, cfg: &ScanConfig) -> Option<
         "stream=codec_type",
         "-of",
         "csv=p=0",
-        "/proc/self/fd/3",
     ]);
+    command
+        .args(rusty_dlna_protocol::media_input::inherited_media_input_options(3))
+        .args(["-i", "fd:"]);
     let out = crate::probe::command_output_supervised_for_file(
         &mut command,
         file,

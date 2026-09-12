@@ -427,7 +427,29 @@ does not discard an otherwise healthy compatible stream. Playlist fetch,
 fragment fetch, and SourceBuffer failures use the same producer-status and
 codec/quality recovery policy as native media-element errors; a temporarily
 busy producer therefore retries instead of becoming an immediate terminal
-Media Source failure. A live copied-HEVC or encoded-HEVC/HDR generation gets
+Media Source failure. Playlist headers have 120 seconds of preparation grace;
+initialization and fragment headers have 30 seconds. Once headers arrive,
+each nonempty body chunk must arrive within 15 seconds. The entire request
+is limited to 180 seconds for a playlist and 120 seconds for media. Bodies are
+counted while streaming, including responses without `Content-Length`: playlists
+are capped at 4 MiB, media resources at 32 MiB, and either at 65,536 reads.
+Source opening and each SourceBuffer append/remove operation have a 20-second
+completion deadline. The producer-status request used by recovery also has a
+15-second deadline, including its body.
+
+While playback is requested, the first appended fragment must produce a frame
+within 20 seconds, and decoded playback must advance its clock within 20 seconds.
+Producer heartbeats or more downloaded bytes do not reset the decoded-playback
+clock. Before the first fragment, or while a seek target is being assembled,
+120 seconds without newly produced fragment timestamps or appended fragments
+triggers recovery; preparation has an absolute five-minute limit. Deliberate
+pause, an autoplay block, and background suspension suspend the playback
+watchdog; resuming gets the normal grace without replenishing automatic retry
+budgets. A pending seek keeps its preparation budget even while paused. Network
+and SourceBuffer operations remain bounded while paused.
+All deadline failures share the existing source-owned recovery promise. Replacing
+or terminating a source aborts its pending reads and clears timers/listeners.
+A live copied-HEVC or encoded-HEVC/HDR generation gets
 one fresh Media Source attachment at the same position and quality. That
 reattachment adopts the existing producer instead of cancelling it first. The
 forward buffer is limited to about ten seconds and retains about five seconds
@@ -839,13 +861,25 @@ used in item, media, caption, preview, and transcode-status URLs.
 | `/Captions/{id}/{index}...?format=webvtt` | Jailed browser caption conversion |
 | `/status` and `/api/status` | Operator status and metrics |
 
+Generation-scoped transcode status, startup timing, and cancellation use the
+active generation's request/session ownership and already validated descriptor.
+They continue working after the source pathname is renamed or removed from the
+catalog, without reopening it for each status poll. Matching-generation DELETE
+is idempotent; stale requests and another viewer cannot cancel the current
+owner's work. Starting new media still requires a current catalog item and a
+successful confined source open.
+An `idle` control response means no matching generation is registered; it does
+not assert that the source still exists in the library.
+
 Original downloads advertise an opaque strong `ETag` derived from the opened
 file's identity and change metadata. Clients can resume with `Range` and
 `If-Range`; a matching tag returns the requested bytes, while a changed file,
 weak tag, or unsupported date validator returns the complete current file.
-Finalized compatible cache artifacts also advertise a validator based on their
-completion stamp and physical file identity; touching cache recency does not
-change it. Outputs without a completion stamp have no resume validator.
+Finalized compatible cache artifacts also advertise a validator based on the
+media's immutable change/physical identity and the completion stamp's stable
+identity. Reads update only stamp modification time for cache recency, preserving
+the validator and reusable output validation. Outputs without a completion stamp
+have no resume validator.
 HEAD on the same compatible rendition URL reports the exact `Content-Length`
 once output is complete, with the same range headers as GET and no response
 body. While output is growing, an ordinary HEAD omits `Content-Length`;

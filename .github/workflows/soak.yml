@@ -34,7 +34,7 @@ jobs:
             exit 2
           fi
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavcodec-dev libavformat-dev libavutil-dev libswscale-dev ffmpeg curl time
-      - run: rustup toolchain install 1.97.1 --profile minimal && rustup default 1.97.1
+      - run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
       - name: Scan/browse/event/remux/restart soak
         env:
           SOAK_REPORT: soak-report.tsv

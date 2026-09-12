@@ -27,11 +27,28 @@ The Docker build accepts `BUILD_VERSION`, `VCS_REF`, `BUILD_DATE`, and
 `SOURCE_DATE_EPOCH`; the release workflow derives them from the signed tag
 commit. Base images, FFmpeg package version, `dovi_tool` version/checksums,
 GitHub Actions, Cargo lockfile, and Rust toolchain are pinned.
-The current Rust toolchain is `1.97.1`; the scheduled updater changes this
-documentation, Cargo, Docker, and every CI/release/soak pin in one tested PR.
+The current Rust toolchain is `1.98.1`; the scheduled updater changes this
+documentation, Cargo, Docker, Compose, and every CI/release/soak pin in one tested PR.
 The isolated Compose test runner uses the same digest-pinned toolchain image,
 checks the exact compiler build, and runs Cargo with `--locked`; it must not be
 used as a floating-toolchain compatibility test.
+The toolchain image uses Debian trixie so the Compose runner's packaged FFmpeg
+supports seekable descriptor inputs. The production application is still built
+and run against the pinned Ubuntu FFmpeg 8 libraries.
+
+`python3 scripts/rust-pins.py check` runs in the ordinary quality gate and the
+release contract, without a release tag or container publication. It rejects
+Docker/Compose version or digest drift, inconsistent workflow/documentation pins,
+and a mismatched Compose compiler assertion. The shared `files` inventory also
+drives the scheduled updater's Git staging, including `AGENTS.md` and
+`docs/INDEX.md`. Recorded benchmark tool versions are historical measurements.
+`scripts/set-rust-version.sh X.Y.Z sha256:HEX` resolves the exact compiler build
+from the official Rust release manifest, validates the entire prospective change,
+then stages all replacements and rollback copies before replacing the pins.
+Missing or malformed metadata fails before any file changes; publication failures
+restore earlier replacements without overwriting concurrent external edits. The
+scheduled version resolver reads the manifest's Rust compiler table, independently
+of the Cargo package version.
 
 All Ubuntu image stages fetch packages over HTTPS. The digest-pinned Rust
 image supplies the initial CA bundle until Ubuntu's `ca-certificates` package

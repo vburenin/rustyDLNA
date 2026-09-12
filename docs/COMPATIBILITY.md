@@ -44,6 +44,15 @@ includes complete remap rules. It and `--check` validate without opening or
 migrating the catalog, creating a UUID, persisting root mappings, or maintaining
 caches.
 
+## Media helper versions and input boundaries
+
+Media probing supports the installed libavformat ABI through the compiled C
+adapter. External media helpers require FFmpeg/FFprobe 6 or newer, including
+the production FFmpeg 8 runtime. Their seekable `fd` input boundary deliberately
+has no fallback to arbitrary `file` access. DASH/HLS/concat media manifests and
+image sequences are not admitted as single-file media; library playlists use
+the separate rooted playlist parser.
+
 ## Contract evidence
 
 The repository keeps normalized wire/database fixtures in `testdata/oracle/`.

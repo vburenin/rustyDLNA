@@ -13,7 +13,7 @@ compatibility decisions as rustyDLNA's own contract.
 
 ## Stack
 
-- Rust 1.97.1 / edition 2021 Cargo workspace; embedded HTML/CSS/JavaScript;
+- Rust 1.98.1 / edition 2021 Cargo workspace; embedded HTML/CSS/JavaScript;
   Node/Playwright browser tests; Python 3.10+ and shell operator/validation tools.
 - Package managers: Cargo (`Cargo.lock`) and npm (`package-lock.json`). Python
   tools use the standard library and require no PyPI packages.
@@ -142,7 +142,11 @@ work in an issue.
 
 ### Rust
 
-- Use the pinned Rust `1.97.1`, edition 2021, and the workspace dependency table.
+- Use the pinned Rust `1.98.1`, edition 2021, and the workspace dependency table.
+- Never downgrade Rust or lower the declared minimum Rust version, including to
+  work around local toolchain availability or build/test failures. Upgrading to
+  a newer Rust release is allowed; keep toolchain, Cargo, CI, container, and
+  documentation version pins consistent.
 - Code must pass formatting and Clippy with warnings denied. Avoid broad lint
   allowances; explain any narrow exception next to it.
 - Prefer typed enums and explicit state transitions over stringly typed flags.

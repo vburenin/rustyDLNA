@@ -54,7 +54,7 @@ fn register_web_order(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-pub(crate) const STREAM_PROBE_REVISION: i64 = 6;
+pub(crate) const STREAM_PROBE_REVISION: i64 = 7;
 pub(crate) const SCAN_CATALOG_EPOCH_KEY: &str = "scan_catalog_epoch";
 
 fn parse_scan_catalog_epoch(value: Option<String>, column: usize) -> rusqlite::Result<u64> {
@@ -4541,7 +4541,7 @@ fn migrate_schema_inner(
                        AND CONTAINER IN ('mp4', 'mov')
                        AND (VIDEO = 'h264' OR VIDEO = 'hevc') THEN 0
                       ELSE ?1 END",
-            [STREAM_PROBE_REVISION],
+            [5],
         )?;
     }
     if rev < 6 {
@@ -4551,9 +4551,12 @@ fn migrate_schema_inner(
             "UPDATE DETAILS SET STREAM_PROBE_REV =
                  CASE WHEN STREAM_PROBE_REV >= 5
                        AND COALESCE(VIDEO, '') NOT LIKE '%other%' THEN ?1 ELSE 0 END",
-            [STREAM_PROBE_REVISION],
+            [6],
         )?;
     }
+    // Revision 7 requires descriptor-confined reprobes of every older row.
+    // Historical migrations above certify only their own milestones; keep
+    // metadata visible until the private stage has classified each input.
     if rev < STREAM_PROBE_REVISION {
         tx.execute(
             "INSERT INTO SETTINGS (KEY, VALUE) VALUES ('stream_probe_rev', ?1)
@@ -5896,11 +5899,11 @@ mod query_tests {
             )
             .unwrap();
         assert_eq!(legacy_revision, 0);
-        assert_eq!(current_revision, STREAM_PROBE_REVISION);
+        assert_eq!(current_revision, 6);
         assert_eq!(timing_revision, 0);
         assert_eq!(
             db.setting("stream_probe_rev").unwrap().as_deref(),
-            Some("6")
+            Some(STREAM_PROBE_REVISION.to_string().as_str())
         );
     }
 

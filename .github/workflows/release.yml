@@ -25,7 +25,7 @@ jobs:
         with:
           node-version: 22.19.0
       - name: Pinned latest stable Rust
-        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy && rustup default 1.97.1
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy && rustup default 1.98.1
       - name: Validate release tag, package, changelog, and toolchain
         run: scripts/release-contract.sh "$GITHUB_REF_NAME"
       - name: Full quality gate
@@ -64,7 +64,7 @@ jobs:
           node-version: 22.19.0
           cache: npm
       - name: Pinned Rust toolchain
-        run: rustup toolchain install 1.97.1 --profile minimal && rustup default 1.97.1
+        run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
       - name: Install locked web dependencies and browsers
         run: |
           npm ci

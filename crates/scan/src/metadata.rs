@@ -185,10 +185,16 @@ pub fn probe_av_meta(path: &Path) -> Option<AvMeta> {
             "-of",
             "default=noprint_wrappers=1",
         ])
-        .arg(path);
-    let out =
-        crate::probe::command_output_with_timeout(&mut command, std::time::Duration::from_secs(30))
-            .ok()?;
+        .args(rusty_dlna_protocol::media_input::inherited_media_input_options(3))
+        .args(["-i", "fd:"]);
+    let file = std::fs::File::open(path).ok()?;
+    let out = crate::probe::command_output_supervised_for_file(
+        &mut command,
+        &file,
+        std::time::Duration::from_secs(30),
+        &CancellationToken::default(),
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }

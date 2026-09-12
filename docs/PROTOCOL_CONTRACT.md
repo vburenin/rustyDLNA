@@ -37,6 +37,36 @@ settings and 4 MiB. An ambiguous or over-budget historical map, key collision,
 or failed setting write leaves both the stored mappings and the caller's root
 set unchanged.
 
+## Demuxer input confinement
+
+The scanner recognizes the explicit single-file demuxers in
+`crates/protocol/src/media_input.rs`; unknown formats have no Matroska fallback.
+DASH, HLS, concat manifests and image sequences cannot become catalog media by
+using an admitted filename extension. Library playlist parsing remains separate.
+
+Before libav opens headers or discovers streams, a custom seekable AVIO reads
+only the admitted regular-file descriptor, and its nested-open callback rejects
+all secondary I/O. Attached pictures use the same owner and limits. Image resize,
+thumbnail generation, stream admission and transcode helpers use FFmpeg/FFprobe's
+seekable `fd` protocol with only `fd` permitted and the same demuxer allowlist;
+`file`, network and wrapper protocols are unavailable to media inputs. This also
+covers every Profile-8 intermediate input. An independent descriptor cursor keeps
+repeated probes and playback attempts from interfering with each other. Existing
+cancellation, absolute helper deadlines, inode aliases and byte-preserving paths
+continue to apply.
+
+The external helper boundary requires FFmpeg 6 or newer (including production
+FFmpeg 8), which provides the seekable `fd` protocol. The custom AVIO adapter is
+compiled against the installed libav headers to account for structure layouts.
+This is a demuxer I/O boundary, not an OS sandbox for arbitrary decoder code.
+
+Stream-probe revision 7 rechecks older catalog entries in the private scan stage.
+A failed probe removes an old entry only when a bounded, byte-only format probe
+positively recognizes an unsupported demuxer. It reads at most 1 MiB and never
+opens nested resources. Ordinary decoder/I/O failures retain supported entries,
+and cancellation leaves the published catalog intact. Current unchanged inode
+aliases reuse their existing probe result.
+
 ## Artwork and NFO
 
 - Kodi `*-poster.jpg/.png`, `*-fanart.jpg/.png`, folder `poster.jpg`.

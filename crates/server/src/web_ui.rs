@@ -2262,25 +2262,9 @@ pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
             None,
         );
     };
-    let Some(item) = read_recover(&app.catalog).get_item_by_detail(id).cloned() else {
-        return api_error(
-            404,
-            "media_missing",
-            "This title is no longer in the library.",
-            true,
-            Some("return_to_library"),
-        );
-    };
-    let source_path = rusty_dlna_scan::rebase_media_path_for_config(&item.path, &app.scan_cfg);
-    if rusty_dlna_scan::open_allowed_file(&source_path, &app.scan_cfg).is_err() {
-        return api_error(
-            404,
-            "media_missing",
-            "The media file is not available.",
-            true,
-            Some("return_to_library"),
-        );
-    }
+    // Controls address an admitted generation, whose source descriptor may
+    // outlive its catalog entry or pathname. Admission in media() still checks
+    // the current catalog and opens through the configured-root boundary.
     if cancel_request && request_id.is_none() {
         return api_error(
             400,
@@ -3207,6 +3191,54 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
     );
     let mut response = live_transcode_response(output_mime);
     response.remux_job = Some(RemuxJobSpec {
+        output_expectation: Some(rusty_dlna_http::RemuxOutputExpectation {
+            video_codec: is_video.then(|| {
+                if copy_video {
+                    item.probe
+                        .video
+                        .split(',')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase()
+                } else if plan.video_encoder.contains("hevc") || plan.video_encoder.contains("265")
+                {
+                    "hevc".into()
+                } else {
+                    "h264".into()
+                }
+            }),
+            audio_codecs: if let Some(download_tracks) = &plan.download_audio {
+                download_tracks
+                    .iter()
+                    .map(|selected| {
+                        if selected.copy {
+                            tracks
+                                .iter()
+                                .find(|track| track.index == selected.index)
+                                .map(|track| track.codec.to_ascii_lowercase())
+                                .unwrap_or_default()
+                        } else {
+                            "aac".into()
+                        }
+                    })
+                    .collect()
+            } else if selected_audio_codec.is_empty() {
+                Vec::new()
+            } else {
+                vec![if copy_audio {
+                    selected_audio_codec.to_ascii_lowercase()
+                } else {
+                    "aac".into()
+                }]
+            },
+            duration_seconds: item
+                .duration
+                .as_deref()
+                .and_then(rusty_dlna_http::RemuxOutputExpectation::duration_seconds),
+            seek_seconds: start_seconds as f64,
+            video_copy: copy_video,
+        }),
         detail_id: item.detail_id,
         web_session_id: session_id,
         web_request_id: request_id,

@@ -456,7 +456,9 @@ fn convert_image_file_to_jpeg(
                 "-max_alloc",
             ])
             .arg(cfg.image_memory_limit_bytes.to_string())
-            .args(["-threads", "1", "-i", "/proc/self/fd/3"])
+            .args(["-threads", "1"])
+            .args(rusty_dlna_protocol::media_input::inherited_media_input_options(3))
+            .args(["-i", "fd:"])
             .arg(temporary);
         crate::probe::command_status_with_file_cancellation(
             &mut command,

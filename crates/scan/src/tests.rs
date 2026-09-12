@@ -6603,3 +6603,209 @@ fn recursive_nfo_events_preserve_aliases_and_cancel_staged_changes() {
         .values()
         .all(|item| item.genre.is_none()));
 }
+
+#[test]
+fn scanner_and_helpers_reject_nested_local_and_network_media_inputs() {
+    use inotify::{Inotify, WatchMask};
+    use std::io::ErrorKind;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let temp = TempPath::new("confined-demux");
+    let root = temp.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/library/video/tagged.mp4");
+    let sentinel = temp.join("outside.mp4");
+    std::fs::copy(&fixture, &sentinel).unwrap();
+    let mut accesses = Inotify::init().unwrap();
+    accesses
+        .watches()
+        .add(&sentinel, WatchMask::OPEN | WatchMask::ACCESS)
+        .unwrap();
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let urls = [
+        sentinel.display().to_string(),
+        format!("http://{}/outside.mp4", listener.local_addr().unwrap()),
+    ];
+    let mut inputs = Vec::new();
+    for (index, url) in urls.iter().enumerate() {
+        for (kind, content) in [
+            (
+                "dash",
+                format!(
+                    r#"<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT4S"><Period><AdaptationSet mimeType="video/mp4"><Representation id="1" bandwidth="100000" codecs="avc1.64000a"><BaseURL>{url}</BaseURL><SegmentBase indexRange="0-100" /></Representation></AdaptationSet></Period></MPD>"#
+                ),
+            ),
+            (
+                "hls",
+                format!("#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\n{url}\n#EXT-X-ENDLIST\n"),
+            ),
+            ("concat", format!("ffconcat version 1.0\nfile '{url}'\n")),
+        ] {
+            let input = root.join(format!("{kind}-{index}.mp4"));
+            std::fs::write(&input, content).unwrap();
+            inputs.push(input);
+        }
+    }
+    // An ordinary supported source and both kinds of alias still publish.
+    let valid = root.join("valid.mp4");
+    std::fs::copy(&fixture, &valid).unwrap();
+    std::fs::hard_link(&valid, root.join("hardlink.mp4")).unwrap();
+    std::os::unix::fs::symlink("valid.mp4", root.join("symlink.mp4")).unwrap();
+    let cfg = ScanConfig {
+        media_dirs: vec![root],
+        db_path: Some(temp.join("catalog.db")),
+        types: MediaTypes::all(),
+        wide_links: false,
+        external_command_timeout: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let catalog = scan(&cfg).unwrap();
+    assert_eq!(
+        catalog
+            .items
+            .values()
+            .map(|item| &item.path)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        3
+    );
+    for input in &inputs {
+        assert!(!catalog.items.values().any(|item| item.path == *input));
+        assert!(probe::probe_media(input).is_none());
+        assert!(probe_stream_identity(input).is_none());
+        assert!(probe_av_meta(input).is_none());
+        assert!(probe::attached_pic_stream(input).is_none());
+        let source = std::fs::File::open(input).unwrap();
+        let control = MediaHelperControl {
+            timeout: Duration::from_secs(2),
+            max_alloc_bytes: 64 * 1024 * 1024,
+            cancellation: &cfg.cancellation,
+        };
+        assert!(!probe::scale_jpeg_file_with_options_cancelled_result(
+            &source,
+            &temp.join("scaled.jpg"),
+            64,
+            64,
+            2,
+            control
+        )
+        .unwrap());
+        assert!(
+            !probe::generate_video_thumb_file_with_limits_cancelled_result(
+                &source,
+                &temp.join("thumb.jpg"),
+                64,
+                2,
+                false,
+                control
+            )
+            .unwrap()
+        );
+        let mut command = std::process::Command::new("ffprobe");
+        command
+            .args(["-v", "error"])
+            .args(rusty_dlna_protocol::media_input::inherited_media_input_options(3))
+            .args(["-i", "fd:", "-show_entries", "format=format_name"]);
+        let output = probe::command_output_supervised_for_file(
+            &mut command,
+            &source,
+            Duration::from_secs(2),
+            &cfg.cancellation,
+        )
+        .unwrap();
+        assert!(!output.status.success());
+    }
+    let mut events = [0; 4096];
+    match accesses.read_events(&mut events) {
+        Ok(mut events) => assert!(
+            events.next().is_none(),
+            "demuxer opened/read the outside sentinel"
+        ),
+        Err(error) => assert_eq!(error.kind(), ErrorKind::WouldBlock),
+    }
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        ErrorKind::WouldBlock,
+        "demuxer contacted the outside HTTP listener"
+    );
+    assert!(!temp.join("scaled.jpg").exists());
+    assert!(!temp.join("thumb.jpg").exists());
+}
+
+#[test]
+fn demuxer_revision_removes_legacy_manifests_without_deleting_failed_supported_probes() {
+    for startup_backfill in [false, true] {
+        let temp = TempPath::new("demux-revision");
+        let root = temp.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/library/video/tagged.mp4");
+        let former = root.join("former.mp4");
+        let valid = root.join("valid.mp4");
+        let damaged = root.join("damaged.mp4");
+        std::fs::copy(&fixture, &former).unwrap();
+        std::fs::copy(&fixture, &valid).unwrap();
+        std::fs::hard_link(&former, root.join("alias.mp4")).unwrap();
+        write_incomplete_mp4(&damaged, 4096);
+        let mut cfg = ScanConfig {
+            media_dirs: vec![root],
+            db_path: Some(temp.join("catalog.db")),
+            types: MediaTypes::all(),
+            ..Default::default()
+        };
+        scan(&cfg).unwrap();
+        // Model an earlier scanner that had already admitted this manifest.
+        std::fs::write(&former, "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nhttp://127.0.0.1:1/sentinel.mp4\n#EXT-X-ENDLIST\n").unwrap();
+        {
+            let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+            db.connection()
+                .execute("UPDATE DETAILS SET STREAM_PROBE_REV = 6", [])
+                .unwrap();
+            db.set_setting("stream_probe_rev", "6").unwrap();
+        }
+        assert!(probe::media_input_is_explicitly_unsupported(
+            &former,
+            std::time::Duration::from_secs(2),
+            &cfg.cancellation
+        ));
+        // Cancellation cannot partially publish the revision or delete items.
+        let mut session = ScanSession::new(&cfg).unwrap();
+        cfg.cancellation.cancel();
+        assert!(session.prepare_fill_missing_av_meta().is_err());
+        drop(session);
+        let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+        assert!(db
+            .find_detail_by_path(&path_to_db(&former))
+            .unwrap()
+            .is_some());
+        drop(db);
+        cfg.cancellation = CancellationToken::default();
+        let corrected = if startup_backfill {
+            let mut session = ScanSession::new(&cfg).unwrap();
+            let prepared = session.prepare_fill_missing_av_meta().unwrap();
+            // Preparation alone leaves the published catalog intact.
+            let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+            assert!(db
+                .find_detail_by_path(&path_to_db(&former))
+                .unwrap()
+                .is_some());
+            drop(db);
+            session.publish(prepared).unwrap();
+            LibraryDb::open(cfg.db_path.as_ref().unwrap())
+                .unwrap()
+                .load_catalog()
+                .unwrap()
+        } else {
+            scan(&cfg).unwrap()
+        };
+        let paths: std::collections::BTreeSet<_> = corrected
+            .items
+            .values()
+            .map(|item| item.path.clone())
+            .collect();
+        assert_eq!(paths, [valid, damaged].into());
+    }
+}

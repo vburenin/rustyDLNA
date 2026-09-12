@@ -145,6 +145,9 @@ const BROWSER_NVENC_IDR_CACHE_REVISION: &str = "browser-nvenc-idr-v1";
 const BROWSER_DATA_SAVER_BASELINE_CACHE_REVISION: &str = "browser-data-saver-baseline-v1";
 const BROWSER_HLS_CACHE_REVISION: &str = "browser-hls-v1";
 const BROWSER_AI_UPSCALE_CACHE_REVISION: &str = "browser-ai-upscale-libplacebo-v1";
+/// Completed outputs must satisfy the structural fragment and track validator.
+pub const OUTPUT_VALIDATION_REVISION: &str = "fragment-tracks-v1";
+const MEDIA_INPUT_CACHE_REVISION: &str = "confined-demux-v1";
 const PROFILE8_TOOLCHAIN_CACHE_REVISION: &str = "profile8-toolchain-v2";
 const CACHE_DIGEST_HEX_BYTES: usize = 64;
 const MAX_BROWSER_CACHE_KEY_BYTES: usize = 512;
@@ -926,6 +929,39 @@ pub fn validate_remap_rules(remaps: &[RemapRule], default_encoder: &str) -> Resu
             }
         }
     }
+    Ok(())
+}
+
+/// Reopen an admitted Linux descriptor with an independent seek position.
+/// Resolves the pinned inode, including after removal, without the media path.
+pub fn reopen_media_input(source: &std::fs::File) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    std::fs::File::open(format!("/proc/self/fd/{}", source.as_raw_fd()))
+}
+
+/// Replace one media input with an explicitly inherited descriptor. Apply this
+/// at execution, after negotiating the recipe but before starting the helper.
+/// The `fd` protocol permits seeking while refusing all file/network URLs.
+pub fn use_inherited_media_input(
+    args: &mut Vec<OsString>,
+    ordinal: usize,
+    fd: i32,
+) -> Result<(), String> {
+    let input = args
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| *arg == "-i")
+        .nth(ordinal)
+        .map(|(index, _)| index)
+        .ok_or_else(|| "missing media input".to_string())?;
+    let value = args
+        .get_mut(input + 1)
+        .ok_or_else(|| "missing media input URL".to_string())?;
+    *value = "fd:".into();
+    args.splice(
+        input..input,
+        rusty_dlna_protocol::media_input::inherited_media_input_options(fd),
+    );
     Ok(())
 }
 
@@ -1853,6 +1889,7 @@ impl ToolVersionFlavor {
 /// trusted snapshot without running the bounded query path.
 #[derive(Clone, Debug)]
 pub struct VerifiedExecutable {
+    flavor: ToolVersionFlavor,
     path: std::path::PathBuf,
     identity: ToolFileIdentity,
     fingerprint: String,
@@ -1861,7 +1898,8 @@ pub struct VerifiedExecutable {
 
 impl PartialEq for VerifiedExecutable {
     fn eq(&self, other: &Self) -> bool {
-        self.path == other.path
+        self.flavor == other.flavor
+            && self.path == other.path
             && self.identity == other.identity
             && self.fingerprint == other.fingerprint
     }
@@ -2320,6 +2358,7 @@ fn tool_snapshot(
         open_tool_executable(&resolved, "cannot fingerprint executable")?;
     if let Some(fingerprint) = cached_tool_fingerprint(flavor, &resolved, &identity) {
         return Ok(VerifiedExecutable {
+            flavor,
             path: resolved,
             identity,
             fingerprint,
@@ -2336,6 +2375,7 @@ fn tool_snapshot(
     (executable_file, identity) = open_tool_executable(&resolved, "cannot fingerprint executable")?;
     if let Some(fingerprint) = cached_tool_fingerprint(flavor, &resolved, &identity) {
         return Ok(VerifiedExecutable {
+            flavor,
             path: resolved,
             identity,
             fingerprint,
@@ -2371,6 +2411,7 @@ fn tool_snapshot(
     identity = admitted_identity;
     if let Some(fingerprint) = cached_tool_fingerprint(flavor, &resolved, &identity) {
         return Ok(VerifiedExecutable {
+            flavor,
             path: resolved,
             identity,
             fingerprint,
@@ -2480,6 +2521,7 @@ fn tool_snapshot(
         fingerprint.clone(),
     );
     Ok(VerifiedExecutable {
+        flavor,
         path: resolved,
         identity,
         fingerprint,
@@ -2505,6 +2547,7 @@ fn tool_snapshot_under_remux_control(
             .map_err(|error| RemuxP8Error::Pipeline(error.to_string()))?;
     if let Some(fingerprint) = cached_tool_fingerprint(flavor, &resolved, &identity) {
         return Ok(VerifiedExecutable {
+            flavor,
             path: resolved,
             identity,
             fingerprint,
@@ -2529,6 +2572,7 @@ fn tool_snapshot_under_remux_control(
         .map_err(|error| RemuxP8Error::Pipeline(error.to_string()))?;
     if let Some(fingerprint) = cached_tool_fingerprint(flavor, &resolved, &identity) {
         return Ok(VerifiedExecutable {
+            flavor,
             path: resolved,
             identity,
             fingerprint,
@@ -2537,6 +2581,7 @@ fn tool_snapshot_under_remux_control(
     }
 
     let provisional = VerifiedExecutable {
+        flavor,
         path: resolved.clone(),
         identity: identity.clone(),
         fingerprint: String::new(),
@@ -2656,6 +2701,7 @@ fn tool_snapshot_under_remux_control(
         fingerprint.clone(),
     );
     Ok(VerifiedExecutable {
+        flavor,
         path: resolved,
         identity,
         fingerprint,
@@ -3027,7 +3073,7 @@ fn transcode_cache_key_with_tools(
         "dovi=unused".into()
     };
     let signature = format!(
-        "source={source}\naction={:?}\nencoder={}\nhardware_decode={:?}\naudio={:?}\naudio_index={}\ncontainer={}\nkeep_hdr10={}\ndrop_dolby_vision={}\nbrowser_quality={browser_quality}\nremux_p8={remux_p8}\nffmpeg={ffmpeg}\n{profile8_signature}\nbuild={}",
+        "validation={OUTPUT_VALIDATION_REVISION}\ninput={MEDIA_INPUT_CACHE_REVISION}\nsource={source}\naction={:?}\nencoder={}\nhardware_decode={:?}\naudio={:?}\naudio_index={}\ncontainer={}\nkeep_hdr10={}\ndrop_dolby_vision={}\nbrowser_quality={browser_quality}\nremux_p8={remux_p8}\nffmpeg={ffmpeg}\n{profile8_signature}\nbuild={}",
         plan.action,
         plan.video_encoder,
         plan.hardware_decode,
@@ -3043,20 +3089,42 @@ fn transcode_cache_key_with_tools(
     lowercase_hex(&hasher.finalize())
 }
 
+fn validated_output_stamp(metadata: &std::fs::Metadata, cache_key: &str) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!(
+        "{OUTPUT_VALIDATION_REVISION}\n{cache_key}\n{}:{}:{}:{}:{}:{}:{}\n",
+        metadata.len(),
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec()
+    )
+}
+
 pub fn write_cache_stamp_for_key(dest: &std::path::Path, cache_key: &str) -> std::io::Result<()> {
-    std::fs::write(cache_stamp_path(dest), cache_key)
+    let metadata = dest.metadata()?;
+    std::fs::write(
+        cache_stamp_path(dest),
+        validated_output_stamp(&metadata, cache_key),
+    )
 }
 
 pub fn cache_is_fresh_for_key(dest: &std::path::Path, cache_key: &str) -> bool {
+    use std::io::Read;
     let Ok(metadata) = dest.metadata() else {
         return false;
     };
-    if metadata.len() == 0 {
+    if !metadata.is_file() || metadata.len() == 0 {
         return false;
     }
-    std::fs::read_to_string(cache_stamp_path(dest))
-        .ok()
-        .is_some_and(|have| have.trim() == cache_key)
+    let Ok(stamp) = std::fs::File::open(cache_stamp_path(dest)) else {
+        return false;
+    };
+    let mut have = String::new();
+    stamp.take(4096).read_to_string(&mut have).is_ok()
+        && have == validated_output_stamp(&metadata, cache_key)
 }
 
 pub fn dovi_tool_path() -> Option<std::path::PathBuf> {
@@ -3227,6 +3295,47 @@ fn run_cmd_controlled_output(
     if args.is_empty() {
         return Err(RemuxP8Error::Pipeline("empty command".into()));
     }
+    // Every FFmpeg/FFprobe input, including generated Profile-8 intermediates,
+    // is opened by the owner and passed using the seekable fd-only protocol.
+    // Other tools (dovi_tool) do not invoke libav demuxers.
+    let media_tool = verified_executable.is_some_and(|tool| {
+        matches!(
+            tool.flavor,
+            ToolVersionFlavor::Ffmpeg | ToolVersionFlavor::Ffprobe
+        )
+    });
+    let mut confined_args = args.to_vec();
+    let mut media_inputs = Vec::new();
+    if media_tool {
+        for (ordinal, input) in args
+            .windows(2)
+            .filter(|pair| pair[0] == "-i")
+            .map(|pair| &pair[1])
+            .enumerate()
+        {
+            control.check("media input").map_err(RemuxP8Error::from)?;
+            let file = if input == "/proc/self/fd/3" {
+                reopen_media_input(source.ok_or("missing admitted source descriptor")?)
+            } else {
+                std::fs::File::open(input)
+            }
+            .map_err(|error| format!("open helper input: {error}"))?;
+            if !file
+                .metadata()
+                .map_err(|error| error.to_string())?
+                .is_file()
+            {
+                return Err("helper input is not a regular file".into());
+            }
+            let fd = i32::try_from(ordinal)
+                .ok()
+                .and_then(|ordinal| ordinal.checked_add(6))
+                .ok_or("too many helper inputs")?;
+            use_inherited_media_input(&mut confined_args, ordinal, fd)?;
+            media_inputs.push((file, fd));
+        }
+    }
+    let args = &confined_args;
     let mut command = verified_executable.map_or_else(
         || std::process::Command::new(&args[0]),
         VerifiedExecutable::command,
@@ -3243,7 +3352,13 @@ fn run_cmd_controlled_output(
                 .read_error(CaptureReadError::Error),
         );
     }
-    if let Some(source) = source {
+    if media_tool {
+        for (file, fd) in &media_inputs {
+            runner = runner
+                .inherit_file_at(file, *fd)
+                .map_err(|error| format!("inherit media input: {error}"))?;
+        }
+    } else if let Some(source) = source {
         runner = runner.inherit_file_at(source, 3).map_err(|error| {
             format!("inherit source for {}: {error}", args[0].to_string_lossy())
         })?;
@@ -3834,6 +3949,7 @@ fn profile8_commands(
         "stream_side_data=dv_level".into(),
         "-of".into(),
         "default=noprint_wrappers=1:nokey=1".into(),
+        "-i".into(),
         source_arg.clone(),
     ];
     let wrap = vec![
@@ -6961,9 +7077,10 @@ encoder = "copy"
             action: RecodeAction::RemuxP8,
             ..TranscodePlan::default()
         };
+        std::fs::write(snapshotted.join("source.mkv"), b"test input").unwrap();
         let commands = profile8_commands(
             &toolchain,
-            OsString::from("source.mkv"),
+            snapshotted.join("source.mkv").into_os_string(),
             Path::new("stage.hevc"),
             Path::new("stage.p8.hevc"),
             Path::new("stage.p8.mp4"),
@@ -7507,5 +7624,24 @@ encoder = "copy"
             assert!(!process.exists(), "stage process {} survived", pid.trim());
         }
         std::fs::remove_dir_all(tmp).unwrap();
+    }
+    #[test]
+    fn validation_stamp_rejects_legacy_and_same_size_output_mutation() {
+        let temp = tool_test_dir("validated-stamp");
+        let dest = temp.join("output.mp4");
+        std::fs::write(&dest, b"original").unwrap();
+        std::fs::write(cache_stamp_path(&dest), "key").unwrap();
+        assert!(!cache_is_fresh_for_key(&dest, "key"));
+        write_cache_stamp_for_key(&dest, "key").unwrap();
+        assert!(cache_is_fresh_for_key(&dest, "key"));
+        let modified = dest.metadata().unwrap().modified().unwrap();
+        // Filesystem change timestamps can share one kernel clock tick.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&dest, b"modified").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&dest).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(!cache_is_fresh_for_key(&dest, "key"));
+        std::fs::remove_dir_all(temp).unwrap();
     }
 }

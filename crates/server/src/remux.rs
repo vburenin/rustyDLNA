@@ -21,6 +21,8 @@ use crate::App;
 
 mod cache;
 mod hls;
+#[cfg(test)]
+mod validation_tests;
 
 pub(crate) use cache::maintain_transcode_cache;
 use cache::{enforce_active_cache_limits, maintain_app_cache};
@@ -962,11 +964,8 @@ fn spawn_ffmpeg(
             // Release execution permits before registry cleanup. A newer web
             // generation can then wait for the producer it cancelled while
             // holding the registry lock, without deadlocking this guard.
-            let _completion_guard = RemuxCompletionGuard::new(
-                app.clone(),
-                spec.job_key.clone(),
-                job.clone(),
-            );
+            let _completion_guard =
+                RemuxCompletionGuard::new(app.clone(), spec.job_key.clone(), job.clone());
             // Reverse drop order releases the global helper first, followed
             // by the ordinary and AI job slots, before the completion guard.
             let _ai_upscale_permit = ai_upscale_permit;
@@ -999,9 +998,9 @@ fn spawn_ffmpeg(
                     if now < next_cache_check {
                         return Ok(());
                     }
-                    enforce_active_cache_limits(&app).map(|_| ()).map_err(|error| {
-                        error.to_string()
-                    })?;
+                    enforce_active_cache_limits(&app)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())?;
                     next_cache_check = now + Duration::from_secs(1);
                     Ok(())
                 };
@@ -1015,14 +1014,14 @@ fn spawn_ffmpeg(
                 );
                 match p8_result {
                     Ok(()) => {
-                        finalize_remux(&app, &job, id, &dest, &part, verify_timeout, true);
-                        if job.is_complete() && spec.cacheable {
-                            if let Err(error) =
-                                write_cache_stamp_for_key(&dest, &spec.cache_key)
-                            {
-                                tracing::warn!(id, dest = %dest.display(), %error, "cache stamp write failed");
-                            }
-                        }
+                        finalize_remux(
+                            &app,
+                            &job,
+                            &spec,
+                            verify_timeout,
+                            &spec.output_expectation,
+                            spec.cacheable,
+                        );
                         return;
                     }
                     Err(RemuxP8Error::Observer(error)) => {
@@ -1101,25 +1100,44 @@ fn spawn_ffmpeg(
             }
             match result {
                 Ok((status, _)) if status.success() => {
-                    let production_ffmpeg = args.first().is_some_and(|executable| {
-                        Path::new(executable)
-                            .file_name()
-                            .is_some_and(|name| name == "ffmpeg")
-                    });
+                    let mut expectation = spec.output_expectation.clone();
+                    if let Some(expected) = expectation.as_mut() {
+                        // A portable fallback may change the negotiated video codec.
+                        for pair in args.windows(2) {
+                            let option = pair[0].to_string_lossy();
+                            let codec = pair[1].to_string_lossy();
+                            if codec != "copy" && (option == "-c:a" || option.starts_with("-c:a:"))
+                            {
+                                if option == "-c:a" {
+                                    expected.audio_codecs.fill(codec.into_owned());
+                                } else if let Some(index) = option
+                                    .strip_prefix("-c:a:")
+                                    .and_then(|index| index.parse::<usize>().ok())
+                                {
+                                    if let Some(track) = expected.audio_codecs.get_mut(index) {
+                                        *track = codec.into_owned();
+                                    }
+                                }
+                            }
+                            if pair[0] == "-c:v" && pair[1] != "copy" {
+                                expected.video_copy = false;
+                                expected.video_codec =
+                                    Some(if pair[1].to_string_lossy().contains("264") {
+                                        "h264".into()
+                                    } else {
+                                        "hevc".into()
+                                    });
+                            }
+                        }
+                    }
                     finalize_remux(
                         &app,
                         &job,
-                        id,
-                        &dest,
-                        &part,
+                        &spec,
                         verify_timeout,
-                        production_ffmpeg,
+                        &expectation,
+                        spec.cacheable && !output_fell_back,
                     );
-                    if job.is_complete() && spec.cacheable && !output_fell_back {
-                        if let Err(error) = write_cache_stamp_for_key(&dest, &spec.cache_key) {
-                            tracing::warn!(id, dest = %dest.display(), %error, "cache stamp write failed");
-                        }
-                    }
                 }
                 Ok((status, stderr)) => {
                     let tail = tail_str(&stderr, 2000);
@@ -1196,10 +1214,18 @@ fn run_ffmpeg_growing(
         || std::process::Command::new(executable),
         rusty_dlna_transcode::VerifiedExecutable::command,
     );
-    command.args(&args[1..]);
+    let mut confined_args = args.to_vec();
+    let inherited_source = source_file
+        .map(rusty_dlna_transcode::reopen_media_input)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    if inherited_source.is_some() {
+        rusty_dlna_transcode::use_inherited_media_input(&mut confined_args, 0, 3)?;
+    }
+    command.args(&confined_args[1..]);
     let mut runner = SupervisedCommand::new(&mut command)
         .capture_stderr(CaptureConfig::new(64 * 1024, CaptureRetention::Tail));
-    if let Some(source) = source_file {
+    if let Some(source) = inherited_source.as_ref() {
         runner = runner
             .inherit_file_at(source, 3)
             .map_err(|error| format!("spawn {}: {error}", executable.to_string_lossy()))?;
@@ -1409,119 +1435,159 @@ fn finish_job(app: &Arc<App>, key: &str, job: &Arc<RemuxJob>) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputSnapshot {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl OutputSnapshot {
+    fn read(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+
+    fn unchanged(&self, file: &std::fs::File, path: &Path) -> Result<(), String> {
+        let descriptor = file.metadata().map_err(|error| error.to_string())?;
+        let pathname = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+        if !pathname.is_file() || *self != Self::read(&descriptor) || *self != Self::read(&pathname)
+        {
+            return Err("output changed during final verification".into());
+        }
+        Ok(())
+    }
+}
+
 fn finalize_remux(
     app: &App,
     job: &RemuxJob,
-    id: i64,
-    dest: &Path,
-    part: &Path,
+    spec: &RemuxJobSpec,
     verify_timeout: Duration,
-    verify: bool,
+    expectation: &Option<rusty_dlna_http::RemuxOutputExpectation>,
+    cacheable: bool,
 ) {
-    let n = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
-    if n == 0 {
-        let msg = "ffmpeg produced empty remux".to_string();
-        tracing::error!(id, dest = %dest.display(), "{msg}");
-        job.transition(RemuxState::Failed(msg));
-        let _ = std::fs::remove_file(part);
-        return;
-    }
-    if verify {
-        if let Err(error) = verify_finished_output(part, verify_timeout, &job.cancelled) {
-            let message = format!("remux output verification failed: {error}");
-            tracing::error!(id, dest = %dest.display(), %message);
-            job.transition(RemuxState::Failed(message));
-            cleanup_intermediates(part);
-            return;
+    let result = publish_finished_output(app, job, spec, verify_timeout, expectation, cacheable);
+    if let Err(error) = result {
+        cleanup_intermediates(&job.part);
+        if job.cancelled.load(Ordering::Acquire) {
+            job.transition(RemuxState::Cancelled);
+        } else {
+            tracing::error!(id = job.detail_id, %error, "remux output verification/publication failed");
+            job.transition(RemuxState::Failed(format!(
+                "remux output verification failed: {error}"
+            )));
         }
     }
-    // The completed bytes are still a protected staging artifact here. Check
-    // quota and the real minimum-free reserve before rename makes the output
-    // observable as Complete; otherwise a waiter could open a file that the
-    // producer immediately deletes during post-publication maintenance.
-    if let Err(error) = enforce_active_cache_limits(app) {
-        cleanup_intermediates(part);
-        // The failed pass accounted the staging bytes. Refresh after cleanup
-        // so the exported cache gauge reflects the bytes still on disk.
-        let _ = enforce_active_cache_limits(app);
-        job.transition(RemuxState::Failed(format!(
-            "transcode cache limits: {error}"
-        )));
-        return;
-    }
-    // Pin the output before publication, and serialize the rename with first
-    // opens. Readers keep this descriptor for their entire generation.
-    let opened = job.open_output();
-    let _maintenance = crate::lock_recover(&app.cache_maintenance);
-    let _publication = crate::lock_recover(&job.output);
-    if job.cancelled.load(Ordering::Acquire) {
-        cleanup_intermediates(part);
-        job.transition(RemuxState::Cancelled);
-        return;
-    }
-    if let Err(e) = opened.and_then(|_| std::fs::rename(part, dest)) {
-        let msg = format!("remux rename: {e}");
-        tracing::error!(id, dest = %dest.display(), "{msg}");
-        job.transition(RemuxState::Failed(msg));
-        cleanup_intermediates(part);
-        return;
-    }
-    tracing::info!(id, dest = %dest.display(), bytes = n, "remux job done");
-    // The pre-publication scan already counted these staging bytes. Renaming
-    // under the maintenance lock changes neither their size nor their count.
-    job.transition(RemuxState::Complete);
 }
 
-fn verify_finished_output(
-    path: &Path,
-    timeout: Duration,
-    cancelled: &AtomicBool,
-) -> Result<(), String> {
-    use rusty_dlna_helper::{
-        CaptureConfig, CaptureRetention, SupervisedCommand, SupervisedOutcome, SupervisionError,
-    };
-    use std::ops::ControlFlow;
+#[cfg(test)]
+type PublicationTestHook = fn(&RemuxJob);
 
-    let mut command = std::process::Command::new("ffprobe");
-    command
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=format_name",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(path);
-    let runner = SupervisedCommand::new(&mut command)
-        .capture_stderr(CaptureConfig::new(64 * 1024, CaptureRetention::Head));
-    let deadline = Instant::now() + timeout;
-    let outcome = runner.run_until(deadline, Duration::from_millis(20), || {
-        if cancelled.load(Ordering::Acquire) {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
+#[cfg(test)]
+fn publication_test_hooks() -> &'static Mutex<HashMap<PathBuf, PublicationTestHook>> {
+    static HOOKS: std::sync::OnceLock<Mutex<HashMap<PathBuf, PublicationTestHook>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn publish_finished_output(
+    app: &App,
+    job: &RemuxJob,
+    spec: &RemuxJobSpec,
+    verify_timeout: Duration,
+    expectation: &Option<rusty_dlna_http::RemuxOutputExpectation>,
+    cacheable: bool,
+) -> Result<(), String> {
+    let original_deadline = job.started + Duration::from_secs(app.cfg.transcode.max_runtime_secs);
+    let deadline = original_deadline.min(Instant::now() + verify_timeout);
+    let output = job.open_output().map_err(|error| error.to_string())?;
+    let snapshot = {
+        let mut file = crate::lock_recover(&output);
+        let snapshot = OutputSnapshot::read(&file.metadata().map_err(|error| error.to_string())?);
+        if snapshot.bytes == 0 {
+            return Err("ffmpeg produced empty remux".into());
         }
-    });
-    match outcome {
-        Ok(SupervisedOutcome::Exited(output)) if output.status.success() => Ok(()),
-        Ok(SupervisedOutcome::Exited(output)) => {
-            let diagnostics = String::from_utf8_lossy(&output.stderr);
-            Err(if diagnostics.trim().is_empty() {
-                format!("ffprobe exited {}", output.status)
-            } else {
-                diagnostics.trim().to_string()
-            })
+        if let Some(expected) = expectation {
+            let started = Instant::now();
+            let stats = hls::validate_finished(&mut file, expected, deadline, &job.cancelled)?;
+            tracing::debug!(
+                id = job.detail_id,
+                metadata_bytes = stats.metadata_bytes,
+                samples = stats.samples,
+                boxes = stats.boxes,
+                elapsed_us = started.elapsed().as_micros(),
+                "completed MP4 structurally validated"
+            );
+        } else if !cfg!(test) {
+            return Err("missing negotiated output validation contract".into());
         }
-        Ok(SupervisedOutcome::NotStarted { .. } | SupervisedOutcome::Stopped { .. }) => {
-            Err("cancelled".into())
-        }
-        Ok(SupervisedOutcome::Deadline { .. }) => Err("ffprobe verification timed out".into()),
-        Err(SupervisionError::Spawn(error) | SupervisionError::Wait(error)) => {
-            Err(error.to_string())
-        }
-        Err(error) => Err(error.to_string()),
+        snapshot.unchanged(&file, &job.part)?;
+        snapshot
+    };
+    #[cfg(test)]
+    if let Some(hook) = crate::lock_recover(publication_test_hooks()).remove(&job.part) {
+        hook(job);
     }
+    // The completed bytes remain protected staging artifacts during the quota check.
+    enforce_active_cache_limits(app).map_err(|error| format!("transcode cache limits: {error}"))?;
+    // Cancellation and lease expiry take this lock too: publication and cancellation
+    // have one ordering through the final Complete transition.
+    let _completion = crate::lock_recover(&job.disconnect_deadline);
+    let _maintenance = crate::lock_recover(&app.cache_maintenance);
+    let _publication = crate::lock_recover(&job.output);
+    let file = crate::lock_recover(&output);
+    if job.cancelled.load(Ordering::Acquire) {
+        return Err("cancelled".into());
+    }
+    if expectation.is_some() && Instant::now() >= deadline {
+        return Err("final verification deadline exceeded".into());
+    }
+    snapshot.unchanged(&file, &job.part)?;
+    std::fs::rename(&job.part, &job.dest).map_err(|error| format!("remux rename: {error}"))?;
+    let publish_result = (|| {
+        // Rename can change ctime. Recheck content identity and take the new stable
+        // snapshot before writing a versioned reusable stamp or exposing Complete.
+        let published = OutputSnapshot::read(&file.metadata().map_err(|error| error.to_string())?);
+        if published.device != snapshot.device
+            || published.inode != snapshot.inode
+            || published.bytes != snapshot.bytes
+            || published.modified != snapshot.modified
+        {
+            return Err("output changed during publication".into());
+        }
+        if cacheable {
+            if let Err(error) = write_cache_stamp_for_key(&job.dest, &spec.cache_key) {
+                return Err(error.to_string());
+            }
+        }
+        published.unchanged(&file, &job.dest).and_then(|()| {
+            if job.cancelled.load(Ordering::Acquire) {
+                Err("cancelled".into())
+            } else if expectation.is_some() && Instant::now() >= deadline {
+                Err("final verification deadline exceeded".into())
+            } else {
+                Ok(())
+            }
+        })?;
+        Ok(())
+    })();
+    if publish_result.is_err() {
+        let _ = std::fs::remove_file(rusty_dlna_transcode::cache_stamp_path(&job.dest));
+        let _ = std::fs::remove_file(&job.dest);
+    }
+    publish_result?;
+    tracing::info!(id = job.detail_id, bytes = snapshot.bytes, "remux job done");
+    job.transition(RemuxState::Complete);
+    Ok(())
 }
 
 fn cleanup_intermediates(part: &Path) {
@@ -2961,10 +3027,23 @@ async fn serve_finished(
         let output = metadata_job.open_output()?;
         let file = crate::lock_recover(&output);
         let metadata = file.metadata()?;
-        let etag = std::fs::metadata(rusty_dlna_transcode::cache_stamp_path(&metadata_job.dest))
+        use std::os::unix::fs::OpenOptionsExt;
+        let etag = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(rusty_dlna_transcode::cache_stamp_path(&metadata_job.dest))
             .ok()
-            .and_then(|stamp| rusty_dlna_http::range::completed_cache_etag(&metadata, &stamp));
-        let _ = file.set_modified(std::time::SystemTime::now());
+            .and_then(|stamp| {
+                let stamp_metadata = stamp
+                    .metadata()
+                    .ok()
+                    .filter(|metadata| metadata.is_file())?;
+                let etag = rusty_dlna_http::range::completed_cache_etag(&metadata, &stamp_metadata);
+                // Output timestamps are part of its validated identity. Record
+                // cache recency on the stamp without rewriting its contents.
+                let _ = stamp.set_modified(std::time::SystemTime::now());
+                etag
+            });
         Ok::<_, std::io::Error>((metadata.len(), etag))
     })
     .await??;
@@ -3253,6 +3332,9 @@ async fn stream_growing(
 }
 
 #[cfg(test)]
+mod control_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3286,7 +3368,7 @@ mod tests {
         }
     }
 
-    struct TempDir(PathBuf);
+    pub(super) struct TempDir(PathBuf);
 
     impl TempDir {
         fn new(label: &str) -> Self {
@@ -3321,11 +3403,11 @@ mod tests {
         }
     }
 
-    fn temp_dir(label: &str) -> TempDir {
+    pub(super) fn temp_dir(label: &str) -> TempDir {
         TempDir::new(label)
     }
 
-    fn test_app(dir: &Path, max_jobs: u32) -> Arc<App> {
+    pub(super) fn test_app(dir: &Path, max_jobs: u32) -> Arc<App> {
         Arc::new(App::from_config(
             crate::Config {
                 cache_dir: Some(dir.display().to_string()),
@@ -3344,12 +3426,13 @@ mod tests {
         ))
     }
 
-    fn job_spec(dir: &Path, key: &str, command: Vec<String>) -> RemuxJobSpec {
+    pub(super) fn job_spec(dir: &Path, key: &str, command: Vec<String>) -> RemuxJobSpec {
         let src = dir.join("source.mkv");
         if !src.exists() {
             std::fs::write(&src, b"source bytes").unwrap();
         }
         RemuxJobSpec {
+            output_expectation: None,
             detail_id: 42,
             web_session_id: None,
             web_request_id: None,
@@ -3393,7 +3476,7 @@ mod tests {
         job
     }
 
-    fn wait_for_terminal_cleanup(app: &App, job: &RemuxJob) {
+    pub(super) fn wait_for_terminal_cleanup(app: &App, job: &RemuxJob) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             if matches!(
@@ -3471,7 +3554,7 @@ mod tests {
         (key, job)
     }
 
-    fn growing_test_job(dir: &Path, id: i64, bytes: &[u8]) -> Arc<RemuxJob> {
+    pub(super) fn growing_test_job(dir: &Path, id: i64, bytes: &[u8]) -> Arc<RemuxJob> {
         let part = dir.join(format!("growing-{id}.mp4.part"));
         std::fs::write(&part, bytes).unwrap();
         Arc::new(RemuxJob {
@@ -3898,7 +3981,7 @@ mod tests {
 
         std::fs::File::options()
             .write(true)
-            .open(&dest)
+            .open(rusty_dlna_transcode::cache_stamp_path(&dest))
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(10))
             .unwrap();
@@ -4014,12 +4097,19 @@ mod tests {
             hls_index: Mutex::new(hls::Index::default()),
         });
 
-        finalize_remux(&app, &job, 42, &dest, &part, Duration::ZERO, false);
+        finalize_remux(
+            &app,
+            &job,
+            &job_spec(&dir, "quota", Vec::new()),
+            Duration::ZERO,
+            &None,
+            false,
+        );
 
         let RemuxState::Failed(error) = job.state() else {
             panic!("rename failure must fail the job");
         };
-        assert!(error.starts_with("remux rename: "));
+        assert!(error.contains("remux rename: "));
         assert!(dest.is_dir());
         assert!(!part.exists());
         assert!(!part.with_extension("hevc").exists());
@@ -5111,6 +5201,7 @@ mod tests {
         let dest = dir.join("shared-output.mp4");
         let part = cache_part(&dest);
         let first = RemuxJobSpec {
+            output_expectation: None,
             detail_id: 42,
             web_session_id: None,
             web_request_id: None,
@@ -5147,6 +5238,7 @@ mod tests {
         let second_key = rusty_dlna_transcode::source_identity(&src).unwrap();
         assert_ne!(first_key, second_key);
         let second = RemuxJobSpec {
+            output_expectation: None,
             detail_id: 42,
             web_session_id: None,
             web_request_id: None,
@@ -5907,26 +5999,6 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_finished_output_is_rejected_before_publish() {
-        if std::process::Command::new("ffprobe")
-            .arg("-version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_err()
-        {
-            return;
-        }
-        let dir = temp_dir("verify-corrupt");
-        let corrupt = dir.join("corrupt.mp4.part");
-        std::fs::write(&corrupt, b"not an mp4").unwrap();
-        let cancelled = AtomicBool::new(false);
-        assert!(verify_finished_output(&corrupt, Duration::from_secs(2), &cancelled).is_err());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn same_key_restart_must_not_reuse_cancelled_producer() {
         let dir = temp_dir("review-same-key-restart");
         let app = test_app(&dir, 1);
@@ -6196,10 +6268,9 @@ mod tests {
         finalize_remux(
             &app,
             &job,
-            42,
-            &job.dest,
-            &job.part,
+            &job_spec(&dir, "failed", Vec::new()),
             Duration::from_secs(1),
+            &None,
             false,
         );
         assert!(matches!(job.state(), RemuxState::Failed(_)));
@@ -6210,10 +6281,9 @@ mod tests {
         finalize_remux(
             &app,
             &other,
-            43,
-            &other.dest,
-            &other.part,
+            &job_spec(&dir, "cancelled", Vec::new()),
             Duration::from_secs(1),
+            &None,
             false,
         );
         assert_eq!(other.state(), RemuxState::Cancelled);

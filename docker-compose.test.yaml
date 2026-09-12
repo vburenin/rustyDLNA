@@ -8,7 +8,7 @@ name: rusty-dlna-test
 
 services:
   rusty-dlna-test:
-    image: rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97
+    image: rust:1.98.1-trixie@sha256:462a9af3c54fb4718850d3c602fc0e54452c20b1c12a4e4080fdb001d4b9acbf
     container_name: rusty-dlna-test
     working_dir: /src
     # Default bridge. Reachable only inside this compose project.
@@ -33,7 +33,7 @@ services:
             libavcodec-dev libavformat-dev libavutil-dev \
             libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev
         fi
-        test "$(rustc --version)" = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+        test "$(rustc --version)" = "rustc 1.98.1 (48a229cea 2026-09-01)"
         cargo test --workspace --locked && cargo run --locked -p rusty-dlna -- --check
     # cap_drop is extra insurance we are not a LAN advertiser
     cap_drop:

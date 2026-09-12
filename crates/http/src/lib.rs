@@ -438,10 +438,40 @@ pub struct OpenFileRange {
     pub end: u64,
 }
 
+/// Media contract checked against every track before completed output is published.
+#[derive(Clone, Debug)]
+pub struct RemuxOutputExpectation {
+    pub video_codec: Option<String>,
+    pub audio_codecs: Vec<String>,
+    pub duration_seconds: Option<f64>,
+    pub seek_seconds: f64,
+    pub video_copy: bool,
+}
+
+impl RemuxOutputExpectation {
+    pub fn duration_seconds(value: &str) -> Option<f64> {
+        let mut fields = value.split(':');
+        let hours = fields.next()?.parse::<f64>().ok()?;
+        let minutes = fields.next()?.parse::<f64>().ok()?;
+        let seconds = fields.next()?.parse::<f64>().ok()?;
+        if fields.next().is_some()
+            || [hours, minutes, seconds]
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return None;
+        }
+        let seconds = hours * 3600.0 + minutes * 60.0 + seconds;
+        (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+    }
+}
+
 /// One `/Transcode/{id}` serve: ffmpeg writes `dest` (via `args`) in the
 /// background; every concurrent GET shares that job.
 #[derive(Clone, Debug)]
 pub struct RemuxJobSpec {
+    /// Always present for admitted production media; absent only in synthetic helper tests.
+    pub output_expectation: Option<RemuxOutputExpectation>,
     pub detail_id: i64,
     /// Stable browser player identity shared by every source generation for
     /// one selected title. A newer generation supersedes older jobs owned by

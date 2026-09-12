@@ -33,11 +33,12 @@ All commands below run from the **repository root**. The agent wrapper invokes
 | Check | Command | Source |
 | --- | --- | --- |
 | Combined verification | `./scripts/agent-verify.sh` → `scripts/check.sh` | `AGENTS.md`, `scripts/check.sh`, `.github/workflows/ci.yml` |
+| Rust pin consistency | `python3 scripts/rust-pins.py check` | `scripts/check.sh`, `scripts/release-contract.sh` |
 | Rust formatting | `cargo fmt --all -- --check` | `AGENTS.md`, `scripts/check.sh` |
 | Rust lint and type checking | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | `AGENTS.md`, `scripts/check.sh` |
 | Rust tests | `cargo test --workspace --locked` | `AGENTS.md`, `scripts/check.sh` |
 | Web unit tests | `npm run test:web-unit` | `package.json`, `scripts/check.sh` |
-| Python tests | `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s contrib/library/tests -p 'test_*.py'` | `scripts/check.sh` |
+| Python tests | `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s contrib/library/tests -p 'test_*.py'` and the same command with `-s scripts/tests` | `scripts/check.sh` |
 | Rust documentation | `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked` | `scripts/check.sh` |
 | Build (optional, separate) | `cargo build --locked -p rusty-dlna` | `.github/workflows/ci.yml`, privileged SSDP job |
 | Full web suite (additional CI check) | `npm run test:web` | `package.json`, `.github/workflows/ci.yml`, browser job |
@@ -56,10 +57,10 @@ not install dependencies.
 
 - Linux amd64 or arm64 is required by the server (`README.md`). The existing
   quality workflow uses Ubuntu 24.04; `scripts/check.sh` also uses GNU utilities.
-- Rust **1.97.1**, edition 2021, with rustfmt and Clippy is declared in
+- Rust **1.98.1**, edition 2021, with rustfmt and Clippy is declared in
   `rust-toolchain.toml` and `Cargo.toml`. CI installs it with
-  `rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy`
-  and selects it with `rustup default 1.97.1`. Cargo test/doc/run commands in
+  `rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy`
+  and selects it with `rustup default 1.98.1`. Cargo test/doc/run commands in
   the quality gate use `--locked` and the workspace lockfile.
 - Node.js **20 or newer** with npm is required by `AGENTS.md` and the gate;
   existing CI pins **22.19.0**. Web unit tests need no npm dependency install.
@@ -72,7 +73,7 @@ not install dependencies.
   Python, shell tools, and GNU utilities must also be available. Operator tools
   use FFmpeg and FFprobe. Additional CI jobs declare their own dependencies.
 
-The existing workflows are authoritative and remain unchanged. The quality job
+The workflows are authoritative. The quality job
 runs `scripts/check.sh` directly; it does not call `scripts/agent-verify.sh`.
 
 ## For agents

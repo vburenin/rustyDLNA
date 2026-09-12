@@ -949,6 +949,19 @@ export function compatibleDecodeRecovery({
     : null;
 }
 
+// Producer status and downloaded bytes cannot prove decoder progress. Give
+// preparation a longer, progress-sensitive grace, then require the media clock
+// to move. Seeking uses preparation grace while its target is being assembled.
+export function mediaSourceStallReason({ now, startedAt, preparationAt, playbackAt,
+  firstFragmentAt, hasFrame, seeking }) {
+  if (hasFrame && !seeking) {
+    return now - playbackAt >= 20_000 ? "playback progress" : null;
+  }
+  if (firstFragmentAt !== null && !seeking && now - firstFragmentAt >= 20_000) return "first frame";
+  if (now - preparationAt >= 120_000 || now - startedAt >= 300_000) return "preparation progress";
+  return null;
+}
+
 export function apiErrorCategory(error) {
   if (error?.code === "media_missing") return "media_missing";
   if (error?.code === "transcode_disabled") return "transcode_disabled";

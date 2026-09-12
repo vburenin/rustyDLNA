@@ -9,6 +9,87 @@ import { bufferedSeekTarget, bufferedRangeSecondsAhead, parseHlsMediaPlaylist } 
 const MEDIA_SOURCE_BUFFER_AHEAD_SECONDS = 10;
 const MEDIA_SOURCE_RETAIN_BEHIND_SECONDS = 5;
 const MEDIA_SOURCE_PLAYLIST_POLL_MS = 500;
+const MEDIA_SOURCE_EVENT_TIMEOUT_MS = 20_000;
+const MEDIA_SOURCE_BODY_PROGRESS_MS = 15_000;
+
+function timeoutError(phase) {
+  return new Error(`Media Source ${phase} timed out.`);
+}
+
+// Race the operation as well as aborting fetch: a body implementation must not
+// be able to hold source replacement or recovery hostage by ignoring abort.
+function withAbort(promise, signal) {
+  if (signal.aborted) {
+    void Promise.resolve(promise).catch(() => {});
+    return Promise.reject(signal.reason || abortedError());
+  }
+  return new Promise((resolve, reject) => {
+    const abort = () => { cleanup(); reject(signal.reason || abortedError()); };
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve(promise).then(
+      (value) => { cleanup(); resolve(value); },
+      (error) => { cleanup(); reject(error); },
+    );
+  });
+}
+
+async function fetchResource(url, signal, { playlist = false } = {}) {
+  if (signal.aborted) throw abortedError();
+  const controller = new AbortController();
+  const abort = () => controller.abort(abortedError());
+  signal.addEventListener("abort", abort, { once: true });
+  const limit = (playlist ? 4 : 32) * 1024 * 1024;
+  // Playlist headers may wait for helper admission, preparation, and the first
+  // complete fragment. Subsequent finite-resource requests need less grace.
+  let progressTimer = window.setTimeout(() => controller.abort(timeoutError("headers")), playlist ? 120_000 : 30_000);
+  const absoluteTimer = window.setTimeout(() => controller.abort(timeoutError("request")), playlist ? 180_000 : 120_000);
+  let reader;
+  let completed = false;
+  try {
+    const response = await withAbort(fetch(url, {
+      cache: "no-store", credentials: "same-origin", signal: controller.signal,
+    }), controller.signal);
+    if (!response.ok) throw new Error(`Media Source resource returned HTTP ${response.status}.`);
+    if (Number(response.headers.get("content-length")) > limit) throw new Error("Media Source resource is too large.");
+    if (!response.body) throw new Error("Media Source resource has no body.");
+    reader = response.body.getReader();
+    const chunks = [];
+    let length = 0;
+    let reads = 0;
+    const resetProgress = () => {
+      window.clearTimeout(progressTimer);
+      progressTimer = window.setTimeout(() => controller.abort(timeoutError("body progress")), MEDIA_SOURCE_BODY_PROGRESS_MS);
+    };
+    resetProgress();
+    while (true) {
+      const { value, done } = await withAbort(reader.read(), controller.signal);
+      if (done) break;
+      if (++reads > 65_536) throw new Error("Media Source resource has too many chunks.");
+      if (value.byteLength) resetProgress();
+      length += value.byteLength;
+      if (length > limit) throw new Error("Media Source resource is too large.");
+      if (value.byteLength) chunks.push(value);
+    }
+    if (length === 0) throw new Error("Media Source resource is empty.");
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    completed = true;
+    return bytes;
+  } finally {
+    window.clearTimeout(progressTimer);
+    window.clearTimeout(absoluteTimer);
+    signal.removeEventListener("abort", abort);
+    if (!completed) {
+      controller.abort();
+      void reader?.cancel().catch(() => {});
+    }
+    // A cancelled stream may still have a pending read; cancellation settles it
+    // without delaying the already bounded operation's failure.
+    try { reader?.releaseLock(); } catch (_) { /* Pending abort completion. */ }
+  }
+}
 
 function abortedError() {
   return new DOMException("Playback source was replaced.", "AbortError");
@@ -40,7 +121,12 @@ function waitForMediaEvent(target, eventName, signal, errorEvent = "error") {
     target.addEventListener(eventName, done, { once: true });
     if (errorEvent) target.addEventListener(errorEvent, failed, { once: true });
     signal.addEventListener("abort", abort, { once: true });
+    const timer = window.setTimeout(() => {
+      cleanup();
+      reject(timeoutError(eventName));
+    }, MEDIA_SOURCE_EVENT_TIMEOUT_MS);
     function cleanup() {
+      window.clearTimeout(timer);
       target.removeEventListener(eventName, done);
       if (errorEvent) target.removeEventListener(errorEvent, failed);
       signal.removeEventListener("abort", abort);
@@ -66,7 +152,12 @@ function sourceBufferOperation(sourceBuffer, operation, signal) {
     sourceBuffer.addEventListener("updateend", done, { once: true });
     sourceBuffer.addEventListener("error", failed, { once: true });
     signal.addEventListener("abort", abort, { once: true });
+    const timer = window.setTimeout(() => {
+      cleanup();
+      reject(timeoutError("buffer update"));
+    }, MEDIA_SOURCE_EVENT_TIMEOUT_MS);
     function cleanup() {
+      window.clearTimeout(timer);
       sourceBuffer.removeEventListener("updateend", done);
       sourceBuffer.removeEventListener("error", failed);
       signal.removeEventListener("abort", abort);
@@ -108,6 +199,7 @@ function bufferedSecondsAhead(sourceBuffer, currentTime) {
 }
 
 function waitForMediaSourcePlayback(player, signal) {
+  if (signal.aborted) return Promise.reject(abortedError());
   if (!player.paused) return Promise.resolve();
   return new Promise((resolve, reject) => {
     player.addEventListener("play", resumed, { once: true });
@@ -137,7 +229,9 @@ export async function pumpMediaSource({
   pendingSeek = () => null,
   onBuffered = () => {},
 }) {
-  await waitForMediaEvent(mediaSource, "sourceopen", signal, "sourceclose");
+  if (mediaSource.readyState !== "open") {
+    await waitForMediaEvent(mediaSource, "sourceopen", signal, "sourceclose");
+  }
   if (signal.aborted || mediaSource.readyState !== "open") throw abortedError();
   const sourceBuffer = mediaSource.addSourceBuffer(contentType);
   sourceBuffer.mode = "segments";
@@ -159,15 +253,8 @@ export async function pumpMediaSource({
     }
     const requestUrl = new URL(playlistUrl);
     requestUrl.searchParams.set("mse_after", String(appended.size));
-    const response = await fetch(requestUrl, {
-      cache: "no-store",
-      credentials: "same-origin",
-      signal,
-    });
-    if (!response.ok) throw new Error(`Media Source playlist returned HTTP ${response.status}.`);
-    const contentLength = Number(response.headers.get("content-length"));
-    if (contentLength > 4 * 1024 * 1024) throw new Error("Media Source playlist is too large.");
-    const playlist = parseHlsMediaPlaylist(await response.text(), requestUrl.href);
+    const bytes = await fetchResource(requestUrl, signal, { playlist: true });
+    const playlist = parseHlsMediaPlaylist(new TextDecoder().decode(bytes), requestUrl.href);
     if (!playlist) throw new Error("Media Source playlist is invalid.");
     if (!playlistReported) {
       playlistReported = true;
@@ -197,7 +284,7 @@ export async function pumpMediaSource({
       if (appended.size > 0 && player.paused && !needsSeekData()) {
         await waitForMediaSourcePlayback(player, signal);
       }
-      while (bufferedSecondsAhead(sourceBuffer, player.currentTime)
+      while (!needsSeekData() && bufferedSecondsAhead(sourceBuffer, player.currentTime)
         >= MEDIA_SOURCE_BUFFER_AHEAD_SECONDS) {
         await abortableDelay(250, signal);
       }
@@ -235,18 +322,7 @@ export async function pumpMediaSource({
 }
 
 async function appendMediaSourceResource(sourceBuffer, url, player, signal, observers = {}) {
-  const response = await fetch(url, {
-    cache: "no-store",
-    credentials: "same-origin",
-    signal,
-  });
-  if (!response.ok) throw new Error(`Media Source fragment returned HTTP ${response.status}.`);
-  const contentLength = Number(response.headers.get("content-length"));
-  if (contentLength > 32 * 1024 * 1024) throw new Error("Media Source fragment is too large.");
-  const bytes = await response.arrayBuffer();
-  if (bytes.byteLength === 0 || bytes.byteLength > 32 * 1024 * 1024) {
-    throw new Error("Media Source fragment has an invalid size.");
-  }
+  const bytes = await fetchResource(url, signal);
   observers.onFetched?.();
   try {
     await sourceBufferOperation(sourceBuffer, () => sourceBuffer.appendBuffer(bytes), signal);

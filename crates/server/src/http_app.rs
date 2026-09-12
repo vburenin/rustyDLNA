@@ -2189,6 +2189,52 @@ impl App {
                 let job_key = format!("{}:{cache_key}:{args:?}", item.detail_id);
                 let mut r = live_transcode_response("video/mp4");
                 r.remux_job = Some(RemuxJobSpec {
+                    output_expectation: Some(rusty_dlna_http::RemuxOutputExpectation {
+                        video_codec: (!probe.video.is_empty()).then(|| {
+                            probe
+                                .video
+                                .split(',')
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .to_ascii_lowercase()
+                        }),
+                        audio_codecs: if probe.audio.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![match plan.audio {
+                                AudioAction::ToAc3 => "ac3".into(),
+                                AudioAction::ToAac => "aac".into(),
+                                AudioAction::Copy => {
+                                    rusty_dlna_protocol::CompactStreamMetadata::parse(
+                                        &probe.audio_streams,
+                                    )
+                                    .ok()
+                                    .and_then(|metadata| {
+                                        metadata
+                                            .audio_records()
+                                            .find(|record| record.audio_index == plan.audio_index)
+                                            .map(|record| record.codec.to_owned())
+                                    })
+                                    .unwrap_or_else(|| {
+                                        probe
+                                            .audio
+                                            .split(',')
+                                            .next()
+                                            .unwrap_or("")
+                                            .trim()
+                                            .to_ascii_lowercase()
+                                    })
+                                }
+                            }]
+                        },
+                        duration_seconds: item
+                            .duration
+                            .as_deref()
+                            .and_then(rusty_dlna_http::RemuxOutputExpectation::duration_seconds),
+                        seek_seconds: 0.0,
+                        video_copy: plan.video_encoder == "copy",
+                    }),
                     detail_id: item.detail_id,
                     web_session_id: None,
                     web_request_id: None,

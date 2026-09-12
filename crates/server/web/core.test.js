@@ -24,6 +24,7 @@ import {
   hdrDisplaySupport,
   hdrVideoOutputCandidate,
   mediaMatchesQuery,
+  mediaSourceStallReason,
   nativeHlsQualityProfile,
   nativeHlsHevcCopyEligible,
   encodingPreset,
@@ -1234,4 +1235,19 @@ test("audio enrichment preserves an explicit default selection and reports Origi
   store.dispatch({ type: "AUDIO_TRACKS_SUCCESS", sessionId: 1, item: { default_audio_index: 7 }, tracks });
   assert.equal(store.getState().playback.selectedAudio, 3);
   assert.equal(store.getState().playback.audioSelectionExplicit, false);
+});
+
+
+test("Media Source distinguishes preparation, undecoded bytes, seeking, and stopped playback", () => {
+  const progress = { startedAt: 0, preparationAt: 0, playbackAt: 0,
+    firstFragmentAt: null, hasFrame: false, seeking: false };
+  assert.equal(mediaSourceStallReason({ ...progress, now: 119_999 }), null);
+  assert.equal(mediaSourceStallReason({ ...progress, now: 120_000 }), "preparation progress");
+  assert.equal(mediaSourceStallReason({ ...progress, preparationAt: 110_000, now: 200_000 }), null);
+  assert.equal(mediaSourceStallReason({ ...progress, preparationAt: 299_000, now: 300_000 }), "preparation progress");
+  assert.equal(mediaSourceStallReason({ ...progress, firstFragmentAt: 1_000, now: 20_999 }), null);
+  assert.equal(mediaSourceStallReason({ ...progress, firstFragmentAt: 1_000, now: 21_000 }), "first frame");
+  assert.equal(mediaSourceStallReason({ ...progress, firstFragmentAt: 1_000, seeking: true, now: 21_000 }), null);
+  assert.equal(mediaSourceStallReason({ ...progress, hasFrame: true, preparationAt: 20_000, now: 20_000 }), "playback progress");
+  assert.equal(mediaSourceStallReason({ ...progress, hasFrame: true, playbackAt: 19_999, now: 20_000 }), null);
 });

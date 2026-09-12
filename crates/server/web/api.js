@@ -199,11 +199,34 @@ export class WebApi {
     if (sessionId !== null) params.set("session", String(sessionId));
     const encoded = params.toString();
     const query = encoded ? `?${encoded}` : "";
-    const response = await fetch(`/api/web/transcode/${encodeURIComponent(String(id))}${query}`, {
-      headers: { Accept: "application/json" },
-      signal,
-    });
-    return responseJson(response);
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    if (signal?.aborted) controller.abort();
+    else signal?.addEventListener("abort", abort, { once: true });
+    const timer = window.setTimeout(() => controller.abort(), 15_000);
+    let rejectAbort;
+    const aborted = new Promise((_, reject) => { rejectAbort = reject; });
+    const onAbort = () => rejectAbort(new DOMException("Stream status request was aborted.", "AbortError"));
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+    if (controller.signal.aborted) onAbort();
+    try {
+      return await Promise.race([aborted, (async () => {
+        const response = await fetch(`/api/web/transcode/${encodeURIComponent(String(id))}${query}`, {
+          headers: { Accept: "application/json" },
+          signal: controller.signal,
+        });
+        return responseJson(response);
+      })()]);
+    } catch (error) {
+      if (controller.signal.aborted && !signal?.aborted) {
+        throw new ApiError("The stream status request timed out.", { code: "network" });
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timer);
+      controller.signal.removeEventListener("abort", onAbort);
+      signal?.removeEventListener("abort", abort);
+    }
   }
 
   async reportTranscodeStartup(id, requestId, sessionId, event, signal = null) {

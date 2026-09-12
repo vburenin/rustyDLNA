@@ -4,6 +4,8 @@ ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
 [ -n "$TOOLCHAIN" ] || { echo "rust-toolchain.toml has no exact channel" >&2; exit 1; }
+python3 scripts/rust-pins.py check
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
 run_cargo() {
 	if command -v rustup >/dev/null 2>&1; then
@@ -64,7 +66,7 @@ python3 -c 'import ast, pathlib; root = pathlib.Path("contrib/library"); [ast.pa
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s contrib/library/tests -p 'test_*.py'
 (bash -n contrib/library/update.sh contrib/library/clean-dead-links.sh contrib/library/fix-genre-permissions.sh contrib/library/lib/refresh-classification-data.sh contrib/library/lib/library-env.sh)
 test -x restart.sh
-grep -F -q "image: rust:$TOOLCHAIN-bookworm@sha256:" docker-compose.test.yaml
+grep -F -q "image: rust:$TOOLCHAIN-trixie@sha256:" docker-compose.test.yaml
 grep -F -q "test \"\$(rustc --version)\" = \"rustc $TOOLCHAIN " docker-compose.test.yaml
 grep -F -q 'cargo test --workspace --locked' docker-compose.test.yaml
 grep -F -q 'cargo run --locked -p rusty-dlna -- --check' docker-compose.test.yaml
@@ -125,6 +127,7 @@ grep -F -q 'docker volume rm' restart.sh
 grep -F -q -- '--clean' restart.sh
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
 	docker compose config --quiet
+	docker compose -f docker-compose.test.yaml config --quiet
 	docker compose -f docker-compose.web.yaml config --quiet
 	test -z "$(docker compose -f docker-compose.web.yaml config --volumes)"
 	test "$(docker compose -f docker-compose.web.yaml config --services)" = "rusty-web"

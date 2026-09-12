@@ -287,7 +287,7 @@ fn decode_utf16_xml(bytes: &[u8], little_endian: bool) -> Result<String, String>
     if bytes.len() & 1 != 0 {
         return Err("UTF-16 XML has an odd byte count".into());
     }
-    let units = bytes.chunks_exact(2).map(|pair| {
+    let units = bytes.as_chunks::<2>().0.iter().map(|pair| {
         if little_endian {
             u16::from_le_bytes([pair[0], pair[1]])
         } else {

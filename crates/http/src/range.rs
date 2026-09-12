@@ -20,23 +20,22 @@ pub fn original_file_etag(metadata: &std::fs::Metadata) -> Option<String> {
     Some(format!("\"original-{:016x}\"", hash.finish()))
 }
 
-/// A finalized cache artifact is immutable until its completion stamp is
-/// rewritten. Cache eviction touches the media mtime on reads, so its validator
-/// uses the stamp's change identity plus the artifact's physical identity.
+/// A finalized media artifact retains its immutable validation identity. Stamp
+/// mtime/ctime can change as cache recency is updated without changing its bytes.
 pub fn completed_cache_etag(
     metadata: &std::fs::Metadata,
     stamp: &std::fs::Metadata,
 ) -> Option<String> {
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    original_file_etag(stamp)?.hash(&mut hash);
-    metadata.len().hash(&mut hash);
-    metadata.created().ok().hash(&mut hash);
+    original_file_etag(metadata)?.hash(&mut hash);
+    stamp.len().hash(&mut hash);
+    stamp.created().ok().hash(&mut hash);
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        metadata.dev().hash(&mut hash);
-        metadata.ino().hash(&mut hash);
+        stamp.dev().hash(&mut hash);
+        stamp.ino().hash(&mut hash);
     }
     Some(format!("\"completed-{:016x}\"", hash.finish()))
 }
@@ -279,15 +278,37 @@ mod tests {
             completed_cache_etag(&std::fs::metadata(&source).unwrap(), &stamp_metadata).unwrap();
         std::fs::OpenOptions::new()
             .write(true)
-            .open(&source)
+            .open(&stamp_file)
             .unwrap()
             .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
             .unwrap();
         assert_eq!(
-            completed_cache_etag(&std::fs::metadata(&source).unwrap(), &stamp_metadata),
+            completed_cache_etag(
+                &std::fs::metadata(&source).unwrap(),
+                &std::fs::metadata(&stamp_file).unwrap()
+            ),
             Some(cache_tag.clone()),
             "Cache recency touches must not invalidate preserved download bytes"
         );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(7200))
+            .unwrap();
+        assert_ne!(
+            completed_cache_etag(
+                &std::fs::metadata(&source).unwrap(),
+                &std::fs::metadata(&stamp_file).unwrap()
+            ),
+            Some(cache_tag.clone()),
+            "Media mutation must change the completed validator"
+        );
+        let cache_tag = completed_cache_etag(
+            &std::fs::metadata(&source).unwrap(),
+            &std::fs::metadata(&stamp_file).unwrap(),
+        )
+        .unwrap();
         std::fs::write(&stamp_file, b"new-completed-cache-key").unwrap();
         assert_ne!(
             completed_cache_etag(

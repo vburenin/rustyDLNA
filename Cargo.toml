@@ -17,7 +17,7 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-only"
 repository = "https://github.com/vburenin/rustyDLNA"
-rust-version = "1.97.1"
+rust-version = "1.98.1"
 
 [workspace.dependencies]
 rusty-dlna-helper = { path = "crates/helper", version = "0.1.0" }

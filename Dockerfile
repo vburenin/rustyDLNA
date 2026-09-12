@@ -2,7 +2,7 @@
 # (see docker-compose.yaml). This file must not request host network —
 # docker-compose.test.yaml stays on a bridge with no published 8200/1900.
 
-FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS build
+FROM rust:1.98.1-trixie@sha256:462a9af3c54fb4718850d3c602fc0e54452c20b1c12a4e4080fdb001d4b9acbf AS build
 
 # The minimal Ubuntu image has no CA bundle yet. Bootstrap verified HTTPS
 # from the digest-pinned toolchain image; Ubuntu's ca-certificates package
@@ -26,7 +26,7 @@ RUN case "$UBUNTU_ARCHIVE_HOST" in \
 
 # Build and run against the same FFmpeg 8 ABI. The official Rust toolchain is
 # copied into the Ubuntu builder so ffmpeg-sys-next links to libavformat 62,
-# rather than to Debian bookworm's incompatible libavformat 59.
+# rather than to the Debian toolchain image's different libavformat ABI.
 FROM ubuntu-base AS app-build
 
 COPY --from=build /usr/local/cargo /usr/local/cargo
