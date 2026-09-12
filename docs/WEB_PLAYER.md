@@ -1076,6 +1076,19 @@ playback. Responses use a bounded, header-safe UTF-8 attachment filename,
 
 ### Native offline copies
 
+Native clients can send `X-RustyDLNA-Download: resumable` on compatible MP4 GETs.
+While the exact generation is preparing, the server returns an empty HTTP 202
+with `X-RustyDLNA-Download: preparing` and `Retry-After: 30`. The client schedules
+another background request to the same URL; this is preparation, not a failed
+transfer. The producer remains bounded by its normal limits and stays alive
+between these requests. Explicit generation cancellation still stops it.
+Once validated and finalized, the response includes Content-Length, ETag and
+byte-range support. Reconnects use Range with If-Range so downloaded bytes are
+reused only for the same artifact. Preparation transfers no provisional video
+bytes: a close-delimited growing stream cannot distinguish an interruption
+from a completed download. Requests without this header, including browser
+playback and HEAD size probes, retain their existing streaming behavior.
+
 Schema 2 capabilities advertise `native_downloads` when compatible output is
 enabled. Native clients can add `download_audio=selected` or `download_audio=all`
 to a compatible MP4 request starting at zero. The existing `audio` index selects

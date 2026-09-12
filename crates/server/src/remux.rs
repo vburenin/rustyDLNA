@@ -2797,9 +2797,20 @@ pub async fn serve_remux(
     app: &Arc<App>,
     sock: &mut tokio::net::TcpStream,
     req: &HttpRequest,
-    spec: RemuxJobSpec,
+    mut spec: RemuxJobSpec,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let head = req.method.eq_ignore_ascii_case("HEAD");
+    let resumable_download = req.method.eq_ignore_ascii_case("GET")
+        && req.path.starts_with("/web/media/")
+        && req.header("X-RustyDLNA-Download") == Some("resumable")
+        && web_delivery(req).is_none();
+    if resumable_download {
+        // The system download queue reconnects after a preparation response,
+        // including while its app is suspended. Keep this bounded producer
+        // alive between those readers; explicit generation cancellation still
+        // owns removal. Browser playback retains its reconnect grace.
+        spec.continue_after_disconnect = true;
+    }
     let attach_app = app.clone();
     let attach_spec = spec.clone();
     // Admission may wait for a cancelled producer's bounded cleanup handoff.
@@ -2857,6 +2868,9 @@ pub async fn serve_remux(
         }
     };
     let job = _client.job.clone();
+    if resumable_download {
+        return serve_resumable_download(app, sock, req, &job, spec.mime).await;
+    }
     let _path = match wait_ready(&job).await {
         Ok(p) => p,
         Err(e) => {
@@ -2926,6 +2940,37 @@ pub async fn serve_remux(
         return serve_finished(app, sock, req, &job, spec.mime, head).await;
     }
     serve_growing(app, sock, req, &job, spec.mime, head).await
+}
+
+/// Native background downloads need a stable validator and a final length.
+/// A close-delimited growing response cannot distinguish EOF from a network
+/// interruption, and cannot supply URLSession's native resume contract.
+async fn serve_resumable_download(
+    app: &App,
+    sock: &mut tokio::net::TcpStream,
+    req: &HttpRequest,
+    job: &Arc<RemuxJob>,
+    mime: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let response = match job.state() {
+        RemuxState::Complete => {
+            let pin_job = job.clone();
+            tokio::task::spawn_blocking(move || pin_job.pin_ready_output()).await??;
+            return serve_finished(app, sock, req, job, mime, false).await;
+        }
+        RemuxState::Failed(_) => crate::web_ui::transcode_stream_error(500, "transcode_failed"),
+        RemuxState::Cancelled => crate::web_ui::transcode_stream_error(409, "transcode_cancelled"),
+        _ => {
+            let mut response = HttpResponse::new(202, "Accepted");
+            response.set("Content-Length", "0");
+            response.set("X-RustyDLNA-Download", "preparing");
+            response.set("Retry-After", "30");
+            response.set("Cache-Control", "private, no-store");
+            response
+        }
+    };
+    write_remux_response(app, sock, response, false).await?;
+    Ok(())
 }
 
 fn web_delivery(req: &HttpRequest) -> Option<&str> {
@@ -5481,6 +5526,90 @@ mod tests {
             "{method} {url} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nConnection: close\r\n{range}\r\n"
         );
         crate::tests::raw_connection(app.clone(), request.as_bytes(), false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_download_prepares_then_resumes_the_same_finalized_bytes() {
+        let (app, job, url, payload) = compatible_connection_fixture();
+        let request = |headers: &str| {
+            format!(
+                "GET {url} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nConnection: close\r\nX-RustyDLNA-Download: resumable\r\n{headers}\r\n"
+            )
+        };
+        // Preparation replies never transfer an unvalidated prefix, and the
+        // next system-owned request retains the same producer/generation.
+        for _ in 0..2 {
+            let bytes =
+                crate::tests::raw_connection(app.clone(), request("").as_bytes(), false).await;
+            let headers = String::from_utf8_lossy(&bytes);
+            assert!(
+                headers.starts_with("HTTP/1.1 202 Accepted\r\n"),
+                "{headers}"
+            );
+            assert!(headers.contains("\r\nX-RustyDLNA-Download: preparing\r\n"));
+            assert!(headers.contains("\r\nRetry-After: 30\r\n"));
+            assert!(wire_body(&bytes).is_empty());
+            assert_eq!(job.state(), RemuxState::Growing);
+            assert!(crate::lock_recover(&job.disconnect_deadline).is_none());
+            assert!(crate::lock_recover(&job.output).is_none());
+        }
+        // Ordinary browser reads keep streaming the growing file.
+        let browser = compatible_connection_wire(&app, &url, "GET", Some("bytes=0-7")).await;
+        assert_eq!(wire_body(&browser), &payload[..8]);
+
+        std::fs::rename(&job.part, &job.dest).unwrap();
+        write_cache_stamp_for_key(&job.dest, &job.web_spec.as_ref().unwrap().cache_key).unwrap();
+        job.transition(RemuxState::Complete);
+        let full = crate::tests::raw_connection(app.clone(), request("").as_bytes(), false).await;
+        assert_eq!(wire_body(&full), payload);
+        let headers = String::from_utf8_lossy(&full[..full.len() - payload.len()]);
+        assert!(headers.contains(&format!("\r\nContent-Length: {}\r\n", payload.len())));
+        let etag = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("ETag: "))
+            .unwrap();
+        let offset = payload.len() / 2;
+        let range = format!("Range: bytes={offset}-\r\nIf-Range: {etag}\r\n");
+        for _ in 0..2 {
+            let resumed =
+                crate::tests::raw_connection(app.clone(), request(&range).as_bytes(), false).await;
+            assert!(resumed.starts_with(b"HTTP/1.1 206 Partial Content\r\n"));
+            assert_eq!(wire_body(&resumed), &payload[offset..]);
+        }
+        let changed = crate::tests::raw_connection(
+            app.clone(),
+            request("Range: bytes=8-\r\nIf-Range: \"different-generation\"\r\n").as_bytes(),
+            false,
+        )
+        .await;
+        assert!(changed.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert_eq!(wire_body(&changed), payload);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_download_cancelled_preparation_does_not_serve_partial_media() {
+        let (app, job, url, _) = compatible_connection_fixture();
+        job.transition(RemuxState::Cancelled);
+        let request = HttpRequest::parse_headers(&format!(
+            "GET {url} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nX-RustyDLNA-Download: resumable\r\n\r\n"
+        ))
+        .unwrap();
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            serve_resumable_download(&app, &mut socket, &request, &job, "video/mp4")
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        server.await.unwrap();
+        assert!(bytes.starts_with(b"HTTP/1.1 409 Conflict\r\n"));
+        let body: serde_json::Value = serde_json::from_slice(wire_body(&bytes)).unwrap();
+        assert_eq!(body["error"]["code"], "transcode_cancelled");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
