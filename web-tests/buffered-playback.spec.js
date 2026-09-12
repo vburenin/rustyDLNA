@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./diagnostics.js";
 
 const execFileAsync = promisify(execFile);
 const contentType = 'video/mp4; codecs="avc1.4d400b,mp4a.40.2"';

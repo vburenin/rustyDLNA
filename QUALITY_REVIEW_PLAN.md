@@ -8,6 +8,8 @@
   raw streaming pipeline remain disabled after their correctness experiments.
   Bundle F implements B01/B02 caption conversion/focus, nonfatal PiP errors,
   and sustained decoded-playback recovery renewal; verification is recorded below.
+  Bundle H implements targeted validation, persistent-process tooling, and
+  dependency/build evidence; verification and runtime limits are recorded below.
   Measurement and verification limits are recorded below; other findings retain
   their individual implementation status. Bundle A's earlier parallel-browser failures and unresolved
   FFmpeg 6 helper crashes remain part of the verification record.
@@ -1946,6 +1948,159 @@ parser, policy and lifecycle changes.
 **Accept when:** each extraction has one clear behavioral owner, preserves public
 compatibility and meaningful tests, and makes a selected finding easier to review.
 No dependency or API/schema migration should be added just to reorganize files.
+
+### Bundle H implementation and verification
+
+The initial tree was clean. Earlier confinement, completed-output, MSE deadline,
+caption, flat-directory and aggregate-query tests were audited before adding
+coverage. Their existing owners and public contracts remain intact.
+
+- **Parallel browser diagnosis:** the original 16-worker matrix recorded
+  812 passes, 151 explicit skips and 17 failures in 6.0 minutes. The earlier
+  Chromium/mobile 10k-card readiness failures did not recur. Firefox startup
+  waited on connection admission: the full Firefox player workload saturated
+  128 connections while an already accepted status socket remained responsive.
+  At limits 128/512/1024, bounded 16-worker trials recorded respectively
+  121/123/124 passes, 32 skips each, and 3/1/0 failures. Peak accepted connections
+  in the last trial was 605. Context-close controls and socket ownership identify
+  Firefox's retained connections as the principal contributor; Playwright's
+  separate request agent also retains and reuses sockets. The fixture daemon now
+  has an explicit 1024-connection budget; production defaults remain unchanged.
+- **Native WebKit decoding:** a plain HTTP video page, outside the application
+  and route mocks, reproduced missing metadata/frames in both 16-browser trials
+  (0/16 each). The same bytes decoded with one and four native browsers (1/1,
+  4/4) and in two 16-browser diagnostic trials excluding GStreamer's NVIDIA
+  H.264 decoder (16/16 each). Audio-device warnings occurred in passing controls
+  too. The supported matrix preserves native decoder selection, uses four
+  parallel workers and zero retries, and retains fully parallel race tests.
+  This establishes a concurrency-sensitive native backend limitation; it does
+  not certify arbitrary GPUs or prove a responsible upstream function.
+- **Focused defects and coverage:** the held-frame fixture now contains its
+  requested local seven-second target and implements finite byte ranges; the
+  previous 0.4-second EOF triggered unrelated truncation recovery. A stronger
+  target assertion also exposed a clamped native metadata seek. Caption fuzzing
+  found a literal SubRip `-->` payload that produced invalid WebVTT; conversion
+  now escapes that arrow while preserving markup, with Rust and real browser cue
+  coverage. The minimized 36-byte regression is retained. The post-fix
+  address-sanitized sidecars trial completed 1,103,556 executions in 31 seconds,
+  and regression replay passed. New deterministic work bounds cover 1k/4k
+  alias-heavy cold/deep SQLite queries, 1k/4k cache inventories with eight
+  concurrent maintenance callers, and 7,200/28,800-entry HLS snapshots/deep pages.
+- **Helper crash diagnosis:** exact Auto/Mobile HD recipes used the checksum-locked
+  Dolby Vision fixture in isolated temporary outputs. Host FFmpeg 6.1.1-3ubuntu5
+  completed 5/5 trials for each default Vulkan recipe; explicit NVIDIA ICD Auto
+  crashed with SIGSEGV in 2/5 trials. Production-image FFmpeg 8.0.1-3ubuntu2
+  completed 5/5 for each recipe after separately recorded Vulkan/permission setup
+  failures. Crashed host outputs were byte-identical to successful outputs and
+  fully decoded with monotonic packet DTS. The retained core points toward
+  LLVM/libc process teardown and unmapped worker code; the exact upstream cause
+  remains unresolved, and the two runtime stacks differ beyond FFmpeg version.
+  No browser assertion or server crash is attributed to that helper failure.
+  A new publication regression generates valid FFmpeg output then crashes the
+  helper, asserting no final/partial/stamp, reaping, released admission and a
+  successful subsequent job on the same app.
+- **Persistent validation:** the new generated-media workload retains one daemon
+  and cache through decoded cold/warm playback, seeks, live producer reconnects
+  and cancellation, scanning, artwork, queries and quota eviction. It measures
+  busy peaks separately from idle trends and requires every steady-state activity.
+  Initial descriptor growth plateaued after the bounded two-minute preparation
+  cache warmed; default warm-up is 150 seconds. The workload also reproduced a
+  protocol defect: response 100 advertised keep-alive immediately before EOF.
+  It now advertises close, with an actual 100-request socket regression. No
+  retry masks this failure. Existing restart/shutdown soak coverage is retained.
+  The accepted `--seconds=360 --warmup-seconds=150` run completed 27 cycles in
+  370.7 seconds: 11 warm-up and 16 steady cycles spanning 205.8 seconds. It
+  verified 54 Chromium MSE playbacks; 27 each of seeks, reconnects, cancellations,
+  cache reuses and scan publications; 432 queries/artwork requests; and 22 cache
+  evictions. Steady FD medians were 72→72, threads 44→44 and RSS growth 1.25 MiB.
+  Completed cache stabilized at 22,516,720 bytes with matching independent
+  accounting; failed transcodes/maintenance were zero. Shutdown took 532 ms,
+  with no captured process remaining and the temporary runtime tree removed.
+  Steady query median/p95 was 1.54/2.90 ms (256 queries); cold/cached third-frame
+  medians were 364/196 ms and seek-to-frame median was 638 ms (16 samples each).
+  Earlier quota, incomplete warm-up and HTTP-reset trials remain failed evidence.
+  These measurements establish finite behavior for the recorded binary and
+  workload, not indefinite stability or GPU/full-matrix certification.
+- **Dependency/build coverage:** weekly updates now include npm and the separate
+  fuzz Cargo workspace. Ordinary/release/scheduled policy checks cover the locked
+  browser graph; root/fuzz Rust audit and license checks remain separate from
+  runtime container scans. Ordinary CI rejects every Rust pin drift before build
+  and stale fuzz lock resolution before cargo-fuzz can rewrite it. Runtime
+  evidence retains tool/library/package versions and hashes. Fresh authenticated
+  amd64 APT probes downloaded 215 build, 219 fixture and 212 runtime packages;
+  fresh dovi_tool 2.3.3 amd64/arm64 archives matched pinned hashes. These are
+  availability checks, not an empty-builder compilation or an arm64 runtime
+  smoke. Documentation now states that live archives and pins do not guarantee
+  indefinite historical availability, offline rebuilds or byte-identical images.
+- **Ownership:** existing caption, HLS history, cache and playback owners suffice;
+  no production module extraction or new JS/Python checker is justified. The new
+  workload separates pure report decisions and bounded tool lifetimes so those
+  invariants have direct tests. No new third-party tooling dependency was added.
+
+The repeated focused browser run passed 36/36 cases, including 12 one-time native
+seek clamps. Each recovered from local time 0 to 7 on the same source while
+preserving paused intent. A state-only loop fixture now models completion of its
+seek before injecting EOF; its four-browser check passed after previously failing
+4/4 with an unresolved target. The first integrated matrix iteration was stopped
+after 513 passes, 101 skips and four failures (four interrupted, 362 not run):
+native activation was incorrectly blocked by the pre-existing MSE pending-seek
+guard, and the sprite fixture also lacked its requested frame. The play guard now
+remains specific to MSE; the sprite test decodes a longer finite ranged source
+without overriding `play()`. Repeated recovery/sprite/held-frame checks then
+passed 72/72. This interrupted iteration is not a complete or passing gate.
+Both final full matrices passed: **832 passed, 152 skipped, zero failures** each,
+in 448.9 and 439.3 seconds. Every skip has an explicit applicability/API reason;
+no skip or timeout was added to hide a failure. The first final run still logged
+two host FFmpeg helper SIGSEGVs; the second logged none. Those runtime failures
+remain distinct from passing browser assertions and the supervised-publication
+regression. The original 16-worker baseline logged four distinct helper crashes.
+
+`./scripts/agent-verify.sh` passed: formatting, Clippy with warnings denied,
+131 Python tests, 124 web unit tests, workspace Rust tests, rustdoc build and
+doc-test commands, all nine mandatory socket E2E tests, fixture hashes and
+isolation checks. Ten opt-in performance benchmarks remained ignored; doc-test
+commands contained no executable doctest cases. Separate JS/Python lint/typecheck
+tools remain unconfigured. Root/fuzz Cargo audit and deny, cargo-machete,
+locked npm installation/graph/audit, workflow actionlint, the package probe and
+the bounded parser fuzz trial also passed. No full empty-builder compilation,
+arm64 runtime smoke, privileged release/network checks or indefinite soak is
+claimed. Final review reproduced a restart-soak sampler defect: reading only the
+process leader's children missed daemons launched by Rust test worker threads.
+The sampler now traverses every task, with a behavioral regression that failed
+before the fix. The original eight-cycle report retains valid test outcomes but
+incomplete process-resource peaks. The corrected run passed eight cycles over
+120 seconds, observing peaks of four processes, 47 threads, 44 descriptors,
+148,732 KiB RSS, 921,605 database bytes and 10,531 cache bytes, with no temporary
+tree leaks. One-second sampling can still miss shorter-lived processes.
+
+Commands used for the principal final checks (evidence paths are under `/tmp`):
+
+```sh
+RUSTY_DLNA_BROWSER_EVIDENCE=/tmp/rustydlna-bundle-h/browser-matrix-4-final1.jsonl npx playwright test
+RUSTY_DLNA_BROWSER_EVIDENCE=/tmp/rustydlna-bundle-h/browser-matrix-4-final2.jsonl npx playwright test
+./scripts/agent-verify.sh
+SOAK_SECONDS=120 SOAK_REPORT=/tmp/rustydlna-bundle-h/restart-soak-final.tsv scripts/soak.sh
+node scripts/persistent-soak.mjs --seconds=360 --warmup-seconds=150 --output=/tmp/rustydlna-bundle-h-persistent-steady.json
+cargo audit --deny warnings
+cargo audit --file fuzz/Cargo.lock --deny warnings
+cargo deny check
+cargo deny --manifest-path fuzz/Cargo.toml check
+cargo machete
+npm --prefix /tmp/rustydlna-q02-audit-x5dryr__ audit --package-lock-only --include=dev --audit-level=low --json
+python3 scripts/clean-build-probe.py --output /tmp/rustydlna-q02-package-probe --platform linux/amd64
+```
+
+Runtime: Rust 1.98.1, Node 22.19.0, npm 11.19.0, Playwright 1.62.1,
+Chromium/mobile Chromium 151.0.7922.34, Firefox 153.0 and WebKit 26.5, on a
+Ryzen 9 5950X Linux host with 32 logical CPUs and 62 GiB RAM. The host uses
+FFmpeg/FFprobe 6.1.1-3ubuntu5; the comparison image uses 8.0.1-3ubuntu2.
+Exact libraries/packages, image identity and matching server hash are retained
+in the runtime JSON reports. Audit tools were cargo-audit 0.22.2,
+cargo-deny 0.20.2, cargo-machete 0.9.2 and actionlint 1.7.7.
+Diagnostic evidence is retained under `/tmp/rustydlna-bundle-h/`; Q02 audit,
+package and runtime reports use `/tmp/rustydlna-q02-*`. These temporary reports
+are not release artifacts. The accepted persistent report and samples are
+`/tmp/rustydlna-bundle-h-persistent-steady.json*`.
 
 ## Suggested implementation sequence and dependencies
 

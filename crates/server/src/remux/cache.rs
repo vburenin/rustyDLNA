@@ -956,6 +956,44 @@ mod tests {
     }
 
     #[test]
+    fn large_completed_inventory_is_discovered_once_across_concurrent_producers() {
+        for entries in [1_000, 4_000] {
+            let directory = TempDir::new("inventory-work");
+            let app = test_app(&directory);
+            for id in 0..entries {
+                let output = directory.join(format!("{id}-hdr10-{id:064x}.mp4"));
+                std::fs::write(output, b"x").unwrap();
+            }
+            let expected_entries = std::fs::read_dir(&*directory).unwrap().count() as u64;
+            let barrier = std::sync::Barrier::new(8);
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    let app = &app;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for _ in 0..8 {
+                            assert_eq!(enforce_active_cache_limits(app).unwrap(), entries);
+                        }
+                    });
+                }
+            });
+            assert_eq!(app.remux_metrics.cache_scans.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                app.remux_metrics.cache_scan_entries.load(Ordering::Relaxed),
+                expected_entries,
+                "warm maintenance must not inspect the completed directory per producer"
+            );
+            assert_eq!(
+                crate::lock_recover(&app.transcode_cache.inventory)
+                    .entries
+                    .len(),
+                entries as usize
+            );
+        }
+    }
+
+    #[test]
     fn blocked_metadata_leaves_registration_status_and_cancellation_responsive_with_artwork() {
         let directory = TempDir::new("blocked-metadata");
         let app = test_app(&directory);

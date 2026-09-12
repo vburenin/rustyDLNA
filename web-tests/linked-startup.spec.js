@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { appendFile } from "node:fs/promises";
 import { cpus, platform, release, totalmem } from "node:os";
 import { promisify } from "node:util";
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./diagnostics.js";
 
 const execFileAsync = promisify(execFile);
 let fixture;

@@ -50,6 +50,11 @@ export const captionConversionFixtures = [
     input: "<SYNC Start=1000><P>First&#13;&#13;Last<SYNC Start=2000><P>&nbsp;",
     cues: [{ start: 1, end: 2, text: "First\n\u00a0\nLast" }],
   },
+  {
+    language: "zzu", name: "SubRip literal timing arrow remains visible cue text", extension: "srt",
+    input: "1\n00:00:01,000 --> 00:00:02,000\nGo --> <b>next</b>\n",
+    cues: [{ start: 1, end: 2, text: "Go --> next", bold: "next" }],
+  },
   ...[
     ["zzi", "signature suffix", "WEBVTTjunk\n\n00:01.000 --> 00:02.000\nBad\n"],
     ["zzj", "missing header separator", "WEBVTT\n00:01.000 --> 00:02.000\nBad\n"],

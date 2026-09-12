@@ -4,21 +4,36 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import AxeBuilder from "@axe-core/playwright";
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./diagnostics.js";
 
 const compatibleFixture = fileURLToPath(new URL("../testdata/library/video/tagged.mp4", import.meta.url));
 const execFileAsync = promisify(execFile);
 
-async function fragmentedCompatibleFixture({ profile = "baseline", level = "3.1" } = {}) {
+async function fragmentedCompatibleFixture({ profile = "baseline", level = "3.1", seconds = null } = {}) {
   const { stdout } = await execFileAsync("ffmpeg", [
-    "-nostdin", "-v", "error", "-i", compatibleFixture,
+    "-nostdin", "-v", "error", ...(seconds ? ["-stream_loop", "-1"] : []), "-i", compatibleFixture,
+    ...(seconds ? ["-t", String(seconds), "-force_key_frames", "expr:gte(t,n_forced*1)"] : []),
     "-map", "0:v:0", "-map", "0:a:0",
-    "-c:v", "libx264", "-profile:v", profile, "-level:v", level, "-bf", "0", "-pix_fmt", "yuv420p",
+    "-c:v", "libx264", "-threads", "1", "-profile:v", profile, "-level:v", level, "-bf", "0", "-pix_fmt", "yuv420p",
     "-c:a", "aac", "-ac", "2",
     "-movflags", "frag_keyframe+empty_moov+delay_moov+default_base_moof",
     "-f", "mp4", "pipe:1",
   ], { encoding: null, timeout: 5_000, maxBuffer: 1024 * 1024 });
   return stdout;
+}
+
+async function fulfillFiniteVideo(route, fixture) {
+  const range = /^bytes=(\d+)-(\d*)$/.exec(route.request().headers().range || "");
+  const first = range ? Number(range[1]) : 0;
+  const last = range?.[2] ? Math.min(Number(range[2]), fixture.length - 1) : fixture.length - 1;
+  if (first > last) return route.fulfill({ status: 416, headers: { "Content-Range": `bytes */${fixture.length}` } });
+  return route.fulfill({
+    status: range ? 206 : 200, contentType: "video/mp4",
+    headers: { "Accept-Ranges": "bytes",
+      ...(range ? { "Content-Range": `bytes ${first}-${last}/${fixture.length}` } : {}),
+    },
+    body: fixture.subarray(first, last + 1),
+  });
 }
 
 function fragmentedMp4Layout(bytes) {
@@ -4780,29 +4795,67 @@ test("repeated compatible seeks coalesce and audio switching preserves global ti
   await expect(page.locator("#mode-label")).toHaveText(/^(Repackaging|Converting audio|Re-encoding video)$/);
 });
 
-test("compatible seeking holds the last video frame until replacement data is ready", async ({ page }) => {
+async function runHeldFrameSeek(page, { clampFirstSeek = false } = {}) {
   await usePreference(page, "stream", "compat");
   await disableFragmentedDelivery(page);
-  await page.addInitScript(() => {
+  await page.addInitScript(({ evidence, clampFirstSeek }) => {
     const drawImage = CanvasRenderingContext2D.prototype.drawImage;
     window.__heldFrameDraws = 0;
     CanvasRenderingContext2D.prototype.drawImage = function heldFrameDraw(...args) {
       window.__heldFrameDraws += 1;
       return drawImage.apply(this, args);
     };
-  });
-  const fixture = await readFile(compatibleFixture);
+    if (!evidence && !clampFirstSeek) return;
+    const observations = window.__nativeSeekEvidence = [];
+    window.__nativeSeekClamps = 0;
+    const snapshot = (video) => ({ time: video.currentTime, duration: video.duration,
+      readyState: video.readyState, seeking: video.seeking,
+      seekable: Array.from({ length: video.seekable.length }, (_, index) => [video.seekable.start(index), video.seekable.end(index)]),
+      buffered: Array.from({ length: video.buffered.length }, (_, index) => [video.buffered.start(index), video.buffered.end(index)]),
+    });
+    const record = (value) => { if (observations.length < 100) observations.push({ at: performance.now(), ...value }); };
+    const currentTime = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "currentTime");
+    Object.defineProperty(HTMLMediaElement.prototype, "currentTime", {
+      ...currentTime,
+      set(value) {
+        const before = snapshot(this);
+        try {
+          // Fault injection preserves native media events and decoding. Model
+          // one accepted assignment clamped to zero while metadata is settling.
+          const clamped = clampFirstSeek && value > 0 && window.__nativeSeekClamps === 0;
+          if (clamped) window.__nativeSeekClamps++;
+          currentTime.set.call(this, clamped ? 0 : value);
+          record({ event: "set", requested: value, clamped, before, after: snapshot(this) });
+        } catch (error) {
+          record({ event: "set-error", requested: value, before, error: error.message });
+          throw error;
+        }
+      },
+    });
+    for (const event of ["loadedmetadata", "loadeddata", "canplay", "seeking", "seeked"]) {
+      document.addEventListener(event, ({ target }) => {
+        if (target instanceof HTMLMediaElement) record({ event, ...snapshot(target) });
+      }, true);
+    }
+  }, { evidence: Boolean(process.env.RUSTY_DLNA_BROWSER_EVIDENCE), clampFirstSeek });
+  // The restarted source begins at 20s and must contain the requested local
+  // 7s frame. A 0.4s file clamps that seek to EOF and correctly triggers the
+  // player's truncated-output recovery, racing the held-frame assertions.
+  const fixture = await fragmentedCompatibleFixture({ seconds: 12 });
+  const generations = new Set();
   let markSeekRequested;
   const seekRequested = new Promise((resolve) => { markSeekRequested = resolve; });
   let releaseSeekResponse;
   const seekResponse = new Promise((resolve) => { releaseSeekResponse = resolve; });
   await page.route("**/web/media/*.mp4?**", async (route) => {
-    const start = new URL(route.request().url()).searchParams.get("start");
+    const url = new URL(route.request().url());
+    generations.add(url.searchParams.get("request"));
+    const start = url.searchParams.get("start");
     if (start !== "0") {
       markSeekRequested();
       await seekResponse;
     }
-    await route.fulfill({ status: 200, contentType: "video/mp4", body: fixture });
+    await fulfillFiniteVideo(route, fixture);
   });
   await page.route("**/api/web/library?**", async (route) => {
     const response = await route.fetch();
@@ -4854,25 +4907,38 @@ test("compatible seeking holds the last video frame until replacement data is re
   await expect(heldFrame).toBeHidden();
   await expect.poll(() => page.locator("#video-player").evaluate((video) => (
     video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+      && !video.seeking && Math.abs(video.currentTime - 7) < 0.1
   ))).toBe(true);
-  // The 0.4-second fixture can reach its natural end after the delayed seek
-  // response even though this test advertises a ten-minute catalog duration.
-  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", /^(Play|Replay)$/);
+  expect(generations.size).toBe(2);
+  if (clampFirstSeek) expect(await page.evaluate(() => window.__nativeSeekClamps)).toBe(1);
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
   await expect.poll(() => page.locator("#video-player").evaluate((video) => video.paused)).toBe(true);
+}
+
+async function checkHeldFrameSeek({ page }, testInfo, options) {
+  try {
+    await runHeldFrameSeek(page, options);
+  } finally {
+    if (process.env.RUSTY_DLNA_BROWSER_EVIDENCE) {
+      const observations = await page.evaluate(() => window.__nativeSeekEvidence)
+        .catch((error) => ({ unavailable: error.message }));
+      await testInfo.attach("native-seek-evidence", {
+        contentType: "application/json", body: Buffer.from(JSON.stringify(observations ?? { unavailable: "Page initialization did not finish" })),
+      });
+    }
+  }
+}
+
+test("compatible seeking holds the last video frame until replacement data is ready", checkHeldFrameSeek);
+
+test("compatible seeking holds the last frame across a clamped native seek", async ({ page }, testInfo) => {
+  await checkHeldFrameSeek({ page }, testInfo, { clampFirstSeek: true });
 });
 
 test("timeline scrubbing shows the nearest sprite until replacement video is ready", async ({ page }) => {
   await usePreference(page, "stream", "compat");
   await disableFragmentedDelivery(page);
-  await page.addInitScript(() => {
-    // This fixture is 0.4 seconds long while the catalog duration is expanded
-    // to ten minutes below. Keep its decode path active without letting an
-    // unrelated early-ended recovery race the seek being tested.
-    HTMLMediaElement.prototype.play = function play() {
-      return Promise.resolve();
-    };
-  });
-  const fixture = await readFile(compatibleFixture);
+  const fixture = await fragmentedCompatibleFixture({ seconds: 12 });
   let markSeekRequested;
   const seekRequested = new Promise((resolve) => { markSeekRequested = resolve; });
   let releaseSeekResponse;
@@ -4883,7 +4949,7 @@ test("timeline scrubbing shows the nearest sprite until replacement video is rea
       markSeekRequested();
       await seekResponse;
     }
-    await route.fulfill({ status: 200, contentType: "video/mp4", body: fixture });
+    await fulfillFiniteVideo(route, fixture);
   });
   await page.route("**/api/web/library?**", async (route) => {
     const response = await route.fetch();
@@ -4972,6 +5038,9 @@ test("timeline scrubbing shows the nearest sprite until replacement video is rea
   expect(await heldFrame.evaluate((canvas) => canvas.width)).toBe(960);
   releaseSeekResponse();
   await expect(heldFrame).toBeHidden();
+  await expect.poll(() => page.locator("#video-player").evaluate((video) => (
+    video.readyState >= 2 && !video.seeking && video.currentTime >= 3
+  ))).toBe(true);
 });
 
 test("repeated compatible keyboard seeks preserve playing intent", async ({ page }) => {
@@ -5883,6 +5952,14 @@ test("Compatible loop restarts the whole title after a seek and takes precedence
   await expect(page.locator("#loop-button")).toHaveAttribute("aria-pressed", "true");
   expect(await video.evaluate((player) => player.loop)).toBe(false);
   await video.evaluate((player) => {
+    // This state-only fixture must finish its local 5s seek before advancing
+    // the source to its end; an unresolved seek still owns the global clock.
+    Object.defineProperties(player, {
+      currentTime: { configurable: true, value: 5 },
+      readyState: { configurable: true, value: 4 },
+      seekable: { configurable: true, value: { length: 1, start: () => 0, end: () => 580 } },
+    });
+    player.dispatchEvent(new Event("loadeddata"));
     Object.defineProperty(player, "currentTime", { configurable: true, value: 580 });
     player.dispatchEvent(new Event("ended"));
   });

@@ -129,7 +129,9 @@ fn srt_to_webvtt(text: &str) -> Result<String, BrowserCaptionError> {
         output.push_str(&millis_vtt(end));
         output.push_str(settings);
         output.push('\n');
-        output.push_str(&payload.join("\n"));
+        // WebVTT treats a literal arrow in cue text as a new timing line.
+        // Escape only the arrow, preserving SubRip's supported cue markup.
+        output.push_str(&payload.join("\n").replace("-->", "--&gt;"));
         output.push_str("\n\n");
         check_output_growth(output.len(), 0)?;
         cues += 1;
@@ -625,6 +627,18 @@ mod tests {
         assert!(output.starts_with("WEBVTT\n\n"));
         assert!(output.contains("00:00:01.250 --> 00:00:04.000\nHello\n世界"));
         assert!(output.contains("00:00:03.500 --> 00:00:05.000\nOverlap"));
+    }
+
+    #[test]
+    fn srt_literal_arrows_remain_text_and_preserve_cue_markup() {
+        let output = converted(
+            CaptionWebVttConversion::SubRipToWebVtt,
+            b"1\n00:00:01,250 --> 00:00:02,500\nGo --> <b>next</b>\n00:00 --> still text\n",
+        );
+        assert!(output.contains("Go --&gt; <b>next</b>\n00:00 --&gt; still text"));
+        assert!(
+            caption_to_webvtt(CaptionWebVttConversion::ValidateWebVtt, output.as_bytes()).is_ok()
+        );
     }
 
     #[test]

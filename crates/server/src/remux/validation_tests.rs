@@ -388,6 +388,55 @@ fn completed_publication_rejects_mutation_replacement_cancellation_and_expired_b
 }
 
 #[test]
+fn helper_signal_after_valid_output_never_publishes_and_releases_admission() {
+    let dir = temp_dir("crashed-valid-output");
+    let fixture = dir.join("valid.mp4");
+    generate(&fixture, "0.2", "libx264", true);
+    let app = test_app(&dir, 1);
+    let pid_file = dir.join("helper.pid");
+    let mut spec = job_spec(&dir, "crashed", Vec::new());
+    spec.output_expectation = Some(expected(0.2));
+    spec.args = vec![
+        "sh".into(),
+        "-c".into(),
+        "ulimit -c 0; printf '%s' $$ > \"$3\"; cp \"$1\" \"$2\"; kill -SEGV $$".into(),
+        "crash-after-output".into(),
+        fixture.clone().into_os_string(),
+        cache_part(&spec.dest).into_os_string(),
+        pid_file.clone().into_os_string(),
+    ];
+    let job = attach(app.clone(), spec).unwrap();
+    wait_for_terminal_cleanup(&app, &job);
+    let RemuxState::Failed(error) = job.state() else {
+        panic!("crashed helper did not fail the job: {:?}", job.state());
+    };
+    assert!(error.contains("signal: 11"), "{error}");
+    assert!(!job.dest.exists());
+    assert!(!job.part.exists());
+    assert!(!rusty_dlna_transcode::cache_stamp_path(&job.dest).exists());
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    assert!(
+        !Path::new("/proc").join(pid.trim()).exists(),
+        "helper leader was not reaped"
+    );
+    assert_eq!(app.helpers.metrics().active, 0);
+
+    // Successful work on the same app proves a helper crash did not exhaust
+    // server admission or turn valid structural output into a reusable failure.
+    let mut next = job_spec(&dir, "after-crash", Vec::new());
+    next.output_expectation = Some(expected(0.2));
+    next.args = vec![
+        "cp".into(),
+        fixture.into_os_string(),
+        cache_part(&next.dest).into_os_string(),
+    ];
+    let completed = attach(app.clone(), next).unwrap();
+    wait_for_terminal_cleanup(&app, &completed);
+    assert_eq!(completed.state(), RemuxState::Complete);
+    assert!(cache_is_fresh_for_key(&completed.dest, "after-crash"));
+}
+
+#[test]
 fn completed_publication_accepts_short_media_hdr_and_mixed_copy_encode() {
     let dir = temp_dir("completed-valid-media");
     for (name, seconds, codec, audio) in [

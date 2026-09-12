@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./diagnostics.js";
 
 // Exercise the real transport in every browser, with deterministic event and
 // stream faults independent of OS codec support. Player recovery/decoding is

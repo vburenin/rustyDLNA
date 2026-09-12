@@ -3,17 +3,18 @@ name = "rusty-dlna-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
+license = "GPL-2.0-only"
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
-rusty-dlna-http = { path = "../crates/http" }
-rusty-dlna-protocol = { path = "../crates/protocol" }
-rusty-dlna-scan = { path = "../crates/scan" }
-rusty-dlna-soap = { path = "../crates/soap" }
-rusty-dlna-ssdp = { path = "../crates/ssdp" }
+rusty-dlna-http = { path = "../crates/http", version = "0.1.0" }
+rusty-dlna-protocol = { path = "../crates/protocol", version = "0.1.0" }
+rusty-dlna-scan = { path = "../crates/scan", version = "0.1.0" }
+rusty-dlna-soap = { path = "../crates/soap", version = "0.1.0" }
+rusty-dlna-ssdp = { path = "../crates/ssdp", version = "0.1.0" }
 
 [workspace]
 members = ["."]

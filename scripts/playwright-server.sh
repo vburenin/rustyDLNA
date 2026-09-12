@@ -106,6 +106,11 @@ fi
 cp -R -- "$ROOT/testdata/library" "$RUNTIME_DIR/library"
 node "$ROOT/web-tests/caption-conversion-fixtures.mjs" "$RUNTIME_DIR/library"
 CONFIG="$RUNTIME_DIR/rusty-dlna.toml"
+# Firefox retains sockets after test contexts close, and Playwright's separate
+# route.fetch pool also uses keepalive. Give this shared daemon test capacity so idle
+# harness sockets cannot consume the production default's 128 permits and hold
+# unrelated page loads in the accept backlog. Production defaults stay bounded
+# separately and have a focused max-connections regression.
 printf '%s\n' \
 	'friendly_name = "rustyDLNA-web-test"' \
 	'media_dir = ["library"]' \
@@ -115,6 +120,7 @@ printf '%s\n' \
 	'advertise_ip = "127.0.0.1"' \
 	'uuid = "uuid:00000000-0000-4000-8000-000000000001"' \
 	'notify_interval = 895' \
+	'max_connections = 1024' \
 	'' \
 	'[transcode]' \
 	'enable = true' \

@@ -97,6 +97,9 @@ const report = {
   schema: 2, started: new Date().toISOString(), binary, binary_sha256: await fileSha256(binary), root_commit: command("git", ["-C", root, "rev-parse", "HEAD"]),
   dirty: command("git", ["-C", root, "status", "--porcelain"]),
   environment: {
+    runtime: JSON.parse(execFileSync("python3", [join(root, "scripts/runtime-evidence.py"), "--binary", binary], {
+      encoding: "utf8", timeout: 120_000, maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
+    })),
     rust: command("rustc", ["--version"]), node: process.version,
     ffmpeg: command("ffmpeg", ["-version"]), ffprobe: command("ffprobe", ["-version"]),
     kernel: release(), cpu: cpus()[0]?.model, logical_cpus: cpus().length, memory_bytes: totalmem(),

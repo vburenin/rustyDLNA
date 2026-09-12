@@ -1045,7 +1045,7 @@ export class PlaybackController {
     }
     this.#store.dispatch({
       type: "PLAYBACK_SOURCE_READY", sessionId: source.sessionId, plan: source.plan,
-      pendingSeekTime: source.plan.mediaSourceDelivery && start > source.segmentOffset ? start : null,
+      pendingSeekTime: source.plan.sourceMode === SOURCE_MODES.COMPATIBLE && start > source.segmentOffset ? start : null,
       message: !message && source.plan.mediaSourceDelivery
         ? source.plan.androidTranscodeEligible ? "Preparing reliable Android stream…" : "Preparing stream…"
         : undefined,
@@ -1095,19 +1095,38 @@ export class PlaybackController {
       }
     });
     listen("seeking", () => { if (sourceMode === SOURCE_MODES.ORIGINAL) status("seeking", { message: "Seeking…" }); });
+    let nativeSeekAttempt = null;
+    if (!mediaSourceDelivery) listen("emptied", () => { nativeSeekAttempt = null; });
     const applyPendingSeek = () => {
       if (!valid()) return false;
       const target = this.#store.getState().playback.pendingSeekTime;
       if (target === null) return true;
+      if (!mediaSourceDelivery && player.seeking) return false;
       const local = target - segmentOffset;
-      const ranges = Array.from({ length: player.buffered.length }, (_, index) => ({
-        start: player.buffered.start(index), end: player.buffered.end(index),
+      // Native fragmented MP4 metadata can precede its seekable timeline.
+      // Retain the requested offset when the browser clamps or rejects a seek;
+      // later source events retry it once the corresponding range exists.
+      const available = mediaSourceDelivery ? player.buffered : player.seekable;
+      const ranges = Array.from({ length: available.length }, (_, index) => ({
+        start: available.start(index), end: available.end(index),
       }));
       if (!bufferedSeekTarget(ranges, local)) return false;
       if (Math.abs(player.currentTime - local) > 0.05) {
+        if (!mediaSourceDelivery) {
+          const buffered = Array.from({ length: player.buffered.length }, (_, index) => [
+            player.buffered.start(index), player.buffered.end(index),
+          ]);
+          const attempt = JSON.stringify([local, player.duration, player.readyState, ranges, buffered]);
+          // A silently clamped seek can emit seeked/canplay at the wrong time.
+          // Retry after independent data notifications or an availability
+          // change, so those events cannot continually repeat the same seek.
+          if (nativeSeekAttempt === attempt) return false;
+          nativeSeekAttempt = attempt;
+        }
         try { player.currentTime = local; } catch (_) { return false; }
       }
-      if (Math.abs(player.currentTime - local) > 0.05 || player.seeking) return false;
+      if (Math.abs(player.currentTime - local) > 0.05 || player.seeking
+        || (!mediaSourceDelivery && player.readyState < 2)) return false;
       this.#store.dispatch({ type: "PLAYBACK_AUX", sessionId, values: { pendingSeekTime: null } });
       return true;
     };
@@ -1124,12 +1143,10 @@ export class PlaybackController {
       }
     });
     listen("loadedmetadata", () => {
-      if (mediaSourceDelivery) {
+      if (sourceMode === SOURCE_MODES.COMPATIBLE) {
         applyPendingSeek();
       } else if (sourceMode === SOURCE_MODES.ORIGINAL && start > 0) {
         try { player.currentTime = Math.min(start, Number.isFinite(player.duration) ? player.duration : start); } catch (_) { /* Native metadata is not seekable yet. */ }
-      } else if (sourceMode === SOURCE_MODES.COMPATIBLE && start > segmentOffset) {
-        try { player.currentTime = start - segmentOffset; } catch (_) { /* Native metadata is not seekable yet. */ }
       }
       const duration = itemDuration(item, player.duration);
       this.#store.dispatch({ type: "PLAYBACK_TIME", sessionId, currentTime: start, duration });
@@ -1139,6 +1156,7 @@ export class PlaybackController {
       this.#store.dispatch({ type: "PLAYBACK_TIME", sessionId, currentTime: this.globalTime(), duration: itemDuration(item, player.duration) });
     });
     listen("loadeddata", () => {
+      if (!mediaSourceDelivery) nativeSeekAttempt = null;
       if (!applyPendingSeek()) return;
       if (sourceMode === SOURCE_MODES.COMPATIBLE) this.#clearStartupTimer();
       this.#releaseHeldVideoFrame();
@@ -1162,7 +1180,15 @@ export class PlaybackController {
       }
     };
     listen("canplay", readyToPlay);
+    if (sourceMode === SOURCE_MODES.COMPATIBLE && !mediaSourceDelivery) {
+      for (const name of ["progress", "durationchange"]) listen(name, () => {
+        nativeSeekAttempt = null;
+        if (this.#store.getState().playback.pendingSeekTime !== null
+          && applyPendingSeek() && player.readyState >= 3) void readyToPlay();
+      });
+    }
     listen("playing", () => {
+      if (!mediaSourceDelivery && !applyPendingSeek()) return;
       this.#reportStartup(source, "playing");
       if (document.visibilityState === "visible"
         && this.#nativeHlsSuspendedSession === sessionId) {
@@ -1579,13 +1605,15 @@ export class PlaybackController {
   #scheduleCompatibleStartupRecovery(source, sourceUrl) {
     const { sessionId, item, player, start, signal } = source;
     const { streamNegotiation, nativeHlsDelivery, mediaSourceDelivery } = source.plan;
-    if (source.hasTimer("startup") || !source.active || player.readyState >= 2) return;
+    const ready = () => player.readyState >= 2
+      && (mediaSourceDelivery || this.#store.getState().playback.pendingSeekTime === null);
+    if (source.hasTimer("startup") || !source.active || ready()) return;
     source.setTimer("startup", () => {
       const playback = this.#store.getState().playback;
       if (signal.aborted
         || sessionId !== playback.sessionId
         || !["loading", "waiting", "seeking"].includes(playback.status)
-        || player.readyState >= 2
+        || ready()
         || player.getAttribute("src") !== sourceUrl) return;
       if (this.#fallbackNativeHlsCopy(sessionId)) return;
       if (!mediaSourceDelivery
@@ -1772,7 +1800,11 @@ export class PlaybackController {
   }
 
   async #attemptPlay(source) {
-    if (!source?.active || this.#store.getState().playback.pendingSeekTime !== null) return;
+    // MSE fetches a pending target independently. Native loading still needs
+    // the initial play request for activation and fetching beyond metadata;
+    // its pending target gates readiness and held-frame release instead.
+    if (!source?.active || (source.plan.mediaSourceDelivery
+      && this.#store.getState().playback.pendingSeekTime !== null)) return;
     const { sessionId, player } = source;
     try {
       await player.play();

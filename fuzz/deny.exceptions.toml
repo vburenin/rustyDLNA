@@ -1,0 +1,6 @@
+# The separate fuzz workspace uses libFuzzer's NCSA-licensed engine through
+# libfuzzer-sys. This exception adds only that exact test tool's license; the
+# root source, registry, license and wildcard restrictions remain unchanged.
+exceptions = [
+  { name = "libfuzzer-sys", version = "=0.4.13", allow = ["NCSA"] },
+]

@@ -28,6 +28,10 @@ run_component() {
 	fi
 }
 
+# cargo-fuzz can rewrite its separate workspace lockfile during a build.
+# Resolve it explicitly in the ordinary gate so dependency drift fails first.
+run_cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 > /dev/null
+
 test -f docs/TRANSCODE.md
 test -f docs/COMPATIBILITY.md
 test -f docs/DISTRIBUTION.md
@@ -111,6 +115,9 @@ fi
 python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding="utf-8")) for path in ("scripts/large-library-http-benchmark.py", "scripts/large-library-restart-benchmark.py", "scripts/check-targeted-coverage.py")]'
 node --check scripts/library-browser-benchmark.mjs
 node --check scripts/library-scan-playback-benchmark.mjs
+node --check scripts/browser-diagnostics-reporter.mjs
+node --check web-tests/diagnostics.js
+node --check scripts/persistent-soak.mjs
 ./restart.sh --help >/dev/null
 ./restart-web.sh --help >/dev/null
 ! ./restart.sh --nope >/dev/null 2>&1

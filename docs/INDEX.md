@@ -47,6 +47,9 @@ All commands below run from the **repository root**. The agent wrapper invokes
 | Profile-8 stage measurements (optional genuine media/tool tier) | `cargo run --locked -p rusty-dlna --example profile8_stages -- --help` | `docs/TRANSCODE.md` |
 | Large-library scan/restart/query/browser measurements | `scripts/large-library-benchmark.sh`; `python3 scripts/large-library-restart-benchmark.py --help`; `node scripts/library-browser-benchmark.mjs --help`; `node scripts/library-scan-playback-benchmark.mjs --help` | `docs/LARGE_LIBRARY_BENCHMARK.md` |
 | Full web suite (additional CI check) | `npm run test:web` | `package.json`, `.github/workflows/ci.yml`, browser job |
+| Persistent daemon/cache validation | `node scripts/persistent-soak.mjs --help` | `docs/OPERATIONS.md`; generated temporary media and isolated ports |
+| Media/runtime evidence | `python3 scripts/runtime-evidence.py --help` | `docs/DISTRIBUTION.md`; exact tool/library/package identities |
+| Fresh package availability | `python3 scripts/clean-build-probe.py --help` | `docs/DISTRIBUTION.md`; availability probe, not a full historical rebuild |
 
 Rust type checking is covered by Clippy; no separate typecheck task is declared.
 No standalone JavaScript or Python lint/typecheck commands are declared; update
@@ -74,6 +77,8 @@ not install dependencies.
   The browser job uses `npm ci` and
   `npx playwright install --with-deps chromium firefox webkit` before
   `npm run test:web`.
+  The supported matrix uses four parallel workers and zero retries. Diagnostic
+  repeated/stress runs and native decoder limits are described in `docs/WEB_PLAYER.md`.
 - Python **3.10 or newer** is required by the library tools. No PyPI packages
   are needed (`contrib/library/requirements.txt`).
 - The CI quality job installs `clang libavformat-dev ffmpeg curl` through apt;

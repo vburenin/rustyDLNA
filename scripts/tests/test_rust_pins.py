@@ -26,7 +26,7 @@ class RustPinsTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         for name in (*PINS.FILES, ".github/workflows/rust-toolchain-update.yml",
                      "scripts/rust-pins.py", "scripts/set-rust-version.sh",
-                     "scripts/release-contract.sh", "CHANGELOG.md"):
+                     "scripts/release-contract.sh", "scripts/check.sh", "CHANGELOG.md"):
             dest = self.root / name
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / name, dest)
@@ -141,6 +141,21 @@ class RustPinsTest(unittest.TestCase):
                 self.assertNotEqual(self.update().returncode, 0)
                 self.assertEqual(self.snapshot(), before)
                 path.write_text(original)
+
+    def test_ordinary_quality_gate_rejects_every_pin_drift_before_building(self):
+        current = PINS.unique(r'^channel = "([^"]+)"$',
+                              (self.root / "rust-toolchain.toml").read_text(), "toolchain")
+        for name in PINS.FILES:
+            with self.subTest(file=name):
+                path = self.root / name
+                original = path.read_text()
+                path.write_text(original.replace(current, "9.0.0"))
+                try:
+                    result = self.run_command("sh", "scripts/check.sh")
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("Rust pin contract:", result.stderr)
+                finally:
+                    path.write_text(original)
 
     def invoke_update(self):
         with patch.dict(os.environ, self.env), patch.object(sys, "argv", [

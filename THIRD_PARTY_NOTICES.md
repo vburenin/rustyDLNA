@@ -2,7 +2,7 @@
 
 The release SBOM is the authoritative machine-readable inventory of Rust and
 system components. The production container additionally distributes FFmpeg
-from Debian and the pinned `dovi_tool` binary described here.
+from Ubuntu and the pinned `dovi_tool` binary described here.
 
 ## nginx 1.31.3 (optional browser gateway)
 
@@ -17,10 +17,10 @@ and license notice remains in the image at:
 Source and licensing information are available from
 `https://nginx.org/en/download.html` and `https://nginx.org/LICENSE`.
 
-## FFmpeg (Debian bookworm package)
+## FFmpeg (Ubuntu resolute package)
 
 FFmpeg is free software whose effective license depends on the enabled build
-options. Debian's `ffmpeg` package includes GPL-covered components and its
+options. Ubuntu's `ffmpeg` package includes GPL-covered components and its
 package copyright file describes the exact build's licenses and authors. In
 the image, read:
 
@@ -28,9 +28,9 @@ the image, read:
 /usr/share/doc/ffmpeg/copyright
 ```
 
-Corresponding Debian source, including Debian patches and copyright metadata,
-is available from `https://sources.debian.org/src/ffmpeg/`. The precise binary
-package version appears in the image SBOM and in:
+Corresponding Ubuntu source, including distribution patches and copyright metadata,
+is identified at [Ubuntu's FFmpeg source page](https://packages.ubuntu.com/source/resolute/ffmpeg).
+The precise binary package version appears in the image SBOM and in:
 
 ```sh
 dpkg-query -W ffmpeg

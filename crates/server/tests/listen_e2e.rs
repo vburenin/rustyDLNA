@@ -7,12 +7,13 @@
 //! ```
 //! Tests offset from those ports so they can run together:
 //! `one_run` +0, byebye +1, series/remux +2, body-cap +3, protocol +4,
-//! remaining +5, kodi-platinum +6. Never bind live 8200/1900 (`isolation`).
+//! remaining +5, kodi-platinum +6, shutdown +7..11, persistence +12.
+//! Never bind live 8200/1900 (`isolation`).
 //!
 //! Unset env → skip for ordinary unit runs. `RUSTY_DLNA_REQUIRE_E2E=1`
 //! converts a missing/invalid environment into a hard failure for CI.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus};
@@ -705,6 +706,61 @@ fn request_body_cap_and_soap_host() {
         "POST /ctl/ContentDir HTTP/1.1\r\nHost: attacker.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
     assert_eq!(st, 400, "SOAP hostname Host must 400: {hdr}");
+}
+
+#[test]
+fn persistent_connection_budget_announces_close_before_eof() {
+    let Some((http, ssdp)) = env_ports() else {
+        eprintln!("skip persistence e2e (RUSTY_DLNA_HTTP_PORT unset)");
+        return;
+    };
+    let http = http.saturating_add(12);
+    let ssdp = ssdp.saturating_add(12);
+    assert!(!rusty_dlna_protocol::isolation::collides_with_live_ports(
+        http, ssdp
+    ));
+    let _server = spawn_bin(http, ssdp);
+    let stream = TcpStream::connect(("127.0.0.1", http)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    for number in 1..=100 {
+        write!(
+            reader.get_mut(),
+            "GET /api/status HTTP/1.1\r\nHost: 127.0.0.1:{http}\r\nConnection: keep-alive\r\n\r\n"
+        )
+        .unwrap();
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        assert!(status.starts_with("HTTP/1.1 200 "), "{number}: {status}");
+        let mut connection = None;
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            let (name, value) = line.split_once(':').expect("HTTP response field");
+            if name.eq_ignore_ascii_case("connection") {
+                connection = Some(value.trim().to_ascii_lowercase());
+            } else if name.eq_ignore_ascii_case("content-length") {
+                length = Some(value.trim().parse::<usize>().unwrap());
+            }
+        }
+        let mut body = vec![0; length.expect("framed status response")];
+        reader.read_exact(&mut body).unwrap();
+        assert_eq!(
+            connection.as_deref(),
+            Some(if number == 100 { "close" } else { "keep-alive" }),
+            "response {number} must describe whether this connection can be reused"
+        );
+    }
+    assert_eq!(reader.read(&mut [0]).unwrap(), 0, "budget must close TCP");
 }
 
 #[test]

@@ -789,7 +789,8 @@ exposed with stable indexes, labels, an inferred language subtag from the
 dot-owned filename variant, and source format. Browser-selectable entries also
 receive a same-origin WebVTT URL. Text must be valid UTF-8 and pass the bounded
 sidecar read and cue validation. VTT is normalized; SRT, ASS/SSA, and SMI are
-converted to WebVTT.
+converted to WebVTT. Literal `-->` in SubRip cue text is escaped for WebVTT
+so it remains visible text while supported cue markup is preserved.
 WebVTT validation distinguishes the signature from annotations, requires valid
 cue timestamps, and retains supported cue identifiers, settings, markup, comments,
 and pre-cue style/region blocks. UTF-8 BOM and LF, CRLF, or CR line endings are
@@ -1257,6 +1258,63 @@ and multi-browser behavior suites. For the same focused checks locally, run
 `npm run test:web-browser`. Browser tests create their configuration, database,
 and derived-media cache under a temporary directory and remove it when the
 test server stops; they do not write runtime state into `testdata/`.
+
+The supported matrix uses **four parallel workers**, both locally and in CI,
+with **zero retries**. Real decoding, generated media, and 10,000-card layouts
+share that budget; tests still run fully in parallel. A CPU-derived worker count
+does not account for native decoder/device initialization, browser process
+memory, or the shared test daemon's connection admission. Keep the canonical
+Rust/socket gate and browser harness sequential because their test-port ranges
+overlap. Do not increase assertion timeouts to compensate for another active
+benchmark or an overloaded browser backend.
+The isolated fixture daemon allows 1,024 connections: browser contexts and the
+test request agents can retain idle connections across tests. This capacity is
+separate from the production connection limit and idle timeout; explicit higher
+worker stress runs must measure admission and host pressure again.
+
+Pure state/queue/retry decisions run in the dependency-free Node suite. The
+`mse-deadlines.spec.js` cases use controlled clocks, transport faults, and media
+events to verify deadlines and source cancellation in every browser. Separate
+`healthy-recovery`, `recovery`, `caption-conversion`, and player cases require
+real FFmpeg output and decoded browser frames/cues. Passing the deterministic
+cases alone does not establish decoder, fragment, or timestamp correctness.
+The held-frame seek fixture contains the requested seven-second local frame;
+a short file whose EOF precedes that target instead tests truncation recovery.
+Native prepared-stream seeking retains the requested intra-segment time and
+held frame until the browser's seekable timeline accepts that time and decoded
+data is ready. A clamped metadata assignment stays pending for subsequent source
+events; the existing bounded startup recovery still handles a source that never
+becomes ready. A controlled clamp regression verifies this with actual decoding.
+
+For a bounded repeated investigation, retain the original run and use explicit
+trial counts, for example:
+
+```sh
+python3 scripts/runtime-evidence.py --output /tmp/browser-runtime.json
+RUSTY_DLNA_BROWSER_EVIDENCE=/tmp/browser-matrix.jsonl npm run test:web-browser
+RUSTY_DLNA_BROWSER_EVIDENCE=/tmp/browser-races.jsonl npx playwright test web-tests/mse-deadlines.spec.js --workers=4 --repeat-each=3
+```
+
+The opt-in shared test fixture records bounded request timings, media events,
+navigation and loading-state phases, and long tasks where supported. The reporter
+records assertion durations, browser versions, explicit skip reasons, host CPU/
+memory/I/O pressure, cgroup limits/events, process/thread totals and test-port
+socket states. It includes startup HTML/script/style requests and marks dropped
+events or truncated assertion detail. Request-only tests do not create a page
+for diagnostics. Firefox/WebKit lack the Long Tasks API; their report says so.
+Failure traces/screenshots remain enabled; the existing 10k-card scale spec
+disables full DOM trace snapshots because copying that DOM dominates the workload.
+CI/release retain runtime versions and diagnostic reports even on success. Store
+reports outside source control; report missing observations as unavailable.
+
+`--workers=16` is an explicit stress experiment, not the supported decoding gate.
+On a host with NVIDIA's GStreamer decoder, concurrent headless WebKit H.264
+initialization can stall before metadata even on a plain media page. A diagnostic
+comparison can exclude that decoder with `GST_PLUGIN_FEATURE_RANK=nvh264dec:0`;
+this changes the test's decoder coverage and must be recorded. The normal matrix
+preserves native decoder selection. GStreamer documents this mechanism in its
+[hardware decoding guide](https://gstreamer.freedesktop.org/documentation/tutorials/playback/hardware-accelerated-video-decoding.html).
+GPU/display certification and audible output require their dedicated environment.
 
 Original playback capabilities vary with the browser, OS, and installed media
 framework. In particular HEVC, Dolby Vision, MKV, and some multichannel audio

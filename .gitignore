@@ -34,4 +34,5 @@ docker-compose.override.yaml
 node_modules/
 test-results/
 playwright-report/
+browser-evidence/
 __pycache__/

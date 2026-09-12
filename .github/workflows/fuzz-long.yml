@@ -31,6 +31,8 @@ jobs:
         run: |
           rustup toolchain install nightly-2026-08-01 --profile minimal --component rust-src
           cargo +nightly-2026-08-01 install cargo-fuzz --version 0.13.2 --locked
+      - name: Reject stale fuzz lockfile before cargo-fuzz can rewrite it
+        run: cargo +nightly-2026-08-01 metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 > /dev/null
       - name: Restore evolving corpus
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:

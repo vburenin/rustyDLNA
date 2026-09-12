@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./diagnostics.js";
 
 // Full DOM trace snapshots dominate this 10,000-card workload in WebKit.
 test.use({ trace: "off" });

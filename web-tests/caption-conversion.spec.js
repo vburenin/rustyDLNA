@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./diagnostics.js";
 import { captionConversionFixtures } from "./caption-conversion-fixtures.mjs";
 
 const execFileAsync = promisify(execFile);

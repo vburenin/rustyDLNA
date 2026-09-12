@@ -437,3 +437,74 @@ SOAK_SECONDS=86400 SOAK_REPORT=/tmp/rustydlna-soak-report.tsv scripts/soak.sh
 
 Keep the source tree unchanged during the run. The script uses temporary test
 libraries and isolated ports; it does not exercise the live media library.
+Resource sampling follows descendants created by every Linux task, including
+daemon and helper processes launched by test worker threads. The one-second
+sampling interval can miss processes that start and exit between samples.
+
+`scripts/persistent-soak.mjs` supplements those restart/shutdown cycles with one
+daemon and one transcode cache kept alive for the entire workload. Install the
+locked npm dependencies and Playwright Chromium and build the pinned server
+first. Run this dedicated workload separately from the browser matrix and
+performance benchmarks so host contention does not obscure resource trends:
+
+```sh
+cargo build --locked -p rusty-dlna
+node scripts/persistent-soak.mjs --binary=target/debug/rusty-dlna \
+  --seconds=3600 --warmup-seconds=150 --output=/tmp/persistent-soak.json
+```
+
+Each cycle publishes a generated temporary media file through the watcher,
+replaces the previous cycle's file, and overlaps bounded library/search/folder
+queries and artwork requests with actual Chromium playback. Chromium presents
+frames from cold and cached H264/AAC MSE output generated from MPEG2/FLAC input,
+then presents a frame at a seek target. Cache reuse must increment the server's
+counter. A separate generated longer source verifies disconnect/reconnect to the
+same live compatible-output producer followed by explicit cancellation and
+helper reaping. Normal quota enforcement must evict completed output during the
+steady-state portion; the harness never deletes cache entries between cycles.
+Only the private generated library is changed. HTTP/SSDP default to test ports
+18440/12440, and the daemon starts exactly once.
+
+The output's parent directory must already exist. Use `--help` for duration,
+sample interval, query load, ports, cache quota, and
+resource limits. Defaults sample once per second, run two query workers and
+16 queries plus artwork requests per cycle, use a 24 MiB transcode quota, and
+bound daemon RSS at 512 MiB, daemon threads at 256, descriptors at 512, children
+at 16, daemon plus helper RSS at 2 GiB, database storage at 128 MiB, and total
+cache storage at 48 MiB. The transcode quota accommodates outputs still protected
+by the reconnect grace while creating pressure on older completed outputs;
+reducing it can correctly reject a producer when every eviction candidate is
+still active or protected. Query operations have a five-second deadline; browser
+startup/seek observations have a 30-second deadline. At least three cycles must
+start after warm-up, and every named workload must be observed during that
+steady-state period. Missing decoding, active cancellation, reconnect, eviction,
+or sufficient steady-state observations fail the run. There are no automatic
+retries or codec/platform skips; missing prerequisites fail explicitly.
+
+The JSON report retains exact runtime tool/package versions, binary and harness
+hashes, configuration, per-cycle playback/media events, latencies, cache counters,
+and idle resource measurements. A sibling `.samples.jsonl` records busy resource
+samples, host CPU/memory pressure, scanner state, cache accounting and observed
+resource peaks; `.server.log` retains the last 4 MiB of server diagnostics. Idle
+samples require no active helpers/children/intermediates and equality between
+the independent completed-media byte count and the server's cache accounting
+(validation stamp bytes are reported separately). Steady-state RSS, FD and
+thread trends report first/last-third medians and descriptive linear slopes.
+Defaults fail median growth above 64 MiB RSS, 16 descriptors or eight threads.
+Busy peaks and warm-up observations are reported separately from idle growth.
+The default 150-second warm-up covers the two-minute prepared-transcode cache:
+each recent browser session can retain its validated source descriptor and
+FFmpeg identity while later seeks reuse that preparation. That cache has a
+64-entry cap and prunes expired entries during access. Include its warm-up in
+comparisons before interpreting growth in source/tool descriptors as a leak.
+Failed transcodes or cache maintenance also fail the workload; network failures
+retain their nested error causes instead of being retried.
+
+Daemon shutdown must finish without escalation within 20 seconds and leave no captured
+daemon, helper or browser PID/start identity alive. The private media/database/
+cache tree is removed even after workload failure; report artifacts stay outside
+it. The duration controls the activity window after fixture generation and
+startup; a cycle already in progress finishes its bounded operations before
+shutdown. A short run provides finite trend and workload evidence. Use longer
+runs on the target host to investigate sustained growth; a passing short run
+does not establish indefinite stability or replace the restart-based soak.

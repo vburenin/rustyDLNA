@@ -4,10 +4,17 @@ export default defineConfig({
   testDir: "./web-tests",
   timeout: 30_000,
   expect: { timeout: 7_500 },
+  // Real decoder/10k-card workloads share this budget. The CLI can raise it
+  // for measured stress runs; CPU count alone does not bound GPU setup costs.
+  workers: 4,
   fullyParallel: true,
   forbidOnly: Boolean(process.env.CI),
-  retries: process.env.CI ? 1 : 0,
-  reporter: process.env.CI ? [["line"], ["html", { open: "never" }]] : "line",
+  retries: 0,
+  reporter: [
+    ["line"],
+    ...(process.env.CI ? [["html", { open: "never" }]] : []),
+    ...(process.env.RUSTY_DLNA_BROWSER_EVIDENCE ? [["./scripts/browser-diagnostics-reporter.mjs"]] : []),
+  ],
   use: {
     baseURL: "http://127.0.0.1:18201",
     trace: "retain-on-failure",

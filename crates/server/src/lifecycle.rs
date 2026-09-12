@@ -1569,7 +1569,7 @@ pub(super) async fn handle_conn(
             handler_app.handle_from(&handler_request, peer)
         });
         let mut poll = tokio::time::interval(Duration::from_millis(20));
-        let resp = loop {
+        let mut resp = loop {
             tokio::select! {
                 result = &mut worker => break result.map_err(|error| format!("request worker failed: {error}"))?,
                 _ = poll.tick() => {
@@ -1591,6 +1591,11 @@ pub(super) async fn handle_conn(
         drop(cancel_query);
         request_number = request_number.saturating_add(1);
         persist_left = persist_left.saturating_sub(1);
+        // Tell pooled clients about the final response before closing the
+        // connection, so they do not send the next request on an exhausted socket.
+        if persist_left == 0 {
+            resp.persist = false;
+        }
         if let Some(spec) = resp.remux_job.clone() {
             remux::serve_remux(&app, &mut sock, &req, spec)
                 .await

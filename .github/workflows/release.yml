@@ -8,7 +8,11 @@ permissions:
   contents: read
 
 jobs:
+  browser-dependency-policy:
+    uses: ./.github/workflows/browser-dependency-policy.yml
+
   validate:
+    needs: browser-dependency-policy
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.release.outputs.version }}
@@ -38,7 +42,9 @@ jobs:
           cargo install cargo-deny --version 0.20.2 --locked
           cargo install cargo-machete --version 0.9.2 --locked
           cargo audit --deny warnings
+          cargo audit --file fuzz/Cargo.lock --deny warnings
           cargo deny check
+          cargo deny --manifest-path fuzz/Cargo.toml check
           cargo machete
       - name: Reproducible release metadata
         id: release
@@ -70,13 +76,18 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium firefox webkit
       - name: Web unit and multi-browser behavior suites
-        run: npm run test:web
+        env:
+          RUSTY_DLNA_BROWSER_EVIDENCE: browser-evidence/run.jsonl
+        run: |
+          python3 scripts/runtime-evidence.py --output browser-evidence/runtime-environment.json
+          npm run test:web
       - name: Retain browser diagnostics
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: release-playwright-diagnostics
           path: |
+            browser-evidence
             playwright-report
             test-results
           if-no-files-found: warn

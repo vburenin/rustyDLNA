@@ -331,6 +331,11 @@ Keep-Alive for SOAP/desc/art/captions. **Never** for `/MediaItems/`
 (or a transcode pipe). Host must be literal IPv4 or 400. TimeSeek
 without Range → 406.
 
+A persistent TCP connection serves at most 100 requests. The final response
+advertises `Connection: close` before the server closes the socket; preceding
+responses retain their normal persistence policy. Idle connections also have
+the configured `keep_alive_timeout_secs` deadline (30 seconds by default).
+
 HTTP field names use the shared RFC token grammar, and optional whitespace is
 only SP/HTAB. Final response serialization validates the public status, reason,
 `Server`, `Date`, and every header field, including fields replaced by the

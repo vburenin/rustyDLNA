@@ -113,6 +113,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn long_title_snapshot_and_deep_page_clone_only_the_appended_tail() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counted(Arc<AtomicUsize>);
+        impl Clone for Counted {
+            fn clone(&self) -> Self {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Self(self.0.clone())
+            }
+        }
+
+        for length in [7_200, 28_800] {
+            let clones = Arc::new(AtomicUsize::new(0));
+            let mut history: History<_> = (0..length).map(|_| Counted(clones.clone())).collect();
+            let snapshot = history.view(0, length);
+            let deep_page = history.view(length - 256, length);
+            assert_eq!(clones.load(Ordering::Relaxed), 0);
+            assert!(
+                deep_page.chunks.len() <= 2,
+                "a deep page must retain only intersecting chunks"
+            );
+            history.push(Counted(clones.clone()));
+            assert_eq!(clones.load(Ordering::Relaxed), length % CHUNK_ENTRIES);
+            assert_eq!(snapshot.iter().count(), length);
+            assert_eq!(deep_page.iter().count(), 256);
+            assert_eq!(history.len(), length + 1);
+        }
+    }
+
+    #[test]
     fn views_share_sealed_chunks_and_remain_consistent_during_append() {
         let mut history: History<_> = (0..600).collect();
         let view = history.view(0, 600);

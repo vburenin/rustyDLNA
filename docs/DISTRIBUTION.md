@@ -50,6 +50,30 @@ restore earlier replacements without overwriting concurrent external edits. The
 scheduled version resolver reads the manifest's Rust compiler table, independently
 of the Cargo package version.
 
+Dependabot proposes weekly updates for Cargo, npm, Docker, and GitHub Actions.
+Both the application and separate `fuzz/` Cargo workspace receive updates and
+advisory and license/source-policy audits. The fuzz package declares the project's
+GPL-2.0-only license and versioned internal path dependencies. Its local license
+exception covers only libfuzzer-sys 0.4.13's additional NCSA license, reviewed
+against that crate's declared `(MIT OR Apache-2.0) AND NCSA` expression; the root
+license, wildcard, and source restrictions remain unchanged. The ordinary quality
+gate and scheduled fuzz jobs resolve the fuzz graph with
+`cargo metadata --locked` before invoking cargo-fuzz, which otherwise may silently
+rewrite an outdated fuzz lockfile after application dependency changes.
+The npm graph contains browser testing/accessibility tools only; the server embeds
+its JavaScript source and has no npm runtime installation. The reusable browser
+dependency-policy workflow runs on ordinary CI, before release validation, weekly,
+and on manual dispatch. It installs `package-lock.json` with lifecycle scripts
+disabled and development dependencies included, then audits that locked graph at
+all advisory severities. Its retained artifacts include the graph, audit result,
+Node/npm versions, and lockfile hashes. This reports development/test exposure
+separately from the Rust server and container runtime scans. Python tooling uses
+the standard library and has no third-party package graph.
+
+Rust advisory, license/source, unused-dependency, and container vulnerability
+checks remain separate gates. A failed audit service or unavailable local audit
+tool is an unavailable check, not evidence of a vulnerability or license violation.
+
 All Ubuntu image stages fetch packages over HTTPS. The digest-pinned Rust
 image supplies the initial CA bundle until Ubuntu's `ca-certificates` package
 is installed; TLS verification and APT signature/hash checks remain enabled.
@@ -79,13 +103,73 @@ checksum before extraction. When no project-local archive exists, BuildKit
 downloads it once into a persistent builder cache and reuses it on later builds;
 a clean builder still downloads the pinned release from GitHub.
 
+## Build availability and retained evidence
+
+Pins identify expected inputs; they do not retain those inputs. Ubuntu stages use
+live archive indexes, and most transitive system packages resolve from those
+indexes at build time. A superseded exact FFmpeg or fixture-tool package can
+disappear from the selected mirror even while its base-image digest remains
+available. Cargo downloads, OCI layers, and the checksum-verified dovi_tool release
+archive also depend on their upstream services unless already retained locally.
+The project does not operate an archive snapshot or retention mirror, and does
+not promise indefinitely available historical rebuilds, offline clean builds, or
+byte-identical images. A successful build at one revision is evidence for that
+revision, architecture, and date only.
+
+The source-side availability probe downloads each build, fixture, and runtime APT
+graph using the Dockerfile's exact package declarations and HTTPS/CA/APT trust
+setup. It uses fresh package indexes/downloads and disables RUN-layer caching;
+immutable base layers may already exist locally. No application compilation,
+installation on the host, running daemon, or media mount is involved:
+
+```sh
+python3 scripts/clean-build-probe.py --print-dockerfile
+python3 scripts/clean-build-probe.py --output /tmp/rustydlna-package-probe --platform linux/amd64
+```
+
+The output directory must be new. It retains the generated Dockerfile, source
+Dockerfile hash, full bounded build log/status, and exact downloaded package
+versions, source identities, and SHA-256 hashes. `--archive-host` uses the existing
+validated mirror override; `--timeout` sets the whole probe deadline (default
+900 seconds). A rejected package version or download is a failed availability
+probe. The probe deliberately does not claim to test Cargo/dovi_tool availability,
+package installation, compilation, or final runtime behavior. Full clean-builder
+validation additionally requires an isolated empty builder, empty Cargo/BuildKit
+caches, no project-local dovi_tool archive, a full Docker build, and the existing
+container smoke on each required architecture. Merely passing `--no-cache` to
+the production Dockerfile does not empty its persistent cache mounts.
+
+For media and performance evidence, capture the tools from the environment that
+actually runs the workload:
+
+```sh
+python3 scripts/runtime-evidence.py --binary target/debug/rusty-dlna --output /tmp/runtime-environment.json
+python3 scripts/runtime-evidence.py --docker-image IMAGE@DIGEST --platform linux/amd64 --output /tmp/image-environment.json
+```
+
+The collector records complete FFmpeg/FFprobe build and linked-libav versions,
+development-library versions when present, installed Debian/Ubuntu package and
+source versions, tool hashes, Rust/Node/npm/Python, and OS/CPU identity. A supplied
+trusted local server binary adds its hash and resolved shared libraries. Image
+inspection uses an already available image in a temporary read-only, networkless
+container and records its image identity; it never pulls or mounts media. Missing
+tools, failed commands, bounded-output truncation, and deadlines remain explicit
+in the JSON. Preserve this file beside reports from other dedicated workloads;
+the playback benchmark and persistent-process soak embed it automatically, and
+the browser CI/release jobs retain it beside their traces and phase diagnostics.
+Retaining a package inventory or SBOM identifies corresponding source; it does
+not itself retain the source bytes or ensure future download availability.
+
 ## Corresponding source
 
 Every public release must keep the repository tag and its lockfile available
 beside the binary/image for at least as long as the artifacts are offered. The
 release notes must link the tag source archive. System-package source is
 identified by package version in the image SBOM; Ubuntu source and patches are
-available from the Ubuntu package archive. `THIRD_PARTY_NOTICES.md` gives the stable
+distributed through the Ubuntu package archive. Before distributing an image,
+confirm that its exact corresponding source remains available and retain it as
+needed for the distribution's source obligations; a live mirror URL alone is not
+a retention guarantee. `THIRD_PARTY_NOTICES.md` gives the stable
 source locations and the complete dovi_tool MIT notice. The image retains
 distribution package copyright files under `/usr/share/doc` and copies the project
 license/notices to `/usr/share/doc/rusty-dlna`.

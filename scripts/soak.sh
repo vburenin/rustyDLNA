@@ -85,7 +85,9 @@ process_tree() {
     tree_pid=$1
     [ -d "/proc/$tree_pid" ] || return 0
     printf '%s\n' "$tree_pid"
-    children=$(sed -n '1p' "/proc/$tree_pid/task/$tree_pid/children" 2>/dev/null || true)
+    # Children belong to the creating task, which may be a test worker rather
+    # than the process leader. Deduplicate if a task exits during traversal.
+    children=$(cat /proc/"$tree_pid"/task/*/children 2>/dev/null | tr ' ' '\n' | sort -nu)
     for child in $children; do
         process_tree "$child"
     done
