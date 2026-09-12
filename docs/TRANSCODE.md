@@ -106,6 +106,29 @@ fallback applies the selected software preset. Copied video and audio-only
 plans ignore tuning. Non-default encoded output adds the versioned
 `browser-encoding-v1` preset identity; Balanced output remains reusable.
 
+The opt-in `gpu_graph` server example compares the existing CUDA download
+boundary with device-resident NVENC input and software decode at identical
+resolution, bitrate and encoding preset. It uses supervised helpers, generated
+SDR media, decoded-frame hashes, SSIM and sampled process/GPU counters. Its
+experimental graphs do not participate in server selection:
+
+```sh
+cargo run --locked -p rusty-dlna --example gpu_graph -- --help
+```
+
+The example captures hashes and SSIM for the first trial of each graph/preset.
+Compare those records separately; successful helper exits alone do not establish
+frame equality or quality acceptance.
+
+Keeping frames on a device can reduce transfer and CPU costs, as described by
+the [NVIDIA FFmpeg guide](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/ffmpeg-with-nvidia-gpu/index.html#n-hwaccel-transcode-with-scaling),
+but fewer transfers do not establish compatibility or end-to-end improvement.
+On the tested RTX 3050, removing the download boundary failed when SPS color
+metadata changed mid-stream; the existing download path completed. The daemon
+therefore retains its current decode choices, frame-context isolation and
+portable recovery. Preset comparisons must disclose their different quality
+effects; they cannot establish a graph improvement by changing encoder tuning.
+
 Configured browser AI-upscale profiles are an explicit exception to the normal
 no-enlargement rule. They apply only to user-selected, at-most-2× Compatible
 output for exactly 8-bit SDR sources inside a measured model envelope. The
@@ -308,7 +331,34 @@ playlist windows or delta delivery.
 `remux-p8` runs `dovi_tool -m 2 convert --discard` (BL + P8.1 RPU) when
 the binary is on `PATH`. The pipeline carries the source Dolby Vision level
 into a Profile 8 `dvvC` record, writes an `hvc1` fragmented MP4, and retains
-PQ/BT.2020 signaling. The signaling pass scans MP4 box headers without loading
+PQ/BT.2020 signaling. This policy discards the enhancement layer, including
+FEL residual image information; it does not reconstruct the full FEL image.
+The [dovi_tool conversion modes](https://github.com/quietvoid/dovi_tool#usage)
+describe the Profile-8.1 RPU rewrite. HDR10 fallback separately discards Dolby
+Vision metadata and is an explicit change in delivered features.
+
+Raw HEVC extraction carries no container timestamps. The pipeline therefore
+wraps the original source video with its original timestamps, then replaces
+each sample's RPU with the converted RPU and removes the enhancement-layer NALs.
+It verifies the converted base-layer VCL payloads against the original sample
+before accepting that association. Samples compact within their existing chunks;
+sample sizes change while chunk offsets, decode/composition timing and edit lists
+remain intact. Unreferenced private staging gaps disappear in the final mux.
+Both final-mux inputs retain the source clock, and any nonnegative output shift
+applies to video and audio together. This preserves VFR intervals and selected
+audio offsets instead of generating a constant-rate timeline from raw HEVC.
+The `profile8-source-timeline-v3` cache revision prevents reuse of the previous
+recipe's output.
+
+The packet rewrite accepts bounded, unencrypted video-only MP4 staging with
+variable sample sizes, one picture and one RPU per sample, and matching converted
+base-layer payloads. It rejects ambiguous mappings and samples that would grow
+outside their original extent. The limits are 32 MiB per sample and movie metadata,
+two million samples and 4,096 boxes/NALs per parsed container/sample. Unsupported
+layouts and failed conversion use the established HDR10 fallback; cancellation,
+deadline and cache pressure terminate the job.
+
+The separate signaling pass scans MP4 box headers without loading
 the media-sized intermediate into memory and shifts staging bytes in fixed-size
 chunks under the job cancellation token and hard deadline. Every preprocessing
 stage also checks the server cache limits; pressure stops and reaps the active
@@ -318,6 +368,42 @@ stage starts. If dovi_tool is missing or the convert/signaling step fails, the
 job falls back to the `hdr10` encode. A runtime HDR10 fallback can complete the
 current request but is not reused under the requested Profile-8 cache identity.
 First audio map prefers `aac` / `ac3` / `eac3` over TrueHD / DTS.
+
+Extraction, conversion, source wrapping, packet rewriting and signaling remain
+private in Preprocessing. Only the final mux can become Growing: its completed
+initialization already has final `dvvC`/`hvc1` signaling, and the bounded fragment
+index must find a complete playable copied-video segment with the established
+dependency look-ahead. Cache limits are rechecked immediately before exposure.
+The mux then appends fragments without rewriting exposed initialization bytes.
+An unpinned failed attempt may still fall back; a pinned generation fails and
+cannot be replaced underneath a reader. Structural validation, quota admission
+and atomic publication still precede Complete and reusable cache stamps.
+Early final-mux delivery does not remove the preceding whole-file stages.
+
+Profile-8 progress is available in
+`/api/status` → `transcode.web_player.performance.profile8`. Diagnostics retain the
+latest event for each of seven fixed stages in at most 64 recent pipelines, with
+elapsed time, logical input/output file lengths and separate I/O counters. The
+packet rewrite and signaling count successful application reads/writes exactly;
+their counters do not measure physical storage. Helper I/O uses sampled Linux
+process counters, including configuration and diagnostic traffic. These are
+explicitly incomplete lower bounds: short helpers can exit before a useful
+sample, and some hosts deny access after exit. Zero sampled writes do not prove
+zero work. Storage counters reflect kernel accounting and delayed writeback,
+not a disk-device measurement. No path, title or raw diagnostic output is exported.
+
+```sh
+DOVI_TOOL=/path/to/dovi_tool cargo run --locked -p rusty-dlna --example profile8_stages -- /path/to/clip.mkv 5 keep > /tmp/profile8-stages.jsonl
+```
+
+This opt-in measurement example reads the source, uses a disposable output
+directory, reserves one helper slot and shares an absolute deadline across all
+stages. It never publishes reusable cache output. Stage completion and a
+decodable fragment are distinct from completed validation or a presented frame.
+The current installed FFmpeg `dovi_rpu` filter offers metadata stripping and
+compression, not the Profile-7-to-8 conversion used here; see the
+[FFmpeg bitstream-filter reference](https://ffmpeg.org/ffmpeg-bitstream-filters.html#dovi_005frpu).
+Raw stdin/stdout support in a converter alone cannot preserve packet timestamps.
 
 Kodi opens several GETs at once. They **attach** to the same job. A
 probe disconnect does **not** kill ffmpeg.

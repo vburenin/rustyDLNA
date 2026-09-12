@@ -12,7 +12,7 @@ fn expected(seconds: f64) -> RemuxOutputExpectation {
     }
 }
 
-fn generate(path: &Path, seconds: &str, video: &str, audio: bool) {
+pub(super) fn generate(path: &Path, seconds: &str, video: &str, audio: bool) {
     generate_with_audio(path, seconds, video, audio.then_some("aac"));
 }
 
@@ -173,6 +173,38 @@ fn assert_rejected(
     assert!(
         !rusty_dlna_transcode::cache_stamp_path(&job.dest).exists(),
         "{key} published a reusable stamp"
+    );
+}
+
+#[test]
+fn profile8_decodable_fragments_do_not_prove_source_timing_coverage() {
+    let dir = temp_dir("profile8-retimed-fragments");
+    let path = dir.join("shortened.mp4");
+    // Model the measured raw-HEVC timestamp loss with generated media: the
+    // video was rebuilt to CFR while a short original audio track remained.
+    // This tests the existing completed validator, independently of dovi_tool.
+    generate_with_durations(&path, "3", "libx264", Some("aac"), Some(("3", "0.4")));
+    let file = std::fs::File::open(&path).unwrap();
+    let mut index = hls::Index::default();
+    index.update_file(&file, false).unwrap();
+    assert!(
+        index.has_playable_segment(),
+        "a prefix can be playable despite lost source timing"
+    );
+    let error = hls::validate_finished(
+        &file,
+        &expected(4.0),
+        Instant::now() + Duration::from_secs(2),
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(error.contains("output tracks cover"), "{error}");
+    assert_rejected(
+        &dir,
+        "retimed",
+        &std::fs::read(&path).unwrap(),
+        expected(4.0),
+        None,
     );
 }
 

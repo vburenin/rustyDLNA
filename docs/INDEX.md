@@ -43,6 +43,8 @@ All commands below run from the **repository root**. The agent wrapper invokes
 | Build (optional, separate) | `cargo build --locked -p rusty-dlna` | `.github/workflows/ci.yml`, privileged SSDP job |
 | Generated playback benchmark (optional CPU/device tiers) | `node scripts/playback-benchmark.mjs --help` | `docs/WEB_PLAYER.md` |
 | Experimental helper resource policy (optional CPU/NVENC tiers) | `cargo run --locked -p rusty-dlna --example resource_budget -- --help` | `docs/TRANSCODE.md` |
+| Selective GPU graph experiments (optional NVIDIA tier) | `cargo run --locked -p rusty-dlna --example gpu_graph -- --help` | `docs/TRANSCODE.md` |
+| Profile-8 stage measurements (optional genuine media/tool tier) | `cargo run --locked -p rusty-dlna --example profile8_stages -- --help` | `docs/TRANSCODE.md` |
 | Large-library scan/restart/query/browser measurements | `scripts/large-library-benchmark.sh`; `python3 scripts/large-library-restart-benchmark.py --help`; `node scripts/library-browser-benchmark.mjs --help`; `node scripts/library-scan-playback-benchmark.mjs --help` | `docs/LARGE_LIBRARY_BENCHMARK.md` |
 | Full web suite (additional CI check) | `npm run test:web` | `package.json`, `.github/workflows/ci.yml`, browser job |
 

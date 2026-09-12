@@ -5,6 +5,13 @@
 //! kind) — not titles or paths. First matching row wins.
 
 pub use rusty_dlna_helper::{JobGate, JobPermit};
+#[cfg(test)]
+mod profile8_media_tests;
+mod profile8_progress;
+mod profile8_rewrite;
+pub use profile8_progress::{
+    RemuxP8IoBasis, RemuxP8Stage, RemuxP8StageEvent, RemuxP8StageIo, RemuxP8StageStatus,
+};
 use rusty_dlna_protocol::{
     identify_user_agent, ClientFlags, ClientKind, ClientProfile, CompactStreamMetadata,
 };
@@ -148,7 +155,7 @@ const BROWSER_AI_UPSCALE_CACHE_REVISION: &str = "browser-ai-upscale-libplacebo-v
 /// Completed outputs must satisfy the structural fragment and track validator.
 pub const OUTPUT_VALIDATION_REVISION: &str = "fragment-tracks-v1";
 const MEDIA_INPUT_CACHE_REVISION: &str = "confined-demux-v1";
-const PROFILE8_TOOLCHAIN_CACHE_REVISION: &str = "profile8-toolchain-v2";
+const PROFILE8_TOOLCHAIN_CACHE_REVISION: &str = "profile8-source-timeline-v3";
 const CACHE_DIGEST_HEX_BYTES: usize = 64;
 const MAX_BROWSER_CACHE_KEY_BYTES: usize = 512;
 const VERIFIED_EXECUTABLE_FD: std::os::fd::RawFd = 4;
@@ -3329,6 +3336,7 @@ struct RemuxP8Control<'a> {
     deadline: std::time::Instant,
     cancelled: &'a std::sync::atomic::AtomicBool,
     observer: &'a mut dyn FnMut() -> Result<(), String>,
+    io: Option<&'a profile8_progress::IoCell>,
 }
 
 enum RemuxP8ControlStop {
@@ -3374,6 +3382,7 @@ fn run_cmd_controlled(
 ) -> Result<(), String> {
     let mut observer = || Ok(());
     let mut control = RemuxP8Control {
+        io: None,
         deadline,
         cancelled,
         observer: &mut observer,
@@ -3392,6 +3401,7 @@ fn run_cmd_capture_controlled(
 ) -> Result<Vec<u8>, String> {
     let mut observer = || Ok(());
     let mut control = RemuxP8Control {
+        io: None,
         deadline,
         cancelled,
         observer: &mut observer,
@@ -3498,20 +3508,37 @@ fn run_cmd_controlled_output(
         Observer(String),
     }
     let executable = args[0].to_string_lossy().into_owned();
-    let outcome = runner.run_until(
+    let outcome = runner.run_until_with_pid(
         control.deadline,
         std::time::Duration::from_millis(50),
-        || match control.check(&executable) {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(RemuxP8ControlStop::Cancelled(_)) => ControlFlow::Break(Stop::Cancelled),
-            Err(RemuxP8ControlStop::Deadline(_)) => ControlFlow::Break(Stop::Deadline),
-            Err(RemuxP8ControlStop::Observer(error)) => ControlFlow::Break(Stop::Observer(error)),
+        |pid| {
+            if let (Some(pid), Some(io)) = (pid, control.io) {
+                if let Some(sample) = profile8_progress::sample_process_io(pid) {
+                    io.set(Some(sample));
+                }
+            }
+            match control.check(&executable) {
+                Ok(()) => ControlFlow::Continue(()),
+                Err(RemuxP8ControlStop::Cancelled(_)) => ControlFlow::Break(Stop::Cancelled),
+                Err(RemuxP8ControlStop::Deadline(_)) => ControlFlow::Break(Stop::Deadline),
+                Err(RemuxP8ControlStop::Observer(error)) => {
+                    ControlFlow::Break(Stop::Observer(error))
+                }
+            }
         },
     );
     match outcome {
         Ok(SupervisedOutcome::Exited(output)) if output.status.success() => Ok(output.stdout),
         Ok(SupervisedOutcome::Exited(output)) => {
             let tail = String::from_utf8_lossy(&output.stderr);
+            // Tools can hit ENOSPC/EDQUOT between periodic quota checks. Do
+            // not spend more storage on HDR10 fallback after a reported limit.
+            let lower = tail.to_ascii_lowercase();
+            if lower.contains("no space left on device") || lower.contains("disk quota exceeded") {
+                return Err(RemuxP8Error::Observer(
+                    "Profile-8 cache storage limit reached".into(),
+                ));
+            }
             Err(RemuxP8Error::Pipeline(format!(
                 "{executable}: {}",
                 tail.trim()
@@ -3593,11 +3620,11 @@ fn check_mp4_signal_control(control: &mut RemuxP8Control<'_>) -> Result<(), Remu
 }
 
 fn read_mp4_box(
-    file: &mut std::fs::File,
+    file: &mut (impl std::io::Read + std::io::Seek),
     offset: u64,
     parent_end: u64,
 ) -> Result<Mp4BoxSpan, String> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::SeekFrom;
 
     let remaining = parent_end
         .checked_sub(offset)
@@ -3641,7 +3668,7 @@ fn read_mp4_box(
 }
 
 fn find_profile8_sample_entry_path(
-    file: &mut std::fs::File,
+    file: &mut (impl std::io::Read + std::io::Seek),
     start: u64,
     end: u64,
     depth: usize,
@@ -3696,7 +3723,7 @@ fn find_profile8_sample_entry_path(
 }
 
 fn profile8_sample_entry_path(
-    file: &mut std::fs::File,
+    file: &mut (impl std::io::Read + std::io::Seek),
     file_len: u64,
     control: &mut RemuxP8Control<'_>,
 ) -> Result<Vec<Mp4BoxSpan>, RemuxP8Error> {
@@ -3709,7 +3736,7 @@ fn profile8_sample_entry_path(
 }
 
 fn validate_profile8_media_data_layout(
-    file: &mut std::fs::File,
+    file: &mut (impl std::io::Read + std::io::Seek),
     file_len: u64,
     moov: Mp4BoxSpan,
     control: &mut RemuxP8Control<'_>,
@@ -3729,7 +3756,7 @@ fn validate_profile8_media_data_layout(
 }
 
 fn entry_has_dolby_vision_configuration(
-    file: &mut std::fs::File,
+    file: &mut (impl std::io::Read + std::io::Seek),
     entry: Mp4BoxSpan,
     control: &mut RemuxP8Control<'_>,
 ) -> Result<bool, RemuxP8Error> {
@@ -3754,7 +3781,7 @@ fn entry_has_dolby_vision_configuration(
 }
 
 fn insert_mp4_bytes(
-    file: &mut std::fs::File,
+    file: &mut profile8_progress::SignalingFile<'_>,
     file_len: u64,
     insert_at: u64,
     bytes: &[u8],
@@ -3770,8 +3797,9 @@ fn insert_mp4_bytes(
         .checked_add(growth)
         .ok_or_else(|| "MP4 file size overflow".to_string())?;
     check_mp4_signal_control(control)?;
-    file.set_len(grown_len)
-        .map_err(|error| format!("extend MP4 staging file: {error}"))?;
+    file.file
+        .set_len(grown_len)
+        .map_err(|error| profile8_progress::staging_io_error("extend MP4 staging file", error))?;
     const MOVE_CHUNK_BYTES: u64 = 64 * 1024;
     let mut buffer = [0u8; MOVE_CHUNK_BYTES as usize];
     let mut read_end = file_len;
@@ -3788,13 +3816,17 @@ fn insert_mp4_bytes(
             .ok_or_else(|| "MP4 move offset overflow".to_string())?;
         file.seek(SeekFrom::Start(write_start))
             .and_then(|_| file.write_all(&buffer[..chunk_len]))
-            .map_err(|error| format!("write MP4 tail at byte {write_start}: {error}"))?;
+            .map_err(|error| {
+                profile8_progress::staging_io_error("write MP4 staging tail", error)
+            })?;
         read_end = read_start;
     }
     check_mp4_signal_control(control)?;
     file.seek(SeekFrom::Start(insert_at))
         .and_then(|_| file.write_all(bytes))
-        .map_err(|error| format!("write Dolby Vision MP4 signaling: {error}"))?;
+        .map_err(|error| {
+            profile8_progress::staging_io_error("write Dolby Vision MP4 signaling", error)
+        })?;
     Ok(())
 }
 
@@ -3818,6 +3850,10 @@ fn signal_profile8_in_mp4_with_control(
         .metadata()
         .map_err(|error| format!("stat {}: {error}", path.display()))?
         .len();
+    let mut file = profile8_progress::SignalingFile {
+        file: &mut file,
+        io: control.io,
+    };
     let spans = profile8_sample_entry_path(&mut file, file_len, control)?;
     let entry = spans
         .last()
@@ -3863,7 +3899,9 @@ fn signal_profile8_in_mp4_with_control(
         check_mp4_signal_control(control)?;
         file.seek(SeekFrom::Start(offset))
             .and_then(|_| file.write_all(&grown.to_be_bytes()))
-            .map_err(|error| format!("update MP4 box size at byte {offset}: {error}"))?;
+            .map_err(|error| {
+                profile8_progress::staging_io_error("update MP4 staging box size", error)
+            })?;
     }
     Ok(())
 }
@@ -3877,6 +3915,7 @@ fn signal_profile8_in_mp4(
 ) -> Result<(), String> {
     let mut observer = || Ok(());
     let mut control = RemuxP8Control {
+        io: None,
         deadline,
         cancelled,
         observer: &mut observer,
@@ -3931,6 +3970,7 @@ pub fn run_remux_p8_controlled_observed(
 ) -> Result<(), RemuxP8Error> {
     let toolchain = {
         let mut control = RemuxP8Control {
+            io: None,
             deadline,
             cancelled,
             observer: &mut observer,
@@ -3960,6 +4000,7 @@ pub fn run_remux_p8_file_controlled_observed(
 ) -> Result<(), RemuxP8Error> {
     let toolchain = {
         let mut control = RemuxP8Control {
+            io: None,
             deadline,
             cancelled,
             observer: &mut observer,
@@ -4008,10 +4049,128 @@ pub fn run_remux_p8_with_toolchain_observed(
         input,
         dest_part,
         plan,
-        deadline,
-        cancelled,
-        &mut observer,
+        Profile8StageRunner {
+            deadline,
+            cancelled,
+            observer: &mut |_| observer(),
+            progress_interval: std::time::Duration::ZERO,
+        },
     )
+}
+
+/// Snapshot-pinned producer with bounded, typed stage diagnostics. Progress is
+/// reported at most every 50 ms, plus stage boundaries. An observer rejection
+/// stops and reaps the current helper, exactly as the compatibility observer.
+/// Final-mux events follow successful conversion and signaling; they permit
+/// indexing, but do not themselves prove that a complete playable fragment or
+/// validated reusable output exists. No event contains a source path or stderr.
+pub fn run_remux_p8_with_toolchain_stage_observed(
+    toolchain: &Profile8ToolchainSnapshot,
+    input: RemuxP8Input<'_>,
+    dest_part: &std::path::Path,
+    plan: &TranscodePlan,
+    deadline: std::time::Instant,
+    cancelled: &std::sync::atomic::AtomicBool,
+    mut observer: impl FnMut(RemuxP8StageEvent) -> Result<(), String>,
+) -> Result<(), RemuxP8Error> {
+    run_remux_p8_impl(
+        toolchain,
+        input,
+        dest_part,
+        plan,
+        Profile8StageRunner {
+            deadline,
+            cancelled,
+            observer: &mut observer,
+            progress_interval: std::time::Duration::from_millis(50),
+        },
+    )
+}
+
+struct Profile8StageRunner<'a> {
+    deadline: std::time::Instant,
+    cancelled: &'a std::sync::atomic::AtomicBool,
+    observer: &'a mut dyn FnMut(RemuxP8StageEvent) -> Result<(), String>,
+    progress_interval: std::time::Duration,
+}
+
+impl Profile8StageRunner<'_> {
+    fn run<T>(
+        &mut self,
+        stage: RemuxP8Stage,
+        input_bytes: Option<u64>,
+        output: Option<&Path>,
+        operation: impl FnOnce(&mut RemuxP8Control<'_>) -> Result<T, RemuxP8Error>,
+    ) -> Result<T, RemuxP8Error> {
+        use std::time::Instant;
+        let started = Instant::now();
+        let io = std::cell::Cell::new(
+            matches!(stage, RemuxP8Stage::Signaling | RemuxP8Stage::PacketRewrite).then_some(
+                RemuxP8StageIo {
+                    read_bytes: 0,
+                    written_bytes: 0,
+                    storage_read_bytes: None,
+                    storage_written_bytes: None,
+                    basis: RemuxP8IoBasis::ApplicationCounters,
+                },
+            ),
+        );
+        let event = |status| RemuxP8StageEvent {
+            stage,
+            status,
+            elapsed: started.elapsed(),
+            input_bytes,
+            output_bytes: output.and_then(file_length),
+            io: io.get(),
+        };
+        let result = (|| {
+            (self.observer)(event(RemuxP8StageStatus::Started)).map_err(RemuxP8Error::Observer)?;
+            let mut last = started;
+            let mut observe = || {
+                if last.elapsed() >= self.progress_interval {
+                    last = Instant::now();
+                    (self.observer)(event(RemuxP8StageStatus::Progress))?;
+                }
+                Ok(())
+            };
+            let mut control = RemuxP8Control {
+                deadline: self.deadline,
+                cancelled: self.cancelled,
+                observer: &mut observe,
+                io: Some(&io),
+            };
+            control
+                .check("Profile-8 stage")
+                .map_err(RemuxP8Error::from)?;
+            let result = operation(&mut control)?;
+            control
+                .check("Profile-8 stage")
+                .map_err(RemuxP8Error::from)?;
+            Ok(result)
+        })();
+        let status = match &result {
+            Ok(_) => RemuxP8StageStatus::Succeeded,
+            Err(RemuxP8Error::Pipeline(_)) => RemuxP8StageStatus::Failed,
+            Err(RemuxP8Error::Cancelled(_)) => RemuxP8StageStatus::Cancelled,
+            Err(RemuxP8Error::Deadline(_)) => RemuxP8StageStatus::Deadline,
+            Err(RemuxP8Error::Observer(_)) => RemuxP8StageStatus::Rejected,
+        };
+        let observed = (self.observer)(event(status)).map_err(RemuxP8Error::Observer);
+        match result {
+            Ok(value) => {
+                if let Err(error) = observed {
+                    let _ = (self.observer)(event(RemuxP8StageStatus::Rejected));
+                    return Err(error);
+                }
+                Ok(value)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn file_length(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|metadata| metadata.len())
 }
 
 struct Profile8Commands {
@@ -4079,10 +4238,11 @@ fn profile8_commands(
         "-nostats".into(),
         "-y".into(),
         "-nostdin".into(),
-        "-fflags".into(),
-        "+genpts".into(),
+        // Keep the source sample boundaries and composition/decode timeline.
+        // Raw HEVC cannot carry container VFR timing or the audio offset.
+        "-copyts".into(),
         "-i".into(),
-        p8.as_os_str().to_os_string(),
+        source_arg.clone(),
         "-map".into(),
         "0:v:0".into(),
         "-c:v".into(),
@@ -4090,6 +4250,12 @@ fn profile8_commands(
         "-tag:v".into(),
         "hvc1".into(),
         "-an".into(),
+        "-map_chapters".into(),
+        "-1".into(),
+        "-strict".into(),
+        "unofficial".into(),
+        "-avoid_negative_ts".into(),
+        "disabled".into(),
         p8_mp4.as_os_str().to_os_string(),
     ];
     let mut mux = vec![
@@ -4098,6 +4264,9 @@ fn profile8_commands(
         "-nostats".into(),
         "-y".into(),
         "-nostdin".into(),
+        // Both inputs retain the original clock. The common output shift in
+        // live_frag_os_tail then makes decode times nonnegative together.
+        "-copyts".into(),
         "-i".into(),
         p8_mp4.as_os_str().to_os_string(),
         "-i".into(),
@@ -4137,9 +4306,7 @@ fn run_remux_p8_impl(
     input: RemuxP8Input<'_>,
     dest_part: &std::path::Path,
     plan: &TranscodePlan,
-    deadline: std::time::Instant,
-    cancelled: &std::sync::atomic::AtomicBool,
-    observer: &mut dyn FnMut() -> Result<(), String>,
+    mut stages: Profile8StageRunner<'_>,
 ) -> Result<(), RemuxP8Error> {
     let (src, source_file) = match input {
         RemuxP8Input::Path(src) => (src, None),
@@ -4163,78 +4330,130 @@ fn run_remux_p8_impl(
     } else {
         src.as_os_str().to_os_string()
     };
+    let source_bytes = source_file.map_or_else(
+        || file_length(src),
+        |file| file.metadata().ok().map(|m| m.len()),
+    );
     let commands = profile8_commands(toolchain, source_arg, &hevc, &p8, &p8_mp4, dest_part, plan);
-    let mut control = RemuxP8Control {
-        deadline,
-        cancelled,
-        observer,
-    };
     let result = (|| {
-        toolchain
-            .ffprobe
-            .verify_current("ffprobe")
-            .map_err(RemuxP8Error::Pipeline)?;
-        let output = run_cmd_controlled_output(
-            &commands.probe_level,
-            source_file,
-            Some(toolchain.ffprobe()),
-            true,
-            &mut control,
+        let level = stages.run(RemuxP8Stage::Probe, source_bytes, None, |control| {
+            toolchain
+                .ffprobe
+                .verify_current("ffprobe")
+                .map_err(RemuxP8Error::Pipeline)?;
+            let output = run_cmd_controlled_output(
+                &commands.probe_level,
+                source_file,
+                Some(toolchain.ffprobe()),
+                true,
+                control,
+            )?;
+            let level = String::from_utf8(output)
+                .map_err(|_| "ffprobe Dolby Vision level was not UTF-8".to_string())?;
+            level
+                .lines()
+                .find_map(|line| line.trim().parse::<u8>().ok())
+                .filter(|level| *level <= 63)
+                .ok_or_else(|| {
+                    RemuxP8Error::Pipeline(
+                        "ffprobe did not report a valid Dolby Vision level".into(),
+                    )
+                })
+        })?;
+        stages.run(
+            RemuxP8Stage::Extraction,
+            source_bytes,
+            Some(&hevc),
+            |control| {
+                toolchain
+                    .ffmpeg
+                    .verify_current("ffmpeg")
+                    .map_err(RemuxP8Error::Pipeline)?;
+                run_cmd_controlled_output(
+                    &commands.extract,
+                    source_file,
+                    Some(toolchain.ffmpeg()),
+                    false,
+                    control,
+                )
+            },
         )?;
-        let level = String::from_utf8(output)
-            .map_err(|_| "ffprobe Dolby Vision level was not UTF-8".to_string())?;
-        let level = level
-            .lines()
-            .find_map(|line| line.trim().parse::<u8>().ok())
-            .filter(|level| *level <= 63)
-            .ok_or_else(|| "ffprobe did not report a valid Dolby Vision level".to_string())?;
-
-        toolchain
-            .ffmpeg
-            .verify_current("ffmpeg")
-            .map_err(RemuxP8Error::Pipeline)?;
-        run_cmd_controlled_output(
-            &commands.extract,
-            source_file,
-            Some(toolchain.ffmpeg()),
-            false,
-            &mut control,
-        )?;
-        toolchain
-            .dovi_tool
-            .verify_current("dovi_tool")
-            .map_err(RemuxP8Error::Pipeline)?;
-        run_cmd_controlled_output(
-            &commands.convert,
-            None,
-            Some(toolchain.dovi_tool()),
-            false,
-            &mut control,
+        stages.run(
+            RemuxP8Stage::Conversion,
+            file_length(&hevc),
+            Some(&p8),
+            |control| {
+                toolchain
+                    .dovi_tool
+                    .verify_current("dovi_tool")
+                    .map_err(RemuxP8Error::Pipeline)?;
+                run_cmd_controlled_output(
+                    &commands.convert,
+                    None,
+                    Some(toolchain.dovi_tool()),
+                    false,
+                    control,
+                )
+            },
         )?;
         let _ = std::fs::remove_file(&hevc);
-        toolchain
-            .ffmpeg
-            .verify_current("ffmpeg")
-            .map_err(RemuxP8Error::Pipeline)?;
-        run_cmd_controlled_output(
-            &commands.wrap,
-            None,
-            Some(toolchain.ffmpeg()),
-            false,
-            &mut control,
+        stages.run(
+            RemuxP8Stage::Wrapping,
+            source_bytes,
+            Some(&p8_mp4),
+            |control| {
+                toolchain
+                    .ffmpeg
+                    .verify_current("ffmpeg")
+                    .map_err(RemuxP8Error::Pipeline)?;
+                run_cmd_controlled_output(
+                    &commands.wrap,
+                    source_file,
+                    Some(toolchain.ffmpeg()),
+                    false,
+                    control,
+                )
+            },
+        )?;
+        let rewrite_input_bytes = file_length(&p8)
+            .zip(file_length(&p8_mp4))
+            .and_then(|(raw, container)| raw.checked_add(container));
+        stages.run(
+            RemuxP8Stage::PacketRewrite,
+            rewrite_input_bytes,
+            Some(&p8_mp4),
+            |control| profile8_rewrite::rewrite(&p8_mp4, &p8, control),
         )?;
         let _ = std::fs::remove_file(&p8);
-        signal_profile8_in_mp4_with_control(&p8_mp4, level, &mut control)?;
-        toolchain
-            .ffmpeg
-            .verify_current("ffmpeg")
-            .map_err(RemuxP8Error::Pipeline)?;
-        run_cmd_controlled_output(
-            &commands.mux,
-            source_file,
-            Some(toolchain.ffmpeg()),
-            false,
-            &mut control,
+        stages.run(
+            RemuxP8Stage::Signaling,
+            file_length(&p8_mp4),
+            Some(&p8_mp4),
+            |control| signal_profile8_in_mp4_with_control(&p8_mp4, level, control),
+        )?;
+        // All mutable signaling is confined to the staging input above. The
+        // final mux uses empty/delayed moov and default-base-moof fragments;
+        // it has no faststart/global-sidx/header-patching pass after exposure.
+        let mux_input_bytes = source_bytes
+            .zip(file_length(&p8_mp4))
+            .and_then(|(source, video)| source.checked_add(video));
+        stages.run(
+            RemuxP8Stage::FinalMux,
+            mux_input_bytes,
+            Some(dest_part),
+            |control| {
+                toolchain
+                    .ffmpeg
+                    .verify_current("ffmpeg")
+                    .map_err(RemuxP8Error::Pipeline)?;
+                run_cmd_controlled_output(
+                    &commands.mux,
+                    source_file,
+                    Some(toolchain.ffmpeg()),
+                    false,
+                    control,
+                )
+            },
         )?;
         let _ = std::fs::remove_file(&p8_mp4);
         Ok(())
@@ -6264,6 +6483,7 @@ action = "audio-ac3"
         let before = {
             let mut observer = || Ok(());
             let mut control = RemuxP8Control {
+                io: None,
                 deadline,
                 cancelled: &cancelled,
                 observer: &mut observer,
@@ -6284,6 +6504,7 @@ action = "audio-ac3"
         let mut after_file = std::fs::File::open(&path).unwrap();
         let mut observer = || Ok(());
         let mut control = RemuxP8Control {
+            io: None,
             deadline,
             cancelled: &cancelled,
             observer: &mut observer,
@@ -7218,6 +7439,7 @@ encoder = "copy"
         let cancelled = std::sync::atomic::AtomicBool::new(false);
         let mut observer = || Ok(());
         let mut control = RemuxP8Control {
+            io: None,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
             cancelled: &cancelled,
             observer: &mut observer,
@@ -7280,6 +7502,7 @@ encoder = "copy"
         let cancelled = std::sync::atomic::AtomicBool::new(true);
         let mut observer = || Ok(());
         let mut control = RemuxP8Control {
+            io: None,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
             cancelled: &cancelled,
             observer: &mut observer,
@@ -7296,6 +7519,7 @@ encoder = "copy"
         let cancelled = std::sync::atomic::AtomicBool::new(false);
         let mut observer = || Ok(());
         let mut control = RemuxP8Control {
+            io: None,
             deadline: std::time::Instant::now(),
             cancelled: &cancelled,
             observer: &mut observer,
@@ -7723,6 +7947,7 @@ encoder = "copy"
         };
         let started = std::time::Instant::now();
         let mut control = RemuxP8Control {
+            io: None,
             deadline: started + std::time::Duration::from_secs(3),
             cancelled: &cancelled,
             observer: &mut observer,
@@ -7746,6 +7971,282 @@ encoder = "copy"
         }
         std::fs::remove_dir_all(tmp).unwrap();
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn profile8_helper_storage_exhaustion_does_not_allow_an_encode_fallback() {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let mut observer = || Ok(());
+        let mut control = RemuxP8Control {
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(3),
+            cancelled: &cancelled,
+            observer: &mut observer,
+            io: None,
+        };
+        let args = ["dd", "if=/dev/zero", "of=/dev/full", "bs=1024", "count=1"].map(OsString::from);
+        let error = run_cmd_controlled_output(&args, None, None, false, &mut control).unwrap_err();
+        assert!(matches!(error, RemuxP8Error::Observer(_)), "{error}");
+    }
+
+    #[cfg(unix)]
+    fn staged_profile8_test_tools(tmp: &Path) -> Profile8ToolchainSnapshot {
+        let (mp4, converted) = profile8_rewrite::test_fixture();
+        std::fs::write(tmp.join("wrapped.mp4"), mp4).unwrap();
+        std::fs::write(tmp.join("converted.hevc"), converted).unwrap();
+        write_executable_script(
+            &tmp.join("ffmpeg"),
+            &format!(
+                r#"if [ "$1" = -version ]; then echo ffmpeg-stage-test; exit; fi
+for arg in "$@"; do out="$arg"; done
+case "$out" in
+  *.p8.mp4) stage=Wrapping;;
+  *.hevc) stage=Extraction;;
+  *) stage=FinalMux;;
+esac
+if [ -f '{dir}/fail-'"$stage" ]; then echo 'malformed or truncated input' >&2; exit 7; fi
+if [ "$stage" = Wrapping ]; then cp '{dir}/wrapped.mp4' "$out"; else printf 'helper output' > "$out"; fi
+sleep 0.06"#,
+                dir = tmp.display()
+            ),
+        );
+        write_executable_script(
+            &tmp.join("ffprobe"),
+            &format!(
+                r#"if [ "$1" = -version ]; then echo ffprobe-stage-test; exit; fi
+if [ -f '{dir}/fail-Probe' ]; then exit 7; fi
+echo 6
+sleep 0.06"#,
+                dir = tmp.display()
+            ),
+        );
+        write_executable_script(
+            &tmp.join("dovi_tool"),
+            &format!(
+                r#"if [ "$1" = --version ]; then echo dovi-stage-test; exit; fi
+if [ -f '{dir}/fail-Conversion' ]; then echo 'malformed RPU' >&2; exit 7; fi
+for arg in "$@"; do out="$arg"; done
+if [ -f '{dir}/fail-PacketRewrite' ]; then printf 'truncated RPU' > "$out"; else cp '{dir}/converted.hevc' "$out"; fi
+sleep 0.06"#,
+                dir = tmp.display()
+            ),
+        );
+        fake_profile8_toolchain(tmp)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile8_stage_events_gate_final_mux_and_measure_signaling_work() {
+        let tmp = tool_test_dir("p8-stage-events");
+        let toolchain = staged_profile8_test_tools(&tmp);
+        let input = tmp.join("source.mkv");
+        let output = tmp.join("output.mp4.part");
+        std::fs::write(&input, "source identity").unwrap();
+        let file = std::fs::File::open(&input).unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let mut events = Vec::new();
+        run_remux_p8_with_toolchain_stage_observed(
+            &toolchain,
+            RemuxP8Input::OpenFile {
+                file: &file,
+                identity_path: &input,
+            },
+            &output,
+            &TranscodePlan::default(),
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            &cancelled,
+            |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let completed = events
+            .iter()
+            .filter(|e| e.status == RemuxP8StageStatus::Succeeded)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completed.iter().map(|e| e.stage).collect::<Vec<_>>(),
+            [
+                RemuxP8Stage::Probe,
+                RemuxP8Stage::Extraction,
+                RemuxP8Stage::Conversion,
+                RemuxP8Stage::Wrapping,
+                RemuxP8Stage::PacketRewrite,
+                RemuxP8Stage::Signaling,
+                RemuxP8Stage::FinalMux,
+            ]
+        );
+        let signal_index = events
+            .iter()
+            .position(|e| {
+                e.stage == RemuxP8Stage::Signaling && e.status == RemuxP8StageStatus::Succeeded
+            })
+            .unwrap();
+        assert!(events[..signal_index]
+            .iter()
+            .all(|e| e.stage != RemuxP8Stage::FinalMux));
+        let rewrite = completed[4];
+        assert_eq!(
+            rewrite.io.unwrap().basis,
+            RemuxP8IoBasis::ApplicationCounters
+        );
+        assert!(rewrite.io.unwrap().written_bytes > 0);
+        let signaling = completed[5];
+        assert_eq!(
+            signaling.output_bytes.unwrap(),
+            signaling.input_bytes.unwrap() + 32
+        );
+        let io = signaling.io.unwrap();
+        assert_eq!(io.basis, RemuxP8IoBasis::ApplicationCounters);
+        assert!(io.written_bytes >= 32 + 7 * 4);
+        assert!(io.read_bytes < signaling.input_bytes.unwrap());
+        assert_eq!(io.storage_written_bytes, None);
+        #[cfg(target_os = "linux")]
+        for stage in [
+            completed[0],
+            completed[1],
+            completed[2],
+            completed[3],
+            completed[6],
+        ] {
+            assert_eq!(stage.io.unwrap().basis, RemuxP8IoBasis::ProcessCounters);
+            assert!(stage.io.unwrap().read_bytes > 0);
+        }
+        for extension in ["hevc", "p8.hevc", "p8.mp4"] {
+            assert!(!output.with_extension(extension).exists());
+        }
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile8_failed_stages_never_start_a_later_stage() {
+        let tmp = tool_test_dir("p8-stage-failures");
+        let toolchain = staged_profile8_test_tools(&tmp);
+        let input = tmp.join("source.mkv");
+        let output = tmp.join("output.mp4.part");
+        std::fs::write(&input, "source identity").unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let stages = [
+            RemuxP8Stage::Probe,
+            RemuxP8Stage::Extraction,
+            RemuxP8Stage::Conversion,
+            RemuxP8Stage::Wrapping,
+            RemuxP8Stage::PacketRewrite,
+            RemuxP8Stage::Signaling,
+            RemuxP8Stage::FinalMux,
+        ];
+        let original_wrap = std::fs::read(tmp.join("wrapped.mp4")).unwrap();
+        for stage in stages {
+            let marker = tmp.join(format!("fail-{stage:?}"));
+            std::fs::write(&marker, "").unwrap();
+            let mut events = Vec::new();
+            let result = run_remux_p8_with_toolchain_stage_observed(
+                &toolchain,
+                RemuxP8Input::Path(&input),
+                &output,
+                &TranscodePlan::default(),
+                std::time::Instant::now() + std::time::Duration::from_secs(10),
+                &cancelled,
+                |event| {
+                    events.push(event);
+                    if stage == RemuxP8Stage::Signaling
+                        && event.stage == stage
+                        && event.status == RemuxP8StageStatus::Started
+                    {
+                        std::fs::write(output.with_extension("p8.mp4"), b"truncated moov").unwrap();
+                    }
+                    Ok(())
+                },
+            );
+            assert!(
+                matches!(result, Err(RemuxP8Error::Pipeline(_))),
+                "{stage:?}: {result:?}"
+            );
+            let last = events.last().unwrap();
+            assert_eq!(
+                (last.stage, last.status),
+                (stage, RemuxP8StageStatus::Failed)
+            );
+            assert!(!output.exists(), "failed pipeline published output");
+            for extension in ["hevc", "p8.hevc", "p8.mp4"] {
+                assert!(!output.with_extension(extension).exists());
+            }
+            std::fs::remove_file(marker).unwrap();
+            std::fs::write(tmp.join("wrapped.mp4"), &original_wrap).unwrap();
+        }
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile8_cancellation_and_pressure_at_each_stage_stop_the_pipeline() {
+        use std::sync::atomic::Ordering;
+        let tmp = tool_test_dir("p8-stage-stop");
+        let toolchain = staged_profile8_test_tools(&tmp);
+        let input = tmp.join("source.mkv");
+        let output = tmp.join("output.mp4.part");
+        std::fs::write(&input, "source identity").unwrap();
+        for rejected in [false, true] {
+            for stage in [
+                RemuxP8Stage::Probe,
+                RemuxP8Stage::Extraction,
+                RemuxP8Stage::Conversion,
+                RemuxP8Stage::Wrapping,
+                RemuxP8Stage::PacketRewrite,
+                RemuxP8Stage::Signaling,
+                RemuxP8Stage::FinalMux,
+            ] {
+                let cancelled = std::sync::atomic::AtomicBool::new(false);
+                let mut events = Vec::new();
+                let result = run_remux_p8_with_toolchain_stage_observed(
+                    &toolchain,
+                    RemuxP8Input::Path(&input),
+                    &output,
+                    &TranscodePlan::default(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(10),
+                    &cancelled,
+                    |event| {
+                        events.push(event);
+                        let stop_status = if matches!(
+                            stage,
+                            RemuxP8Stage::Signaling | RemuxP8Stage::PacketRewrite
+                        ) {
+                            RemuxP8StageStatus::Started
+                        } else {
+                            RemuxP8StageStatus::Progress
+                        };
+                        if event.stage == stage && event.status == stop_status {
+                            if rejected {
+                                return Err("cache free-space limit reached".into());
+                            }
+                            cancelled.store(true, Ordering::Release);
+                        }
+                        Ok(())
+                    },
+                );
+                let expected = if rejected {
+                    RemuxP8StageStatus::Rejected
+                } else {
+                    RemuxP8StageStatus::Cancelled
+                };
+                assert!(result.is_err());
+                let last = events.last().unwrap();
+                assert_eq!((last.stage, last.status), (stage, expected));
+                // The caller owns the final .part inode; interrupted output
+                // must never receive a validated/reusable completed stamp.
+                assert!(!cache_is_fresh_for_key(&output, "unused"));
+                if output.exists() {
+                    std::fs::remove_file(&output).unwrap();
+                }
+                for extension in ["hevc", "p8.hevc", "p8.mp4"] {
+                    assert!(!output.with_extension(extension).exists());
+                }
+            }
+        }
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
     #[test]
     fn validation_stamp_rejects_legacy_and_same_size_output_mutation() {
         let temp = tool_test_dir("validated-stamp");

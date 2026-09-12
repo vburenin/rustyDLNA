@@ -9,17 +9,19 @@ import { resolve, join, dirname, extname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "@playwright/test";
 import { summarizeRecords, compareReports } from "./playback-benchmark-summary.mjs";
+import { sourceBoundedQualityProfile } from "../crates/server/web/core.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = Object.fromEntries(process.argv.slice(2).map((arg) => {
   const [key, ...value] = arg.replace(/^--/, "").split("=");
   return [key, value.join("=") || true];
 }));
-const acceptedArguments = new Set(["help", "binary", "output", "samples", "recipes", "concurrency", "size", "fps", "duration", "rate", "sustain-seconds", "compare", "median-percent", "median-ms", "p95-percent", "p95-ms", "fixture", "tier", "encoder", "port", "build-profile"]);
+const acceptedArguments = new Set(["help", "binary", "output", "samples", "recipes", "concurrency", "size", "fps", "duration", "rate", "sustain-seconds", "compare", "median-percent", "median-ms", "p95-percent", "p95-ms", "fixture", "tier", "encoder", "port", "build-profile", "quality", "encoding-preset"]);
 if (Object.entries(args).some(([key, value]) => !acceptedArguments.has(key) || (key !== "help" && value === true))) {
   throw new Error("Unknown benchmark option or missing --option=value; see --help");
 }
 if (args.help) {
+  console.log("Preset experiments: --encoding-preset=balanced|fast_start|maximum_speed --quality=auto|uhd_high|uhd_optimized|full_hd|data_saver|sd_480|low_360. Quality follows the browser's source bounds; each validation records the requested preference and effective quality separately. Compare graph changes within the same preset; different presets can change quality and are not accepted by --compare as equivalent workloads.");
   console.log("node scripts/playback-benchmark.mjs --binary=target/debug/rusty-dlna --output=/tmp/playback.json --samples=10 --recipes=copy,audio,video,both --concurrency=1 --size=1280x720 --fps=24 --duration=40 --rate=1 --sustain-seconds=2 [--build-profile=debug|release|unknown] [--compare=/tmp/baseline.json] [--median-percent=25 --median-ms=50 --p95-percent=30 --p95-ms=100]\nOptional existing hardware/media tiers: --fixture=/path/to/35-600s-clip.mkv --tier=hdr10 --encoder=h264_nvenc (copies supplied media into the temporary library; maximum 8 GiB). Available encoders: libx264, h264_nvenc. CPU default generates SDR fixtures.");
   process.exit(0);
 }
@@ -31,6 +33,8 @@ const rate = Number(args.rate || 1);
 const size = String(args.size || "1280x720");
 const recipes = args.fixture ? ["external"] : String(args.recipes || "copy").split(",");
 const encoder = String(args.encoder || "libx264");
+const requestedQuality = String(args.quality || "auto");
+const encodingPreset = String(args["encoding-preset"] || "balanced");
 const buildProfile = String(args["build-profile"] || "unknown");
 const sustainSeconds = Number(args["sustain-seconds"] || 2);
 if (!Number.isInteger(samples) || samples < 1 || samples > 1000
@@ -39,6 +43,8 @@ if (!Number.isInteger(samples) || samples < 1 || samples > 1000
   || !Number.isFinite(duration) || duration < 35 || duration > 600
   || !Number.isFinite(sustainSeconds) || sustainSeconds < 0.5 || sustainSeconds > 30
   || !["libx264", "h264_nvenc"].includes(encoder) || !["debug", "release", "unknown"].includes(buildProfile)
+  || !["auto", "uhd_high", "uhd_optimized", "full_hd", "data_saver", "sd_480", "low_360"].includes(requestedQuality)
+  || !["balanced", "fast_start", "maximum_speed"].includes(encodingPreset)
   || !recipes.every((r) => ["copy", "audio", "video", "both", ...(args.fixture ? ["external"] : [])].includes(r)) || new Set(recipes).size !== recipes.length) {
   throw new Error("Invalid bounded benchmark options; see --help");
 }
@@ -106,7 +112,7 @@ const report = {
     unmeasured_tiers: ["Dedicated GPU decode/encode/compute/VRAM telemetry", "P7/P8 conversion", "HDR10/HLG/Dolby Vision presentation", "Physical device rendering", "Cold storage/page cache", "Concurrent scanner/artwork workload"],
     unavailable_tiers: [],
   },
-  configuration: { samples, concurrency, duration, fps, rate, size, recipes, encoder, build_profile: buildProfile, tier: String(args.tier || (args.fixture ? "external" : "cpu-sdr")), sustain_seconds: sustainSeconds, quality: "auto", encoding_preset: "balanced", delivery: "MSE (Android Chromium UA; native HLS capability disabled; actual resource requests verified)" },
+  configuration: { samples, concurrency, duration, fps, rate, size, recipes, encoder, build_profile: buildProfile, tier: String(args.tier || (args.fixture ? "external" : "cpu-sdr")), sustain_seconds: sustainSeconds, quality: requestedQuality, encoding_preset: encodingPreset, delivery: "MSE (Android Chromium UA; native HLS capability disabled; actual resource requests verified)" },
   limitations: ["Generated audio ends one second before video. An earlier audio-longest fixture exposed a selected-track-tail indexing failure; this CPU subset does not cover that separate case.", "Active attachment/cancellation are unavailable when a producer finishes before it can be observed; completed-job cleanup is never counted as cancellation.", "Process samples include harness, browser, server, and live descendants; short-lived children between samples can be missed.", "Shared developer host: unrelated workloads are not stopped. Host load averages and CPU frequency are recorded; they do not establish controlled hardware isolation.", "External --fixture/--tier and existing --encoder settings exercise normal browser negotiation, not an artificial forced GPU, Dolby Vision, or P7/P8 pipeline. Requested tier names are descriptive; actual output probe and browser recipe determine what ran."],
   measurement_windows: {
     resource_sampling: "sampler_wall_ms is cumulative time spent in processSnapshot sampling, not the resource window duration. Samples can overlap the operation and impose observer overhead; do not subtract this value from browser latency or wall_ms.",
@@ -275,13 +281,15 @@ async function openPlayback(item, mode = "compat", { awaitFrame = true, beforeMe
       await route.continue();
     });
   }
-  await page.addInitScript(({ mode, rate }) => {
+  await page.addInitScript(({ mode, rate, quality, encodingPreset }) => {
     const canPlayType = HTMLMediaElement.prototype.canPlayType;
     HTMLMediaElement.prototype.canPlayType = function(type) {
       return String(type).includes("mpegurl") ? "" : canPlayType.call(this, type);
     };
     localStorage.setItem("rustydlna.stream", mode);
     localStorage.setItem("rustydlna.rate", String(rate));
+    localStorage.setItem("rustydlna.quality", quality);
+    localStorage.setItem("rustydlna.encodingPreset", encodingPreset);
     const state = window.__playbackBench = { start: null, first: null, frames: 0, stages: [], records: [], sourceOffset: 0 };
     const fetchMedia = window.fetch;
     window.fetch = function(input, options) {
@@ -314,7 +322,7 @@ async function openPlayback(item, mode = "compat", { awaitFrame = true, beforeMe
       video.requestVideoFrameCallback(frame);
       for (const event of ["loadstart", "loadedmetadata", "loadeddata", "canplay", "playing", "seeking", "seeked", "waiting", "error"]) video.addEventListener(event, () => { if (state.stages.length < 128) state.stages.push({ event, ms: performance.now() - state.start, media: video.currentTime }); });
     });
-  }, { mode, rate });
+  }, { mode, rate, quality: requestedQuality, encodingPreset });
   await page.goto(`${base}/?view=video`);
   await page.waitForFunction(() => document.querySelectorAll(".media-card").length > 0);
   await page.evaluate((id) => {
@@ -472,14 +480,24 @@ function decodedHashes(path) {
 }
 
 const sourceFrameHashes = new Map();
-async function validateOutput(recipe, artifact, requested, sample) {
+async function validateOutput(recipe, artifact, requested, sample, { item, capabilities }) {
   const fixture = report.fixtures.find((entry) => entry.recipe === recipe);
   const probe = JSON.parse(command("ffprobe", ["-v", "error", "-show_streams", "-show_format", "-of", "json", artifact]));
   const video = probe.streams.find((stream) => stream.codec_type === "video");
   const audio = probe.streams.find((stream) => stream.codec_type === "audio");
   const sourceVideo = fixture.probe.streams.find((stream) => stream.codec_type === "video");
   const videoCopy = requested.video_mode === "copy";
-  const expectedVideoCopy = ["copy", "audio"].includes(recipe);
+  if (!Array.isArray(capabilities?.quality_profiles) || !capabilities.quality_profiles.length) {
+    throw new Error("Advertised quality profiles unavailable for output validation");
+  }
+  const effectiveQuality = sourceBoundedQualityProfile(
+    capabilities.quality_profiles, requestedQuality, item, capabilities.ai_upscale,
+  );
+  if ((requested.quality || "auto") !== effectiveQuality
+    || (!videoCopy && (requested.encoding_preset || "balanced") !== encodingPreset)) {
+    throw new Error(`Expected effective quality ${effectiveQuality} from preference ${requestedQuality}, with preset ${encodingPreset}: ${JSON.stringify(requested)}`);
+  }
+  const expectedVideoCopy = effectiveQuality === "auto" && ["copy", "audio"].includes(recipe);
   if (recipe !== "external" && (videoCopy !== expectedVideoCopy || requested.audio_mode !== (["copy", "video"].includes(recipe) ? "copy" : "transcode"))) {
     throw new Error(`Requested recipe differs from ${recipe}: ${JSON.stringify(requested)}`);
   }
@@ -504,6 +522,7 @@ async function validateOutput(recipe, artifact, requested, sample) {
     decoded_frames_sampled: outputFrames.length, encoded_output_decoded_hash_sha256: sha256(outputFrames.join("\n")),
     scope: "Requested profile video encode; bounded output decoded-frame hashes can verify identical before/after frames. Output codec, dimensions, pixel format, frame rate, bitrate, and color metadata are recorded. No perceptual quality score or full-movie equality inferred." };
   const validation = { id: report.validations.length, recipe, sample, requested, output_probe: probe, output_bytes: (await stat(artifact)).size,
+    quality_selection: { requested: requestedQuality, effective: effectiveQuality },
     stamp_bytes: (await stat(`${artifact}.src`)).size, quality, outside_latency_measurements: true };
   report.validations.push(validation);
   return validation.id;
@@ -653,7 +672,7 @@ try {
           }
           const artifact = await waitForCompletedArtifact(item);
           const requested = players[0].requests.find((request) => request.recipe.delivery === "mse").recipe;
-          const validationId = workload === "cold" ? await validateOutput(recipe, artifact, requested, sample)
+          const validationId = workload === "cold" ? await validateOutput(recipe, artifact, requested, sample, { item, capabilities: library.capabilities })
             : report.validations.findLast((value) => value.recipe === recipe && value.sample === sample).id;
           records.forEach((record) => { record.validation_id = validationId; });
           if (workload === "warm") {

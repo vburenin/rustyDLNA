@@ -33,6 +33,12 @@ const validated = {...before, validations:[{recipe:'copy', requested:{quality:'a
 const changedOutput = structuredClone(validated);
 changedOutput.validations[0].output_probe.streams[0].width = 640;
 assert.equal(compareReports(validated, changedOutput).comparable, false);
+const changedPreset = structuredClone(validated);
+changedPreset.configuration.encoding_preset = 'maximum_speed';
+assert.equal(compareReports(validated, changedPreset).comparable, false);
+const changedRecipePreset = structuredClone(validated);
+changedRecipePreset.validations[0].requested.encoding_preset = 'fast_start';
+assert.equal(compareReports(validated, changedRecipePreset).comparable, false);
 const starved = {...validated, records:[{sustained:{progression_within_tolerance:false}}]};
 assert.equal(compareReports(starved, validated).comparable, false);
 assert.deepEqual(compareReports(starved, validated).workloads, {});

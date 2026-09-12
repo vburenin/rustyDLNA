@@ -3,6 +3,9 @@
 - Status: bundles A (R01–R05), B (P01–P04/P11), and C structural fixes
   (P05/P06/P10) implemented. P07 has measured opt-in resource and pacing
   prototypes; production scheduling/threading/pacing defaults remain unchanged.
+  Bundle D implements P09 source-timing repair, bounded stage diagnostics and
+  measured final-mux growing delivery. P08 device residency and the larger P09
+  raw streaming pipeline remain disabled after their correctness experiments.
   Measurement and verification limits are recorded below; other findings retain
   their individual implementation status. Bundle A's earlier parallel-browser failures and unresolved
   FFmpeg 6 helper crashes remain part of the verification record.
@@ -13,8 +16,8 @@
   scanner/catalog/protocols, and browser/API behavior; focused local reproductions
   and the configured quality gates.
 - This is the local plan file explicitly requested by the user. Finding evidence
-  and source locations below describe the original review baseline; each R01–R05
-  and P01–P04/P11 implementation note records the resulting behavior and
+  and source locations below describe the original review baseline; individual
+  implementation notes record the resulting behavior and
   verification limits.
 
 ## Goal
@@ -104,7 +107,7 @@ experiments, not a formal proof or a claim that every production combination ran
 | Warm completed output | Identity/stamp check and pinned open; **no repeated FFprobe on cache hit** | P02 maintenance and P06 rebuilding indexes remain |
 | Compatible seek | MSE reuses buffered media when timeline, decoder prerequisites and source semantics match; other seeks restart | P04 avoids source replacement for eligible buffered seeks |
 | Encoded indexed output | One-second forced IDRs, 30-second initial burst then 1x pacing | Preserve known startup/timing fixes; measure P07 rate/concurrency behavior |
-| P7 → P8 remap | Sequential whole-file stages, then final validation/publication | P09 is a substantially larger change than ordinary remux tuning |
+| P7 → P8 remap | Private whole-file conversion with source-timing repair, then guarded growing final mux and validated publication | P09 reduces final-mux delivery delay; earlier whole-file stages remain |
 
 ## Bundle A implementation verification
 
@@ -515,6 +518,73 @@ other GPU families, AI-upscale execution, cgroup quota enforcement, cold storage
 remain unavailable or outside these exercised surfaces. No production defaults,
 fixtures, lockfiles or live configuration were changed. Commit and push are
 authorized for this bundle C handoff; deployment remains outside scope.
+
+## Bundle D verification
+
+The final canonical `./scripts/agent-verify.sh` run passes on Rust 1.98.1 with
+temporary `DOVI_TOOL` pointing to 2.3.3. It includes 121 Python tests, 102 web
+unit tests, formatting, Clippy with warnings denied, workspace tests, Rust
+documentation, fixture checksums, CLI maintenance, eight explicitly enabled
+socket tests and port isolation. Ten opt-in Rust scale/streaming benchmarks
+remain intentionally ignored by that gate. Its first run failed one unmodified
+watcher test (`real_inotify_tracks_a_hard_link_writer_unlinked_before_close`)
+with a catalog timeout; that test passed independently and in the complete
+rerun. No watcher code or timeout was changed. Logs remain outside Git as
+`/tmp/rustydlna-bundle-d-agent-verify.log`, `-agent-verify-rerun.log` and
+`-agent-verify-final.log` (after the final benchmark-reporting corrections).
+
+Focused regressions exercise genuine MEL CFR/VFR with FFmpeg 6.1.1 and 8.0.1
+and dovi_tool 2.3.3, without tool-availability skips. They compare decoded
+video/audio, source packet timing, selected audio offsets, RPU bytes, signaling
+and seeks. Parser, every-stage cancellation/failure/pressure, real ENOSPC,
+pre-exposure readiness, pinned failure, final validation and atomic publication
+tests pass. GPU and actual HTTP measurements, sample counts, variability,
+correctness failures and deliberate no-go decisions are recorded in P08/P09.
+
+The full Playwright matrix with default 16 workers completed 908 cases:
+749 passed, 150 skipped and nine failed. All nine failures passed unchanged
+with `--last-failed --workers=1`. Four Firefox traces spent 20.6–27.9 seconds
+of their 30-second budgets loading the initial page; two others stalled on
+initial library fetches. Three WebKit first-frame failures use intercepted
+direct H.264 and bypass Profile-8 entirely. This supports load sensitivity,
+but does not establish a passing parallel matrix. The 150 existing skips cover
+project-specific codecs, MSE/native HLS, fullscreen and mobile layouts; they
+are not passes. Browser assets, tests and worker settings were not changed.
+Logs are `/tmp/rustydlna-bundle-d-playwright.log` and `-playwright-rerun.log`;
+original traces are retained in `-playwright-first-artifacts.tar.gz`.
+
+`scripts/helper-load.sh` passes 24 requests within its existing limits:
+sampled peaks 59,280 KiB RSS, 64 threads, 40 FDs and one process; cache
+890,521 bytes; longest response 0.584 seconds. Short helpers can escape
+sampling, so the process peak is not a claim that no helper ran. Log:
+`/tmp/rustydlna-bundle-d-helper-load.log`.
+
+A separate one-trial Chromium MSE check uses a generated 60-second 720p24
+MPEG-2 SDR/AAC source, existing Balanced H.264 NVENC/AAC-copy output and
+source-bounded `full_hd`→`data_saver` selection. Both 25-second windows pass
+at 1× (600/599 presented frames, zero reported drops, no endpoint reached).
+Warm stamped reuse, live attachment, buffered/paused/restart seeks and actual
+helper cancellation (279 ms) pass. This validates the benchmark's requested/
+effective-quality reporting and bounded playback; one trial establishes no
+performance gain. An initial 30-second-window trial reached the clip endpoint
+and is retained as inconclusive. Reports: `/tmp/rustydlna-bundle-d-sustained.json`
+and `-sustained-final.json`, with matching logs.
+
+The fixed-tree 120-second soak passes 12 socket/restart cycles over 121 seconds:
+sampled peaks two processes, nine threads, nine FDs, 56,780 KiB RSS,
+921,605 database bytes and 10,531 cache bytes; no temporary-tree leaks.
+`/tmp/rustydlna-bundle-d-soak.tsv` records the exact source fingerprint before
+this verification-note update; production code is unchanged. The soak and
+performance measurements ran separately. This is not a 24-hour soak or
+feature-length display test.
+
+No physical Dolby Vision display, genuine FEL video, UHD conversion workload,
+other GPU family, driver reset, physical VRAM exhaustion, cold-storage run,
+privileged network suite, Docker release smoke or fuzz campaign was validated
+for this bundle. Unvalidated GPU residency and concurrent raw conversion stay
+disabled. Tracked fixtures, lockfiles, user media, live configuration, drivers
+and deployment remain unchanged. Commit and push are authorized for this
+bundle D handoff; deployment remains outside scope.
 
 ## Original review evidence and verification
 
@@ -1064,6 +1134,47 @@ only from a dedicated representative workload, not the cache microbenchmark.
 
 ### P08 — Benchmark selective GPU paths without sacrificing compatibility
 
+**Measured prototype; no-go for production activation.** The supervised
+`gpu_graph` example compares software decode, the established CUDA download
+boundary and device-resident NVENC input at the same output profile/preset.
+RTX 3050 8 GiB, driver 555.42.06, native FFmpeg 6.1.1/libplacebo 6.338.2:
+five rotated trials per graph/preset on generated 8-second 1080p24 HEVC8 SDR/AAC
+to 720p H.264/AAC-copy measured download→resident median helper duration
+1,029.5→951.9 ms (Balanced), 1,131.8→989.7 ms (Fast start), and
+970.3→1,013.4 ms (Maximum speed). Respective sample standard deviations were
+31.7→80.2, 114.5→59.4, and 39.4→61.6 ms. All 45 helpers completed successfully;
+decoded quality checks captured the first trial of each graph/preset. Those
+matched CUDA graph pairs had identical 192 decoded frames. SSIM against a lossless
+CUDA-scaled reference was 0.994903/0.994903/0.994806 by preset. Preset quality
+differences and the software scaler's different pixels are not graph gains.
+
+The same resident candidate **fails after 48 of 96 frames** when generated
+HEVC8 begins signaling BT.709 in a later SPS; the established download graph
+completes all 96. `gpu_graph --context-change` reproduces this failure. No
+production GPU selection, preset, resource policy or cache identity changes.
+Bounded probes distinguish unsupported AV1 encode/High10 hardware decode,
+invalid device index, address-space pressure and malformed input. A real
+driver reset and physical VRAM exhaustion were not performed.
+
+A separate 40-second workload completed 960 frames per output with matching
+CUDA-pair pixels/timing, but has only one sample per graph/preset. Sampled
+decode/encode/SM utilization reached 73%/100%/49%; peak whole-device VRAM was
+256–272 MiB for download and 254–258 MiB for resident. Exact transfer traffic,
+cold storage, feature-length playback and HDR10/HLG/P5/P7/P8 candidate display
+quality remain unvalidated. These shared-host observations do not support
+changing defaults.
+
+P01 Chromium/MSE measurements use the existing production NVENC path, generated
+40-second 720p24 MPEG-2 SDR/AAC→720p H.264/AAC-copy, three independent trials per
+preset. Cold / validated warm / live attachment / actual cancellation medians
+were 563.5/52.7/160.6/354.85 ms (Balanced), 473.2/47.5/166.8/326.55 ms
+(Fast start), and 488.5/52.1/144.9/330.70 ms (Maximum speed). Cold sample standard
+deviations were 96.02/25.31/48.95 ms. All 63 records and 18 short sustained
+windows passed their checks. These are descriptive preset comparisons, not
+resident-graph browser gains or reliable tail estimates. Reports remain outside
+Git at `/tmp/rustydlna-p08-*`; the complete environment, recipes, sample records,
+limitations and report paths are in `/tmp/rustydlna-p08-handoff.md`.
+
 **P2 · Experiment · L.** Current code deliberately software-decodes some H.264/P7
 sources (`crates/transcode/src/lib.rs:549–598`) and downloads scaled CUDA or Vulkan
 frames for stable encoder input (`:1159–1180`, `:1242–1274`). CUDA HDR fallback can
@@ -1091,6 +1202,60 @@ measure the exact graph, not assume a result.
 [FFmpeg hardware options](https://ffmpeg.org/ffmpeg.html#Advanced-Video-options))
 
 ### P09 — Reduce whole-file Profile-8 preprocessing
+
+**Implemented timing repair, stage diagnostics and guarded final-mux delivery;
+larger streaming pipeline remains a no-go.** Experiments found a correctness
+defect in the former raw-HEVC wrapping path: genuine MEL retimed to VFR lost
+1.043 seconds by its last video timestamp despite identical decoded pixels.
+The corrected pipeline wraps the original source with `-copyts`, verifies
+converted BL VCL/sample association, replaces RPU and drops EL inside existing
+MP4 chunks, preserving timing/edit tables. Final audio and video share the
+source clock. The cache revision is `profile8-source-timeline-v3`.
+No new dependency or parallel media-helper pipeline was introduced.
+
+Real FFmpeg 6.1.1 and 8.0.1 with dovi_tool 2.3.3 pass genuine MEL CFR/VFR
+regressions for per-track PTS/DTS/duration against direct remux, all 259 decoded
+BL frames, selected offset audio, three seeks and converted RPU bytes. A repeated
+5.4-minute MEL source also matches all 7,770 decoded frames and packet timing.
+Profile-8 initialization includes `dvvC`/`hvc1`, PQ/BT.2020 and ten-bit video.
+FEL residual image information is explicitly discarded by the existing policy;
+genuine FEL video and physical Dolby Vision display validation remain unavailable.
+
+Seven stages report bounded elapsed/file-size/I/O diagnostics. Packet rewrite
+and signaling count application I/O; child counters are sampled, explicitly
+incomplete lower bounds. On the long fixture, packet rewrite read 5,271,535 bytes
+and wrote 2,177,153 bytes; signaling separately read 122,005 and wrote 121,857
+bytes against a 3,057,941-byte staging MP4. Signaling is not a whole-movie copy.
+Five-sample pipeline medians increased from 708.738 ms (SD 3.378) to 792.478 ms
+(SD 2.391), an 83.740 ms/11.8% correctness cost, explained by packet rewrite
+83.793 ms (SD 2.243). The short pipeline's apparent 47 ms decrease is polling/
+scheduling noise and is not claimed as an optimization.
+
+After prerequisite success, final-mux exposure uses the existing bounded copied
+segment index and immediate quota check. Full validation and atomic stamps still
+precede Complete; pinned failures cannot replace a reader's generation. Five
+fresh-server/cache HTTP trials per arm isolate this change using the **same
+corrected conversion recipe**: median first-body 955.915 ms (SD 30.517) when
+kept private versus 671.020 ms (SD 24.888) while growing, a 284.895 ms/29.8%
+improvement. First complete fragment was 956.116→671.203 ms. All cold/warm
+outputs were byte-identical (28,675,419 bytes); warm-cache first-body medians
+7.519→7.289 ms are reported separately and launch no new conversion. Separate
+active-producer attachment samples (one per arm) were 368.831→49.569 ms and
+confirmed one producer. Sampled CPU 1.38→1.43 seconds and peak RSS
+108,796→109,016 KiB do not establish a resource-cost improvement. These are
+shared-host debug-build delivery timings, not presented Dolby Vision frames.
+
+Installed dovi_tool supports raw stdin and `/proc/self/fd/1` output, but accepts
+no container timing. Installed FFmpeg's `dovi_rpu` exposes stripping/compression,
+not Profile-7-to-8 conversion. A raw pipe alone would reintroduce timestamp loss;
+the larger concurrent pipeline is not enabled. Partial conversion can exit
+successfully on truncated raw data, and a short `/dev/full` write can also be
+reported successful by dovi_tool, reinforcing the need for sample association,
+subsequent parsing and final validation. Tests cover malformed mappings, extra/
+missing VCL/RPU, valid EOS/suffix SEI, bounded layouts, quota/ENOSPC, stage failure,
+cancellation and post-exposure cleanup. Reports, source recipes and binary hashes
+remain under `/tmp/rustydlna-bundle-d-p09-av211tol/`; see `stage-summary.json`,
+`http-summary.json`, `http-private-results.json` and `http-growing-results.json`.
 
 **P2 · Code-backed cost; pipeline redesign is experimental · M to XL.**
 `crates/transcode/src/lib.rs:3789–4008` serially extracts raw video, converts it,

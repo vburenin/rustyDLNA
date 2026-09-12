@@ -65,6 +65,7 @@ struct Record {
 
 #[derive(Debug)]
 pub(crate) struct PerformanceMetrics {
+    pub(super) profile8: super::profile8::Metrics,
     stages: [AtomicDurationMetric; 10],
     records: Mutex<VecDeque<Record>>,
     sequence: AtomicU64,
@@ -74,6 +75,7 @@ pub(crate) struct PerformanceMetrics {
 impl Default for PerformanceMetrics {
     fn default() -> Self {
         Self {
+            profile8: super::profile8::Metrics::default(),
             stages: std::array::from_fn(|_| AtomicDurationMetric::default()),
             records: Mutex::new(VecDeque::new()),
             sequence: AtomicU64::new(0),
@@ -187,6 +189,7 @@ impl PerformanceMetrics {
             serde_json::json!({ "sequence": record.sequence, "stages_ms": stages, "helper_attempts": record.attempts, "helper_attempt_durations_ms": record.attempt_durations_ms })
         }).collect::<Vec<_>>();
         serde_json::json!({ "bucket_bounds_ms": super::DURATION_BUCKET_BOUNDS_MS, "stages_ms": stages,
+            "profile8": self.profile8.snapshot(),
             "recent": records, "recent_limit": MAX_RECORDS,
             "fallbacks": { "hardware_total": self.fallbacks_hardware.load(Ordering::Relaxed),
                 "portable_total": self.fallbacks_portable.load(Ordering::Relaxed) } })

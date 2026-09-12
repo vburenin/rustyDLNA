@@ -499,7 +499,30 @@ impl<'a> SupervisedCommand<'a> {
         poll_interval: Duration,
         mut observe: impl FnMut() -> ControlFlow<R>,
     ) -> Result<SupervisedOutcome<R>, SupervisionError> {
-        if let ControlFlow::Break(reason) = observe() {
+        self.run_until_impl(deadline, poll_interval, false, |_| observe())
+    }
+
+    /// Observe the owned child without transferring process lifecycle ownership.
+    /// `None` is checked before spawn; `Some(pid)` is checked while running and
+    /// once after exit is detected, before reaping, for final process counters.
+    /// An observer stop still terminates and reaps the entire private group.
+    pub fn run_until_with_pid<R>(
+        self,
+        deadline: Instant,
+        poll_interval: Duration,
+        observe: impl FnMut(Option<u32>) -> ControlFlow<R>,
+    ) -> Result<SupervisedOutcome<R>, SupervisionError> {
+        self.run_until_impl(deadline, poll_interval, true, observe)
+    }
+
+    fn run_until_impl<R>(
+        self,
+        deadline: Instant,
+        poll_interval: Duration,
+        observe_exit: bool,
+        mut observe: impl FnMut(Option<u32>) -> ControlFlow<R>,
+    ) -> Result<SupervisedOutcome<R>, SupervisionError> {
+        if let ControlFlow::Break(reason) = observe(None) {
             return Ok(SupervisedOutcome::NotStarted { reason });
         }
         if Instant::now() >= deadline {
@@ -508,9 +531,12 @@ impl<'a> SupervisedCommand<'a> {
                 stderr: Vec::new(),
             });
         }
-        self.spawn()
-            .map_err(SupervisionError::Spawn)?
-            .wait_until(deadline, poll_interval, observe)
+        self.spawn().map_err(SupervisionError::Spawn)?.wait_until(
+            deadline,
+            poll_interval,
+            observe_exit,
+            observe,
+        )
     }
 }
 
@@ -554,11 +580,12 @@ impl SupervisedChild {
         mut self,
         deadline: Instant,
         poll_interval: Duration,
-        mut observe: impl FnMut() -> ControlFlow<R>,
+        observe_exit: bool,
+        mut observe: impl FnMut(Option<u32>) -> ControlFlow<R>,
     ) -> Result<SupervisedOutcome<R>, SupervisionError> {
         let poll_interval = poll_interval.max(Duration::from_millis(1));
         loop {
-            if let ControlFlow::Break(reason) = observe() {
+            if let ControlFlow::Break(reason) = observe(Some(self.child.id())) {
                 let (stdout, stderr) = self.stop_and_collect();
                 return Ok(SupervisedOutcome::Stopped {
                     reason,
@@ -571,7 +598,20 @@ impl SupervisedChild {
                 return Ok(SupervisedOutcome::Deadline { stdout, stderr });
             }
             match leader_has_exited(&mut self.child) {
-                Ok(true) => return self.collect_exited().map(SupervisedOutcome::Exited),
+                Ok(true) => {
+                    if let Some(reason) = observe_exit
+                        .then(|| observe(Some(self.child.id())).break_value())
+                        .flatten()
+                    {
+                        let (stdout, stderr) = self.stop_and_collect();
+                        return Ok(SupervisedOutcome::Stopped {
+                            reason,
+                            stdout,
+                            stderr,
+                        });
+                    }
+                    return self.collect_exited().map(SupervisedOutcome::Exited);
+                }
                 Ok(false) => std::thread::sleep(
                     poll_interval.min(deadline.saturating_duration_since(Instant::now())),
                 ),
@@ -720,7 +760,8 @@ mod tests {
         match child.wait_until(
             Instant::now() + Duration::from_secs(2),
             Duration::from_millis(5),
-            || ControlFlow::<()>::Continue(()),
+            false,
+            |_| ControlFlow::<()>::Continue(()),
         )? {
             SupervisedOutcome::Exited(output) => Ok(output),
             _ => panic!("short command did not exit"),
@@ -920,7 +961,8 @@ mod tests {
             .wait_until(
                 Instant::now() + Duration::from_secs(2),
                 Duration::from_millis(5),
-                || ControlFlow::<()>::Continue(()),
+                false,
+                |_| ControlFlow::<()>::Continue(()),
             )
             .unwrap();
         let SupervisedOutcome::Exited(output) = outcome else {
@@ -987,7 +1029,8 @@ mod tests {
             .wait_until(
                 Instant::now() + Duration::from_secs(2),
                 Duration::from_millis(5),
-                || ControlFlow::<()>::Continue(()),
+                false,
+                |_| ControlFlow::<()>::Continue(()),
             )
             .unwrap();
         assert!(matches!(
@@ -1022,7 +1065,8 @@ mod tests {
             .wait_until(
                 Instant::now() + Duration::from_secs(2),
                 Duration::from_millis(5),
-                || ControlFlow::Break(Stop::Cancelled),
+                false,
+                |_| ControlFlow::Break(Stop::Cancelled),
             )
             .unwrap();
         assert!(matches!(
@@ -1055,7 +1099,7 @@ mod tests {
             .spawn()
             .unwrap();
         let outcome = child
-            .wait_until(Instant::now(), Duration::from_millis(5), || {
+            .wait_until(Instant::now(), Duration::from_millis(5), false, |_| {
                 ControlFlow::<Stop>::Continue(())
             })
             .unwrap();
@@ -1140,6 +1184,46 @@ mod tests {
             }
         ));
         assert!(!marker.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_observation_includes_final_io_before_reaping() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'owned child output'; sleep 0.02"]);
+        let mut observations = Vec::new();
+        let mut last_io = String::new();
+        let outcome = SupervisedCommand::new(&mut command)
+            .run_until_with_pid(
+                Instant::now() + Duration::from_secs(3),
+                Duration::from_millis(5),
+                |pid| {
+                    observations.push(pid);
+                    if let Some(pid) = pid {
+                        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+                        // Exec can transiently change dumpability and deny
+                        // proc counters; supervision must remain independent.
+                        if let Ok(io) = std::fs::read_to_string(format!("/proc/{pid}/io")) {
+                            last_io = io;
+                        }
+                    }
+                    ControlFlow::<()>::Continue(())
+                },
+            )
+            .unwrap();
+        assert!(matches!(outcome, SupervisedOutcome::Exited(output) if output.status.success()));
+        assert_eq!(observations[0], None);
+        let pid = observations.last().copied().flatten().unwrap();
+        assert!(observations[1..].iter().all(|value| *value == Some(pid)));
+        let written = last_io
+            .lines()
+            .find_map(|line| line.strip_prefix("wchar:"))
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        assert!(written >= 18, "{last_io}");
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
     }
 
     #[test]

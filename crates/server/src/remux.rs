@@ -12,9 +12,9 @@ use rusty_dlna_http::{
     HttpRequest, HttpResponse, RangeError, RemuxAudio, RemuxJobSpec,
 };
 use rusty_dlna_transcode::{
-    cache_is_fresh_for_key, cache_part, run_remux_p8_with_toolchain_observed,
+    cache_is_fresh_for_key, cache_part, run_remux_p8_with_toolchain_stage_observed,
     write_cache_stamp_for_key, BrowserOutputOptions, RecodeAction, RemuxP8Error, RemuxP8Input,
-    TranscodeCacheIdentity, TranscodePlan,
+    RemuxP8Stage, RemuxP8StageEvent, RemuxP8StageStatus, TranscodeCacheIdentity, TranscodePlan,
 };
 
 use crate::App;
@@ -24,6 +24,7 @@ pub(crate) mod fallback;
 mod hls;
 pub(crate) mod performance;
 mod positional;
+mod profile8;
 #[cfg(test)]
 mod validation_tests;
 
@@ -60,7 +61,7 @@ type P8TestRunner = fn(
     &Path,
     Instant,
     &AtomicBool,
-    &mut dyn FnMut() -> Result<(), String>,
+    &mut dyn FnMut(RemuxP8StageEvent) -> Result<(), String>,
 ) -> Result<(), RemuxP8Error>;
 
 #[cfg(test)]
@@ -76,7 +77,7 @@ fn run_profile8_pipeline(
     plan: &TranscodePlan,
     deadline: Instant,
     cancelled: &AtomicBool,
-    observer: &mut dyn FnMut() -> Result<(), String>,
+    observer: &mut dyn FnMut(RemuxP8StageEvent) -> Result<(), String>,
 ) -> Result<(), RemuxP8Error> {
     #[cfg(test)]
     if let Some(runner) = crate::lock_recover(p8_test_runners()).remove(part) {
@@ -86,7 +87,7 @@ fn run_profile8_pipeline(
         RemuxP8Error::Pipeline("Profile-8 job is missing its toolchain snapshot".into())
     })?;
     if let Some(source) = spec.source_file.as_deref() {
-        run_remux_p8_with_toolchain_observed(
+        run_remux_p8_with_toolchain_stage_observed(
             toolchain,
             RemuxP8Input::OpenFile {
                 file: source,
@@ -99,7 +100,7 @@ fn run_profile8_pipeline(
             observer,
         )
     } else {
-        run_remux_p8_with_toolchain_observed(
+        run_remux_p8_with_toolchain_stage_observed(
             toolchain,
             RemuxP8Input::Path(&spec.src),
             part,
@@ -1109,16 +1110,36 @@ fn spawn_ffmpeg(
                 };
                 tracing::info!(id, dest = %dest.display(), "remux-p8 dovi_tool start");
                 job.transition(RemuxState::Preprocessing);
+                let mut sequence = app.remux_metrics.performance.profile8.begin();
+                let mut final_mux_index = hls::Index::default();
                 let mut next_cache_check = Instant::now();
-                let mut observe_cache_pressure = || {
-                    let now = Instant::now();
-                    if now < next_cache_check {
-                        return Ok(());
+                let mut observe_progress = |event: RemuxP8StageEvent| {
+                    app.remux_metrics
+                        .performance
+                        .profile8
+                        .record(&mut sequence, event);
+                    if job.reconnect_grace_expired() {
+                        job.cancel();
                     }
-                    enforce_active_cache_limits(&app)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())?;
-                    next_cache_check = now + Duration::from_secs(1);
+                    let now = Instant::now();
+                    if now >= next_cache_check {
+                        enforce_active_cache_limits(&app)
+                            .map(|_| ())
+                            .map_err(|error| format!("transcode cache limits: {error}"))?;
+                        next_cache_check = now + Duration::from_secs(1);
+                    }
+                    // The packet rewrite has verified source sample association
+                    // and retained its timeline before this immutable final mux.
+                    if event.stage == RemuxP8Stage::FinalMux
+                        && matches!(
+                            event.status,
+                            RemuxP8StageStatus::Started
+                                | RemuxP8StageStatus::Progress
+                                | RemuxP8StageStatus::Succeeded
+                        )
+                    {
+                        profile8::observe_final_mux(&app, &job, &mut final_mux_index)?;
+                    }
                     Ok(())
                 };
                 let p8_result = run_profile8_pipeline(
@@ -1127,7 +1148,7 @@ fn spawn_ffmpeg(
                     &p8,
                     deadline,
                     &job.cancelled,
-                    &mut observe_cache_pressure,
+                    &mut observe_progress,
                 );
                 match p8_result {
                     Ok(()) => {
@@ -1143,12 +1164,10 @@ fn spawn_ffmpeg(
                     }
                     Err(RemuxP8Error::Observer(error)) => {
                         cleanup_intermediates(&part);
-                        // The failed pressure pass accounted the bytes it saw;
-                        // refresh after cleanup so the gauge reflects disk.
+                        // Refresh after cleanup so the gauge reflects disk,
+                        // whether pressure or final-mux inspection stopped it.
                         let _ = enforce_active_cache_limits(&app);
-                        job.transition(RemuxState::Failed(format!(
-                            "transcode cache limits: {error}"
-                        )));
+                        job.transition(RemuxState::Failed(error));
                         return;
                     }
                     Err(RemuxP8Error::Cancelled(_)) => {
@@ -2742,8 +2761,8 @@ async fn wait_ready_until(job: &Arc<RemuxJob>, mut deadline: Instant) -> Result<
             RemuxState::Failed(error) => return Err(error),
             RemuxState::Cancelled => return Err(REMUX_CANCELLED.into()),
             RemuxState::Preprocessing => {
-                // Dolby Vision conversion does not expose playable bytes.
-                // Start the first-fragment deadline only after fallback begins.
+                // Earlier Dolby Vision stages remain private. The final mux
+                // becomes Growing only after a complete playable segment.
                 notified.await;
                 deadline = Instant::now() + FIRST_WAIT;
                 continue;
@@ -4919,7 +4938,7 @@ mod tests {
         part: &Path,
         deadline: Instant,
         cancelled: &AtomicBool,
-        observer: &mut dyn FnMut() -> Result<(), String>,
+        observer: &mut dyn FnMut(RemuxP8StageEvent) -> Result<(), String>,
     ) -> Result<(), RemuxP8Error> {
         use rusty_dlna_helper::{SupervisedCommand, SupervisedOutcome};
         use std::ops::ControlFlow;
@@ -4948,7 +4967,14 @@ mod tests {
                 if Instant::now() >= deadline {
                     return ControlFlow::Break(Stop::Deadline);
                 }
-                match observer() {
+                match observer(RemuxP8StageEvent {
+                    stage: RemuxP8Stage::Conversion,
+                    status: RemuxP8StageStatus::Progress,
+                    elapsed: Duration::ZERO,
+                    input_bytes: None,
+                    output_bytes: None,
+                    io: None,
+                }) {
                     Ok(()) => ControlFlow::Continue(()),
                     Err(error) => ControlFlow::Break(Stop::Observer(error)),
                 }
@@ -5260,7 +5286,7 @@ mod tests {
             ..TranscodePlan::default()
         };
         let cancelled = AtomicBool::new(false);
-        let mut observer = || Ok(());
+        let mut observer = |_| Ok(());
         let error = run_profile8_pipeline(
             &spec,
             &cache_part(&spec.dest),

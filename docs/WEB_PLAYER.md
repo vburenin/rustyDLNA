@@ -1092,6 +1092,10 @@ source open/sample, tool identity, admission, helper attempts, server-observed
 first complete fragment, and playlist readiness are distinct observations.
 The recent server record is bounded to 64 generations; paths, titles, session
 IDs, and request IDs are absent from metric labels and exported records.
+Profile-8 remap jobs additionally expose bounded per-stage file sizes and I/O
+in `transcode.web_player.performance.profile8`; this shared diagnostic location
+does not imply that the browser negotiated a Dolby Vision remap. See the
+[Profile-8 pipeline contract](TRANSCODE.md#serve-path-background-growing-fmp4-file-cache).
 
 `node scripts/playback-benchmark.mjs --help` describes the generated-fixture
 benchmark. Run it against each saved server binary under matching conditions;
@@ -1122,7 +1126,12 @@ threshold rather than a confidence interval. Concurrent viewers from one
 trial are correlated. Repeat flagged workloads under matching idle conditions.
 
 `--concurrency=1|2|4`, `--fps=24|30|60`, `--rate=1|2` and `--size` select generated
-tiers. A supplied 35–600-second `--fixture` is copied into the temporary library;
+tiers. `--quality` and `--encoding-preset=balanced|fast_start|maximum_speed`
+select existing browser preferences and verify the negotiated recipe. Different
+presets are not comparable workloads for a graph regression gate.
+Each validation records the requested and effective quality separately when
+the browser limits a profile to the source resolution.
+A supplied 35–600-second `--fixture` is copied into the temporary library;
 `--tier` labels the intended coverage and `--encoder` selects an existing server
 encoder. Actual negotiation, output probes and frame checks establish which tier
 ran. They do not force a GPU/HDR/Dolby Vision pipeline. The CPU subset deliberately
