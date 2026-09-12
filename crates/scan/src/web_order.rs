@@ -2,6 +2,49 @@
 
 use std::path::Path;
 
+/// Browser substring matching uses Unicode lowercase only. It deliberately does
+/// not fold accents, normalize combining marks, or alter SOAP search semantics.
+pub fn web_search_normalize(value: &str) -> String {
+    value.to_lowercase()
+}
+
+pub fn web_media_file_name(path: &Path, title: &str) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| title.to_owned())
+}
+
+pub fn web_media_matches(item: &crate::MediaItem, normalized_query: &str) -> bool {
+    web_media_fields_match(
+        &item.path,
+        &item.title,
+        item.artist.as_deref(),
+        item.album_artist.as_deref(),
+        item.album.as_deref(),
+        normalized_query,
+    )
+}
+
+pub(crate) fn web_media_fields_match(
+    path: &Path,
+    title: &str,
+    artist: Option<&str>,
+    album_artist: Option<&str>,
+    album: Option<&str>,
+    normalized_query: &str,
+) -> bool {
+    if normalized_query.is_empty()
+        || web_search_normalize(&web_media_file_name(path, title)).contains(normalized_query)
+    {
+        return true;
+    }
+    [Some(title), artist, album_artist, album]
+        .into_iter()
+        .flatten()
+        .any(|value| web_search_normalize(value).contains(normalized_query))
+}
+
 /// An explicitly numbered movie's containing collection. No media is renamed.
 #[derive(Debug, PartialEq, Eq)]
 pub struct VideoCollection {
@@ -50,18 +93,27 @@ pub fn web_media_title_key(path: &Path, mime: &str, title: &str) -> String {
     match video_collection(path, mime) {
         Some(group) => format!(
             "{}\0{}\0{:03}\0{}",
-            group.title.to_lowercase(),
+            web_search_normalize(&group.title),
             group.id,
             group.sequence,
-            title.to_lowercase()
+            web_search_normalize(title)
         ),
-        None => title.to_lowercase(),
+        None => web_search_normalize(title),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_case_normalization_preserves_accents_and_combining_forms() {
+        assert_eq!(web_search_normalize("ÉTÉ ФИЛЬМ"), "été фильм");
+        assert_eq!(web_search_normalize("E\u{301}"), "e\u{301}");
+        assert_ne!(web_search_normalize("E\u{301}"), web_search_normalize("É"));
+        assert_ne!(web_search_normalize("É"), "e");
+        assert_eq!(web_search_normalize("Straße %_\\"), "straße %_\\");
+    }
 
     #[test]
     fn movies_sort_in_collection_sequence_among_standalones() {

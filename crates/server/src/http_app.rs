@@ -154,11 +154,13 @@ fn load_ai_upscale_profiles(
 }
 
 impl App {
-    pub(super) fn invalidate_catalog_query_cache(&self) {
+    pub(super) fn invalidate_catalog_query_cache(&self) -> web_ui::FolderProjectionCache {
+        let retired = std::mem::take(&mut *lock_recover(&self.folder_projection_cache));
         self.catalog_query_cache
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
+        retired
     }
 
     fn cached_catalog_query_page(
@@ -604,6 +606,8 @@ impl AppPreflight {
             scan_telemetry: Arc::new(WatchTelemetry::default()),
             db_pool,
             catalog_query_cache: Mutex::new(CatalogQueryCache::default()),
+            catalog_query_admission: QueryAdmission::default(),
+            folder_projection_cache: Mutex::new(web_ui::FolderProjectionCache::default()),
             db_integrity,
             required_tools_ready,
             runtime_metrics: RuntimeMetrics::default(),
@@ -673,9 +677,41 @@ impl App {
     /// Shipped request handler. The accept loop passes the real peer.
     /// Route one parsed HTTP request from a known peer.
     pub fn handle_from(&self, req: &HttpRequest, peer: SocketAddr) -> HttpResponse {
+        let _query_scope = ensure_query_scope(self.runtime_metrics.queries.clone());
         let started = Instant::now();
         let request_route = route(&req.method, &req.path);
-        let response = self.handle_from_inner(req, peer);
+        let needs_catalog_permit = (request_route == rusty_dlna_http::HttpRoute::WebLibrary
+            && self.cfg.web.enable)
+            || (request_route == rusty_dlna_http::HttpRoute::Soap
+                && req
+                    .header("SOAPAction")
+                    .map(str::trim)
+                    .map(|value| value.trim_matches('"'))
+                    .and_then(|value| value.rsplit('#').next())
+                    .is_some_and(|action| matches!(action, "Browse" | "Search")));
+        let permit = if needs_catalog_permit {
+            self.catalog_query_admission
+                .acquire(&current_query_control())
+                .map(Some)
+        } else {
+            Ok(None)
+        };
+        let response = match permit {
+            Ok(_permit) => self.handle_from_inner(req, peer),
+            Err(_) if request_route == rusty_dlna_http::HttpRoute::WebLibrary => {
+                web_ui::query_budget_error()
+            }
+            Err(_) => HttpResponse::xml(500, soap_fault(501, "Action Failed"), false),
+        };
+        // Cooperative fallbacks abandon their private page on exhaustion. Never
+        // expose that partial/empty page as a successful SOAP result.
+        let response = if current_query_control().check().is_err()
+            && request_route == rusty_dlna_http::HttpRoute::Soap
+        {
+            HttpResponse::xml(500, soap_fault(501, "Action Failed"), response.persist)
+        } else {
+            response
+        };
         self.runtime_metrics.record_request(
             request_route,
             response.status,
@@ -1105,7 +1141,9 @@ impl App {
                     })
             });
             let (mut didl, total, response_generation) = {
-                let cat = read_recover(&self.catalog);
+                let Ok(cat) = query_read_catalog(self, &current_query_control()) else {
+                    return HttpResponse::xml(500, soap_fault(501, "Action Failed"), persist);
+                };
                 let catalog_generation = self.update_id.load(Ordering::Acquire);
                 if flag == "BrowseMetadata" {
                     match cat.metadata(&oid) {
@@ -1131,10 +1169,21 @@ impl App {
                     }
                 } else {
                     let sort = direct_sort.as_deref().unwrap_or_default();
-                    let displayed_total = cat
-                        .containers
-                        .contains_key(&oid)
-                        .then(|| cat.displayed_child_count(&oid));
+                    let control = current_query_control();
+                    let displayed_total = if cat.containers.contains_key(&oid) {
+                        let Some(total) = cat.displayed_child_count_controlled(&oid, |visited| {
+                            control.check_work_items(visited).is_ok()
+                        }) else {
+                            return HttpResponse::xml(
+                                500,
+                                soap_fault(501, "Action Failed"),
+                                persist,
+                            );
+                        };
+                        Some(total)
+                    } else {
+                        None
+                    };
                     if let Some((objects, total)) = db_page.as_ref().and_then(|snapshot| {
                         (snapshot.generation == catalog_generation
                             && Some(snapshot.page.total) == displayed_total)
@@ -1153,6 +1202,7 @@ impl App {
                         (
                             objects
                                 .into_iter()
+                                .take_while(|_| current_query_control().check().is_ok())
                                 .map(|child| {
                                     self.to_didl_ref(child, &cat, client, ua, &filter_bits)
                                 })
@@ -1160,38 +1210,12 @@ impl App {
                             total,
                             catalog_generation,
                         )
-                    } else if sort.is_empty() && order == DefaultOrder::FoldersFirst {
-                        match cat.page_children(&oid, start, take) {
-                            Some((objects, total)) => (
-                                objects
-                                    .iter()
-                                    .map(|child| {
-                                        self.to_didl_ref(
-                                            catalog_child_as_ref(child),
-                                            &cat,
-                                            client,
-                                            ua,
-                                            &filter_bits,
-                                        )
-                                    })
-                                    .collect(),
-                                total,
-                                catalog_generation,
-                            ),
-                            None => {
-                                return soap_fault_logged(
-                                    SoapOutcome::fault701(),
-                                    persist,
-                                    &call,
-                                    req.user_agent().unwrap_or("-"),
-                                );
-                            }
-                        }
                     } else {
                         match sorted_child_page(&cat, &oid, start, take, sort, order) {
                             Some((objects, total)) => (
                                 objects
                                     .iter()
+                                    .take_while(|_| current_query_control().check().is_ok())
                                     .map(|child| {
                                         self.to_didl_ref(
                                             catalog_child_as_ref(child),
@@ -1340,7 +1364,9 @@ impl App {
                 .flatten()
             });
         let (didl, total, response_generation) = {
-            let cat = read_recover(&self.catalog);
+            let Ok(cat) = query_read_catalog(self, &current_query_control()) else {
+                return HttpResponse::xml(500, soap_fault(501, "Action Failed"), persist);
+            };
             let catalog_generation = self.update_id.load(Ordering::Acquire);
             if let Some(snapshot) = db_page
                 .as_ref()
@@ -1354,6 +1380,7 @@ impl App {
                     );
                     let didl = objects
                         .into_iter()
+                        .take_while(|_| current_query_control().check().is_ok())
                         .map(|child| self.to_didl_ref(child, &cat, client, ua, &filter_bits))
                         .collect();
                     (didl, snapshot.page.total, catalog_generation)
@@ -1420,6 +1447,7 @@ impl App {
     ) -> DidlObject {
         match child {
             CatalogChildRef::Container(c) => {
+                let control = current_query_control();
                 let av = match c.object_id.chars().next() {
                     Some('1') => Some('M'),
                     Some('2') => Some('V'),
@@ -1443,8 +1471,13 @@ impl App {
                     date: None,
                     restricted: true,
                     searchable: Some(c.searchable),
-                    child_count: Some(cat.displayed_child_count(&c.object_id)),
-                    child_container_count: Some(cat.displayed_container_count(&c.object_id)),
+                    child_count: cat.displayed_child_count_controlled(&c.object_id, |visited| {
+                        control.check_work_items(visited).is_ok()
+                    }),
+                    child_container_count: cat
+                        .displayed_container_count_controlled(&c.object_id, |visited| {
+                            control.check_work_items(visited).is_ok()
+                        }),
                     is_container: true,
                     resources: vec![],
                     album_art_uri: None,
@@ -1754,11 +1787,12 @@ impl App {
                 }
             }
         }
-        self.invalidate_catalog_query_cache();
+        let retired_projections = self.invalidate_catalog_query_cache();
         self.update_id.store(update_id, Ordering::Release);
         let parent_ids = parent_ids.into_iter().collect::<Vec<_>>();
         self.notify_catalog_publication(&cat, update_id, Some(&parent_ids));
         drop(cat);
+        drop(retired_projections);
         Ok(())
     }
 
@@ -1822,11 +1856,12 @@ impl App {
                 }
             }
         }
-        self.invalidate_catalog_query_cache();
+        let retired_projections = self.invalidate_catalog_query_cache();
         self.update_id.store(update_id, Ordering::Release);
         let parent_ids = parent_ids.into_iter().collect::<Vec<_>>();
         self.notify_catalog_publication(&cat, update_id, Some(&parent_ids));
         drop(cat);
+        drop(retired_projections);
         Ok(true)
     }
 

@@ -248,6 +248,51 @@ storage independent of literal escaping or expansion size.
 SQLite and in-memory Browse/Search ordering both append ascending object ID as
 the final tie-breaker so page boundaries remain stable during fallback.
 
+Scanner child allocation initializes the maximum legacy hexadecimal suffix once
+per parent in a writable transaction. Connection-private SQLite TEMP state tracks
+insertions, moves, and deletion of the maximum suffix, and rolls back with
+transactions and savepoints. A later transaction rechecks persisted rows. This
+changes neither the stored schema nor the existing IDs, overflow checks, or
+deletion/recreation rules. Catalog restoration appends unique item rows and uses
+temporary membership sets for seeded and mirrored container overlap. Existing
+mirror metadata and folder child vectors are not cloned again.
+Aggregate membership starts with the existing inode index and checks only that
+inode's object mappings. Bulk patches build child membership once per affected
+parent receiving multiple links, preserving ordered vectors and seeded overlap.
+Fixed-size patches remove changed detail mappings directly; object-only changes
+also journal their affected details so canonical
+representatives are reselected from surviving mappings.
+
+Playlist discovery and member resolution check scanner cancellation before
+continuing private staged work. Empty discovery does not read or canonicalize
+media details, while disappeared playlists are still removed. Targeted media
+arrivals and playlist events reuse known playlist paths and resolve requested
+members through path/inode indexes, retaining duplicates, alias-local paths,
+encoding rules, and references that become available after later media arrivals.
+
+Browser search lowercases Unicode text with Rust's lowercase mapping and matches
+literal substrings of the displayed title, artist, album artist, album, and
+filename. It does not search parent directory names, fold accents, normalize
+composed/decomposed Unicode, or interpret wildcard characters. SQLite and memory
+use the same functions, including byte-preserving stored-path decoding followed
+by lossy filename presentation. This browser rule does not change SOAP search.
+
+Catalog requests share one five-second absolute budget across heavy-query and
+reader admission, SQLite execution, generation retries, and memory fallback. SQLite progress
+callbacks belong exclusively to a reader lease and are removed before reuse;
+cancelling an old request cannot interrupt a later reader owner. Cancellation or
+budget exhaustion does not start another fallback query or publish a partial
+result. Connection-task cancellation, server shutdown, and detected socket reset
+cancel the underlying work. A TCP read-side FIN can be a valid HTTP half-close,
+so FIN alone retains the absolute deadline while the response is prepared.
+At most four browser-library or SOAP Browse/Search queries execute concurrently;
+media, item-detail and status routes do not take this admission permit. Memory
+query projections stop at one million inspected records and a 64 MiB scratch/key
+budget. These are query work bounds, not a process RSS limit. Exhausted web queries
+return recoverable `503 catalog_busy`; SOAP returns fault 501. Detailed status
+reports fixed-cardinality admission wait, reader wait, execution, fallback,
+timeout, cancellation and work-budget counters.
+
 ## SOAP and SSDP parsing
 
 SOAP arguments are accepted only as direct children of the one action selected

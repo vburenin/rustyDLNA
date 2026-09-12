@@ -809,8 +809,22 @@ export async function negotiateCompatibleStreams({
   };
 }
 
+// Store queue snapshots are immutable. Weak ownership lets old library snapshots
+// leave memory when navigation and playback no longer retain them.
+const queuePositions = new WeakMap();
+
 export function queuePosition(queue, itemId) {
-  return queue.findIndex((item) => String(item.id) === String(itemId));
+  let positions = queuePositions.get(queue);
+  if (!positions) {
+    positions = new Map();
+    queue.forEach((item, index) => {
+      const id = String(item.id);
+      // Preserve findIndex's first-match behavior for a repeated member.
+      if (!positions.has(id)) positions.set(id, index);
+    });
+    queuePositions.set(queue, positions);
+  }
+  return positions.get(String(itemId)) ?? -1;
 }
 
 export function queueNeighbor(queue, itemId, delta) {

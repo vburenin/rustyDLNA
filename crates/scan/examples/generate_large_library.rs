@@ -19,10 +19,14 @@ fn parse_count(index: usize, name: &str) -> Result<usize, String> {
         .map_err(|error| format!("invalid {name}: {error}"))
 }
 
-fn physical_path(root: &Path, index: usize) -> PathBuf {
-    root.join("physical")
-        .join(format!("{:03}", index / 1_000))
-        .join(format!("media-{index:08}.mkv"))
+fn physical_path(root: &Path, index: usize, flat: bool) -> PathBuf {
+    let parent = root.join("physical");
+    let parent = if flat {
+        parent
+    } else {
+        parent.join(format!("{:03}", index / 1_000))
+    };
+    parent.join(format!("media-{index:08}.mkv"))
 }
 
 fn write_fake_container(path: &Path) -> io::Result<()> {
@@ -37,6 +41,12 @@ fn run() -> Result<(), String> {
     let root = PathBuf::from(argument(1, "output directory")?);
     let physical_files = parse_count(2, "physical file count")?;
     let aliases_per_kind = parse_count(3, "alias count")?;
+    let shape = env::args().nth(4).unwrap_or_else(|| "sharded".into());
+    let flat = match shape.as_str() {
+        "flat" => true,
+        "sharded" => false,
+        _ => return Err("shape must be flat or sharded".into()),
+    };
     if physical_files == 0 {
         return Err("physical file count must be positive".into());
     }
@@ -54,7 +64,7 @@ fn run() -> Result<(), String> {
     fs::create_dir_all(&root).map_err(|error| error.to_string())?;
 
     for index in 0..physical_files {
-        write_fake_container(&physical_path(&root, index))
+        write_fake_container(&physical_path(&root, index, flat))
             .map_err(|error| format!("physical file {index}: {error}"))?;
     }
     let hardlinks = root.join("aliases-hardlink");
@@ -62,7 +72,7 @@ fn run() -> Result<(), String> {
     fs::create_dir_all(&hardlinks).map_err(|error| error.to_string())?;
     fs::create_dir_all(&symlinks).map_err(|error| error.to_string())?;
     for index in 0..aliases_per_kind {
-        let source = physical_path(&root, index);
+        let source = physical_path(&root, index, flat);
         fs::hard_link(&source, hardlinks.join(format!("hard-{index:08}.mkv")))
             .map_err(|error| format!("hard-link alias {index}: {error}"))?;
         #[cfg(unix)]
@@ -72,7 +82,7 @@ fn run() -> Result<(), String> {
         return Err("symlink aliases require Unix".into());
     }
     println!(
-        "generated physical_files={physical_files} hardlink_aliases={aliases_per_kind} symlink_aliases={aliases_per_kind} paths={}",
+        "generated shape={shape} physical_files={physical_files} hardlink_aliases={aliases_per_kind} symlink_aliases={aliases_per_kind} paths={}",
         physical_files.saturating_add(aliases_per_kind.saturating_mul(2))
     );
     Ok(())

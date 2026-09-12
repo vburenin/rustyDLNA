@@ -186,6 +186,7 @@ pub(crate) struct RuntimeSnapshot {
 
 #[derive(Debug)]
 pub(crate) struct RuntimeMetrics {
+    pub(crate) queries: std::sync::Arc<crate::catalog_query::QueryMetrics>,
     http_listener: AtomicComponentState,
     ssdp: AtomicComponentState,
     remux_supervisor: AtomicComponentState,
@@ -203,6 +204,7 @@ pub(crate) struct RuntimeMetrics {
 impl Default for RuntimeMetrics {
     fn default() -> Self {
         Self {
+            queries: Default::default(),
             http_listener: AtomicComponentState::default(),
             ssdp: AtomicComponentState::default(),
             remux_supervisor: AtomicComponentState::default(),
@@ -323,6 +325,7 @@ impl RuntimeMetrics {
                 "ssdp_state": runtime.ssdp.as_str(),
                 "remux_supervisor_state": runtime.remux_supervisor.as_str(),
             },
+            "catalog_queries": self.queries.json(),
             "soap": {
                 "actions_total": actions,
                 "faults_total": faults,

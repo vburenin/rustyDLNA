@@ -275,7 +275,9 @@ const player = new PlaybackController({
   onReturnLibrary: focusLibrary,
   onClosePlayback: closePlaybackToLibrary,
 });
-store.subscribe((state) => renderLayout(state));
+store.subscribe((state, action) => {
+  if (action.type !== "PLAYBACK_TIME" && action.type !== "PLAYBACK_PREVIEW") renderLayout(state);
+});
 
 let navigationEpoch = 0;
 let navigationController = null;

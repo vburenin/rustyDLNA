@@ -30,8 +30,9 @@ inodes, 10,000 additional paths, 60,000 media records, 170,000 item objects,
 Cold time starts immediately before daemon launch and ends when `/api/status`
 reports the watcher phase, no scanner error, and the exact physical and alias
 counts. CPU time, resident/peak memory, open descriptors, and SQLite bytes are
-sampled at that point. Reconciliation is run twice without loading a second
-server catalog: the first result records any one-time database normalization,
+sampled at that point. Reconciliation is run twice against an isolated SQLite
+online backup, without loading a second server catalog or changing the daemon's
+scan epoch: the first result records any one-time database normalization,
 and the second is the steady unchanged measurement. Browse and Search each get
 10 warmups followed by 200 sequential requests for a 64-object page over
 closed local HTTP connections. Update latency starts before an `fsync` of a new
@@ -42,6 +43,8 @@ page, a later title-sorted page, and a search. The later page starts at offset
 40,000 for the reference workload, or at the final full page for smaller
 workloads, so reduced runs still exercise real pagination. Each web case must
 meet `RUSTY_DLNA_BENCH_WEB_P95_TARGET_MS` (250 ms by default).
+Latency threshold failures still write the complete measurements and set
+`latency_check_passed` to false before the command exits unsuccessfully.
 
 The scanner uses one online backup to initialize a reusable private stage,
 then records changed detail/object/art/caption/playlist/settings keys in
@@ -52,6 +55,73 @@ reviews should therefore treat repeated `files.db`-sized I/O or per-media
 directory reads during the targeted update as a regression. Capacity samples
 must include the private stage, while live-writer latency should remain bounded
 during backup, probe, NFO, rebuild, and stage journal cleanup.
+
+## Responsiveness workloads
+
+Set `RUSTY_DLNA_BENCH_SHAPE=flat` to put every physical file in one folder;
+`sharded` remains the default. The generator accepts the same optional fourth
+argument. Use matching shapes, counts, aliases, workers and request counts for
+comparisons. Saved builds can be selected with `RUSTY_DLNA_BENCH_BINARY`,
+`RUSTY_DLNA_BENCH_GENERATOR` and `RUSTY_DLNA_BENCH_RECONCILE`; a supplied server
+binary skips rebuilding. Reports include the executable hash and shape. Keep
+the working directory when measuring restoration separately:
+
+```sh
+python3 scripts/large-library-restart-benchmark.py --binary /tmp/rusty-dlna-before --config /tmp/retained-benchmark/benchmark.toml --samples 10 --output /tmp/restart-before.json
+```
+
+This uses normal `--database-check` startup to restore the catalog and run SQLite
+quick-check without listeners or reconciliation. It measures each process's wall
+time, CPU and peak RSS using GNU time. The OS page cache is warm. It is a catalog
+restoration measurement, not a second cold scan or a network-ready measurement.
+
+Focused generated-catalog workloads exercise allocation/restoration at
+1k/4k/50k in flat and sharded shapes, fixed-size detail-map patches, and SQL and
+physical-folder paging at 50k/250k:
+
+```sh
+cargo test --locked -p rusty-dlna-scan bundle_e_catalog_scale_measurement -- --ignored --nocapture
+cargo test --locked -p rusty-dlna-scan bundle_e_detail_map_patch_measurement -- --ignored --nocapture
+cargo test --release --locked -p rusty-dlna-scan browser_query_scale_profile -- --ignored --nocapture
+cargo test --release --locked -p rusty-dlna folder_paging_benchmark --lib -- --ignored --nocapture
+timeout 180s cargo test --release --locked -p rusty-dlna folder_pages_under_incremental_publication_benchmark --lib -- --ignored --nocapture
+```
+
+SQL profiling reports EXPLAIN plans, VM steps, thread CPU and individual wall
+samples for first/deep pages and varied searches. Reused population/matching
+counts are measured separately from a cold query. Folder profiling clears the
+projection cache for cold samples, measures warm pages separately, and runs four
+clients with distinct searches while observing catalog-writer acquisition wait
+(the synthetic observer does not publish a watcher patch). These
+synthetic catalogs isolate query work; they do not replace filesystem scans,
+watcher updates, or actual browser measurements. The separate publication
+workload applies scanner-journal patches during four-client page traffic at
+50k/250k, checks response generation/order, retries 409 responses, and measures
+publication duration plus health/status latency. Algorithmic counts and estimated
+allocation reductions are separate from process CPU and peak RSS.
+
+The browser workload uses a running isolated server and generated API responses:
+
+```sh
+node scripts/library-browser-benchmark.mjs --url=http://127.0.0.1:18201 --cards=10000 --samples=5 --cpu-rate=4 --output=/tmp/library-before.json
+node scripts/library-scan-playback-benchmark.mjs --binary=target/release/rusty-dlna --files=4000 --samples=5 --output=/tmp/scan-playback.json
+```
+
+Use `--assets=crates/server/web` only when intentionally measuring current assets
+against a saved server; omit it for the saved executable's embedded assets. The
+Chromium workload records card publication, long tasks, timer scheduling delay,
+layout/resize, DOM/heap counts, repeated navigation and playback-tick mutations.
+CPU throttling is a repeatable engineering workload, not a physical-device
+measurement. Heap diagnosis must release remote DOM handles before concluding
+that navigation retains detached cards.
+
+The scan/playback runner creates disposable H.264/AAC media and a seeded catalog,
+then admits generated scan files. Each trial starts a fresh server and browser;
+it records whether scanning was actually active before and after a presented
+frame. Its default 500-ms scan delay is outside the frame-latency window. Server
+CPU/RSS excludes browser and helper resources. Every report retains sample counts
+and variability; small samples do not establish reliable p95/p99 tails. Keep
+reports, traces, heap snapshots and generated libraries outside Git.
 
 ## Artwork cleanup regression workload
 

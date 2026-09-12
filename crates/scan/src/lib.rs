@@ -45,9 +45,10 @@ use artwork::{
 };
 pub use catalog::*;
 pub use db::{
-    mime_to_ext, CatalogDefaultOrder, CatalogQuery, CatalogQueryClause, CatalogQueryField,
-    CatalogQueryOp, CatalogQueryPage, CatalogQuerySort, DetailStat, DetailStreamUpdate,
-    ExistingDetail, InodeSource, LibraryDb, NewDetail, WebMediaKind, WebMediaSort,
+    mime_to_ext, CatalogDefaultOrder, CatalogQuery, CatalogQueryClause, CatalogQueryCounts,
+    CatalogQueryField, CatalogQueryOp, CatalogQueryPage, CatalogQuerySort, DetailStat,
+    DetailStreamUpdate, ExistingDetail, InodeSource, LibraryDb, NewDetail, WebMediaKind,
+    WebMediaSort,
 };
 pub use metadata::*;
 pub use nfo::{
@@ -80,7 +81,10 @@ pub use watch::{
     repair_objects_if_needed, run_inotify, run_inotify_prepared_updates_until, run_inotify_until,
     run_inotify_updates_until, WatchTelemetry,
 };
-pub use web_order::{video_collection, web_media_title_key, VideoCollection};
+pub use web_order::{
+    video_collection, web_media_file_name, web_media_matches, web_media_title_key,
+    web_search_normalize, VideoCollection,
+};
 
 use rusty_dlna_protocol::object_id::{
     BROWSEDIR_ID, IMAGE_ALBUM_ID, IMAGE_ALL_ID, IMAGE_CAMERA_ID, IMAGE_DATE_ID, IMAGE_DIR_ID,
@@ -3472,8 +3476,12 @@ fn monitor_dirty_with_db(
         sidecar_changed |= apply_nfo_in_dir(db, cfg, &dir, recursive)?;
     }
     changed += usize::from(sidecar_changed);
-    let playlists_changed = if restat_all || dirty.iter().any(|path| playlist::is_playlist(path)) {
+    let playlists_changed = if restat_all {
         playlist::sync_playlists(db, cfg)?
+    } else if added > 0 || removed > 0 || dirty.iter().any(|path| playlist::is_playlist(path)) {
+        // Previously unresolved entries may become playable when media arrives.
+        // Known playlist paths avoid a second whole-library directory walk.
+        playlist::sync_targeted_playlists(db, cfg, dirty)?
     } else {
         false
     };

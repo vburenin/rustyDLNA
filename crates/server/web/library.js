@@ -32,6 +32,9 @@ export class LibraryController {
   #gridWidth = -1;
   #artworkQueue = new Set();
   #artworkRequests = new Map();
+  #chunkKeys = new WeakMap();
+  #chunkHeights = new Map();
+  #cardsById = new Map();
 
   constructor({ store, api, dom, onSelect, onNavigate = () => {} }) {
     this.#store = store;
@@ -102,11 +105,20 @@ export class LibraryController {
         ? await this.#continueWatchingPage(current.navigation.query, onFirstPage)
         : await this.#api.librarySnapshot(current.navigation, { onFirstPage });
       if (requestId !== this.#request) return;
+      const batches = this.#cardBatches(payload.entries, current.navigation);
+      let batch = batches.next();
+      while (!batch.done) {
+        // Build privately so Find, keyboard traversal, and the queue see one
+        // complete list. Navigation can abandon the fragment between batches.
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
+        if (requestId !== this.#request) return;
+        batch = batches.next();
+      }
       this.#store.dispatch({ type: "LIBRARY_SUCCESS", requestId, payload });
       if (current.navigation.view === "folders" && !current.navigation.folder) {
         this.#store.dispatch({ type: "NAVIGATE", navigation: { folder: payload.root_folder_id } });
       }
-      this.render();
+      this.render(batch.value);
       if (focusAfterLoad) {
         this.#dom.libraryPanel.focus({ preventScroll: true });
       }
@@ -129,7 +141,7 @@ export class LibraryController {
     this.render();
   }
 
-  render() {
+  render(cards = null) {
     const state = this.#store.getState();
     const { library, navigation, server, playback } = state;
     document.title = playback.item ? `${playback.item.title} · ${server.name}` : `${server.name} · Library`;
@@ -162,7 +174,7 @@ export class LibraryController {
       ? `${library.total} ${library.total === 1 ? "result" : "results"} for “${navigation.query}”`
       : `${library.total} ${noun}`;
     this.renderBreadcrumbs();
-    this.renderCards();
+    this.renderCards(cards);
     this.syncTabs();
   }
 
@@ -273,18 +285,36 @@ export class LibraryController {
     });
   }
 
-  renderCards() {
+  renderCards(cards = null) {
     const { library, playback, navigation } = this.#store.getState();
     this.#artworkQueue.clear();
     // Detached images may never emit load/error. Release their admission
     // slots explicitly so a slow old view cannot starve the current one.
     for (const cancel of this.#artworkRequests.values()) cancel();
+    if (!cards) {
+      const batches = this.#cardBatches(library.entries, navigation);
+      let batch;
+      do { batch = batches.next(); } while (!batch.done);
+      cards = batch.value;
+    }
+    this.#cardsById = cards.byId;
+    const current = this.#cardsById.get(String(playback.item?.id));
+    current?.classList.add("playing");
+    this.#dom.grid.replaceChildren(cards.fragment);
+    this.#gridWidth = -1;
+    this.#chunkHeights.clear();
+    this.#sizeChunks();
+    this.#scheduleArtwork();
+  }
+
+  *#cardBatches(entries, navigation) {
     const fragment = document.createDocumentFragment();
+    const byId = new Map();
     const columns = getComputedStyle(this.#dom.grid).gridTemplateColumns.split(" ").length;
     this.#dom.grid.style.setProperty("--library-columns", columns);
-    const chunkSize = library.entries.length >= 500
+    const chunkSize = entries.length >= 500
       && CSS.supports("content-visibility", "auto") ? columns * 8 : 0;
-    const appendCard = (parent, card) => {
+    const appendCard = (parent, card, entry) => {
       if (!chunkSize) {
         parent.append(card);
         return;
@@ -293,13 +323,26 @@ export class LibraryController {
       if (!chunk?.classList.contains("media-chunk") || chunk.children.length >= chunkSize) {
         chunk = document.createElement("div");
         chunk.className = "media-chunk";
+        // Only representative chunks need layout before exact reserved heights
+        // are assigned in the same publication task.
+        chunk.style.contentVisibility = "hidden";
+        this.#chunkKeys.set(chunk, []);
         parent.append(chunk);
       }
       chunk.append(card);
+      // Titles occupy a fixed two-line box, and filenames one non-wrapping
+      // line. Metadata is the remaining variable-height card content. Continue
+      // watching is small and has additional progress controls: measure it
+      // independently instead of sharing its geometry.
+      this.#chunkKeys.get(chunk).push(navigation.view === "continue" ? String(entry.id) : JSON.stringify([
+        entry.entry_type, entry.kind, Boolean(entry.file_name && entry.file_name !== entry.title), mediaDetails(entry),
+      ]));
     };
-    for (const entry of library.entries) {
+    let batchStarted = performance.now();
+    let batchCount = 0;
+    for (const entry of entries) {
       const card = entry.entry_type === "folder" ? this.#folderCard(entry) : this.#mediaCard(entry);
-      if (entry.entry_type === "media" && String(entry.id) === String(playback.item?.id)) card.classList.add("playing");
+      if (entry.entry_type === "media" && !byId.has(String(entry.id))) byId.set(String(entry.id), card);
       const collection = navigation.view === "library" && navigation.sort === "title"
         ? entry.collection : null;
       if (collection?.id && collection.title) {
@@ -316,20 +359,23 @@ export class LibraryController {
           section.append(heading);
           fragment.append(section);
         }
-        appendCard(section, card);
+        appendCard(section, card, entry);
       } else {
-        appendCard(fragment, card);
+        appendCard(fragment, card, entry);
+      }
+      batchCount += 1;
+      if (entries.length >= 500 && (batchCount >= 128 || (batchCount % 16 === 0 && performance.now() - batchStarted >= 8))) {
+        yield;
+        batchStarted = performance.now();
+        batchCount = 0;
       }
     }
-    this.#dom.grid.replaceChildren(fragment);
-    this.#gridWidth = -1;
-    this.#scheduleArtwork();
+    return { fragment, byId };
   }
 
   markCurrent(itemId) {
     for (const card of this.#dom.grid.querySelectorAll(".media-card.playing")) card.classList.remove("playing");
-    const selected = [...this.#dom.grid.querySelectorAll("[data-media-id]")]
-      .find((card) => card.dataset.mediaId === String(itemId));
+    const selected = this.#cardsById.get(String(itemId));
     selected?.classList.add("playing");
   }
 
@@ -536,16 +582,31 @@ export class LibraryController {
     const width = this.#dom.grid.getBoundingClientRect().width;
     if (!width || width === this.#gridWidth) return;
     this.#gridWidth = width;
-    this.#dom.grid.style.setProperty("--library-columns",
-      getComputedStyle(this.#dom.grid).gridTemplateColumns.split(" ").length);
+    const columns = getComputedStyle(this.#dom.grid).gridTemplateColumns.split(" ").length;
+    this.#dom.grid.style.setProperty("--library-columns", columns);
     const chunks = [...this.#dom.grid.querySelectorAll(".media-chunk")];
-    // Measure each batch once at this width before letting the browser skip
-    // offscreen rendering. Exact reserved heights keep the scrollbar stable.
-    for (const chunk of chunks) chunk.classList.remove("sized");
-    const heights = chunks.map((chunk) => chunk.getBoundingClientRect().height);
+    const widthKey = `${width}:${columns}`;
+    let heights = this.#chunkHeights.get(widthKey);
+    if (!heights) {
+      heights = new Map();
+      // Two widths cover switching Browse/Watch or returning after resize.
+      // The cache is also cleared whenever the published list changes.
+      if (this.#chunkHeights.size >= 2) this.#chunkHeights.delete(this.#chunkHeights.keys().next().value);
+      this.#chunkHeights.set(widthKey, heights);
+    }
+    const keys = chunks.map((chunk) => JSON.stringify(this.#chunkKeys.get(chunk)));
+    const representatives = new Map();
     chunks.forEach((chunk, index) => {
-      chunk.style.setProperty("--chunk-height", `${heights[index]}px`);
+      chunk.style.contentVisibility = "hidden";
+      const key = keys[index];
+      if (!heights.has(key) && !representatives.has(key)) representatives.set(key, chunk);
+    });
+    for (const chunk of representatives.values()) chunk.style.contentVisibility = "visible";
+    for (const [key, chunk] of representatives) heights.set(key, chunk.getBoundingClientRect().height);
+    chunks.forEach((chunk, index) => {
+      chunk.style.setProperty("--chunk-height", `${heights.get(keys[index])}px`);
       chunk.classList.add("sized");
+      chunk.style.removeProperty("content-visibility");
     });
   }
 

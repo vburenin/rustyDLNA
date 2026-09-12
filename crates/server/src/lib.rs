@@ -42,12 +42,14 @@ use rusty_dlna_scan::{
     WatchTelemetry,
 };
 
+#[cfg(test)]
+use rusty_dlna_soap::DefaultOrder;
 use rusty_dlna_soap::{
     apply_title_hack, bookmark_seconds, build_browse_bounded, default_order, dispatch_simple,
     empty_cd_response, extra_ci1_protocol_infos, magic_object_id, parse_filter, parse_soap_call,
     parse_update_object_tags, soap_fault, sort_or_709, try_parse_search_criteria,
-    try_parse_soap_call, DefaultOrder, DidlCaption, DidlObject, DidlRes, FilterBits, SoapCall,
-    SoapOutcome, UpdateObjectParseError,
+    try_parse_soap_call, DidlCaption, DidlObject, DidlRes, FilterBits, SoapCall, SoapOutcome,
+    UpdateObjectParseError,
 };
 #[cfg(test)]
 use rusty_dlna_ssdp::msearch_replies;
@@ -186,6 +188,8 @@ pub struct App {
     scan_telemetry: Arc<WatchTelemetry>,
     db_pool: Option<Arc<DbPool>>,
     catalog_query_cache: Mutex<CatalogQueryCache>,
+    catalog_query_admission: QueryAdmission,
+    folder_projection_cache: Mutex<web_ui::FolderProjectionCache>,
     db_integrity: Arc<DbIntegrityCache>,
     required_tools_ready: bool,
     runtime_metrics: RuntimeMetrics,
@@ -487,6 +491,19 @@ impl DbReaderLease<'_> {
 
 impl Drop for DbReaderLease<'_> {
     fn drop(&mut self) {
+        // The progress closure is removed while this lease still exclusively
+        // owns the reader. No asynchronously callable SQLite interrupt escapes.
+        // rusqlite 0.40 only rejects callbacks on borrowed SQLite handles;
+        // pool readers own theirs. Quarantine even that impossible state rather
+        // than return a connection with another request's callback installed.
+        let reusable = match self.db().clear_query_control() {
+            Ok(()) => true,
+            Err(error) => {
+                self.failed = true;
+                tracing::error!(%error, "quarantining database reader after callback reset failed");
+                false
+            }
+        };
         self.pool.read_active.fetch_sub(1, Ordering::Relaxed);
         self.pool.reads_total.fetch_add(1, Ordering::Relaxed);
         if self.failed {
@@ -497,7 +514,10 @@ impl Drop for DbReaderLease<'_> {
             .readers
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        available.push(self.db.take().expect("reader returned exactly once"));
+        let db = self.db.take().expect("reader returned exactly once");
+        if reusable {
+            available.push(db);
+        }
         drop(available);
         self.pool.reader_available.notify_one();
     }
@@ -562,7 +582,10 @@ impl DbPool {
         &self,
         query: impl FnOnce(&LibraryDb) -> rusqlite::Result<T>,
     ) -> rusqlite::Result<T> {
+        let control = current_query_control();
+        control.sqlite_check()?;
         let wait_started = Instant::now();
+        let wait_timer = control.phase(QueryPhase::ReaderWait);
         let mut available = self
             .readers
             .lock()
@@ -571,20 +594,19 @@ impl DbPool {
         if waited {
             self.read_waiters.fetch_add(1, Ordering::Relaxed);
         }
-        while available.is_empty() {
-            available = self
-                .reader_available
-                .wait(available)
-                .unwrap_or_else(|error| error.into_inner());
-        }
-        let db = loop {
-            if let Some(db) = available.pop() {
-                break db;
+        let admission = loop {
+            if let Err(error) = control.sqlite_check() {
+                break Err(error);
             }
-            available = self
+            if let Some(db) = available.pop() {
+                break Ok(db);
+            }
+            let remaining = control.deadline.saturating_duration_since(Instant::now());
+            let (guard, _) = self
                 .reader_available
-                .wait(available)
+                .wait_timeout(available, remaining.min(Duration::from_millis(10)))
                 .unwrap_or_else(|error| error.into_inner());
+            available = guard;
         };
         if waited {
             self.read_waiters.fetch_sub(1, Ordering::Relaxed);
@@ -594,13 +616,20 @@ impl DbPool {
             self.read_wait_ms_max.fetch_max(wait_ms, Ordering::Relaxed);
         }
         drop(available);
+        drop(wait_timer);
+        let db = admission?;
         self.read_active.fetch_add(1, Ordering::Relaxed);
         let mut lease = DbReaderLease {
             pool: self,
             db: Some(db),
             failed: true,
         };
+        lease
+            .db()
+            .install_query_control(control.cancellation.clone(), control.deadline)?;
+        let _execution = control.phase(QueryPhase::Execution);
         let result = query(lease.db());
+        let result = control.sqlite_check().and(result);
         lease.failed = result.is_err();
         result
     }
@@ -849,11 +878,13 @@ struct CatalogQueryCacheEntry {
 #[derive(Debug, Default)]
 struct CatalogQueryCache {
     entries: VecDeque<CatalogQueryCacheEntry>,
+    epoch: Arc<()>,
 }
 
 impl CatalogQueryCache {
     fn clear(&mut self) {
         self.entries.clear();
+        self.epoch = Arc::new(());
     }
 
     fn get(&mut self, generation: u32, key: &str) -> Option<rusty_dlna_scan::CatalogQueryPage> {

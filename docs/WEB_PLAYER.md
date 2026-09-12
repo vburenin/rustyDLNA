@@ -124,16 +124,20 @@ scrolling loads only nearby posters and does not insert cards or adjust the scro
 position. Changing views cancels unfinished metadata requests, and a failed batch
 offers Retry without exposing an incomplete list.
 For lists of at least 500 entries, browsers supporting `content-visibility`
-skip offscreen rendering in batches of cards. Each batch reserves its measured
-height, recalculated when the library width changes; titles remain available
-to browser Find and assistive technology. Poster images occupy reserved space
-and do not change card geometry as they arrive.
+skip offscreen rendering in batches of cards. Card creation yields between
+bounded private batches, then publishes the complete list at once. Navigation
+cancels unfinished construction. Each batch reserves its measured height;
+matching chunk layouts reuse measurements at up to two widths for the current
+list. Titles remain available to browser Find and assistive technology. Poster
+images occupy reserved space and do not change card geometry as they arrive.
 
 Selecting an item takes the complete active folder/search order directly from
 that in-memory list. Previous and Next use that snapshot even after library
 navigation, without additional queue requests. Queue position is shown next to
-Now playing. Optional auto-advance is off by default and can be enabled under
-Advanced playback.
+Now playing. Queue-position lookup is indexed by the immutable queue snapshot;
+playback clock ticks update time, chapter, and position controls without
+rebuilding the full player control state. Optional auto-advance is off by default
+and can be enabled under Advanced playback.
 
 The player uses one custom control surface for Original and Compatible media.
 The close control, timeline, transport, volume, captions, audio and chapter
@@ -957,7 +961,36 @@ an offscreen batch, without depending on `IntersectionObserver`. A catalog chang
 offers a full refresh without displaying an incomplete list or mixing pages from
 different generations.
 The flat view performs at most three total SQLite snapshot attempts, uses
-deterministic ordering, and only materializes the requested page. Continue
+deterministic ordering, and only materializes the requested page. Browser search
+uses Unicode lowercase substring matching over title, artist, album artist,
+album, and filename in both SQLite and memory. Accents and combining marks remain
+distinct; parent directory names are outside the search domain, and `%`, `_`, and
+backslash are literal characters. Date order breaks equal dates by normalized
+title and detail ID; episode/track order uses normalized album, disc, track,
+normalized title, and detail ID.
+
+Later SQLite pages reuse generation-scoped population and matching counts in the
+bounded catalog query cache. Identical SQLite pages also reuse validated IDs
+and counts; each response hydrates current metadata after generation and private
+epoch checks. The shared cache holds at most 256 entries. Physical-folder pages
+reuse ordered ID projections
+for up to eight folder/query combinations within 32 MiB; child counts have their
+own bounded cache. Generation publication invalidates these caches, including
+when the public generation wraps. Search-key collection and child counting use
+bounded catalog-lock intervals; sorting and page DTO construction release the
+catalog lock. Unchanged conditional requests validate parameters, folder
+existence where applicable, and generation before skipping page work.
+
+Heavy-query admission, reader admission, SQLite execution, retries, and memory
+fallback share a five-second absolute budget. An exhausted request returns recoverable
+`503 catalog_busy` rather than retrying an expensive memory search. SQLite
+unavailability can still use the bounded fallback. Four catalog queries may
+execute concurrently; media, item-detail and status requests bypass that gate.
+Memory query work is capped at one million inspected records and 64 MiB of
+scratch/key storage. The fallback retains a catalog read guard during filtering
+and sorting, so its bounded execution can still delay publication. Detailed status
+includes fixed-cardinality `catalog_queries` wait, execution, fallback, timeout,
+cancellation, and work-budget measurements. Continue
 Watching takes one browser-local progress snapshot, keeps at most the 500
 persisted IDs, and hydrates them through
 `view=continue&ids=...` in generation-consistent batches of at most 100. It

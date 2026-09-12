@@ -39,6 +39,7 @@ import {
   playbackProcessing,
   primaryVideoCodec,
   queueNeighbor,
+  queuePosition,
   reconcileQualityPreference,
   resumePosition,
   saferCompatibleQualityProfile,
@@ -1049,6 +1050,18 @@ test("queue navigation is stable by item ID", () => {
   assert.equal(queueNeighbor(queue, "8", -1).id, "3");
   assert.equal(queueNeighbor(queue, "8", 1).id, "13");
   assert.equal(queueNeighbor(queue, "13", 1), null);
+});
+
+test("queue positions preserve first duplicate and follow replaced immutable snapshots", () => {
+  const first = Object.freeze([{ id: 3 }, { id: "8" }, { id: "3" }]);
+  assert.equal(queuePosition(first, "3"), 0);
+  assert.equal(queuePosition(first, 8), 1);
+  assert.equal(queuePosition(first, "missing"), -1);
+  const replacement = Object.freeze([first[1], first[0]]);
+  assert.equal(queuePosition(replacement, 3), 1);
+  assert.equal(queueNeighbor(first, 3, 1), first[1]);
+  assert.equal(queueNeighbor(replacement, 3, -1), first[1]);
+  assert.equal(queuePosition(Object.freeze([{ id: "3" }]), 3), 0);
 });
 
 test("track labels include language, title, codec, and channel layout", () => {

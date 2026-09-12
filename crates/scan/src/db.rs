@@ -26,15 +26,48 @@ use crate::{
 fn register_web_order(conn: &Connection) -> rusqlite::Result<()> {
     use rusqlite::functions::FunctionFlags;
     conn.create_scalar_function(
+        "web_metadata_matches",
+        5,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let path = path_from_db(context.get_raw(0).as_str()?);
+            Ok(crate::web_order::web_media_fields_match(
+                &path,
+                "",
+                Some(context.get_raw(1).as_str()?),
+                Some(context.get_raw(2).as_str()?),
+                Some(context.get_raw(3).as_str()?),
+                context.get_raw(4).as_str()?,
+            ))
+        },
+    )?;
+    conn.create_scalar_function(
+        "web_search_normalize",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| Ok(crate::web_search_normalize(context.get_raw(0).as_str()?)),
+    )?;
+    conn.create_scalar_function(
+        "web_media_display_title",
+        4,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            Ok(media_display_title(
+                &path_from_db(&context.get::<String>(0)?),
+                context.get(1)?,
+                context.get(2)?,
+                &context.get::<String>(3)?,
+            ))
+        },
+    )?;
+    conn.create_scalar_function(
         "web_media_kind",
         1,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |context| {
-            let mime: String = context.get(0)?;
-            Ok(
-                rusty_dlna_protocol::media_format::media_kind_for_mime(&mime)
-                    .map(|kind| kind.upnp_class()),
-            )
+            let mime = context.get_raw(0).as_str()?;
+            Ok(rusty_dlna_protocol::media_format::media_kind_for_mime(mime)
+                .map(|kind| kind.upnp_class()))
         },
     )?;
     conn.create_scalar_function(
@@ -52,6 +85,115 @@ fn register_web_order(conn: &Connection) -> rusqlite::Result<()> {
             ))
         },
     )
+}
+
+fn media_display_title(
+    path: &Path,
+    detail_title: Option<String>,
+    object_name: Option<String>,
+    parent_id: &str,
+) -> String {
+    let nonempty = |value: Option<String>| value.filter(|value| !value.is_empty());
+    let under_series_or_genre = parent_id == VIDEO_SERIES_ID
+        || parent_id.starts_with(&format!("{VIDEO_SERIES_ID}$"))
+        || parent_id == VIDEO_GENRE_ID
+        || parent_id.starts_with(&format!("{VIDEO_GENRE_ID}$"));
+    if under_series_or_genre {
+        nonempty(object_name.clone()).or_else(|| nonempty(detail_title.clone()))
+    } else {
+        nonempty(detail_title).or_else(|| nonempty(object_name))
+    }
+    .unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("item")
+            .to_string()
+    })
+}
+
+// Connection-private allocation state participates in scanner transactions and
+// savepoints. It is never persisted in the catalog schema.
+fn install_child_suffix_cache(conn: &Connection) -> rusqlite::Result<()> {
+    conn.create_scalar_function(
+        "scan_child_suffix",
+        2,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let parent: String = context.get(0)?;
+            let object: String = context.get(1)?;
+            Ok(child_suffix(&parent, &object))
+        },
+    )?;
+    conn.execute_batch(
+        "CREATE TEMP TABLE scan_child_suffixes (
+             PARENT_ID TEXT PRIMARY KEY, MAX_SUFFIX INTEGER NOT NULL
+         ) WITHOUT ROWID;
+         CREATE TEMP TRIGGER scan_child_suffix_insert AFTER INSERT ON main.OBJECTS BEGIN
+             UPDATE scan_child_suffixes
+             SET MAX_SUFFIX = MAX(MAX_SUFFIX, scan_child_suffix(NEW.PARENT_ID, NEW.OBJECT_ID))
+             WHERE PARENT_ID = NEW.PARENT_ID;
+         END;
+         CREATE TEMP TRIGGER scan_child_suffix_delete AFTER DELETE ON main.OBJECTS BEGIN
+             DELETE FROM scan_child_suffixes
+             WHERE PARENT_ID = OLD.PARENT_ID
+               AND MAX_SUFFIX = scan_child_suffix(OLD.PARENT_ID, OLD.OBJECT_ID);
+         END;
+         CREATE TEMP TRIGGER scan_child_suffix_update
+         AFTER UPDATE OF OBJECT_ID, PARENT_ID ON main.OBJECTS
+         WHEN OLD.OBJECT_ID IS NOT NEW.OBJECT_ID OR OLD.PARENT_ID IS NOT NEW.PARENT_ID BEGIN
+             DELETE FROM scan_child_suffixes
+             WHERE PARENT_ID = OLD.PARENT_ID
+               AND MAX_SUFFIX = scan_child_suffix(OLD.PARENT_ID, OLD.OBJECT_ID);
+             UPDATE scan_child_suffixes
+             SET MAX_SUFFIX = MAX(MAX_SUFFIX, scan_child_suffix(NEW.PARENT_ID, NEW.OBJECT_ID))
+             WHERE PARENT_ID = NEW.PARENT_ID;
+         END;",
+    )
+}
+
+fn child_suffix(parent: &str, object: &str) -> i64 {
+    object
+        .strip_prefix(parent)
+        .and_then(|rest| rest.strip_prefix('$'))
+        .and_then(|rest| rest.split('$').next())
+        .and_then(|suffix| i64::from_str_radix(suffix, 16).ok())
+        .unwrap_or(0)
+        .max(0)
+}
+
+fn web_media_query_sql(kind: WebMediaKind, sort: WebMediaSort) -> (String, String) {
+    let mime = match kind {
+            WebMediaKind::All => "web_media_kind(COALESCE(d.MIME, '')) IN ('item.videoItem', 'item.audioItem.musicTrack')",
+            WebMediaKind::Video => "web_media_kind(COALESCE(d.MIME, '')) = 'item.videoItem'",
+            WebMediaKind::Audio => "web_media_kind(COALESCE(d.MIME, '')) = 'item.audioItem.musicTrack'",
+        };
+    let title = format!("CASE WHEN o.PARENT_ID IN ('{VIDEO_SERIES_ID}', '{VIDEO_GENRE_ID}') OR o.PARENT_ID GLOB '{VIDEO_SERIES_ID}$*' OR o.PARENT_ID GLOB '{VIDEO_GENRE_ID}$*' THEN web_media_display_title(COALESCE(d.PATH, ''), d.TITLE, o.NAME, o.PARENT_ID) ELSE COALESCE(NULLIF(d.TITLE, ''), NULLIF(o.NAME, ''), web_media_display_title(COALESCE(d.PATH, ''), d.TITLE, o.NAME, o.PARENT_ID)) END");
+    let order = match sort {
+            WebMediaSort::Title => format!("web_media_title_key(COALESCE(d.COLLECTION_PATH, d.PATH, ''), COALESCE(d.MIME, ''), {title}), d.ID"),
+            WebMediaSort::DateDescending => format!("COALESCE(d.DATE, '') DESC, web_search_normalize({title}), d.ID"),
+            WebMediaSort::EpisodeTrack => format!("web_search_normalize(COALESCE(d.ALBUM, '')), COALESCE(d.DISC, 0), COALESCE(d.TRACK, 0), web_search_normalize({title}), d.ID"),
+        };
+    // Effective titles can have object-local overlays. A correlated lookup
+    // uses the existing detail index only when that field is searched;
+    // empty searches avoid whole-catalog representative materialization.
+    let search_title = format!("(SELECT {title} FROM OBJECTS o WHERE o.DETAIL_ID = d.ID ORDER BY o.REF_ID IS NOT NULL, o.OBJECT_ID LIMIT 1)");
+    let cte = format!(
+            "WITH matching AS (\
+               SELECT MIN(d.ID) AS detail_id FROM DETAILS d \
+               WHERE {mime} AND EXISTS (SELECT 1 FROM OBJECTS present WHERE present.DETAIL_ID = d.ID) AND (?1 = '' OR (\
+                 web_metadata_matches(COALESCE(d.PATH, ''), COALESCE(d.ARTIST, ''), COALESCE(d.ALBUM_ARTIST, ''), COALESCE(d.ALBUM, ''), ?1) OR \
+                 INSTR(web_search_normalize(COALESCE({search_title}, '')), ?1) > 0\
+               )) GROUP BY CASE WHEN COALESCE(d.INODE, 0) = 0 \
+                 THEN 'id:' || d.ID ELSE d.DEVICE || ':' || d.INODE END\
+             ), representatives AS (\
+               SELECT m.detail_id, COALESCE(\
+                 MIN(CASE WHEN o.REF_ID IS NULL THEN o.OBJECT_ID END), MIN(o.OBJECT_ID)\
+               ) AS object_id FROM matching m JOIN OBJECTS o ON o.DETAIL_ID = m.detail_id \
+               GROUP BY m.detail_id\
+             ) "
+        );
+    (cte, order)
 }
 
 pub(crate) const STREAM_PROBE_REVISION: i64 = 7;
@@ -188,23 +330,9 @@ fn media_item_from_catalog_row(
         .get::<_, Option<String>>(10)?
         .unwrap_or_else(|| "video/x-matroska".into());
     let ext = mime_to_ext(&mime);
-    let nonempty = |value: Option<String>| value.filter(|value| !value.is_empty());
     let detail_title: Option<String> = row.get(25)?;
-    let under_series_or_genre = parent_id == VIDEO_SERIES_ID
-        || parent_id.starts_with(&format!("{VIDEO_SERIES_ID}$"))
-        || parent_id == VIDEO_GENRE_ID
-        || parent_id.starts_with(&format!("{VIDEO_GENRE_ID}$"));
-    let title = if under_series_or_genre {
-        nonempty(object_name.clone()).or_else(|| nonempty(detail_title.clone()))
-    } else {
-        nonempty(detail_title).or_else(|| nonempty(object_name))
-    }
-    .unwrap_or_else(|| {
-        path.file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("item")
-            .to_string()
-    });
+    let title = media_display_title(&path, detail_title, object_name, &parent_id);
+    let nonempty = |value: Option<String>| value.filter(|value| !value.is_empty());
     let container: Option<String> = row.get(19)?;
     let video: Option<String> = row.get(20)?;
     let audio: Option<String> = row.get(21)?;
@@ -534,6 +662,14 @@ pub struct CatalogQueryPage {
     pub population: u32,
 }
 
+/// Generation-validated invariant counts supplied by the request layer. The
+/// caller must read the generation and use the counts in the same transaction.
+#[derive(Clone, Copy, Debug)]
+pub struct CatalogQueryCounts {
+    pub total: u32,
+    pub population: u32,
+}
+
 /// Media-kind filter for the embedded web player's detail-deduplicated query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WebMediaKind {
@@ -796,6 +932,8 @@ impl LibraryDb {
 
     /// Capture the exact catalog rows touched by the next scanner transaction.
     /// TEMP triggers keep the journal connection-local and transactional.
+    /// Object changes also capture their old/new detail IDs so patches can
+    /// reselect a representative from all surviving mappings of that detail.
     pub fn begin_catalog_change_capture(&self) -> rusqlite::Result<()> {
         self.conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS catalog_object_changes (
@@ -813,15 +951,23 @@ impl LibraryDb {
              CREATE TEMP TRIGGER IF NOT EXISTS capture_object_insert
              AFTER INSERT ON main.OBJECTS BEGIN
                  INSERT INTO catalog_object_changes VALUES (NEW.OBJECT_ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO catalog_detail_changes SELECT NEW.DETAIL_ID
+                 WHERE NEW.DETAIL_ID IS NOT NULL ON CONFLICT DO NOTHING;
              END;
              CREATE TEMP TRIGGER IF NOT EXISTS capture_object_update
              AFTER UPDATE ON main.OBJECTS BEGIN
                  INSERT INTO catalog_object_changes VALUES (OLD.OBJECT_ID) ON CONFLICT DO NOTHING;
                  INSERT INTO catalog_object_changes VALUES (NEW.OBJECT_ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO catalog_detail_changes SELECT OLD.DETAIL_ID
+                 WHERE OLD.DETAIL_ID IS NOT NULL ON CONFLICT DO NOTHING;
+                 INSERT INTO catalog_detail_changes SELECT NEW.DETAIL_ID
+                 WHERE NEW.DETAIL_ID IS NOT NULL ON CONFLICT DO NOTHING;
              END;
              CREATE TEMP TRIGGER IF NOT EXISTS capture_object_delete
              AFTER DELETE ON main.OBJECTS BEGIN
                  INSERT INTO catalog_object_changes VALUES (OLD.OBJECT_ID) ON CONFLICT DO NOTHING;
+                 INSERT INTO catalog_detail_changes SELECT OLD.DETAIL_ID
+                 WHERE OLD.DETAIL_ID IS NOT NULL ON CONFLICT DO NOTHING;
              END;
              CREATE TEMP TRIGGER IF NOT EXISTS capture_detail_insert
              AFTER INSERT ON main.DETAILS BEGIN
@@ -1484,6 +1630,7 @@ impl LibraryDb {
         conn.execute_batch(SCHEMA)?;
         migrate_schema(&mut conn)?;
         verify_integrity(&conn)?;
+        install_child_suffix_cache(&conn)?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
@@ -1496,6 +1643,7 @@ impl LibraryDb {
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
         migrate_schema(&mut conn)?;
+        install_child_suffix_cache(&conn)?;
         Ok(Self {
             conn,
             path: PathBuf::from(":memory:"),
@@ -1510,11 +1658,31 @@ impl LibraryDb {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         register_web_order(&conn)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(std::time::Duration::from_millis(20))?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
         })
+    }
+
+    /// Install lease-local cooperative query cancellation. No interrupt handle
+    /// escapes this lease, so a late cancellation cannot affect its next owner.
+    pub fn install_query_control(
+        &self,
+        cancellation: crate::CancellationToken,
+        deadline: std::time::Instant,
+    ) -> rusqlite::Result<()> {
+        self.conn
+            .busy_timeout(std::time::Duration::from_millis(20))?;
+        self.conn.progress_handler(
+            1_000,
+            Some(move || cancellation.is_cancelled() || std::time::Instant::now() >= deadline),
+        )
+    }
+
+    /// Remove every request-owned callback before a reader is returned to its pool.
+    pub fn clear_query_control(&self) -> rusqlite::Result<()> {
+        self.conn.progress_handler(0, None::<fn() -> bool>)
     }
 
     pub(crate) fn backup_to_path_cancelled(
@@ -1673,60 +1841,39 @@ impl LibraryDb {
         start: usize,
         take: usize,
     ) -> rusqlite::Result<CatalogQueryPage> {
-        let mime = match kind {
-            WebMediaKind::All => "web_media_kind(COALESCE(d.MIME, '')) IN ('item.videoItem', 'item.audioItem.musicTrack')",
-            WebMediaKind::Video => "web_media_kind(COALESCE(d.MIME, '')) = 'item.videoItem'",
-            WebMediaKind::Audio => "web_media_kind(COALESCE(d.MIME, '')) = 'item.audioItem.musicTrack'",
-        };
-        let order = match sort {
-            WebMediaSort::Title => "web_media_title_key(COALESCE(d.COLLECTION_PATH, d.PATH, ''), COALESCE(d.MIME, ''), COALESCE(NULLIF(d.TITLE, ''), d.PATH, '')), d.ID",
-            WebMediaSort::DateDescending => {
-                "COALESCE(d.DATE, '') DESC, LOWER(COALESCE(NULLIF(d.TITLE, ''), d.PATH)), d.ID"
+        self.query_web_media_page_with_counts(kind, query, sort, start, take, None)
+    }
+
+    pub fn query_web_media_page_with_counts(
+        &self,
+        kind: WebMediaKind,
+        query: &str,
+        sort: WebMediaSort,
+        start: usize,
+        take: usize,
+        counts: Option<CatalogQueryCounts>,
+    ) -> rusqlite::Result<CatalogQueryPage> {
+        let (cte, order) = web_media_query_sql(kind, sort);
+        let needle = crate::web_search_normalize(query);
+        let (total_i64, population) = match counts {
+            Some(counts) => (i64::from(counts.total), counts.population),
+            None => {
+                let population_i64: i64 = self.conn.query_row(
+                    "SELECT COUNT(*) FROM OBJECTS WHERE OBJECT_ID <> ?1",
+                    [ROOT_ID],
+                    |row| row.get(0),
+                )?;
+                let total_i64: i64 = self
+                    .conn
+                    .prepare_cached(&format!("{cte}SELECT COUNT(*) FROM representatives"))?
+                    .query_row([&needle], |row| row.get(0))?;
+                (
+                    total_i64,
+                    u32::try_from(population_i64.max(0)).unwrap_or(u32::MAX),
+                )
             }
-            WebMediaSort::EpisodeTrack => {
-                "LOWER(COALESCE(d.ALBUM, '')), COALESCE(d.DISC, 0), COALESCE(d.TRACK, 0), \
-                 LOWER(COALESCE(NULLIF(d.TITLE, ''), d.PATH)), d.ID"
-            }
         };
-        let escaped = query
-            .to_lowercase()
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let needle = format!("%{escaped}%");
-        let cte = format!(
-            "WITH matching AS (\
-               SELECT MIN(d.ID) AS detail_id \
-               FROM DETAILS d \
-               WHERE {mime} AND (\
-                 LOWER(COALESCE(d.TITLE, '')) LIKE ?1 ESCAPE '\\' OR \
-                 LOWER(COALESCE(d.ARTIST, '')) LIKE ?1 ESCAPE '\\' OR \
-                 LOWER(COALESCE(d.ALBUM_ARTIST, '')) LIKE ?1 ESCAPE '\\' OR \
-                 LOWER(COALESCE(d.ALBUM, '')) LIKE ?1 ESCAPE '\\' OR \
-                 LOWER(COALESCE(d.PATH, '')) LIKE ?1 ESCAPE '\\'\
-               ) \
-               GROUP BY CASE WHEN COALESCE(d.INODE, 0) = 0 \
-                 THEN 'id:' || d.ID ELSE d.DEVICE || ':' || d.INODE END\
-             ), representatives AS (\
-               SELECT m.detail_id, COALESCE(\
-                 MIN(CASE WHEN o.REF_ID IS NULL THEN o.OBJECT_ID END), \
-                 MIN(o.OBJECT_ID)\
-               ) AS object_id \
-               FROM matching m JOIN OBJECTS o ON o.DETAIL_ID = m.detail_id \
-               GROUP BY m.detail_id\
-             ) "
-        );
-        let population_i64: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM OBJECTS WHERE OBJECT_ID <> ?1",
-            [ROOT_ID],
-            |row| row.get(0),
-        )?;
-        let total_i64: i64 = self
-            .conn
-            .prepare_cached(&format!("{cte}SELECT COUNT(*) FROM representatives"))?
-            .query_row([&needle], |row| row.get(0))?;
         let total = u32::try_from(total_i64.max(0)).unwrap_or(u32::MAX);
-        let population = u32::try_from(population_i64.max(0)).unwrap_or(u32::MAX);
         if take == 0 || page_start_at_or_past_total(start, total_i64) {
             return Ok(CatalogQueryPage {
                 object_ids: Vec::new(),
@@ -1736,14 +1883,15 @@ impl LibraryDb {
         }
         let sql = format!(
             "{cte}SELECT r.object_id FROM representatives r \
-             JOIN DETAILS d ON d.ID = r.detail_id \
-             ORDER BY {order} LIMIT {} OFFSET {}",
-            sqlite_page_value(take),
-            sqlite_page_value(start)
+             JOIN DETAILS d ON d.ID = r.detail_id JOIN OBJECTS o ON o.OBJECT_ID = r.object_id \
+             ORDER BY {order} LIMIT ?2 OFFSET ?3"
         );
         let mut statement = self.conn.prepare_cached(&sql)?;
         let object_ids = statement
-            .query_map([&needle], |row| row.get::<_, String>(0))?
+            .query_map(
+                params![needle, sqlite_page_value(take), sqlite_page_value(start)],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(CatalogQueryPage {
             object_ids,
@@ -1802,11 +1950,24 @@ impl LibraryDb {
     }
 
     pub fn transaction(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
-        self.conn.unchecked_transaction()
+        let transaction = self.conn.unchecked_transaction()?;
+        if !self.conn.is_readonly("main")? {
+            self.conn
+                .execute("DELETE FROM temp.scan_child_suffixes", [])?;
+        }
+        Ok(transaction)
     }
 
     pub(crate) fn immediate_transaction(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
-        rusqlite::Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if !self.conn.is_readonly("main")? {
+            self.conn
+                .execute("DELETE FROM temp.scan_child_suffixes", [])?;
+        }
+        Ok(transaction)
     }
 
     #[cfg(test)]
@@ -3042,37 +3203,49 @@ impl LibraryDb {
     }
 
     pub fn all_video_has_inode(&self, device: i64, inode: i64) -> rusqlite::Result<bool> {
-        let n: i64 = self.conn.query_row(
-            "SELECT count(*) FROM OBJECTS o JOIN DETAILS d ON o.DETAIL_ID = d.ID
-             WHERE o.PARENT_ID = ?1 AND d.DEVICE = ?2 AND d.INODE = ?3",
-            params![VIDEO_ALL_ID, device, inode],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
+        self.indexed_folder_has_inode(VIDEO_ALL_ID, device, inode)
     }
 
     /// Next `$HEX` suffix for a new child of `parent`. Uses the max existing
     /// suffix, not `count(*)+1`, so deleting a sibling cannot reuse an id
     /// and `upsert` cannot rename another folder onto leftover children.
     pub fn next_child_seq(&self, parent: &str) -> rusqlite::Result<i64> {
-        let prefix = format!("{parent}$");
-        let mut stmt = self
-            .conn
-            .prepare("SELECT OBJECT_ID FROM OBJECTS WHERE PARENT_ID = ?1")?;
-        let rows = stmt.query_map([parent], |r| r.get::<_, String>(0))?;
-        let mut max = 0i64;
-        for id in rows {
-            let id = id?;
-            let Some(rest) = id.strip_prefix(&prefix) else {
-                continue;
-            };
-            let suffix = rest.split('$').next().unwrap_or(rest);
-            if let Ok(n) = i64::from_str_radix(suffix, 16) {
-                max = max.max(n);
+        // Autocommit callers retain the public read-only observation semantics.
+        // Scanner transactions initialize each parent's maximum once, then
+        // TEMP triggers track admissions, explicit IDs, deletions and moves.
+        let transactional = !self.conn.is_autocommit() && !self.conn.is_readonly("main")?;
+        if transactional {
+            let cached: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT MAX_SUFFIX FROM temp.scan_child_suffixes WHERE PARENT_ID = ?1",
+                    [parent],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(maximum) = cached {
+                return maximum
+                    .checked_add(1)
+                    .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, maximum));
             }
         }
-        max.checked_add(1)
-            .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, max))
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT OBJECT_ID FROM OBJECTS WHERE PARENT_ID = ?1")?;
+        let rows = stmt.query_map([parent], |r| r.get::<_, String>(0))?;
+        let mut maximum = 0i64;
+        for id in rows {
+            maximum = maximum.max(child_suffix(parent, &id?));
+        }
+        if transactional {
+            self.conn.execute(
+                "INSERT INTO temp.scan_child_suffixes (PARENT_ID, MAX_SUFFIX) VALUES (?1, ?2)",
+                params![parent, maximum],
+            )?;
+        }
+        maximum
+            .checked_add(1)
+            .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, maximum))
     }
 
     pub fn object_exists(&self, object_id: &str) -> rusqlite::Result<bool> {
@@ -3998,12 +4171,25 @@ impl LibraryDb {
         if inode == 0 {
             return Ok(false);
         }
+        self.indexed_folder_has_inode(parent_id, device, inode)
+    }
+
+    fn indexed_folder_has_inode(
+        &self,
+        parent_id: &str,
+        device: i64,
+        inode: i64,
+    ) -> rusqlite::Result<bool> {
+        // The parent-first plan scans every already-admitted sibling for each
+        // new video. Pin the selective inode lookup before its object mappings
+        // so aggregate membership stays proportional to matching aliases.
         self.conn
             .query_row(
                 "SELECT EXISTS(
-                   SELECT 1 FROM OBJECTS o
-                   JOIN DETAILS d ON d.ID = o.DETAIL_ID
-                   WHERE o.PARENT_ID = ?1 AND d.DEVICE = ?2 AND d.INODE = ?3
+                   SELECT 1 FROM DETAILS d INDEXED BY IDX_DETAILS_INODE
+                   CROSS JOIN OBJECTS o INDEXED BY IDX_OBJECTS_DETAIL
+                   WHERE d.DEVICE = ?2 AND d.INODE = ?3
+                     AND o.DETAIL_ID = d.ID AND o.PARENT_ID = ?1
                  )",
                 params![parent_id, device, inode],
                 |r| r.get::<_, i64>(0),
@@ -4195,6 +4381,11 @@ impl LibraryDb {
 
     pub fn load_catalog(&self) -> rusqlite::Result<Catalog> {
         let mut cat = Catalog::new();
+        let mut linked_containers: HashSet<String> = cat
+            .containers
+            .values()
+            .flat_map(|container| container.children.iter().cloned())
+            .collect();
         {
             let mut stmt = self.conn.prepare(
                 "SELECT OBJECT_ID, PARENT_ID, CLASS, NAME FROM OBJECTS WHERE DETAIL_ID IS NULL",
@@ -4223,7 +4414,7 @@ impl LibraryDb {
                         searchable: true,
                     });
                 if let Some(p) = cat.containers.get_mut(&parent) {
-                    if !p.children.iter().any(|c| c == &id) {
+                    if linked_containers.insert(id.clone()) {
                         p.children.push(id);
                     }
                 }
@@ -4257,11 +4448,20 @@ impl LibraryDb {
                 let oid = item.object_id.clone();
                 let parent = item.parent_id.clone();
                 let did = item.detail_id;
-                cat.by_detail.entry(did).or_insert_with(|| oid.clone());
+                let replace_representative = cat
+                    .by_detail
+                    .get(&did)
+                    .and_then(|current| cat.items.get(current))
+                    .is_none_or(|current| {
+                        (item.ref_id.is_some(), &oid)
+                            < (current.ref_id.is_some(), &current.object_id)
+                    });
+                if replace_representative {
+                    cat.by_detail.insert(did, oid.clone());
+                }
                 if let Some(p) = cat.containers.get_mut(&parent) {
-                    if !p.children.iter().any(|c| c == &oid) {
-                        p.children.push(oid.clone());
-                    }
+                    // OBJECT_ID is unique and Catalog::new seeds no items.
+                    p.children.push(oid.clone());
                 }
                 let next_detail = did
                     .checked_add(1)
@@ -5535,7 +5735,9 @@ mod query_tests {
                 10,
             )
             .unwrap();
-        assert_eq!(searched.object_ids, ["2$3", "2$5", "2$1"]);
+        // Browser matching searches the filename and metadata, not its parent
+        // collection directory; only the title itself contains "Briar Saga".
+        assert_eq!(searched.object_ids, ["2$3"]);
     }
 
     #[test]
@@ -6163,3 +6365,7 @@ mod query_tests {
         let _ = std::fs::remove_file(parent);
     }
 }
+
+#[cfg(test)]
+#[path = "db_query_benchmark.rs"]
+mod query_benchmark;

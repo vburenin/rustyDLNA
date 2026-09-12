@@ -63,3 +63,127 @@ test("10,000 movie cards reserve stable offscreen space and load posters on dema
   await expect(last).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
+
+test("navigation cancels private card batches without publishing a partial list", async ({ page, request }) => {
+  const template = await (await request.get("/api/web/library?view=library&kind=video")).json();
+  const base = template.entries.find((entry) => entry.entry_type === "media");
+  await page.addInitScript(() => {
+    const create = document.createElement.bind(document);
+    window.__cardBuild = { count: 0, atNavigation: null };
+    document.createElement = (...args) => {
+      const element = create(...args);
+      if (args[0] === "article" && ++window.__cardBuild.count === 64) {
+        setTimeout(() => {
+          window.__cardBuild.atNavigation = document.querySelectorAll(".media-card.video").length;
+          document.querySelector('[data-kind="audio"]').click();
+        }, 0);
+      }
+      return element;
+    };
+  });
+  await page.route("**/api/web/library?**", async (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    if (params.get("kind") !== "video") return route.fallback();
+    const offset = Number(params.get("offset"));
+    await route.fulfill({ json: { ...template, offset, limit: 200, total: 1000, has_more: offset + 200 < 1000,
+      entries: Array.from({ length: 200 }, (_, index) => ({
+        ...base, id: String(100000 + offset + index), title: `Cancelled card ${offset + index}`, art_url: null,
+      })),
+    } });
+  });
+  await page.goto("/?view=video");
+  await expect(page.getByRole("tab", { name: "Audio", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#library-panel")).toHaveAttribute("aria-busy", "false");
+  await expect(page.locator(".media-card.audio").first()).toBeVisible();
+  expect(await page.evaluate(() => window.__cardBuild.atNavigation)).toBe(0);
+  expect(await page.evaluate(() => window.__cardBuild.count)).toBeLessThan(200);
+  await expect(page.locator(".media-card.video")).toHaveCount(0);
+});
+
+test("chunk reservations match heterogeneous card layouts and reuse an unchanged width", async ({ page, request }) => {
+  const template = await (await request.get("/api/web/library?view=library&kind=video")).json();
+  const base = template.entries.find((entry) => entry.entry_type === "media");
+  await page.addInitScript(() => {
+    window.__chunkMeasurements = 0;
+    const measure = Element.prototype.getBoundingClientRect;
+    Element.prototype.getBoundingClientRect = function () {
+      if (this.classList.contains("media-chunk") && this.style.contentVisibility === "visible") window.__chunkMeasurements += 1;
+      return measure.call(this);
+    };
+  });
+  await page.route("**/api/web/library?**", async (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    if (params.get("kind") !== "video") return route.fallback();
+    const offset = Number(params.get("offset"));
+    await route.fulfill({ json: { ...template, offset, limit: 200, total: 1000, has_more: offset + 200 < 1000,
+      entries: Array.from({ length: 200 }, (_, index) => ({
+        ...base, id: String(100000 + offset + index), title: `A varying title ${index} ${"long ".repeat(index % 10)}`,
+        kind: index % 4 === 0 ? "audio" : "video", artist: "A long artist name ".repeat(index % 3),
+        album: "Album", file_name: index % 3 ? "file.mp4" : null, art_url: null,
+        collection: offset >= 400 && offset < 600 ? { id: "varied", title: "Varied collection" } : null,
+      })),
+    } });
+  });
+  await page.goto("/?view=video");
+  await expect(page.locator(".media-card")).toHaveCount(1000);
+  const checkHeights = async () => {
+    const mismatches = await page.evaluate(() => {
+      const chunks = [...document.querySelectorAll(".media-chunk")];
+      for (const chunk of chunks) chunk.style.contentVisibility = "visible";
+      const mismatches = chunks.map((chunk) => ({ measured: chunk.getBoundingClientRect().height,
+        reserved: parseFloat(chunk.style.getPropertyValue("--chunk-height")) }))
+        .filter(({ measured, reserved }) => Math.abs(measured - reserved) > 1);
+      for (const chunk of chunks) chunk.style.removeProperty("content-visibility");
+      return mismatches;
+    });
+    expect(mismatches).toEqual([]);
+  };
+  await checkHeights();
+  const focusedCard = page.locator(".media-card .card-button").nth(850);
+  await focusedCard.focus();
+  const original = page.viewportSize();
+  await page.setViewportSize({ width: original.width === 820 ? 1000 : 820, height: original.height });
+  await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+  await expect(focusedCard).toBeFocused();
+  await checkHeights();
+  await page.evaluate(() => { window.__chunkMeasurements = 0; });
+  await page.setViewportSize(original);
+  await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+  await expect(focusedCard).toBeFocused();
+  expect(await page.evaluate(() => window.__chunkMeasurements)).toBe(0);
+  await checkHeights();
+});
+
+test("clock events update time and chapters without repainting static playback controls", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("rustydlna.stream", "direct"));
+  await page.route("**/api/web/library?**", async (route) => {
+    const payload = await (await route.fetch()).json();
+    for (const item of payload.entries) {
+      if (item.title === "tagged") item.chapters = [
+        { index: 0, start_seconds: 0, title: "First" },
+        { index: 1, start_seconds: 1, title: "Second" },
+      ];
+    }
+    await route.fulfill({ json: payload });
+  });
+  await page.goto("/?view=video");
+  await page.getByRole("button", { name: /^Play tagged\./ }).click();
+  await expect(page.locator("#video-player")).toHaveAttribute("src", /\/web\/media\//);
+  const result = await page.evaluate(() => {
+    const video = document.querySelector("#video-player");
+    Object.defineProperty(video, "currentTime", { configurable: true, get: () => 1.25 });
+    const observer = new MutationObserver(() => {});
+    for (const id of ["queue-position", "now-playing-title", "previous-button", "next-button", "stream-controls"]) {
+      const element = document.getElementById(id);
+      if (element) observer.observe(element, { subtree: true, childList: true, attributes: true, characterData: true });
+    }
+    video.dispatchEvent(new Event("timeupdate"));
+    const mutations = observer.takeRecords().length;
+    observer.disconnect();
+    return { mutations, time: document.querySelector("#timeline-current").textContent,
+      chapter: document.querySelector("#chapter-controls").value };
+  });
+  expect(result.mutations).toBe(0);
+  expect(result.time).toBe("0:01");
+  expect(result.chapter).toBe("1");
+});

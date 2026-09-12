@@ -2553,6 +2553,7 @@ fn incremental_catalog_patch_matches_reload_for_add_sidecar_and_remove() {
                 "incremental container {id} differs from a full reload"
             );
         }
+        assert_eq!(published.by_detail, reloaded.by_detail);
         assert_eq!(published.album_art_paths, reloaded.album_art_paths);
         assert_eq!(published.recent_ids, reloaded.recent_ids);
     };
@@ -6808,4 +6809,787 @@ fn demuxer_revision_removes_legacy_manifests_without_deleting_failed_supported_p
             .collect();
         assert_eq!(paths, [valid, damaged].into());
     }
+}
+
+// Bounded synthetic catalog workload: run explicitly with --ignored --nocapture.
+// Times describe database allocation/restoration, not media probing or HTTP latency.
+#[test]
+#[ignore = "large-library algorithm and resource measurement"]
+fn bundle_e_catalog_scale_measurement() {
+    let sizes: Vec<usize> = std::env::var("RUSTY_DLNA_CATALOG_BENCH_SIZES")
+        .unwrap_or_else(|_| "1000,4000,50000".into())
+        .split(',')
+        .map(|value| value.parse().unwrap())
+        .collect();
+    assert!(sizes.iter().all(|size| (1..=50_000).contains(size)));
+    for size in sizes {
+        for sharded in [false, true] {
+            let db = LibraryDb::open_memory().unwrap();
+            db.seed_virtual_containers().unwrap();
+            let transaction = db.transaction().unwrap();
+            let started = std::time::Instant::now();
+            for index in 0..size {
+                let parent = if sharded {
+                    format!("64${:X}", index / 1000 + 1)
+                } else {
+                    "64$1".into()
+                };
+                if index == 0 || (sharded && index % 1000 == 0) {
+                    db.upsert_object(
+                        &parent,
+                        "64",
+                        "container.storageFolder",
+                        None,
+                        &parent,
+                        None,
+                    )
+                    .unwrap();
+                }
+                let path = format!("/generated/{index:08}.mkv");
+                let detail = db
+                    .insert_detail(NewDetail {
+                        path: &path,
+                        size: 1,
+                        timestamp: 1,
+                        title: &path,
+                        date: "2026-01-01",
+                        mime: "video/x-matroska",
+                        device: 1,
+                        inode: index as i64 + 1,
+                        dlna_pn: None,
+                    })
+                    .unwrap();
+                let object = allocate_child_id(&db, &parent).unwrap();
+                db.upsert_object(
+                    &object,
+                    &parent,
+                    "item.videoItem",
+                    Some(detail),
+                    &path,
+                    None,
+                )
+                .unwrap();
+                let aggregate = allocate_child_id(&db, VIDEO_ALL_ID).unwrap();
+                db.upsert_object(
+                    &aggregate,
+                    VIDEO_ALL_ID,
+                    "item.videoItem",
+                    Some(detail),
+                    &path,
+                    Some(&object),
+                )
+                .unwrap();
+                let mirror = browse_to_typed_dir(&object, VIDEO_DIR_ID);
+                let mirror_parent = browse_to_typed_dir(&parent, VIDEO_DIR_ID);
+                db.upsert_object(
+                    &mirror_parent,
+                    VIDEO_DIR_ID,
+                    "container.storageFolder",
+                    None,
+                    &parent,
+                    None,
+                )
+                .unwrap();
+                db.upsert_object(
+                    &mirror,
+                    &mirror_parent,
+                    "item.videoItem",
+                    Some(detail),
+                    &path,
+                    Some(&object),
+                )
+                .unwrap();
+            }
+            transaction.commit().unwrap();
+            let allocation = started.elapsed();
+            let started = std::time::Instant::now();
+            let mut catalog = db.load_catalog().unwrap();
+            let restore = started.elapsed();
+            assert_eq!(catalog.items.len(), size * 3);
+            assert_eq!(catalog.containers[VIDEO_ALL_ID].children.len(), size);
+            for container in catalog.containers.values() {
+                assert_eq!(
+                    container.children.len(),
+                    container.children.iter().collect::<HashSet<_>>().len()
+                );
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..1000 {
+                catalog.apply_patch(CatalogPatch {
+                    changed_detail_ids: vec![i64::MAX - 1],
+                    ..Default::default()
+                });
+            }
+            let patches = started.elapsed();
+            eprintln!("catalog_scale size={size} shape={} allocate_ms={:.3} restore_ms={:.3} patches_1000_ms={:.3}", if sharded { "sharded" } else { "flat" }, allocation.as_secs_f64()*1000., restore.as_secs_f64()*1000., patches.as_secs_f64()*1000.);
+        }
+    }
+}
+
+#[test]
+#[ignore = "large-library detail-map patch measurement"]
+fn bundle_e_detail_map_patch_measurement() {
+    for size in [1000, 4000, 50000] {
+        let mut catalog = Catalog::new();
+        catalog.by_detail = (0..size).map(|id| (id, format!("64${id:X}"))).collect();
+        let started = std::time::Instant::now();
+        for _ in 0..1000 {
+            catalog.apply_patch(CatalogPatch {
+                changed_detail_ids: vec![i64::MAX - 1],
+                ..Default::default()
+            });
+        }
+        eprintln!(
+            "detail_map_patch size={size} patches_1000_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1000.
+        );
+    }
+}
+
+#[test]
+fn child_suffix_cache_preserves_rollback_deletion_moves_and_overflow() {
+    let db = LibraryDb::open_memory().unwrap();
+    let insert = |id: &str, parent: &str| {
+        db.upsert_object(id, parent, "container.storageFolder", None, id, None)
+            .unwrap();
+    };
+    insert("64$1", "64");
+    insert("64$A", "64");
+    {
+        let transaction = db.transaction().unwrap();
+        assert_eq!(db.next_child_seq("64").unwrap(), 11);
+        insert("64$B", "64");
+        assert_eq!(db.next_child_seq("64").unwrap(), 12);
+        db.connection()
+            .execute("DELETE FROM OBJECTS WHERE OBJECT_ID = '64$B'", [])
+            .unwrap();
+        assert_eq!(db.next_child_seq("64").unwrap(), 11);
+        insert("64$B", "64");
+        db.connection()
+            .execute_batch("SAVEPOINT allocation;")
+            .unwrap();
+        insert("64$FF", "64");
+        assert_eq!(db.next_child_seq("64").unwrap(), 256);
+        db.connection()
+            .execute_batch("ROLLBACK TO allocation; RELEASE allocation;")
+            .unwrap();
+        assert_eq!(db.next_child_seq("64").unwrap(), 12);
+        // Moving a row invalidates only the old maximum and updates its new parent.
+        insert("64$B", "elsewhere");
+        assert_eq!(db.next_child_seq("64").unwrap(), 11);
+        insert("64$7FFFFFFFFFFFFFFF", "64");
+        assert!(db.next_child_seq("64").is_err());
+        transaction.rollback().unwrap();
+    }
+    assert_eq!(db.next_child_seq("64").unwrap(), 11);
+    let transaction = db.transaction().unwrap();
+    assert_eq!(db.next_child_seq("64").unwrap(), 11);
+    db.clear_objects().unwrap();
+    assert_eq!(db.next_child_seq("64").unwrap(), 1);
+    // A conflicting global ID under an unrelated parent must still be skipped.
+    insert("64$1", "elsewhere");
+    assert_eq!(allocate_child_id(&db, "64").unwrap(), "64$2");
+    transaction.commit().unwrap();
+}
+
+#[test]
+fn child_suffix_allocation_vm_work_scales_linearly() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    fn measure(size: usize) -> usize {
+        let db = LibraryDb::open_memory().unwrap();
+        let transaction = db.transaction().unwrap();
+        let work = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed = work.clone();
+        db.connection()
+            .progress_handler(
+                1,
+                Some(move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            )
+            .unwrap();
+        for index in 1..=size {
+            let id = allocate_child_id(&db, "64").unwrap();
+            assert_eq!(id, format!("64${index:X}"));
+            db.upsert_object(&id, "64", "container.storageFolder", None, &id, None)
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        work.load(Ordering::Relaxed)
+    }
+    let small = measure(1000);
+    let large = measure(4000);
+    eprintln!("child_suffix_vm_steps size1000={small} size4000={large}");
+    assert!(
+        large < small * 5,
+        "quadrupling admissions must remain near linear: {small} -> {large}"
+    );
+}
+
+#[test]
+fn aggregate_inode_membership_preserves_aliases_and_scales_linearly() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn measure(size: usize) -> usize {
+        let db = LibraryDb::open_memory().unwrap();
+        let transaction = db.transaction().unwrap();
+        for index in 0..size {
+            let detail = db
+                .insert_detail(NewDetail {
+                    path: &format!("/generated/video-{index}.mkv"),
+                    size: 1,
+                    timestamp: 1,
+                    title: "video",
+                    date: "2026-01-01",
+                    mime: "video/x-matroska",
+                    device: 7,
+                    inode: index as i64,
+                    dlna_pn: None,
+                })
+                .unwrap();
+            db.upsert_object(
+                &format!("{VIDEO_ALL_ID}${index:X}"),
+                VIDEO_ALL_ID,
+                "item.videoItem",
+                Some(detail),
+                "video",
+                None,
+            )
+            .unwrap();
+        }
+        // The first matching detail need not have an object in this folder.
+        let alias = db
+            .insert_detail(NewDetail {
+                path: "/generated/alias.mkv",
+                size: 1,
+                timestamp: 1,
+                title: "alias",
+                date: "2026-01-01",
+                mime: "video/x-matroska",
+                device: 7,
+                inode: 1,
+                dlna_pn: None,
+            })
+            .unwrap();
+        db.upsert_object(
+            "virtual$1",
+            "virtual",
+            "item.videoItem",
+            Some(alias),
+            "alias",
+            None,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        assert!(db.folder_has_inode("virtual", 7, 1).unwrap());
+        assert!(!db.folder_has_inode("virtual", 8, 1).unwrap());
+        // All Video historically treats zero as a matching stored inode;
+        // virtual folder dedup deliberately treats it as unknown instead.
+        assert!(db.all_video_has_inode(7, 0).unwrap());
+        assert!(!db.folder_has_inode(VIDEO_ALL_ID, 7, 0).unwrap());
+        let work = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed = work.clone();
+        db.connection()
+            .progress_handler(
+                1,
+                Some(move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            )
+            .unwrap();
+        for index in 1..size {
+            assert!(db.all_video_has_inode(7, index as i64).unwrap());
+            assert!(db.folder_has_inode(VIDEO_ALL_ID, 7, index as i64).unwrap());
+            assert!(!db.all_video_has_inode(8, index as i64).unwrap());
+            assert!(!db.all_video_has_inode(7, (size + index) as i64).unwrap());
+        }
+        work.load(Ordering::Relaxed)
+    }
+
+    let small = measure(1000);
+    let large = measure(4000);
+    eprintln!("aggregate_inode_vm_steps size1000={small} size4000={large}");
+    assert!(
+        large < small * 5,
+        "aggregate membership must avoid scanning unrelated siblings: {small} -> {large}"
+    );
+}
+
+#[test]
+fn object_only_patches_reselect_detail_representatives_without_unrelated_rows() {
+    let db = LibraryDb::open_memory().unwrap();
+    let mut detail_ids = Vec::new();
+    for index in 0..2 {
+        detail_ids.push(
+            db.insert_detail(NewDetail {
+                path: &format!("/generated/audio-{index}.mp3"),
+                size: 1,
+                timestamp: 1,
+                title: "audio",
+                date: "2026-01-01",
+                mime: "audio/mpeg",
+                device: 1,
+                inode: index + 1,
+                dlna_pn: None,
+            })
+            .unwrap(),
+        );
+    }
+    for (id, detail, reference) in [
+        ("64$A", detail_ids[0], None),
+        ("64$B", detail_ids[0], None),
+        ("64$C", detail_ids[0], Some("64$A")),
+        ("64$F0", detail_ids[1], None),
+    ] {
+        db.upsert_object(id, "64", "item.audioItem", Some(detail), id, reference)
+            .unwrap();
+    }
+    let mut catalog = db.load_catalog().unwrap();
+    assert_eq!(catalog.by_detail[&detail_ids[0]], "64$A");
+    for (sql, expected) in [
+        (
+            "UPDATE OBJECTS SET REF_ID='64$B' WHERE OBJECT_ID='64$A'",
+            Some("64$B"),
+        ),
+        ("DELETE FROM OBJECTS WHERE OBJECT_ID='64$B'", Some("64$A")),
+        ("DELETE FROM OBJECTS WHERE OBJECT_ID='64$A'", Some("64$C")),
+        ("DELETE FROM OBJECTS WHERE OBJECT_ID='64$C'", None),
+    ] {
+        db.begin_catalog_change_capture().unwrap();
+        let transaction = db.transaction().unwrap();
+        db.connection().execute(sql, []).unwrap();
+        transaction.commit().unwrap();
+        let patch = db.load_catalog_patch().unwrap();
+        assert_eq!(patch.changed_detail_ids, [detail_ids[0]]);
+        assert!(patch
+            .items
+            .iter()
+            .all(|item| item.detail_id == detail_ids[0]));
+        catalog.apply_patch(patch);
+        assert_eq!(
+            catalog.by_detail.get(&detail_ids[0]).map(String::as_str),
+            expected,
+            "{sql}"
+        );
+        assert_eq!(catalog.by_detail, db.load_catalog().unwrap().by_detail);
+        assert_eq!(catalog.by_detail[&detail_ids[1]], "64$F0");
+    }
+    db.begin_catalog_change_capture().unwrap();
+    let transaction = db.transaction().unwrap();
+    db.upsert_object(
+        "64$D",
+        "64",
+        "item.audioItem",
+        Some(detail_ids[0]),
+        "replacement",
+        None,
+    )
+    .unwrap();
+    transaction.commit().unwrap();
+    let patch = db.load_catalog_patch().unwrap();
+    assert_eq!(patch.changed_detail_ids, [detail_ids[0]]);
+    catalog.apply_patch(patch);
+    assert_eq!(catalog.by_detail, db.load_catalog().unwrap().by_detail);
+
+    db.begin_catalog_change_capture().unwrap();
+    let transaction = db.transaction().unwrap();
+    db.connection()
+        .execute(
+            "UPDATE OBJECTS SET DETAIL_ID=?1 WHERE OBJECT_ID='64$D'",
+            [detail_ids[1]],
+        )
+        .unwrap();
+    transaction.rollback().unwrap();
+    assert!(db
+        .load_catalog_patch()
+        .unwrap()
+        .changed_detail_ids
+        .is_empty());
+    assert_eq!(catalog.by_detail, db.load_catalog().unwrap().by_detail);
+
+    let transaction = db.transaction().unwrap();
+    db.connection()
+        .execute(
+            "UPDATE OBJECTS SET DETAIL_ID=?1 WHERE OBJECT_ID='64$D'",
+            [detail_ids[1]],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    let patch = db.load_catalog_patch().unwrap();
+    assert_eq!(patch.changed_detail_ids, detail_ids);
+    catalog.apply_patch(patch);
+    assert_eq!(catalog.by_detail, db.load_catalog().unwrap().by_detail);
+    assert_eq!(catalog.by_detail[&detail_ids[1]], "64$D");
+}
+
+#[test]
+fn bulk_catalog_patch_preserves_seeded_overlap_and_incoming_order() {
+    let db = LibraryDb::open_memory().unwrap();
+    let detail = db
+        .insert_detail(NewDetail {
+            path: "/generated/template.mp3",
+            size: 1,
+            timestamp: 1,
+            title: "template",
+            date: "2026-01-01",
+            mime: "audio/mpeg",
+            device: 1,
+            inode: 1,
+            dlna_pn: None,
+        })
+        .unwrap();
+    db.upsert_object(
+        "64$1",
+        "64",
+        "container.storageFolder",
+        None,
+        "folder",
+        None,
+    )
+    .unwrap();
+    db.upsert_object(
+        "64$2",
+        "64",
+        "item.audioItem",
+        Some(detail),
+        "template",
+        None,
+    )
+    .unwrap();
+    let mut catalog = db.load_catalog().unwrap();
+    let template = catalog.items["64$2"].clone();
+    let mut patch = CatalogPatch {
+        changed_object_ids: vec!["64".into(), "64$1".into(), "64$2".into()],
+        containers: vec![
+            catalog.containers["64"].clone(),
+            catalog.containers["64$1"].clone(),
+        ],
+        items: vec![template.clone()],
+        ..Default::default()
+    };
+    let mut expected = catalog.containers["64"].children.clone();
+    for id in ["64$4", "64$3"] {
+        let mut container = catalog.containers["64$1"].clone();
+        container.object_id = id.into();
+        patch.containers.push(container);
+        expected.push(id.into());
+    }
+    for index in (0..4000).rev() {
+        let mut item = template.clone();
+        item.object_id = format!("64$A{index:04X}");
+        item.detail_id = index + 10;
+        expected.push(item.object_id.clone());
+        patch.items.push(item);
+    }
+    // An overlapping synthetic/mirrored input must never append the same ID.
+    patch.items.push(template);
+    catalog.apply_patch(patch);
+    assert_eq!(catalog.containers["64"].children, expected);
+    assert_eq!(
+        catalog.containers["64"].children.len(),
+        catalog.containers["64"]
+            .children
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+    );
+}
+
+#[test]
+fn playlist_late_arrival_and_cancellation_preserve_published_stage() {
+    let tmp = TempPath::new("playlist-stage-cancel");
+    let media_root = tmp.join("media");
+    std::fs::create_dir_all(&media_root).unwrap();
+    let playlist = media_root.join("Queue.m3u");
+    std::fs::write(&playlist, "later.mkv\n").unwrap();
+    let cfg = ScanConfig {
+        media_dirs: vec![media_root.clone()],
+        db_path: Some(tmp.join("files.db")),
+        thumbnails: false,
+        ..Default::default()
+    };
+    let empty = scan(&cfg).unwrap();
+    assert!(empty.containers[VIDEO_PLIST_ID].children.is_empty());
+    let media = media_root.join("later.mkv");
+    write_fake_mkv(&media, 4096);
+    let (updated, _) = monitor_dirty(&cfg, std::slice::from_ref(&media)).unwrap();
+    let updated = updated.unwrap();
+    let queue = updated.containers[VIDEO_PLIST_ID].children[0].clone();
+    assert_eq!(updated.containers[&queue].children.len(), 1);
+    let original = format!("{:?}", updated.page_children(&queue, 0, 100));
+    std::fs::write(&playlist, "later.mkv\n".repeat(100)).unwrap();
+    for checkpoints in [1, 4, 250] {
+        let attempt_cfg = ScanConfig {
+            cancellation: CancellationToken::default(),
+            ..cfg.clone()
+        };
+        let mut session = ScanSession::new(&attempt_cfg).unwrap();
+        playlist::cancel_after_checkpoints(checkpoints);
+        assert!(matches!(
+            session.prepare_monitor(std::slice::from_ref(&playlist), true),
+            Err(ScanError::Cancelled)
+        ));
+        drop(session);
+        let reloaded = load_existing(&cfg);
+        assert_eq!(
+            format!("{:?}", reloaded.page_children(&queue, 0, 100)),
+            original
+        );
+    }
+    let (updated, _) = monitor_dirty(&cfg, std::slice::from_ref(&playlist)).unwrap();
+    assert_eq!(updated.unwrap().containers[&queue].children.len(), 100);
+    std::fs::remove_file(&playlist).unwrap();
+    let (updated, _) = monitor_dirty(&cfg, &[playlist]).unwrap();
+    assert!(!updated.unwrap().containers.contains_key(&queue));
+}
+
+#[test]
+fn suffix_transactions_refresh_after_another_writer_admits_objects() {
+    let tmp = TempPath::new("suffix-external-writer");
+    let db = LibraryDb::open(&tmp).unwrap();
+    {
+        let transaction = db.transaction().unwrap();
+        assert_eq!(db.next_child_seq("64").unwrap(), 1);
+        db.upsert_object("64$1", "64", "container.storageFolder", None, "first", None)
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    let writer = LibraryDb::open(&tmp).unwrap();
+    writer
+        .upsert_object(
+            "64$F",
+            "64",
+            "container.storageFolder",
+            None,
+            "external",
+            None,
+        )
+        .unwrap();
+    {
+        let transaction = db.immediate_transaction().unwrap();
+        assert_eq!(db.next_child_seq("64").unwrap(), 16);
+        transaction.commit().unwrap();
+    }
+    writer
+        .upsert_object(
+            "64$FF",
+            "64",
+            "container.storageFolder",
+            None,
+            "external2",
+            None,
+        )
+        .unwrap();
+    let transaction = db.transaction().unwrap();
+    assert_eq!(db.next_child_seq("64").unwrap(), 256);
+    transaction.commit().unwrap();
+}
+
+#[test]
+fn restoration_repairs_seeded_mirror_overlap_without_duplicate_links() {
+    let db = LibraryDb::open_memory().unwrap();
+    db.seed_virtual_containers().unwrap();
+    // Persist the child before its parent and seed the mirror container without
+    // its item. Restoration must connect the existing mirror once.
+    db.upsert_object(
+        "2$15$1$1",
+        "2$15$1",
+        "container.storageFolder",
+        None,
+        "child",
+        None,
+    )
+    .unwrap();
+    db.upsert_object(
+        "64$1",
+        "64",
+        "container.storageFolder",
+        None,
+        "parent",
+        None,
+    )
+    .unwrap();
+    db.upsert_object(
+        "64$1$1",
+        "64$1",
+        "container.storageFolder",
+        None,
+        "child",
+        None,
+    )
+    .unwrap();
+    db.upsert_object(
+        "2$15$1",
+        "2$15",
+        "container.storageFolder",
+        None,
+        "parent",
+        None,
+    )
+    .unwrap();
+    let detail = db
+        .insert_detail(NewDetail {
+            path: "/generated/member.mkv",
+            size: 1,
+            timestamp: 1,
+            title: "member",
+            date: "2026-01-01",
+            mime: "video/x-matroska",
+            device: 1,
+            inode: 1,
+            dlna_pn: None,
+        })
+        .unwrap();
+    db.upsert_object(
+        "64$1$1$1",
+        "64$1$1",
+        "item.videoItem",
+        Some(detail),
+        "member",
+        None,
+    )
+    .unwrap();
+    let mut catalog = db.load_catalog().unwrap();
+    for _ in 0..2 {
+        catalog.ensure_video_folder_mirrors();
+        assert_eq!(catalog.containers["2$15$1"].children, ["2$15$1$1"]);
+        assert_eq!(catalog.containers["2$15$1$1"].children, ["2$15$1$1$1"]);
+        for container in catalog.containers.values() {
+            assert_eq!(
+                container.children.len(),
+                container.children.iter().collect::<HashSet<_>>().len()
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn controlled_recent_views_match_legacy_alias_order_limits_and_cancel() {
+    let tmp = TempPath::new("controlled-recent");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let real = tmp.join("real.mp4");
+    let alias = tmp.join("alias.mp4");
+    std::fs::write(&real, b"fixture").unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let db = LibraryDb::open_memory().unwrap();
+    let detail = db
+        .insert_detail(NewDetail {
+            path: &path_to_db(&real),
+            size: 7,
+            timestamp: 1,
+            title: "template",
+            date: "2026-01-01",
+            mime: "audio/mp4",
+            device: 1,
+            inode: 1,
+            dlna_pn: None,
+        })
+        .unwrap();
+    db.upsert_object(
+        "64$0",
+        "64",
+        "item.audioItem.musicTrack",
+        Some(detail),
+        "template",
+        None,
+    )
+    .unwrap();
+    let template = db.load_catalog().unwrap().items["64$0"].clone();
+    let mut catalog = Catalog::new();
+    for index in 0..1200 {
+        let mut item = template.clone();
+        item.object_id = format!("64$1${index:X}");
+        item.detail_id = index + 1;
+        item.title = format!("Title {:02}", index % 23);
+        item.class = match (index / 4) % 3 {
+            0 => "item.videoItem",
+            1 => "item.audioItem.musicTrack",
+            _ => "item.imageItem.photo",
+        }
+        .into();
+        item.inode = if index % 19 == 0 {
+            0
+        } else {
+            (index / 2 + 1) as u64
+        };
+        item.path = if index % 2 == 0 {
+            real.clone()
+        } else {
+            alias.clone()
+        };
+        item.mtime = (1_700_000_000 + index % 17) * if index % 7 == 0 { 1_000_000_000 } else { 1 };
+        item.ref_id = (index % 29 == 0).then(|| "64$reference".into());
+        catalog.items.insert(item.object_id.clone(), item);
+    }
+    for limit in [1, 17, 200] {
+        catalog.configure_recent_policy_at(limit, None, 1_700_000_030);
+        for cached_video in [true, false] {
+            if !cached_video {
+                catalog.recent_ids.clear();
+            }
+            for root in [VIDEO_RECENT_ID, MUSIC_RECENT_ID, IMAGE_RECENT_ID] {
+                let expected = catalog.recent_items(root);
+                let controlled = catalog.recent_items_controlled(root, |_| true).unwrap();
+                assert_eq!(
+                    format!("{controlled:?}"),
+                    format!("{expected:?}"),
+                    "root={root}, limit={limit}, cached={cached_video}"
+                );
+                assert_eq!(
+                    catalog.displayed_child_count_controlled(root, |_| true),
+                    Some(catalog.displayed_child_count(root))
+                );
+                assert!(controlled.len() <= limit);
+                assert_eq!(
+                    catalog.displayed_container_count_controlled(root, |_| true),
+                    Some(catalog.displayed_container_count(root))
+                );
+            }
+        }
+    }
+    catalog.configure_recent_policy_at(200, Some(1), 1_700_086_410);
+    for root in [VIDEO_RECENT_ID, MUSIC_RECENT_ID, IMAGE_RECENT_ID] {
+        assert_eq!(
+            format!(
+                "{:?}",
+                catalog.recent_items_controlled(root, |_| true).unwrap()
+            ),
+            format!("{:?}", catalog.recent_items(root))
+        );
+    }
+    catalog.recent_ids.clear();
+    for root in [VIDEO_RECENT_ID, MUSIC_RECENT_ID, IMAGE_RECENT_ID] {
+        let mut visited = 0;
+        assert!(catalog
+            .recent_items_controlled(root, |count| {
+                visited = count;
+                count < 31
+            })
+            .is_none());
+        assert_eq!(visited, 31);
+        assert!(catalog
+            .displayed_child_count_controlled(root, |count| count < 31)
+            .is_none());
+    }
+    assert!(Catalog::new()
+        .recent_items_controlled(VIDEO_RECENT_ID, |_| false)
+        .is_none());
+    for id in catalog.containers.keys() {
+        assert_eq!(
+            catalog.displayed_container_count_controlled(id, |_| true),
+            Some(catalog.displayed_container_count(id))
+        );
+    }
+    let root = catalog.containers.get_mut(BROWSEDIR_ID).unwrap();
+    root.children = vec![VIDEO_ALL_ID.into(), MUSIC_ALL_ID.into(), "64$absent".into()];
+    assert_eq!(
+        catalog.displayed_container_count_controlled(BROWSEDIR_ID, |_| true),
+        Some(2)
+    );
+    assert!(catalog
+        .displayed_container_count_controlled(BROWSEDIR_ID, |count| count < 2)
+        .is_none());
 }

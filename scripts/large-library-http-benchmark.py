@@ -92,6 +92,7 @@ def percentile(values: list[float], quantile: float) -> float:
 
 def benchmark(port: int, requests: int, warmups: int, web_p95_target_ms: float) -> None:
     output: dict[str, dict[str, float | int]] = {}
+    failures = []
     for action in ("Browse", "Search"):
         request_fields = fields(action)
         for _ in range(warmups):
@@ -103,6 +104,7 @@ def benchmark(port: int, requests: int, warmups: int, web_p95_target_ms: float) 
             "p95_ms": round(percentile(samples, 0.95), 3),
             "p99_ms": round(percentile(samples, 0.99), 3),
             "mean_ms": round(statistics.fmean(samples), 3),
+            "sample_sd_ms": round(statistics.stdev(samples), 3) if requests > 1 else None,
             "max_ms": round(max(samples), 3),
         }
     population, _ = web_call(port, "view=library&kind=video&sort=title&offset=0&limit=1")
@@ -123,12 +125,15 @@ def benchmark(port: int, requests: int, warmups: int, web_p95_target_ms: float) 
             "p95_ms": round(p95, 3),
             "p99_ms": round(percentile(samples, 0.99), 3),
             "mean_ms": round(statistics.fmean(samples), 3),
+            "sample_sd_ms": round(statistics.stdev(samples), 3) if requests > 1 else None,
             "max_ms": round(max(samples), 3),
             "p95_target_ms": web_p95_target_ms,
         }
         if p95 > web_p95_target_ms:
-            raise RuntimeError(f"{name} p95 {p95:.3f}ms exceeded {web_p95_target_ms:.3f}ms target")
+            failures.append(f"{name} p95 {p95:.3f}ms exceeded {web_p95_target_ms:.3f}ms target")
     print(json.dumps(output, sort_keys=True))
+    if failures:
+        raise RuntimeError("; ".join(failures))
 
 
 def wait_for_total(port: int, expected: int, timeout: float, create: str | None) -> None:

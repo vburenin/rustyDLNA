@@ -2,6 +2,15 @@ use super::*;
 use rusty_dlna_scan::scan;
 use rusty_dlna_soap::xml_tag_text;
 
+#[path = "large_library_tests.rs"]
+mod large_library;
+
+#[path = "folder_publication_scale.rs"]
+mod folder_publication_scale;
+
+#[path = "query_budget_tests.rs"]
+mod query_budget;
+
 const TINY_JPEG: &[u8] = &[
     0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
     0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08,
@@ -938,7 +947,7 @@ fn web_item_samples_item_and_generation_under_one_catalog_snapshot() {
     assert_eq!(json["generation"], old_generation);
     assert_eq!(
         resp_header(&response, "ETag"),
-        Some(format!("W/\"web-v2-r8-{old_generation}-item-{detail_id}\"").as_str())
+        Some(format!("W/\"web-v2-r9-{old_generation}-item-{detail_id}\"").as_str())
     );
     done_rx.recv().unwrap().unwrap();
     publisher.join().unwrap();
@@ -5913,8 +5922,8 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     )));
     assert_eq!(folders.status, 200);
     let folders_etag = resp_header(&folders, "ETag").unwrap().to_owned();
-    assert!(folders_etag.starts_with("W/\"web-v2-r8-"), "{folders_etag}");
-    let stale_capability_etag = folders_etag.replacen("-r8-", "-r7-", 1);
+    assert!(folders_etag.starts_with("W/\"web-v2-r9-"), "{folders_etag}");
+    let stale_capability_etag = folders_etag.replacen("-r9-", "-r8-", 1);
     let stale_conditional = req(&format!(
         "GET /api/web/library?view=folders&folder=64&offset=0&limit=200 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\nIf-None-Match: {stale_capability_etag}\r\n\r\n"
     ));

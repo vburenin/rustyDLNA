@@ -13,6 +13,10 @@ HTTP_PORT=${RUSTY_DLNA_BENCH_HTTP_PORT:-18240}
 SSDP_PORT=${RUSTY_DLNA_BENCH_SSDP_PORT:-11940}
 TIMEOUT_SECS=${RUSTY_DLNA_BENCH_TIMEOUT_SECS:-7200}
 KEEP_WORKDIR=${RUSTY_DLNA_BENCH_KEEP_WORKDIR:-0}
+SHAPE=${RUSTY_DLNA_BENCH_SHAPE:-sharded}
+SERVER_BINARY=${RUSTY_DLNA_BENCH_BINARY:-target/release/rusty-dlna}
+GENERATOR_BINARY=${RUSTY_DLNA_BENCH_GENERATOR:-target/release/examples/generate_large_library}
+RECONCILE_BINARY=${RUSTY_DLNA_BENCH_RECONCILE:-target/release/examples/benchmark_reconcile}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 OUTPUT=${RUSTY_DLNA_BENCH_OUTPUT:-$ROOT/benchmark-results/large-library-$STAMP.json}
 TOOLCHAIN=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
@@ -27,6 +31,7 @@ if ((ALIASES > FILES)); then
     echo "RUSTY_DLNA_BENCH_ALIASES cannot exceed RUSTY_DLNA_BENCH_FILES" >&2
     exit 2
 fi
+case "$SHAPE" in flat|sharded) ;; *) echo "benchmark shape must be flat or sharded" >&2; exit 2 ;; esac
 for command in curl python3 rustup; do
     command -v "$command" >/dev/null || {
         echo "required command is missing: $command" >&2
@@ -42,6 +47,7 @@ RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/rusty-dlna-large-library.XXXXXX")
 LIBRARY=$RUN_DIR/library
 CACHE=$RUN_DIR/cache
 DATABASE=$RUN_DIR/database
+RECONCILE_DATABASE=$RUN_DIR/reconcile-database
 CONFIG=$RUN_DIR/benchmark.toml
 STATUS_JSON=$RUN_DIR/status.json
 LATENCY_JSON=$RUN_DIR/latency.json
@@ -70,14 +76,16 @@ run_cargo() {
         rustup run "$TOOLCHAIN" cargo "$@"
 }
 
-echo "building release benchmark binaries" >&2
-run_cargo build --release --locked -p rusty-dlna
-run_cargo build --release --locked -p rusty-dlna-scan \
-    --example generate_large_library --example benchmark_reconcile
+if [[ -z "${RUSTY_DLNA_BENCH_BINARY:-}" ]]; then
+    echo "building release benchmark binaries" >&2
+    run_cargo build --release --locked -p rusty-dlna
+    run_cargo build --release --locked -p rusty-dlna-scan \
+        --example generate_large_library --example benchmark_reconcile
+fi
 
 mkdir -p "$LIBRARY" "$CACHE" "$DATABASE" "$(dirname "$OUTPUT")"
 echo "generating $FILES physical files plus $ALIASES hard-link and symlink aliases" >&2
-target/release/examples/generate_large_library "$LIBRARY" "$FILES" "$ALIASES"
+"$GENERATOR_BINARY" "$LIBRARY" "$FILES" "$ALIASES" "$SHAPE"
 
 python3 - "$CONFIG" "$LIBRARY" "$CACHE" "$DATABASE" "$SCAN_WORKERS" <<'PY'
 import pathlib
@@ -105,7 +113,7 @@ PY
 START_NS=$(python3 -c 'import time; print(time.time_ns())')
 RUSTY_DLNA_HTTP_PORT=$HTTP_PORT RUSTY_DLNA_SSDP_PORT=$SSDP_PORT \
 RUST_LOG=rusty_dlna=info \
-    target/release/rusty-dlna --config "$CONFIG" >"$DAEMON_LOG" 2>&1 &
+    "$SERVER_BINARY" --config "$CONFIG" >"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 
 echo "waiting for cold scan publication" >&2
@@ -159,12 +167,27 @@ OPEN_FDS=$(find "/proc/$DAEMON_PID/fd" -mindepth 1 -maxdepth 1 -printf . 2>/dev/
 SQLITE_BYTES=$(find "$DATABASE" -maxdepth 1 -type f -name 'files.db*' -printf '%s\n' | awk '{sum += $1} END {print sum + 0}')
 
 echo "measuring unchanged reconciliation" >&2
-target/release/examples/benchmark_reconcile "$LIBRARY" "$DATABASE/files.db" >"$RECONCILE_WARMUP_JSON"
-target/release/examples/benchmark_reconcile "$LIBRARY" "$DATABASE/files.db" >"$RECONCILE_JSON"
+# Standalone monitor sessions publish even no-op scan epochs. Isolate them
+# from the daemon's reusable stage so they cannot force watcher recovery.
+python3 - "$DATABASE/files.db" "$RECONCILE_DATABASE/files.db" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+source = pathlib.Path(sys.argv[1]).resolve()
+destination = pathlib.Path(sys.argv[2])
+destination.parent.mkdir()
+with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as live:
+    with sqlite3.connect(destination) as snapshot:
+        live.backup(snapshot)
+PY
+"$RECONCILE_BINARY" "$LIBRARY" "$RECONCILE_DATABASE/files.db" >"$RECONCILE_WARMUP_JSON"
+"$RECONCILE_BINARY" "$LIBRARY" "$RECONCILE_DATABASE/files.db" >"$RECONCILE_JSON"
 
 echo "measuring Browse/Search latency ($REQUESTS requests each)" >&2
+LATENCY_RESULT=0
 python3 scripts/large-library-http-benchmark.py --port "$HTTP_PORT" latency \
-    --requests "$REQUESTS" --web-p95-target-ms "$WEB_P95_TARGET_MS" >"$LATENCY_JSON"
+    --requests "$REQUESTS" --web-p95-target-ms "$WEB_P95_TARGET_MS" >"$LATENCY_JSON" || LATENCY_RESULT=$?
 
 echo "measuring targeted inotify update-to-Browse latency" >&2
 python3 scripts/large-library-http-benchmark.py --port "$HTTP_PORT" wait-for-total \
@@ -180,12 +203,15 @@ fi
 KERNEL=$(uname -srmo)
 CPU_MODEL=$(awk -F: '/model name/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' /proc/cpuinfo)
 RUSTC_VERSION=$(rustup run "$TOOLCHAIN" rustc --version)
+BINARY_SHA256=$(sha256sum "$SERVER_BINARY" | cut -d ' ' -f 1)
 
 BENCH_FILES=$FILES BENCH_ALIASES=$ALIASES BENCH_REQUESTS=$REQUESTS \
+BENCH_SHAPE=$SHAPE BENCH_BINARY_SHA256=$BINARY_SHA256 \
 BENCH_WORKERS=$SCAN_WORKERS BENCH_COLD_MS=$COLD_WALL_MS \
 BENCH_CPU_TICKS=$CPU_TICKS BENCH_CLK_TCK=$CLK_TCK BENCH_RSS_KB=$RSS_KB \
 BENCH_HWM_KB=$HWM_KB BENCH_OPEN_FDS=$OPEN_FDS BENCH_SQLITE_BYTES=$SQLITE_BYTES \
 BENCH_STATUS=$STATUS_JSON BENCH_LATENCY=$LATENCY_JSON \
+BENCH_LATENCY_RESULT=$LATENCY_RESULT \
 BENCH_RECONCILE=$RECONCILE_JSON BENCH_RECONCILE_WARMUP=$RECONCILE_WARMUP_JSON \
 BENCH_UPDATE=$UPDATE_JSON \
 BENCH_REVISION=$GIT_REVISION BENCH_DIRTY=$GIT_DIRTY BENCH_KERNEL=$KERNEL \
@@ -208,12 +234,14 @@ report = {
         "hardlink_aliases": int(os.environ["BENCH_ALIASES"]),
         "symlink_aliases": int(os.environ["BENCH_ALIASES"]),
         "media_template": "testdata/library/video/movie.mkv",
+        "shape": os.environ["BENCH_SHAPE"],
     },
     "build": {
         "git_revision": os.environ["BENCH_REVISION"],
         "git_dirty": os.environ["BENCH_DIRTY"] == "true",
         "rustc": os.environ["BENCH_RUSTC"],
         "profile": "release",
+        "binary_sha256": os.environ["BENCH_BINARY_SHA256"],
     },
     "host": {
         "kernel": os.environ["BENCH_KERNEL"],
@@ -238,7 +266,9 @@ report = {
     },
     "reconcile": load("BENCH_RECONCILE"),
     "reconcile_warmup": load("BENCH_RECONCILE_WARMUP"),
+    "reconcile_database": "isolated_snapshot",
     "request_latency": load("BENCH_LATENCY"),
+    "latency_check_passed": os.environ["BENCH_LATENCY_RESULT"] == "0",
     "update": load("BENCH_UPDATE"),
     "catalog": status["catalog"],
 }
@@ -248,3 +278,4 @@ PY
 python3 -m json.tool "$OUTPUT" >/dev/null
 echo "large-library benchmark complete: $OUTPUT" >&2
 cat "$OUTPUT"
+exit "$LATENCY_RESULT"

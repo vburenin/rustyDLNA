@@ -15,6 +15,11 @@ use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::Ordering;
 
+mod folder;
+#[cfg(test)]
+pub(crate) use folder::pause_projection;
+pub(super) use folder::FolderProjectionCache;
+
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
@@ -48,6 +53,30 @@ type ItemSnapshotHook = (
 #[cfg(test)]
 static ITEM_SNAPSHOT_HOOK: std::sync::LazyLock<std::sync::Mutex<Option<ItemSnapshotHook>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+type LibraryCacheHook = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
+#[cfg(test)]
+static LIBRARY_CACHE_HOOKS: std::sync::LazyLock<Mutex<HashMap<usize, LibraryCacheHook>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn pause_library_cache_for_test(
+    app: &App,
+    reached: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+) {
+    lock_recover(&LIBRARY_CACHE_HOOKS).insert(app as *const App as usize, (reached, release));
+}
+
+#[cfg(test)]
+fn pause_library_cache_if_requested(app: &App) {
+    let hook = lock_recover(&LIBRARY_CACHE_HOOKS).remove(&(app as *const App as usize));
+    if let Some((reached, release)) = hook {
+        reached.wait();
+        release.wait();
+    }
+}
 
 #[cfg(test)]
 pub(crate) fn pause_item_snapshot_for_test(
@@ -89,7 +118,7 @@ const WEB_SCHEMA_VERSION: u8 = 2;
 // Change when a browser API representation can differ without a catalog
 // generation change. This keeps conditional requests from reusing capability
 // or media metadata cached from an older rustyDLNA build.
-const WEB_API_CACHE_REVISION: u8 = 8;
+const WEB_API_CACHE_REVISION: u8 = 9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WebItemId(i64);
@@ -570,18 +599,40 @@ pub(crate) fn transcode_stream_error(status_code: u16, code: &'static str) -> Ht
     }
 }
 
+pub(super) fn query_budget_error() -> HttpResponse {
+    api_error(
+        503,
+        "catalog_busy",
+        "The library is busy. Try again in a moment.",
+        true,
+        Some("retry_library"),
+    )
+}
+
+fn generation_etag(generation: u32) -> String {
+    format!("W/\"web-v{WEB_SCHEMA_VERSION}-r{WEB_API_CACHE_REVISION}-{generation}\"")
+}
+
+fn generation_not_modified(req: &HttpRequest, generation: u32) -> Option<HttpResponse> {
+    let etag = generation_etag(generation);
+    if req.header("If-None-Match") != Some(etag.as_str()) {
+        return None;
+    }
+    let mut response = HttpResponse::new(304, "Not Modified");
+    response.set("ETag", etag);
+    response.set("Cache-Control", "private, max-age=0, must-revalidate");
+    Some(response)
+}
+
 fn generation_json_response<T: Serialize>(
     req: &HttpRequest,
     generation: u32,
     value: &T,
 ) -> HttpResponse {
-    let etag = format!("W/\"web-v{WEB_SCHEMA_VERSION}-r{WEB_API_CACHE_REVISION}-{generation}\"");
-    if req.header("If-None-Match") == Some(etag.as_str()) {
-        let mut response = HttpResponse::new(304, "Not Modified");
-        response.set("ETag", etag);
-        response.set("Cache-Control", "private, max-age=0, must-revalidate");
+    if let Some(response) = generation_not_modified(req, generation) {
         return response;
     }
+    let etag = generation_etag(generation);
     let mut response = json_response_with_status_and_cache_control(
         200,
         value,
@@ -635,6 +686,7 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
     if !app.cfg.web.enable {
         return not_found();
     }
+    let control = current_query_control();
     let params = QueryParams::parse(&req.query);
     if params.get("view") == Some("continue") {
         return continue_library(app, req, &params);
@@ -773,14 +825,35 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
             None,
         );
     }
-    let normalized_query = query.to_lowercase();
+    let normalized_query = rusty_dlna_scan::web_search_normalize(query);
     let root_folder_id = rusty_dlna_protocol::object_id::BROWSEDIR_ID.to_owned();
     let capabilities = web_capabilities(app);
 
     if view == "folders" {
-        let catalog = read_recover(&app.catalog);
+        let folder_id = params
+            .get("folder")
+            .filter(|value| !value.is_empty())
+            .unwrap_or(rusty_dlna_protocol::object_id::BROWSEDIR_ID);
+        return folder::page(
+            app,
+            req,
+            folder_id,
+            query,
+            &normalized_query,
+            requested_generation,
+            offset,
+            limit,
+            sort,
+        );
+    }
+
+    {
+        let _catalog = match query_read_catalog(app, &control) {
+            Ok(catalog) => catalog,
+            Err(_) => return query_budget_error(),
+        };
         let generation = app.update_id.load(Ordering::Acquire);
-        if requested_generation.is_some_and(|requested| requested != generation) {
+        if requested_generation.is_some_and(|expected| expected != generation) {
             return api_error(
                 409,
                 "catalog_changed",
@@ -789,118 +862,10 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
                 Some("retry_library"),
             );
         }
-        let folder_id = params
-            .get("folder")
-            .filter(|value| !value.is_empty())
-            .unwrap_or(rusty_dlna_protocol::object_id::BROWSEDIR_ID);
-        let Some(breadcrumbs) = physical_folder_chain(&catalog, folder_id) else {
-            return api_error(
-                404,
-                "folder_missing",
-                "That folder is no longer available.",
-                true,
-                Some("return_to_library"),
-            );
-        };
-        let current = breadcrumbs
-            .last()
-            .expect("a valid physical folder chain is never empty");
-        let mut entries = current
-            .children
-            .iter()
-            .filter_map(|object_id| {
-                if let Some(folder) = catalog.containers.get(object_id) {
-                    return Some(WebEntry::Folder(folder));
-                }
-                catalog.items.get(object_id).and_then(|item| {
-                    matches!(
-                        media_kind_for_mime(&item.mime),
-                        Some(MediaKind::Video | MediaKind::Audio)
-                    )
-                    .then_some(WebEntry::Media(item))
-                })
-            })
-            .filter(|entry| normalized_query.is_empty() || entry.matches(&normalized_query))
-            .collect::<Vec<_>>();
-        entries.sort_by(|left, right| {
-            left.rank()
-                .cmp(&right.rank())
-                .then_with(|| left.sort_title().cmp(&right.sort_title()))
-                .then_with(|| left.stable_id().cmp(right.stable_id()))
-        });
-        let total = entries.len();
-        let page = entries
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|entry| match entry {
-                WebEntry::Folder(folder) => {
-                    let child_count = folder
-                        .children
-                        .iter()
-                        .filter(|object_id| {
-                            catalog.containers.contains_key(*object_id)
-                                || catalog.items.get(*object_id).is_some_and(|item| {
-                                    matches!(
-                                        media_kind_for_mime(&item.mime),
-                                        Some(MediaKind::Video | MediaKind::Audio)
-                                    )
-                                })
-                        })
-                        .count();
-                    WebEntryDto::Folder {
-                        id: folder.object_id.clone(),
-                        title: folder.title.clone(),
-                        child_count,
-                    }
-                }
-                WebEntry::Media(item) => WebEntryDto::Media(Box::new(media_dto(app, item))),
-            })
-            .collect::<Vec<_>>();
-        let breadcrumb_dtos = breadcrumbs
-            .iter()
-            .enumerate()
-            .map(|(index, folder)| WebFolderRef {
-                id: folder.object_id.clone(),
-                title: if index == 0 {
-                    "Media".to_owned()
-                } else {
-                    folder.title.clone()
-                },
-            })
-            .collect::<Vec<_>>();
-
-        return generation_json_response(
-            req,
-            generation,
-            &WebLibraryPage {
-                schema_version: WEB_SCHEMA_VERSION,
-                generation,
-                server_name: app.cfg.friendly_name.clone(),
-                root_folder_id,
-                capabilities,
-                library_state: if total == 0 { "empty" } else { "ready" },
-                view: "folders",
-                folder: Some(WebFolderRef {
-                    id: current.object_id.clone(),
-                    title: if current.object_id == rusty_dlna_protocol::object_id::BROWSEDIR_ID {
-                        "Media".to_owned()
-                    } else {
-                        current.title.clone()
-                    },
-                }),
-                breadcrumbs: breadcrumb_dtos,
-                offset,
-                limit,
-                total,
-                has_more: offset.saturating_add(page.len()) < total,
-                query: query.to_owned(),
-                sort,
-                entries: page,
-            },
-        );
+        if let Some(response) = generation_not_modified(req, generation) {
+            return response;
+        }
     }
-
     let db_kind = match kind {
         "video" => rusty_dlna_scan::WebMediaKind::Video,
         "audio" => rusty_dlna_scan::WebMediaKind::Audio,
@@ -911,10 +876,36 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
         "episode" => rusty_dlna_scan::WebMediaSort::EpisodeTrack,
         _ => rusty_dlna_scan::WebMediaSort::Title,
     };
+    let count_key = format!("web-count:{kind}:{normalized_query}");
+    // Keep the free-form query last so literal separators cannot collide with
+    // the finite kind/sort names and canonical numeric paging values.
+    let page_key = format!("web-page:{kind}:{sort}:{offset}:{limit}:{normalized_query}");
     const MAX_GENERATION_ATTEMPTS: usize = 3;
     let mut consistent = None;
     for attempt in 0..MAX_GENERATION_ATTEMPTS {
+        let counts_generation = app.update_id.load(Ordering::Acquire);
+        let (cached_page, counts, counts_epoch) = {
+            let mut cache = lock_recover(&app.catalog_query_cache);
+            (
+                cache.get(counts_generation, &page_key),
+                cache
+                    .get(counts_generation, &count_key)
+                    .map(|page| (counts_generation, page)),
+                Arc::clone(&cache.epoch),
+            )
+        };
+        let was_cached = cached_page.is_some();
+        #[cfg(test)]
+        if was_cached {
+            pause_library_cache_if_requested(app);
+        }
         let db_page = match query_catalog_snapshot_once(app, || {
+            if let Some(page) = cached_page {
+                return Some(CatalogQuerySnapshot {
+                    generation: counts_generation,
+                    page,
+                });
+            }
             query_db_web_media(
                 app.db_pool.as_deref(),
                 app.scan_cfg.db_path.as_deref(),
@@ -923,10 +914,16 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
                 db_sort,
                 offset,
                 limit,
+                counts
+                    .as_ref()
+                    .map(|(generation, page)| (*generation, page)),
             )
         }) {
             Ok(page) => page,
             Err(()) => {
+                if control.check().is_err() {
+                    return query_budget_error();
+                }
                 if attempt + 1 < MAX_GENERATION_ATTEMPTS {
                     std::thread::yield_now();
                     continue;
@@ -940,11 +937,15 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
                 );
             }
         };
-        let catalog = read_recover(&app.catalog);
+        let catalog = match query_read_catalog(app, &control) {
+            Ok(catalog) => catalog,
+            Err(_) => return query_budget_error(),
+        };
         let generation = app.update_id.load(Ordering::Acquire);
-        if db_page
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.generation != generation)
+        if !Arc::ptr_eq(&lock_recover(&app.catalog_query_cache).epoch, &counts_epoch)
+            || db_page
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.generation != generation)
         {
             drop(catalog);
             if attempt + 1 < MAX_GENERATION_ATTEMPTS {
@@ -959,10 +960,10 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
                 Some("retry_library"),
             );
         }
-        consistent = Some((db_page, catalog, generation));
+        consistent = Some((db_page, catalog, generation, was_cached));
         break;
     }
-    let Some((db_page, catalog, generation)) = consistent else {
+    let Some((db_page, catalog, generation, was_cached)) = consistent else {
         return api_error(
             503,
             "catalog_busy",
@@ -993,14 +994,39 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
         })
     });
     let (items, total) = if let Some(page) = db_materialized {
+        if let Some(snapshot) = db_page.as_ref().filter(|_| !was_cached) {
+            let mut cache = lock_recover(&app.catalog_query_cache);
+            cache.insert(
+                generation,
+                count_key,
+                rusty_dlna_scan::CatalogQueryPage {
+                    object_ids: Vec::new(),
+                    total: snapshot.page.total,
+                    population: snapshot.page.population,
+                },
+            );
+            cache.insert(generation, page_key, snapshot.page.clone());
+        }
         page
     } else {
-        memory_web_page(&catalog, kind, &normalized_query, sort, offset, limit)
+        match memory_web_page(
+            &catalog,
+            kind,
+            &normalized_query,
+            sort,
+            offset,
+            limit,
+            &control,
+        ) {
+            Ok(page) => page,
+            Err(_) => return query_budget_error(),
+        }
     };
     let entries = items
         .into_iter()
         .map(|item| WebEntryDto::Media(Box::new(media_dto(app, item))))
         .collect::<Vec<_>>();
+    drop(catalog);
     generation_json_response(
         req,
         generation,
@@ -1062,7 +1088,11 @@ fn continue_library(app: &App, req: &HttpRequest, params: &QueryParams) -> HttpR
     // Catalog publication updates the in-memory catalog and generation while
     // holding this lock. Sample the generation only after acquiring it so a
     // response can never label newer entries with an older generation.
-    let catalog = read_recover(&app.catalog);
+    let control = current_query_control();
+    let catalog = match query_read_catalog(app, &control) {
+        Ok(catalog) => catalog,
+        Err(_) => return query_budget_error(),
+    };
     let generation = app.update_id.load(Ordering::Acquire);
     if requested_generation.is_some_and(|requested| requested != generation) {
         return api_error(
@@ -1087,17 +1117,24 @@ fn continue_library(app: &App, req: &HttpRequest, params: &QueryParams) -> HttpR
             .get(*id)
             .is_some_and(|container| !container.children.is_empty())
     });
-    let entries = ids
-        .iter()
-        .filter_map(|id| catalog.get_item_by_detail(*id))
-        .filter(|item| {
+    let mut entries = Vec::with_capacity(ids.len());
+    for id in &ids {
+        if control.check().is_err() {
+            return query_budget_error();
+        }
+        if let Some(item) = catalog.get_item_by_detail(*id).filter(|item| {
             matches!(
                 media_kind_for_mime(&item.mime),
                 Some(MediaKind::Video | MediaKind::Audio)
             )
-        })
-        .map(|item| WebEntryDto::Media(Box::new(media_dto(app, item))))
-        .collect::<Vec<_>>();
+        }) {
+            entries.push(WebEntryDto::Media(Box::new(media_dto(app, item))));
+        }
+    }
+    drop(catalog);
+    if control.check().is_err() {
+        return query_budget_error();
+    }
     generation_json_response(
         req,
         generation,
@@ -1141,6 +1178,7 @@ fn continue_detail_ids(value: &str) -> Result<Vec<i64>, ()> {
     Ok(ids)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn memory_web_page<'a>(
     catalog: &'a Catalog,
     kind: &str,
@@ -1148,53 +1186,180 @@ fn memory_web_page<'a>(
     sort: &str,
     offset: usize,
     limit: usize,
-) -> (Vec<&'a MediaItem>, usize) {
-    let mut items = catalog
+    control: &QueryControl,
+) -> Result<(Vec<&'a MediaItem>, usize), QueryStopped> {
+    let _fallback = control.phase(QueryPhase::Fallback);
+    control.check_work_items(catalog.by_detail.len())?;
+    let reference_bytes = catalog
         .by_detail
-        .values()
-        .filter_map(|object_id| catalog.items.get(object_id))
-        .filter(|item| {
-            let media_kind = media_kind_for_mime(&item.mime);
-            matches!(media_kind, Some(MediaKind::Video | MediaKind::Audio))
-                && match kind {
-                    "video" => media_kind == Some(MediaKind::Video),
-                    "audio" => media_kind == Some(MediaKind::Audio),
-                    _ => true,
-                }
-        })
-        .filter(|item| query.is_empty() || media_matches(item, query))
-        .collect::<Vec<_>>();
-    // Match SQLite's MIN(detail_id) representative before ordering, even when
-    // a symlink alias has a different NFO title that would otherwise sort first.
-    items.sort_unstable_by_key(|item| item.detail_id);
-    let mut physical_files = HashSet::new();
-    items.retain(|item| item.inode == 0 || physical_files.insert((item.device, item.inode)));
-    if sort == "title" {
-        items.sort_by_cached_key(|item| {
-            (
-                rusty_dlna_scan::web_media_title_key(
-                    item.collection_path.as_deref().unwrap_or(&item.path),
-                    &item.mime,
-                    &item.title,
-                ),
-                item.detail_id,
-            )
-        });
-    } else {
-        items.sort_by(|left, right| {
-            let ordering = match sort {
-                "date_desc" => right.date.cmp(&left.date),
-                _ => left
-                    .disc
-                    .unwrap_or(0)
-                    .cmp(&right.disc.unwrap_or(0))
-                    .then_with(|| left.track.unwrap_or(0).cmp(&right.track.unwrap_or(0))),
-            };
-            ordering.then_with(|| left.detail_id.cmp(&right.detail_id))
-        });
+        .len()
+        .saturating_mul(std::mem::size_of::<&MediaItem>());
+    // Account for the live reference array and both merge-sort buffers before
+    // reserving. Fixed capacities avoid unaccounted geometric Vec growth.
+    control.check_work_bytes(reference_bytes.saturating_mul(3))?;
+    let mut items = Vec::with_capacity(catalog.by_detail.len());
+    for (index, object_id) in catalog.by_detail.values().enumerate() {
+        if index % 256 == 0 {
+            control.check()?;
+        }
+        let Some(item) = catalog.items.get(object_id) else {
+            continue;
+        };
+        if !query.is_empty() {
+            let field_bytes = [
+                item.path.as_os_str().as_encoded_bytes().len(),
+                item.title.len(),
+                item.artist.as_deref().unwrap_or("").len(),
+                item.album_artist.as_deref().unwrap_or("").len(),
+                item.album.as_deref().unwrap_or("").len(),
+            ]
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+            // Covers lossy path decoding, lowercase expansion, and temporary
+            // string capacity while the reference array is live.
+            control
+                .check_work_bytes(reference_bytes.saturating_add(field_bytes.saturating_mul(12)))?;
+        }
+        let media_kind = media_kind_for_mime(&item.mime);
+        if !matches!(media_kind, Some(MediaKind::Video | MediaKind::Audio))
+            || match kind {
+                "video" => media_kind != Some(MediaKind::Video),
+                "audio" => media_kind != Some(MediaKind::Audio),
+                _ => false,
+            }
+            || (!query.is_empty() && !media_matches(item, query))
+        {
+            continue;
+        }
+        items.push(item);
     }
-    let total = items.len();
-    (items.into_iter().skip(offset).take(limit).collect(), total)
+    // Select the lowest matching detail ID for each physical identity, including
+    // path-local sidecars, before applying display order.
+    controlled_sort_by(&mut items, control, |left, right| {
+        left.detail_id.cmp(&right.detail_id)
+    })?;
+    // The pinned standard library's hash table uses a power-of-two bucket
+    // allocation plus control bytes. Rounding twice the requested entries up
+    // conservatively covers its spare buckets and allocation padding.
+    let hash_bytes = items
+        .len()
+        .saturating_mul(2)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+        .saturating_mul(std::mem::size_of::<(u64, u64)>().saturating_add(1))
+        .saturating_add(32);
+    control.check_work_bytes(
+        reference_bytes
+            .saturating_add(
+                items
+                    .len()
+                    .saturating_mul(std::mem::size_of::<&MediaItem>()),
+            )
+            .saturating_add(hash_bytes),
+    )?;
+    let mut physical_files = HashSet::with_capacity(items.len());
+    let mut representatives = Vec::with_capacity(items.len());
+    for (index, item) in items.into_iter().enumerate() {
+        if index % 256 == 0 {
+            control.check()?;
+        }
+        if item.inode == 0 || physical_files.insert((item.device, item.inode)) {
+            representatives.push(item);
+        }
+    }
+    drop(physical_files);
+    // Normalize keys once, rather than allocating metadata on each comparison.
+    // The original array and hash table are gone. Bound every simultaneously
+    // live reference/key/index array, both index-sort buffers, and the page.
+    let mut key_bytes = representatives
+        .capacity()
+        .saturating_mul(std::mem::size_of::<&MediaItem>())
+        .saturating_add(
+            representatives.len().saturating_mul(
+                std::mem::size_of::<(String, String)>()
+                    .saturating_add(std::mem::size_of::<usize>().saturating_mul(3)),
+            ),
+        )
+        .saturating_add(
+            limit
+                .min(representatives.len().saturating_sub(offset))
+                .saturating_mul(std::mem::size_of::<&MediaItem>()),
+        );
+    control.check_work_bytes(key_bytes)?;
+    let mut keys = Vec::with_capacity(representatives.len());
+    for (index, item) in representatives.iter().enumerate() {
+        if index % 256 == 0 {
+            control.check()?;
+        }
+        let temporary_key_bytes = item
+            .title
+            .len()
+            .saturating_add(if sort == "episode" {
+                item.album.as_deref().unwrap_or("").len()
+            } else {
+                0
+            })
+            .saturating_add(if sort == "title" {
+                item.collection_path
+                    .as_deref()
+                    .unwrap_or(&item.path)
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .len()
+            } else {
+                0
+            })
+            .saturating_mul(12)
+            .saturating_add(256);
+        control.check_work_bytes(key_bytes.saturating_add(temporary_key_bytes))?;
+        let title = if sort == "title" {
+            rusty_dlna_scan::web_media_title_key(
+                item.collection_path.as_deref().unwrap_or(&item.path),
+                &item.mime,
+                &item.title,
+            )
+        } else {
+            rusty_dlna_scan::web_search_normalize(&item.title)
+        };
+        let album = if sort == "episode" {
+            rusty_dlna_scan::web_search_normalize(item.album.as_deref().unwrap_or(""))
+        } else {
+            String::new()
+        };
+        key_bytes = key_bytes
+            .saturating_add(title.capacity())
+            .saturating_add(album.capacity());
+        control.check_work_bytes(key_bytes)?;
+        keys.push((title, album));
+    }
+    let mut order: Vec<usize> = (0..representatives.len()).collect();
+    controlled_sort_by(&mut order, control, |left, right| {
+        let a = representatives[*left];
+        let b = representatives[*right];
+        let ordering = match sort {
+            "date_desc" => b.date.cmp(&a.date),
+            "episode" => keys[*left]
+                .1
+                .cmp(&keys[*right].1)
+                .then_with(|| a.disc.unwrap_or(0).cmp(&b.disc.unwrap_or(0)))
+                .then_with(|| a.track.unwrap_or(0).cmp(&b.track.unwrap_or(0))),
+            _ => std::cmp::Ordering::Equal,
+        };
+        ordering
+            .then_with(|| keys[*left].0.cmp(&keys[*right].0))
+            .then_with(|| a.detail_id.cmp(&b.detail_id))
+    })?;
+    let total = order.len();
+    Ok((
+        order
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|index| representatives[index])
+            .collect(),
+        total,
+    ))
 }
 
 enum WebEntry<'a> {
@@ -1255,26 +1420,11 @@ fn physical_folder_chain<'a>(
 }
 
 fn media_matches(item: &MediaItem, query: &str) -> bool {
-    if media_file_name(item).to_lowercase().contains(query) {
-        return true;
-    }
-    [
-        Some(item.title.as_str()),
-        item.artist.as_deref(),
-        item.album_artist.as_deref(),
-        item.album.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|value| value.to_lowercase().contains(query))
+    rusty_dlna_scan::web_media_matches(item, query)
 }
 
 fn media_file_name(item: &MediaItem) -> String {
-    item.path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| item.title.clone())
+    rusty_dlna_scan::web_media_file_name(&item.path, &item.title)
 }
 
 fn stored_audio_tracks(

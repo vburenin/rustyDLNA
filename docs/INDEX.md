@@ -42,6 +42,7 @@ All commands below run from the **repository root**. The agent wrapper invokes
 | Rust documentation | `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked` | `scripts/check.sh` |
 | Build (optional, separate) | `cargo build --locked -p rusty-dlna` | `.github/workflows/ci.yml`, privileged SSDP job |
 | Generated playback benchmark (optional CPU/device tiers) | `node scripts/playback-benchmark.mjs --help` | `docs/WEB_PLAYER.md` |
+| Large-library scan/restart/query/browser measurements | `scripts/large-library-benchmark.sh`; `python3 scripts/large-library-restart-benchmark.py --help`; `node scripts/library-browser-benchmark.mjs --help`; `node scripts/library-scan-playback-benchmark.mjs --help` | `docs/LARGE_LIBRARY_BENCHMARK.md` |
 | Full web suite (additional CI check) | `npm run test:web` | `package.json`, `.github/workflows/ci.yml`, browser job |
 
 Rust type checking is covered by Clippy; no separate typecheck task is declared.

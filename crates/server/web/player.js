@@ -37,6 +37,7 @@ import {
   playbackError,
   playbackEndedEarly,
   queueNeighbor,
+  queuePosition,
   resumePosition,
   saferCompatibleQualityProfile,
   seekTarget,
@@ -237,7 +238,12 @@ export class PlaybackController {
     this.#captions = new CaptionController({ store, dom });
     this.#bindControls();
     this.#applyInitialPreferences();
-    this.#store.subscribe(() => {
+    this.#store.subscribe((state, action) => {
+      if (action.type === "PLAYBACK_TIME" || action.type === "PLAYBACK_PREVIEW") {
+        this.#renderTimeline(state.playback);
+        if (action.type === "PLAYBACK_TIME") this.#renderChapters();
+        return;
+      }
       this.render();
       this.#updateWakeLock();
     });
@@ -928,23 +934,11 @@ export class PlaybackController {
     }
     this.#renderQualityProfiles();
 
-    const current = playback.previewTime ?? playback.currentTime;
-    this.#dom.timeline.max = String(playback.duration || 0);
-    this.#dom.timeline.value = String(Math.min(current, playback.duration || current));
-    const timelineProgress = playback.duration > 0 ? Math.min(100, Math.max(0, (current / playback.duration) * 100)) : 0;
-    this.#dom.timeline.style.setProperty("--timeline-progress", `${timelineProgress}%`);
-    this.#dom.timeline.disabled = !(playback.duration > 0);
-    this.#dom.timeline.setAttribute("aria-valuetext", timelineValueText(current, playback.duration));
-    this.#dom.timeline.setAttribute("aria-busy", String(playback.status === "seeking"));
-    this.#dom.timelineStatus.textContent = playback.status === "seeking"
-      ? `${timelineValueText(current, playback.duration)}. Starting a prepared stream.`
-      : timelineValueText(current, playback.duration);
-    this.#dom.timelineCurrent.textContent = clockLabel(current);
-    this.#dom.timelineDuration.textContent = playback.duration > 0 ? clockLabel(playback.duration) : "Unknown";
+    this.#renderTimeline(playback);
 
     const previous = queueNeighbor(queue.entries, item.id, -1);
     const next = queueNeighbor(queue.entries, item.id, 1);
-    const queueIndex = queue.entries.findIndex((entry) => String(entry.id) === String(item.id));
+    const queueIndex = queuePosition(queue.entries, item.id);
     this.#dom.queuePosition.textContent = queueIndex < 0 ? "" : queue.status === "loading"
       ? `Item ${queueIndex + 1} · loading queue…`
       : `Item ${queueIndex + 1} of ${queue.entries.length}`;
@@ -969,6 +963,23 @@ export class PlaybackController {
     this.#captions.render();
     this.#renderStreamInfo();
     this.#renderMessage();
+  }
+
+  #renderTimeline(playback) {
+    if (!playback.item) return;
+    const current = playback.previewTime ?? playback.currentTime;
+    this.#dom.timeline.max = String(playback.duration || 0);
+    this.#dom.timeline.value = String(Math.min(current, playback.duration || current));
+    const timelineProgress = playback.duration > 0 ? Math.min(100, Math.max(0, (current / playback.duration) * 100)) : 0;
+    this.#dom.timeline.style.setProperty("--timeline-progress", `${timelineProgress}%`);
+    this.#dom.timeline.disabled = !(playback.duration > 0);
+    this.#dom.timeline.setAttribute("aria-valuetext", timelineValueText(current, playback.duration));
+    this.#dom.timeline.setAttribute("aria-busy", String(playback.status === "seeking"));
+    this.#dom.timelineStatus.textContent = playback.status === "seeking"
+      ? `${timelineValueText(current, playback.duration)}. Starting a prepared stream.`
+      : timelineValueText(current, playback.duration);
+    this.#dom.timelineCurrent.textContent = clockLabel(current);
+    this.#dom.timelineDuration.textContent = playback.duration > 0 ? clockLabel(playback.duration) : "Unknown";
   }
 
   async #loadSource(item, options = {}) {

@@ -956,6 +956,45 @@ For 50,000 children, allocation alone implies 1,249,975,000 row visits.
 deterministic order. Record scan/restart CPU, peak RSS and playback startup under
 scan load. This is a better first scalability change than a broad catalog redesign.
 
+**Bundle E implemented.** Writable transactions initialize each parent's suffix
+maximum once; TEMP triggers track inserts, moves, deletion/recreation, overflow
+and rollback without a persisted schema change. Restoration and bulk patch links
+use ordered vectors plus temporary membership sets for seeded/mirrored overlap.
+Actual cold scans also exposed parent-first All Video/virtual-folder inode checks;
+those now start from existing inode/detail indexes. Allocation VM steps were
+164,024→656,024 for 1k→4k admissions; aggregate positive/negative membership
+probes were 117,882→471,882. Both scale ~4× for 4× input. Regression coverage
+includes aliases, object-only representative changes, rename, cancellation,
+transaction/savepoint rollback, external writers, restart, rebuild and overflow.
+
+Final release filesystem scans use 10% hard-link plus 10% symlink aliases:
+
+| Shape / physical files | Cold wall before→after | Process CPU before→after | Peak RSS before→after |
+| --- | ---: | ---: | ---: |
+| Sharded / 1k | 1.643→1.613 s | 2.07→2.03 s | 102.9→96.9 MiB |
+| Sharded / 4k | 7.437→6.453 s | 9.53→8.80 s | 127.9→127.9 MiB |
+| Sharded / 50k | 513.148→76.995 s | 542.70→112.50 s | 621.0→547.5 MiB |
+| Flat / 50k | 816.215→66.005 s | 845.12→95.10 s | 660.5→589.6 MiB |
+
+Flat 1k/4k final scans took 1.622/5.322 s (CPU 1.83/7.08 s; peak
+93.5/130.4 MiB); matching filesystem baselines were not collected at these two
+small flat tiers, while matching algorithm workloads cover all six combinations.
+Each filesystem scan is one sample on a shared host. The near-linear claim is
+for changed operation counts; total scan time also includes probing and I/O.
+Ten-process, warm-OS-cache 50k sharded restoration medians were
+13.416→6.941 s (sample SD 0.436→0.649 s), CPU medians 13.31→6.885 s,
+peak RSS medians 561.1→506.6 MiB. Earlier 1k/4k restoration medians were
+183.48→148.54 ms and 590.70→414.30 ms (10 samples each). Flat restoration
+is covered behaviorally and by the isolated catalog workload, but no separate
+flat process-restart distribution was collected.
+
+Presented-frame startup during a real 4k scan succeeded with verified overlap
+in all five final trials per binary: medians 99.2→107.2 ms, means
+104.88→109.14 ms, sample SD 17.90→13.93 ms. The modest observed regression
+and shared-host variability do not support a startup-speed improvement claim.
+Earlier quieter trials were 81.6→81.5 ms. Generated playback bytes match;
+quality, delivery and linked-startup semantics remain unchanged.
+
 ### C02 — Make database and fallback browser search agree
 
 **P2 · Reproduced expression mismatch · S/M.** `crates/scan/src/db.rs:1691–1706`
@@ -977,6 +1016,13 @@ SQLite documents this ASCII-only behavior.
 IDs/counts across pages for accented/Cyrillic text, combining marks, mixed case,
 literal wildcard/backslash inputs and non-UTF-8 paths. Do not silently add linguistic
 normalization semantics beyond the agreed contract.
+
+**Bundle E implemented.** SQLite and memory share Unicode lowercase-only
+substring normalization, filename/metadata search fields, canonical object title,
+physical representative selection, all sort keys, counts and paging. Bound INSTR
+parameters preserve literal `%`, `_` and backslash. Actual API parity tests cover
+accented/Cyrillic text, combining marks, alias overlays and non-UTF-8 paths;
+SOAP matching is unchanged. Exact matching has a measured cold SQL cost (see C04).
 
 ### C03 — Bound query wait and execution, including memory fallback
 
@@ -1001,6 +1047,18 @@ this is not a claim of unlimited request/task creation.
 leases return promptly, a later query is not cancelled by stale handlers, and media
 and status remain responsive. Cover generation churn and publication races. Merely
 wrapping `spawn_blocking` in an async timeout does not stop its underlying work.
+
+**Bundle E implemented.** One absolute five-second control follows heavy-query
+admission (four active queries), reader waits, SQLite progress callbacks,
+generation retries and bounded fallback. Lease cleanup removes its callback
+before reuse, with no externally retained SQLite interrupt handle. Cancellation,
+deadline and work exhaustion cannot trigger fallback or partial success. Memory
+queries cap inspected records at 1m and scratch/keys at 64 MiB. Status exposes
+fixed-cardinality phase times and stop counts. Regressions exercise occupied
+readers, executing SQL, late cancellation, admission, media/status access,
+publication, TCP reset and valid FIN half-close. Memory fallback still holds a
+read guard while filtering/sorting within its budget; that publication-delay
+limit remains. No ownership redesign was introduced.
 
 ### C04 — Avoid repeated whole-catalog/folder work for each page
 
@@ -1031,6 +1089,54 @@ on 50k/250k fixtures. Record CPU, allocations, writer wait and page/startup perc
 for both SQL and physical-folder views. Avoid using warm identical-query cache hits
 as evidence that cold/deep paging is cheap.
 
+**Bundle E implemented with measured limits.** Paging parameters are bound;
+a generation/query count hint avoids repeated invariant counts, including safe
+ui4-wrap rejection. Complete validated pages also reuse IDs/counts in the existing
+256-entry cache after the flat 50k warm-page workload still exceeded 250 ms
+with count reuse alone. Cold SQL timings below remain separate from page hits.
+Physical folders cache ordered IDs (8 entries / 32 MiB) and
+child counts (1,024 entries / 512 KiB), copy keys in 256-child lock intervals,
+sort outside the catalog lock and clone only the requested page. Evicted IDs
+are destroyed after releasing publication locks. Valid unchanged requests
+short-circuit before page work. Cache, cancellation and publication races are
+covered at the API boundary.
+
+Matched release folder workloads (10 cold and 10 warm samples per case) at
+250k entries improved median first/deep/search cold pages from
+782.79/849.33/377.47 ms to 160.22/159.30/164.82 ms; warm pages from
+772.08/788.10/374.75 ms to 0.867/0.857/0.839 ms. Four clients' 20 distinct queries
+fell from 2,096.67 to 1,561.10 ms; maximum observed writer acquisition wait
+(20 observations, not a tail percentile or an actual watcher publication) fell
+from 836.51 to 101.12 ms. Whole harness CPU fell 54.31→12.85 s; peak RSS rose
+1.68% (1,062,012→1,079,864 KiB), including fixture creation and teardown.
+
+SQLite release profiles use five samples per case plus separate EXPLAIN/VM
+runs. At 250k, empty first-page medians were 623.17 ms before,
+760.31 ms cold after, and 470.35 ms with reused counts; offset 40k was
+625.07/778.88/500.01 ms. Reused counts cut ~50.25m to ~30m VM steps.
+Cold varied substring queries regressed about 2–2.35× because exact Unicode and
+canonical-title matching do more work; `title 04` was 294.43/655.44/326.38 ms,
+and `title 2` 342.05/710.47/361.62 ms. Known-zero counts short-circuit misses.
+Final 50k server warm-page means after complete-page reuse are
+0.538/0.486/0.191 ms (sharded first/deep/search) and 0.496/0.466/0.196 ms
+(flat), with 20 timed samples after ten warmups. All six final filesystem tiers
+pass the existing 250 ms web threshold. These are repeated page hits, not cold
+SQL improvements; the prior flat before/intermediate runs that exceeded the
+threshold remain recorded.
+
+An additional after-only handler workload applies ten real four-detail patches
+per 50k/250k catalog while four clients page. Publication median including wait
+was 17.89/127.00 ms (SD 1.55/8.22 ms); exact IDs, metadata generation, cached-empty
+invalidation and all 409 retries passed. Each tier had 40 successful client pages
+and 30 retried responses. Health medians were 0.183/0.201 ms, detailed status
+12.45/78.64 ms; largest observed successful page was 59.10/363.86 ms.
+The harness used 13.58 s CPU and 1,082,580 KiB peak RSS, including fixtures.
+It invokes real API/publication handlers without network transport.
+
+These measurements justify bounded reuse, and identify a remaining SQL cost;
+they do not validate a particular persisted-index/cursor design. No schema,
+FTS, cursor API or whole-catalog ownership redesign was added.
+
 ### C05 — Reduce catalog duplication and publication work where measured
 
 **P2 · Code-backed narrow fixes; larger model change conditional · S to L.**
@@ -1056,6 +1162,20 @@ alias-heavy/metadata-heavy memory and lock profiles improve; alias-local sidecar
 deletion of one alias, bookmarks, recent groups and deterministic Browse stay correct.
 Retain existing staged disk-backed publication and reusable scan sessions.
 
+**Bundle E implemented narrowly.** Changed detail mappings are removed by key;
+existing mirrors avoid metadata/child-vector clones, and physical ancestors are
+visited once per distinct parent. Object-only journals retain affected details
+for canonical representative reselection. Ten-sample, 1,000-patch isolated
+mapping medians at 1k/4k/50k unrelated mappings changed from
+187.16/722.43/8,977.77 ms to 2.15/2.32/1.44 ms (final ten-run medians). This is
+an operation-specific measurement: full video patch publication still includes Recent maintenance
+(~6.2 s for 1,000 patches in the debug workload). Existing mirrors require zero
+metadata/container clones; new mirrors retain object/path-local overlays.
+Shared metadata ownership and detailed-status count caching were not justified
+by isolated attribution of the remaining RSS and publication costs, and remain
+conditional. Alias sidecars, surviving aliases, bookmarks, Recent and staged
+publication stay covered by scanner/server regressions.
+
 ### C06 — Avoid redundant playlist traversal and add cancellation checkpoints
 
 **P2 · Code-backed · S/M.** On full reconciliation or playlist events
@@ -1074,6 +1194,15 @@ delays cooperative shutdown. Ordinary media events do not always take this path.
 one playlist update does not needlessly resolve every unrelated file; cancellation
 rolls back its private stage promptly. Preserve order, duplicate members, encoding,
 playlist identity, later media arrivals and alias behavior.
+
+**Bundle E implemented.** Empty playlist discovery skips DETAILS entirely but
+still removes disappeared playlists. Targeted updates use known playlist paths,
+indexed requested members and relevant inode aliases; ordinary arrivals with no
+playlists skip object cleanup too. Member lookup used 22 SQLite VM steps with
+both 1k and 4k unrelated details. Cancellation checkpoints cover discovery,
+member processing and private-stage mutation. Behavioral tests cover staged
+rollback, removal, later arrivals, duplicate order, encodings, aliases and
+non-UTF-8 paths. No global playlist/member index or schema change was needed.
 
 ### B01 — Fix caption conversion, caption focus, and optional display errors
 
@@ -1148,6 +1277,27 @@ four-request viewport artwork queue already reduce paint and network work.
 navigation/title switches do not grow retained memory. The failed large-list cases
 in the full browser run followed by isolated passes justify investigation, but do
 not by themselves prove this layout path caused the failures. Instrument it first.
+
+**Bundle E implemented after instrumentation.** Weakly owned queue indexes keep
+first-member and immutable snapshot semantics. Clock/preview actions update the
+timeline and active chapter without a full control/layout render. Large lists
+build privately in batches of at most 128 cards or approximately 8 ms, then
+publish coherently; navigation cancels between batches. Matching chunks share
+measured geometry with a two-width cache. All cards remain in DOM order for
+Find, keyboard traversal, screen readers and collection headings.
+
+Three matched Chromium runs, 10k cards, 4× CPU throttling: median publication
+7,201.7→1,793.4 ms, largest long task 5,518→152 ms, initial layout
+3,669.7→47.32 ms, first resize 3,115.7→188 ms, return resize
+3,161.4→126.9 ms. Two hundred playback ticks fell 358.8→20.1 ms and
+8,000→1,400 mutations. Timer scheduling delay fell 6,667.7→174.4 ms;
+this is not a trusted-input latency measurement. Five navigation cycles showed
+no growing detached card trees or listeners after releasing a benchmark-created
+remote DOM handle; heap varied 12.4–13.8 MB before and 13.6–14.5 MB after.
+Physical constrained-device testing is unavailable. True virtualization,
+lean-DTO/lazy-detail architecture and incremental visible list publication were
+not introduced. Focused four-project tests include offscreen focus through resize,
+chunk geometry, navigation cancellation and unchanged linked/full-snapshot queues.
 
 ### O01 — Supervise and isolate operator conversion jobs
 
@@ -1357,6 +1507,67 @@ full browser matrix for playback/UI changes and dedicated media/GPU/soak tests
 where the selected behavior requires them. Update the relevant authoritative
 guide and bump transcode cache identity whenever old output is no longer reusable.
 
+## Bundle E validation and measurement scope
+
+Bundle E measurements use Rust 1.98.1, SQLite 3.53.2, Node 22.19.0,
+host FFmpeg 6.1.1 and Chromium 151.0.7922.34 on the shared Linux Ryzen 9
+5950X / 32-CPU / 64-GiB development host. The baseline is the clean
+`70df12bd99da247ce7ea3944f18badace1be6b2e` build containing bundle A/B work.
+Saved binary hashes, raw samples, standard deviations and workload metadata
+are under `/tmp/rustydlna-bundle-e/`; SQL logs are also retained as
+`/tmp/bundle-e-sql-profile-counts.log`. Reports and generated media stay outside Git.
+
+Cold scans use freshly generated bounded files with warm OS caches; scans are
+single runs per shape/size, not tail-latency samples. Restart uses ten separate
+`--database-check` processes against the same retained catalog, including SQLite
+quick-check but no listeners or scan. SQL profiles separate VM instruction
+counts from five uninstrumented timing samples. Folder profiles use ten samples
+per cache condition and record whole-harness CPU/RSS separately. Browser timing
+uses three fresh contexts and five navigation cycles per context. Physical
+constrained devices, allocator call/byte profiling, privileged CPU perf sampling
+(`perf_event_paranoid=4`), and deployment/GPU tiers were unavailable; peak RSS,
+explicit capacities, clone counts and operation counts are reported without
+claiming an allocation trace. No ownership/index redesign is inferred from them.
+
+The original large-library harness ran standalone reconciliations against the
+live daemon database. This advanced its scan epoch and made the next watcher
+update trigger stale-stage rejection and full recovery. Those old `update`
+values (~18 s at 50k) are recovery measurements, not ordinary targeted-update
+latency. Cold scan, restoration and HTTP timings are unaffected by that
+interpretation. Corrected runs isolate reconciliation in a SQLite backup and
+check daemon logs for genuine targeted publication.
+
+Five corrected alternating 50k sharded watcher trials per binary used the same
+frozen database and matching fsynced additions. All ten published directly:
+median 429.03→376.82 ms, ranges 418.79–459.85→370.54–450.70 ms, sample SD
+15.74→34.30 ms. Preparation medians were 48→22 ms and update CPU medians
+0.15→0.13 s. Process peak RSS including startup was 630.6→581.7 MiB
+(medians). Fifty-millisecond polling granularity and concurrent validation load
+limit the timing claim; startup was excluded. Final unchanged reconciliation
+remains a whole-library operation (~15–16 s at 50k).
+
+Final validation: `./scripts/agent-verify.sh` passed formatting, Clippy with
+warnings denied, Python/operator checks, all 101 web unit tests, workspace tests,
+Rust documentation, administrative smoke checks and all eight explicitly enabled
+isolated socket E2E tests. Server tests: 337 passed / 3 ignored; scanner tests:
+258 passed / 4 ignored. The applicable full four-project Playwright matrix ran
+twice with four workers; each run had 750 passed, 146 intentional browser/media/
+fullscreen/platform skips, and zero failures. Relevant ignored allocation,
+mapping, SQL, folder and publication workloads were run explicitly. The unrelated
+transcode-cache scale test, privileged namespace/Docker/GPU/soak/fuzz and 250k
+filesystem-scan tiers were not run. No separate JS/Python lint/typecheck task is
+configured; the canonical gate's configured checks all passed.
+
+Initial integration failures were diagnosed and fixed: unused import/test-module
+lint, one owned comparison in a new regression, stale representation-revision
+ETag expectations, and a missing publication-pool fixture in the opt-in workload.
+The first flat baseline threshold failure lost its report in the old fail-fast
+harness; a repeat preserved all measurements. The final threshold failures were
+resolved with bounded page reuse. An interrupted flat watcher setup produced no
+measurement and was replaced by the matching sharded workload. No failed or
+skipped run is counted as a pass. Tracked fixtures, toolchain pins, lockfiles,
+user media and live configuration are unchanged. No commit, push or deployment.
+
 ## Evidence ledger and reproducibility limits
 
 All material conclusions and experiment numbers are recorded above. The following
@@ -1365,6 +1576,9 @@ permanent repository documentation and may disappear when `/tmp` is cleaned.
 
 | Artifact | Contents |
 | --- | --- |
+| `/tmp/rustydlna-bundle-e/measurements.json` | Bundle E final report index, hashes, raw sample references and resource measurements |
+| `/tmp/rustydlna-bundle-e/agent-verify.log` | Bundle E final canonical gate, workspace and isolated E2E checks |
+| `/tmp/rustydlna-bundle-e/playwright-verified.log` | Bundle E final full four-project matrix (750 passed, 146 skipped) |
 | `/tmp/rustydlna-review-agent-verify.log` | Complete canonical gate output and isolated E2E result |
 | `/tmp/rustydlna-review-browser.log` | Full 680-case matrix, failures and helper diagnostics |
 | `/tmp/rustydlna-review-browser-rerun.log` | Four formerly failed cases passed with one worker |
@@ -1379,7 +1593,7 @@ permanent repository documentation and may disappear when `/tmp` is cleaned.
 | `/tmp/rustydlna-review-operator-ksycdsbr/result.json` | Actual artwork hardlink mode changed from 0640 to 0666 |
 | `/tmp/rustydlna-review-toolchain-g0dxdu3s/result.json` | Real updater's successful temp-copy update with stale Compose pins |
 
-Runtime evidence here used Rust 1.97.1, Node 22.19.0, npm 11.19.0 and host FFmpeg
+The original review evidence used Rust 1.97.1, Node 22.19.0, npm 11.19.0 and host FFmpeg
 6.1.1. It is not a performance measurement of the production FFmpeg 8 container,
 a dedicated GPU run or a user's full library. Microbenchmarks used warm local
 filesystem caches and generated inputs; repeat with cold/large/realistic inputs

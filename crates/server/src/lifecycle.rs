@@ -297,10 +297,11 @@ pub(crate) fn apply_catalog(
     prepare_catalog_generation(app, id, |db| db.hydrate_catalog_bookmarks(&mut next))?;
     let mut published = write_recover(&app.catalog);
     *published = next;
-    app.invalidate_catalog_query_cache();
+    let retired_projections = app.invalidate_catalog_query_cache();
     app.update_id.store(id, Ordering::Release);
     app.notify_catalog_publication(&published, id, None);
     drop(published);
+    drop(retired_projections);
     tracing::info!(
         items,
         added = delta.added,
@@ -335,10 +336,11 @@ pub(crate) fn apply_catalog_update(
     let mut published = write_recover(&app.catalog);
     published.apply_patch(patch);
     let items = published.items.len();
-    app.invalidate_catalog_query_cache();
+    let retired_projections = app.invalidate_catalog_query_cache();
     app.update_id.store(id, Ordering::Release);
     app.notify_catalog_publication(&published, id, None);
     drop(published);
+    drop(retired_projections);
     tracing::info!(
         items,
         added = delta.added,
@@ -467,10 +469,11 @@ pub(super) fn apply_prepared_catalog_change(
     }
     let id = publication_id.unwrap_or(update_id);
     let items = catalog.items.len();
-    app.invalidate_catalog_query_cache();
+    let retired_projections = app.invalidate_catalog_query_cache();
     app.update_id.store(id, Ordering::Release);
     app.notify_catalog_publication(&catalog, id, None);
     drop(catalog);
+    drop(retired_projections);
     drop(_publication);
     session.finish_publication();
     drop(session_guard);
@@ -1552,10 +1555,40 @@ pub(super) async fn handle_conn(
         pending.drain(..request_end);
         let handler_app = app.clone();
         let handler_request = req.clone();
-        let resp =
-            tokio::task::spawn_blocking(move || handler_app.handle_from(&handler_request, peer))
-                .await
-                .map_err(|error| format!("request worker failed: {error}"))?;
+        let query_control = QueryControl::new(app.runtime_metrics.queries.clone());
+        // Dropping/aborting this connection task also stops its blocking query.
+        struct CancelQueryOnDrop(CancellationToken);
+        impl Drop for CancelQueryOnDrop {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let cancel_query = CancelQueryOnDrop(query_control.cancellation.clone());
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let _scope = enter_query_scope(query_control);
+            handler_app.handle_from(&handler_request, peer)
+        });
+        let mut poll = tokio::time::interval(Duration::from_millis(20));
+        let resp = loop {
+            tokio::select! {
+                result = &mut worker => break result.map_err(|error| format!("request worker failed: {error}"))?,
+                _ = poll.tick() => {
+                    if app.scan_control.cancellation.is_cancelled() {
+                        cancel_query.0.cancel();
+                    }
+                    // A read-side FIN also means a valid HTTP half-close. Only
+                    // reset/write-closed states establish disconnection; FIN-only
+                    // queries retain the same absolute execution deadline.
+                    if let Ok(ready) = tokio::time::timeout(Duration::from_millis(1),
+                        sock.ready(tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE)).await {
+                        if ready?.is_write_closed() || sock.take_error()?.is_some() {
+                            cancel_query.0.cancel();
+                        }
+                    }
+                }
+            }
+        };
+        drop(cancel_query);
         request_number = request_number.saturating_add(1);
         persist_left = persist_left.saturating_sub(1);
         if let Some(spec) = resp.remux_job.clone() {

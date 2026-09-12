@@ -322,7 +322,6 @@ impl Catalog {
             .iter()
             .map(|item| item.object_id.clone())
             .collect();
-        let changed_details: HashSet<i64> = patch.changed_detail_ids.iter().copied().collect();
         let mut removed_objects: HashSet<String> =
             patch.changed_object_ids.iter().cloned().collect();
         removed_objects.extend(patch.items.iter().map(|item| item.object_id.clone()));
@@ -345,8 +344,9 @@ impl Catalog {
                     .retain(|object_id| !removed_objects.contains(object_id));
             }
         }
-        self.by_detail
-            .retain(|detail_id, _| !changed_details.contains(detail_id));
+        for detail_id in &patch.changed_detail_ids {
+            self.by_detail.remove(detail_id);
+        }
 
         let mut container_links = Vec::with_capacity(patch.containers.len());
         for mut container in patch.containers.drain(..) {
@@ -358,9 +358,36 @@ impl Catalog {
             self.containers.insert(object_id.clone(), container);
             container_links.push((object_id, parent_id));
         }
+        let mut link_counts = HashMap::<&str, usize>::new();
+        for parent in container_links
+            .iter()
+            .map(|(_, parent)| parent.as_str())
+            .chain(patch.items.iter().map(|item| item.parent_id.as_str()))
+        {
+            *link_counts.entry(parent).or_default() += 1;
+        }
+        // Build membership once only for parents receiving a batch. A single
+        // incoming link retains the existing small-patch cost and no extra
+        // folder-sized allocation. Vectors preserve their original order.
+        let mut child_membership: HashMap<String, HashSet<String>> = link_counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .filter_map(|(parent, _)| {
+                self.containers.get(parent).map(|container| {
+                    (
+                        parent.to_owned(),
+                        container.children.iter().cloned().collect(),
+                    )
+                })
+            })
+            .collect();
         for (object_id, parent_id) in container_links {
             if let Some(parent) = self.containers.get_mut(&parent_id) {
-                if !parent.children.contains(&object_id) {
+                let missing = match child_membership.get_mut(&parent_id) {
+                    Some(members) => members.insert(object_id.clone()),
+                    None => !parent.children.contains(&object_id),
+                };
+                if missing {
                     parent.children.push(object_id);
                 }
             }
@@ -370,12 +397,24 @@ impl Catalog {
             let parent_id = item.parent_id.clone();
             let detail_id = item.detail_id;
             self.next_detail = self.next_detail.max(detail_id.saturating_add(1));
-            self.by_detail
-                .entry(detail_id)
-                .or_insert_with(|| object_id.clone());
+            let replace_representative = self
+                .by_detail
+                .get(&detail_id)
+                .and_then(|current| self.items.get(current))
+                .is_none_or(|current| {
+                    (item.ref_id.is_some(), &object_id)
+                        < (current.ref_id.is_some(), &current.object_id)
+                });
+            if replace_representative {
+                self.by_detail.insert(detail_id, object_id.clone());
+            }
             self.items.insert(object_id.clone(), item);
             if let Some(parent) = self.containers.get_mut(&parent_id) {
-                if !parent.children.contains(&object_id) {
+                let missing = match child_membership.get_mut(&parent_id) {
+                    Some(members) => members.insert(object_id.clone()),
+                    None => !parent.children.contains(&object_id),
+                };
+                if missing {
                     parent.children.push(object_id);
                 }
             }
@@ -617,6 +656,31 @@ impl Catalog {
             .unwrap_or(0)
     }
 
+    /// Count child containers with cooperative checks before inspecting each
+    /// child. Synthetic Recent views contain only media items.
+    pub fn displayed_container_count_controlled(
+        &self,
+        id: &str,
+        mut check: impl FnMut(usize) -> bool,
+    ) -> Option<u32> {
+        if !check(0) {
+            return None;
+        }
+        if recent_root(id).is_some() {
+            return Some(0);
+        }
+        let mut count = 0usize;
+        if let Some(container) = self.containers.get(id) {
+            for (index, child) in container.children.iter().enumerate() {
+                if !check(index.saturating_add(1)) {
+                    return None;
+                }
+                count += usize::from(self.containers.contains_key(child));
+            }
+        }
+        Some(catalog_count(count))
+    }
+
     /// Newest unique videos (inode-deduped so symlink aliases count once),
     /// newest first, up to `RECENT_MAX`. Object IDs are `2$FF0$` + source id.
     pub fn recent_videos(&self) -> Vec<CatalogChild> {
@@ -647,6 +711,137 @@ impl Catalog {
                 Some(CatalogChild::Item(Box::new(clone)))
             })
             .collect()
+    }
+
+    /// Read the synthetic Recent view with cooperative work checks. The callback
+    /// receives a monotonically increasing count of inspected/materialized rows;
+    /// false abandons the private result. Only the configured Recent limit of
+    /// distinct physical identities is retained, avoiding a whole-catalog sort.
+    pub fn recent_items_controlled(
+        &self,
+        root: &str,
+        mut check: impl FnMut(usize) -> bool,
+    ) -> Option<Vec<CatalogChild>> {
+        use std::cmp::Reverse;
+        use std::collections::BTreeMap;
+
+        if !check(0) {
+            return None;
+        }
+        let mut visited = 0usize;
+        let selected: Vec<&MediaItem> = if root == VIDEO_RECENT_ID && !self.recent_ids.is_empty() {
+            let mut selected = Vec::new();
+            for id in &self.recent_ids {
+                visited = visited.saturating_add(1);
+                if !check(visited) {
+                    return None;
+                }
+                if let Some(item) = self.items.get(id) {
+                    selected.push(item);
+                }
+            }
+            selected
+        } else {
+            let class = match root {
+                MUSIC_RECENT_ID => "audio",
+                IMAGE_RECENT_ID => "image",
+                _ => "video",
+            };
+            let mut ranked = BTreeMap::new();
+            let mut physical = HashMap::new();
+            for item in self.items.values() {
+                visited = visited.saturating_add(1);
+                if !check(visited) {
+                    return None;
+                }
+                if !self.recent_item_is_eligible(item, class) {
+                    continue;
+                }
+                // Cache this filesystem observation once per candidate. Ordering
+                // otherwise exactly matches collect_recent_item_ids, including
+                // legacy second/nanosecond timestamps and alias tie-breakers.
+                let key = (
+                    Reverse(normalized_mtime_seconds(item.mtime)),
+                    Reverse(item.mtime),
+                    path_is_symlink(&item.path),
+                    item.title.as_str(),
+                    item.object_id.as_str(),
+                );
+                let identity = physical_identity_key(item);
+                if let Some(previous) = physical.get(&identity).copied() {
+                    if previous <= key {
+                        continue;
+                    }
+                    ranked.remove(&previous);
+                } else if ranked.len() >= self.recent_limit {
+                    if ranked
+                        .last_key_value()
+                        .is_some_and(|(worst, _)| *worst <= key)
+                    {
+                        continue;
+                    }
+                    if let Some((_, previous)) = ranked.pop_last() {
+                        physical.remove(&physical_identity_key(previous));
+                    }
+                }
+                physical.insert(identity, key);
+                ranked.insert(key, item);
+            }
+            ranked.into_values().collect()
+        };
+        let mut output = Vec::with_capacity(selected.len());
+        for item in selected {
+            visited = visited.saturating_add(1);
+            if !check(visited) {
+                return None;
+            }
+            let mut item = item.clone();
+            item.object_id = format!("{root}${}", item.object_id);
+            item.parent_id = root.to_owned();
+            output.push(CatalogChild::Item(Box::new(item)));
+        }
+        Some(output)
+    }
+
+    /// Count visible children while permitting a caller to stop an uncached
+    /// Recent scan. Ordinary containers and cached video counts are constant work.
+    pub fn displayed_child_count_controlled(
+        &self,
+        id: &str,
+        mut check: impl FnMut(usize) -> bool,
+    ) -> Option<u32> {
+        if !check(0) {
+            return None;
+        }
+        if recent_root(id).is_none() {
+            return Some(
+                self.containers
+                    .get(id)
+                    .map(|container| catalog_count(container.children.len()))
+                    .unwrap_or(0),
+            );
+        }
+        if id == VIDEO_RECENT_ID && !self.recent_ids.is_empty() {
+            return Some(catalog_count(self.recent_ids.len()));
+        }
+        let class = match id {
+            MUSIC_RECENT_ID => "audio",
+            IMAGE_RECENT_ID => "image",
+            _ => "video",
+        };
+        let mut physical = HashSet::new();
+        for (index, item) in self.items.values().enumerate() {
+            if !check(index.saturating_add(1)) {
+                return None;
+            }
+            if self.recent_item_is_eligible(item, class) {
+                physical.insert(physical_identity_key(item));
+                if physical.len() == self.recent_limit {
+                    break;
+                }
+            }
+        }
+        Some(catalog_count(physical.len()))
     }
 
     fn recent_cache_limit(&self) -> usize {
@@ -861,30 +1056,56 @@ impl Catalog {
             );
             self.link_child(VIDEO_ID, VIDEO_GENRE_ID);
         }
-        let videos: Vec<MediaItem> = self
+        let mut parents = HashSet::new();
+        let mut missing = Vec::new();
+        for item in self
             .items
             .values()
-            .filter(|i| i.class.contains("video") && i.object_id.starts_with(BROWSEDIR_ID))
+            .filter(|item| item.class.contains("video") && item.object_id.starts_with(BROWSEDIR_ID))
+        {
+            parents.insert(item.parent_id.as_str());
+            let mirror = browse_to_typed_dir(&item.object_id, VIDEO_DIR_ID);
+            if !self.items.contains_key(&mirror) {
+                missing.push((item.object_id.clone(), mirror));
+            }
+        }
+        // Walk each physical parent once, without cloning its child vector.
+        let mut parents: Vec<_> = parents.into_iter().map(str::to_owned).collect();
+        parents.sort();
+        let mut linked_containers: HashSet<String> = self
+            .containers
+            .values()
+            .flat_map(|container| container.children.iter())
+            .filter(|object_id| self.containers.contains_key(*object_id))
             .cloned()
             .collect();
-        for it in videos {
-            self.mirror_video_dir_ancestors(&it.parent_id);
-            let vobj = browse_to_typed_dir(&it.object_id, VIDEO_DIR_ID);
-            let vparent = browse_to_typed_dir(&it.parent_id, VIDEO_DIR_ID);
-            if self.items.contains_key(&vobj) {
+        for parent in parents {
+            self.mirror_video_dir_ancestors(&parent, &mut linked_containers);
+        }
+        missing.sort();
+        for (object_id, mirror) in missing {
+            let Some(source) = self.items.get(&object_id) else {
                 continue;
+            };
+            let mut item = source.clone();
+            item.object_id = mirror.clone();
+            item.parent_id = browse_to_typed_dir(&item.parent_id, VIDEO_DIR_ID);
+            item.ref_id = Some(object_id);
+            // This missing object's unique key was checked before mutation.
+            // Existing persisted mirrors keep their original position.
+            if let Some(parent) = self.containers.get_mut(&item.parent_id) {
+                parent.children.push(mirror.clone());
             }
-            let mut clone = it.clone();
-            clone.object_id = vobj.clone();
-            clone.parent_id = vparent.clone();
-            clone.ref_id = Some(it.object_id.clone());
-            self.link_child(&vparent, &vobj);
-            self.items.insert(vobj, clone);
+            self.items.insert(mirror, item);
         }
         self.rebuild_recent_index();
     }
 
-    fn mirror_video_dir_ancestors(&mut self, browse_folder_id: &str) {
+    fn mirror_video_dir_ancestors(
+        &mut self,
+        browse_folder_id: &str,
+        linked_containers: &mut HashSet<String>,
+    ) {
         let mut chain = Vec::new();
         let mut cur = browse_folder_id.to_string();
         while cur != BROWSEDIR_ID && cur != ROOT_ID {
@@ -896,15 +1117,20 @@ impl Catalog {
         }
         chain.reverse();
         for bid in chain {
-            let Some(cont) = self.containers.get(&bid).cloned() else {
+            let vid = browse_to_typed_dir(&bid, VIDEO_DIR_ID);
+            let Some(cont) = self.containers.get(&bid) else {
                 continue;
             };
-            let vid = browse_to_typed_dir(&bid, VIDEO_DIR_ID);
             let vparent = browse_to_typed_dir(&cont.parent_id, VIDEO_DIR_ID);
             if !self.containers.contains_key(&vid) {
-                self.add_container(&vid, &vparent, &cont.title, "container.storageFolder", true);
+                let title = cont.title.clone();
+                self.add_container(&vid, &vparent, &title, "container.storageFolder", true);
             }
-            self.link_child(&vparent, &vid);
+            if linked_containers.insert(vid.clone()) {
+                if let Some(parent) = self.containers.get_mut(&vparent) {
+                    parent.children.push(vid);
+                }
+            }
         }
     }
 }

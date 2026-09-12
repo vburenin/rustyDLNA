@@ -108,7 +108,9 @@ fi
 (bash -n restart-web.sh)
 (sh -n scripts/web-gateway-smoke.sh)
 (bash -n scripts/ssdp-netns-e2e.sh scripts/host-network-e2e.sh scripts/compose-smoke.sh scripts/large-library-benchmark.sh scripts/generate-advanced-fixtures.sh scripts/generate-dolby-vision-fixture.sh scripts/promote-fuzz-regression.sh)
-python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding="utf-8")) for path in ("scripts/large-library-http-benchmark.py", "scripts/check-targeted-coverage.py")]'
+python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding="utf-8")) for path in ("scripts/large-library-http-benchmark.py", "scripts/large-library-restart-benchmark.py", "scripts/check-targeted-coverage.py")]'
+node --check scripts/library-browser-benchmark.mjs
+node --check scripts/library-scan-playback-benchmark.mjs
 ./restart.sh --help >/dev/null
 ./restart-web.sh --help >/dev/null
 ! ./restart.sh --nope >/dev/null 2>&1
