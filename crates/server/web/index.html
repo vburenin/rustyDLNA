@@ -53,7 +53,13 @@
         </div>
 
         <div class="control-surface" id="playback-controls" hidden>
-          <div class="caption-menu" id="caption-menu" hidden><fieldset><legend>Captions</legend><div id="caption-choices"></div></fieldset></div>
+          <div class="caption-menu" id="caption-menu" hidden>
+            <fieldset><legend>Captions</legend><div id="caption-choices"></div></fieldset>
+            <div id="caption-error" hidden>
+              <p id="caption-error-message" role="status" aria-live="polite" aria-atomic="true"></p>
+              <div class="caption-error-actions"><button type="button" id="caption-retry">Retry captions</button><button type="button" id="caption-off">Turn captions off</button></div>
+            </div>
+          </div>
           <div class="timeline-control">
             <input id="timeline" type="range" min="0" max="0" value="0" step="0.1" list="chapter-markers" aria-label="Media position" aria-describedby="timeline-status">
             <datalist id="chapter-markers"></datalist>

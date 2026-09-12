@@ -92,6 +92,11 @@ main[data-layout="browse"] .media-grid { grid-template-columns: repeat(auto-fill
 .caption-menu fieldset { margin: 0; padding: 0; border: 0; }
 .caption-menu label { min-height: 44px; display: flex; align-items: center; gap: .55rem; }
 .caption-menu input { width: 20px; height: 20px; accent-color: var(--accent); }
+/* WebKit can omit :focus-visible after native radio Arrow selection. */
+.caption-menu input:focus { outline: 3px solid var(--focus); outline-offset: 3px; }
+.caption-error-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+.caption-error-actions button { flex: 1 1 7rem; min-height: 44px; }
+#caption-error-message { margin: .5rem 0; }
 .advanced-playback-dialog { width: min(34rem, calc(100% - 2rem)); max-height: calc(100dvh - 2rem); overflow: auto; }
 .advanced-playback-dialog form { display: grid; gap: .5rem; }
 .advanced-playback-dialog fieldset { margin: 0; padding: 0; border: 0; }
@@ -549,12 +554,16 @@ dialog dd { margin: 0; color: var(--muted); }
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+/* The popup is positioned inside the controls; give it the player bounds
+   while open so long track lists cannot escape behind the page header. */
+.control-surface:has(.caption-menu:not([hidden])) { height: 100%; }
 .caption-menu {
+  --caption-menu-bottom: max(4.8rem, calc(4.35rem + env(safe-area-inset-bottom)));
   position: absolute;
   right: max(.75rem, env(safe-area-inset-right));
-  bottom: max(4.8rem, calc(4.35rem + env(safe-area-inset-bottom)));
+  bottom: var(--caption-menu-bottom);
   width: min(19rem, calc(100% - 1.5rem));
-  max-height: min(20rem, 55vh);
+  max-height: min(20rem, 55vh, calc(100% - var(--caption-menu-bottom) - .75rem));
   padding: .75rem 1rem;
   overflow: auto;
   border: 0;
@@ -663,7 +672,7 @@ body.player-expanded .player-panel { z-index: 1000; overflow: visible; }
   .player-stage:fullscreen #previous-button,
   .player-stage.expanded-player #previous-button { display: none; }
   .timeline-times { padding-inline: .15rem; }
-  .caption-menu { bottom: max(4.5rem, calc(4.15rem + env(safe-area-inset-bottom))); }
+  .caption-menu { --caption-menu-bottom: max(4.5rem, calc(4.15rem + env(safe-area-inset-bottom))); }
   .stream-info-columns { grid-template-columns: 1fr; }
 }
 

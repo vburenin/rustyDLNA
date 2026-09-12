@@ -6,6 +6,8 @@
   Bundle D implements P09 source-timing repair, bounded stage diagnostics and
   measured final-mux growing delivery. P08 device residency and the larger P09
   raw streaming pipeline remain disabled after their correctness experiments.
+  Bundle F implements B01/B02 caption conversion/focus, nonfatal PiP errors,
+  and sustained decoded-playback recovery renewal; verification is recorded below.
   Measurement and verification limits are recorded below; other findings retain
   their individual implementation status. Bundle A's earlier parallel-browser failures and unresolved
   FFmpeg 6 helper crashes remain part of the verification record.
@@ -1636,6 +1638,18 @@ non-UTF-8 paths. No global playlist/member index or schema change was needed.
 
 **P2 · Reproduced · S/M, divisible into small fixes.**
 
+Implementation: SAMI clear markers retain cue boundaries; checked integer
+timestamps and WebVTT signature/timing validation preserve supported headers,
+line endings, cue settings and markup. ASS/SAMI literal text and line breaks
+survive escaping and entity conversion. Caption radios retain selection focus,
+track-list changes preserve logical focus, and source-scoped load failures offer
+caption-only Retry/Off with obsolete listeners and requests detached. PiP denial
+is a nonfatal status message; entry/exit requests and late events remain guarded.
+Long caption lists scroll within the player's safe bounds, including phones.
+Generated temporary sidecars exercise the actual converter and browser cue
+times/displayed text. Focus, failure, retry, seek, PiP and accessibility
+regressions are in the browser matrix. Verification is recorded with B02 below.
+
 - `crates/server/src/web_caption.rs:241–256` drops empty SAMI sync markers, extending
   preceding text to the next nonempty cue. The actual converter turned text at
   1s / clear at 2s / next text at 5s into a first cue ending at 5s.
@@ -1664,6 +1678,52 @@ demonstrated caption script-execution vulnerability.
 ### B02 — Define recovery after sustained healthy playback
 
 **P2 · Code-backed documentation/behavior mismatch · S/M.**
+Implementation: at least 30 continuous foreground seconds of decoded progress
+renew the three generation retries and one same-plan HEVC/HDR MSE reattachment.
+Credit is bounded by elapsed monotonic time and rate-normalized media progress;
+pause, waiting, seeking, rate/visibility changes, discontinuities and observation
+gaps over two seconds restart the interval. Confirmed producer admission ends
+the independent five-minute queue window. Codec/quality fallbacks and native
+startup reopen counts remain unchanged. Source-owned callbacks and shared
+recovery reject obsolete progress. Real WebKit decoding exposed a missing native
+Compatible seek-completion transition: playback advanced while the UI remained
+Preparing. Guarded readiness handling now preserves playing/paused intent even
+without a later canplay event. The exact policy is in `docs/WEB_PLAYER.md`.
+
+Validation: 16 focused Rust converter tests, 124 web unit tests, and the final
+`./scripts/agent-verify.sh` pass, including formatting, Clippy, workspace/doc
+checks, fixture integrity and eight isolated socket E2E tests. Ten opt-in
+benchmarks remain ignored. Converter browser coverage passes 8/8, caption-control
+coverage passes 24/24, and all 20 recovery browser cases pass. The sustained
+outage case uses finalized indexed test media to keep injected errors distinct;
+four other health cases retain fragmented media. HEVC renewal is a controller
+and policy assertion with real H.264 playback, not a hardware HEVC decode claim.
+
+The first full four-worker matrix recorded 812 passes, 152 skips and eight
+failures: paused buffered/restarted frame retention in Chromium and mobile
+Chromium (four), unfinished-caption menu readiness in Chromium/WebKit (two),
+WebKit paused PiP test focus (one), and mobile caption restart selection clipped
+behind the header (one). Observer suspension, explicit test focus/readiness and
+bounded menu layout address these. Subsequent focused runs exposed four
+absolute-property/relative-attribute URL assertion mismatches, one additional
+Firefox native-fragment tail recovery after successful renewal, and one WebKit
+two-frame fixture loop stall. Correct URL comparisons and sufficiently long,
+indexed test media resolve those test assumptions without changing delivery
+policy or weakening decoded-progress assertions. Earlier converter harness
+query/range errors and WebKit native readiness failures were also corrected.
+
+Final full Playwright matrix (`--workers=4`): **828 passed, 152 skipped, zero
+failures/retries** across Chromium, Firefox, WebKit and mobile Chromium. New
+bundle F cases contribute 70 passes and two native PiP skips: WebKit lacks the
+element API; the compact phone toolbar omits its control. The other 150 skips
+are existing platform/API or shared-pipeline exclusions. Default 16-worker
+concurrency and optional GPU, privileged-network, Docker, soak, fuzz and scale
+suites were not run. Logs recorded one FFmpeg 6.1.1 SIGSEGV in the first full
+run and three in the final run; their cause remains unresolved despite passing
+browser assertions. Complete diff review and `git diff --check` pass; tracked
+fixtures, Rust 1.98.1 pins, lockfiles and live configuration are unchanged.
+Commit and push are authorized for this handoff; nothing was deployed.
+
 `docs/WEB_PLAYER.md:444–446` promises decoded playback resets recovery budgets.
 The player resets automatic recovery on explicit selection/retry/seek/close or
 control changes, but not on sustained playing/time advancement. Separate outages

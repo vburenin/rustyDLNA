@@ -7,6 +7,10 @@ import {
   automaticCompatibleRecoveryProfile,
   audioDecodingConfiguration,
   audioTrackLabel,
+  admittedCompatibleRecovery,
+  decodedProgressWindow,
+  healthyCompatibleRecovery,
+  HEALTHY_DECODED_PROGRESS_MS,
   initialCompatibleRecovery,
   nextCompatibleRetry,
   bufferedRangeSecondsAhead,
@@ -1229,7 +1233,7 @@ test("captions reset per title but survive playback source restarts", () => {
   assert.equal(store.getState().playback.selectedCaption, "off");
 });
 
-test("compatible retry accounting persists across generations until an explicit reset", () => {
+test("compatible retry accounting persists across generations until an intentional renewal", () => {
   let recovery = initialCompatibleRecovery();
   for (let sessionId = 1; sessionId <= 3; sessionId += 1) {
     recovery = nextCompatibleRetry(recovery, { sessionId, now: sessionId });
@@ -1242,6 +1246,61 @@ test("compatible retry accounting persists across generations until an explicit 
   const busy = nextCompatibleRetry(recovery, { sessionId: 4, busy: true, now: 10 });
   assert.equal(busy.retries, 3);
   assert.equal(nextCompatibleRetry(busy, { sessionId: 5, busy: true, now: 300_010 }), null);
+});
+
+test("admission and healthy-decoder renewal preserve each other's independent allowance", () => {
+  const spent = { retries: 3, busyStartedAt: 1_000, busyRetries: 12, pendingSession: null };
+  for (const producerState of ["queued", "idle", "cancelled", "failed"]) {
+    assert.equal(admittedCompatibleRecovery(spent, producerState), spent);
+  }
+  for (const producerState of ["starting", "producing", "ready", "complete"]) {
+    assert.deepEqual(admittedCompatibleRecovery(spent, producerState), {
+      ...spent, busyStartedAt: null, busyRetries: 0,
+    });
+  }
+  const renewed = healthyCompatibleRecovery(spent);
+  assert.deepEqual(renewed, { ...spent, retries: 0 });
+  assert.equal(nextCompatibleRetry(renewed, { sessionId: 9, now: 400_000 }).retries, 1);
+  assert.equal(nextCompatibleRetry(renewed, { sessionId: 9, busy: true, now: 400_000 }), null);
+  const pending = { ...spent, pendingSession: 8 };
+  assert.equal(healthyCompatibleRecovery(pending), pending);
+  assert.equal(admittedCompatibleRecovery(pending, "ready"), pending);
+});
+
+test("healthy decoded progress requires the full wall-clock interval at every playback rate and offset", () => {
+  for (const rate of [0.25, 0.5, 1, 1.5, 2, 4]) {
+    for (const offset of [0, 3_600]) {
+      let window = null;
+      for (let now = 0; now <= HEALTHY_DECODED_PROGRESS_MS; now += 250) {
+        window = decodedProgressWindow(window, { now, mediaTime: offset + now / 1_000 * rate, rate, eligible: true });
+        assert.equal(window.healthyMs, now);
+        if (now < HEALTHY_DECODED_PROGRESS_MS) assert.ok(window.healthyMs < HEALTHY_DECODED_PROGRESS_MS);
+      }
+      assert.equal(window.healthyMs, 30_000);
+    }
+  }
+});
+
+test("pause, missing frames, seek jumps, suspension, and rate changes cannot join brief progress bursts", () => {
+  let window = null;
+  for (let now = 0; now <= 29_000; now += 1_000) {
+    window = decodedProgressWindow(window, { now, mediaTime: now / 1_000, rate: 1, eligible: true });
+  }
+  assert.equal(window.healthyMs, 29_000);
+  const beforeBoundary = decodedProgressWindow(window, { now: 29_999, mediaTime: 29.999, rate: 1, eligible: true });
+  assert.equal(beforeBoundary.healthyMs, 29_999);
+  assert.equal(decodedProgressWindow(beforeBoundary, { now: 30_000, mediaTime: 30, rate: 1, eligible: true }).healthyMs, 30_000);
+  const sample = { now: 30_000, mediaTime: 30, rate: 1, eligible: true };
+  for (const change of [
+    { eligible: false }, { mediaTime: 29 }, { mediaTime: 28 }, { mediaTime: 90 },
+    { now: 31_001, mediaTime: 31.001 }, { now: 29_000 }, { rate: 2 },
+    { mediaTime: NaN }, { now: Infinity }, { rate: 0 },
+  ]) {
+    assert.equal(decodedProgressWindow(window, { ...sample, ...change })?.healthyMs || 0, 0);
+  }
+  const slower = decodedProgressWindow(window, { ...sample, mediaTime: 29.5 });
+  assert.equal(slower.healthyMs, 29_500, "slow decoding cannot borrow wall-clock time");
+  assert.equal(decodedProgressWindow(null, sample).healthyMs, 0, "one frame is only a baseline");
 });
 
 test("exact buffered seeks wait for data beyond the requested point", () => {

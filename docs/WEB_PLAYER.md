@@ -508,9 +508,11 @@ path also fails. This avoids silently discarding HDR after rapid seek churn.
 
 Admission-busy playback waits and retries for up to five minutes without using
 the three-attempt budget reserved for abandoned or failed stream generations;
-requests back off to a five-second interval. Decoded playback resets both
-recovery budgets, so a later connection failure can recover independently. The
-player still exposes a manual Retry action if a slot does not become available
+requests back off to a five-second interval. A current-generation producer status
+of starting, producing, or ready (including completed cached output) ends that
+admission window without replenishing failed-generation retries. Sustained
+decoded playback renews those retries as described below. The player still
+exposes a manual Retry action if a slot does not become available
 within that bounded window.
 
 Safari on macOS and Apple mobile devices uses the native HLS path when the
@@ -788,6 +790,19 @@ dot-owned filename variant, and source format. Browser-selectable entries also
 receive a same-origin WebVTT URL. Text must be valid UTF-8 and pass the bounded
 sidecar read and cue validation. VTT is normalized; SRT, ASS/SSA, and SMI are
 converted to WebVTT.
+WebVTT validation distinguishes the signature from annotations, requires valid
+cue timestamps, and retains supported cue identifiers, settings, markup, comments,
+and pre-cue style/region blocks. UTF-8 BOM and LF, CRLF, or CR line endings are
+accepted. SAMI synchronization markers end preceding text even when the next
+marker is empty or contains only a nonbreaking space; clear markers therefore
+leave real caption gaps. A final nonempty SAMI cue without another marker keeps
+the existing five-second ending convention.
+ASS override styling and SAMI formatting tags are flattened to text. ASS line
+breaks and hard spaces, SAMI paragraph/BR breaks, and common named or numeric
+SAMI entities are preserved. Literal angle brackets and ampersands in converted
+text are escaped for WebVTT, so text such as an encoded `<b>` is displayed
+literally. Timing arithmetic is checked; conversion accepts at most the existing
+16 MiB sidecar input limit and caps expanded output at 96 MiB.
 The ambiguous `.sub` extension remains visible as unsupported metadata but
 cannot be selected in the browser. Malformed, oversized, unsupported, and
 path-jail failures return structured errors. Captions default to Off for each
@@ -804,6 +819,18 @@ deep links, saved resume, repeated seeks, and returns to Original playback in
 sync. `captions.js` owns these tracks and their selection; `player.js` supplies
 the source lifetime and timeline origin. Fragmented MediaSource delivery and
 buffer maintenance live in `media-source.js`.
+
+Caption selection updates existing radio controls, preserving Space/Arrow focus
+and visible controls. Long track lists scroll within the player bounds so their
+first and last choices remain reachable on small screens. If available tracks
+change, focus follows the same available choice, the selected choice, or Off;
+removing the selected track selects Off.
+A caption load failure opens a polite status message with Retry captions and Turn
+captions off. Retry replaces only that caption track and reapplies the source's
+timeline offset. It preserves healthy video, position, intent, and playback
+recovery allowances. Turning captions off, changing selection while loading, or
+replacing the media source detaches obsolete tracks and removes their listeners;
+late loads or errors cannot affect the current selection.
 
 Audio language, title, channel count, codec, default disposition, and chapters
 are normally read from compact scan metadata. Legacy records can request a
@@ -846,21 +873,48 @@ Play control exposed instead of presenting the ready stream as an error. Every
 source load has a monotonically increasing request ID, and callbacks, timers,
 polls, picture-in-picture events, previews, or errors from an older session are
 ignored. Pending and active picture-in-picture state is rebound when the same
-title restarts its source, while selecting another title clears it. Delayed
-stream-metadata enrichment can update or restart only the title that requested
-it. Screen readers receive plain-language server/library and playback
+title restarts its source, while selecting another title clears it.
+Picture-in-picture entry or exit denial is a nonfatal status message: it leaves
+the media source, position, intent, controls, and recovery allowances intact.
+Only one entry/exit request runs at a time; late rejections after source
+replacement are ignored, and events agree with the browser's active PiP element.
+Delayed stream-metadata enrichment can update or restart only the title that
+requested it. Screen readers receive plain-language server/library and playback
 updates through separate polite, atomic live regions. Repeated renders of the
 same asynchronous state do not repeat an announcement, and visible status or
 alert messages are not mirrored into a competing live region.
 A delayed startup-status connection failure does not interrupt playback that
 has already become playable; subsequent media events remain authoritative.
+Native Compatible seek completion restores the ready playback state when the
+target has decoded data, including WebKit sequences that omit a later `canplay`
+event. The current playing or paused intent remains authoritative.
 
 User-facing failures distinguish missing media, unsupported Original playback,
 disabled Compatible playback, a busy transcode queue, cancelled/failed
-transcoding, and network/offline failure. Busy,
-cancelled, or disconnected replacement streams retry automatically up to three
-times per selected title or explicit user restart. Brief playback cannot reset
-that budget. A media connection that fails while its producer is still healthy
+transcoding, and network/offline failure. Fresh-generation recovery retries at
+most three times before requiring user action. Selection, explicit Retry, seek,
+and playback-setting changes reset that allowance. Automatic renewal requires
+at least 30 continuous foreground seconds of decoded progress in the current
+source. Video must present new frames or advance a browser decoded-frame counter
+as its media clock advances; audio requires an advancing playing media clock.
+Credit is limited by both elapsed
+monotonic time and media-time advancement divided by playback rate, so faster
+playback cannot earn the allowance sooner. A playing/canplay event, one frame,
+downloaded bytes, or a producer heartbeat is insufficient.
+
+Pause, buffering, seeking, rate changes, hiding the page, source replacement,
+nonadvancing media, and observation gaps over two seconds discard the unfinished
+healthy interval. A discontinuous media-clock sample also starts a new interval.
+Samples are considered at least 250 ms apart; advancement below half or above
+1.5 times the elapsed interval at the selected rate starts a new interval.
+Resuming therefore requires a new continuous run; brief recoveries still exhaust
+the three retries. Browsers without frame callbacks or decoded-frame counters
+retain the finite video allowance until an explicit user reset.
+Renewal restores the three generation retries and the one same-plan HEVC/HDR
+Media Source reattachment. It does not retry rejected codecs, raise a recovered
+quality, reset native growing-MP4 startup reopen counts, or change the separate
+five-minute admission policy. A pending or obsolete recovery cannot be renewed
+by a late frame. A media connection that fails while its producer is still healthy
 starts a newer generation automatically and cancels the abandoned one. If a
 Chromium media element remains attached without decoding data after its
 compatible producer is healthy, the player first reopens the same growing MP4

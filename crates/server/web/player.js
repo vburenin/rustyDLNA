@@ -10,6 +10,7 @@ import { pumpMediaSource } from "./media-source.js";
 import { CaptionController } from "./captions.js";
 import {
   aiUpscaleQualityAvailable,
+  admittedCompatibleRecovery,
   apiErrorCategory,
   compatibleDecodeRecovery,
   mediaSourceStallReason,
@@ -21,6 +22,7 @@ import {
   compatibleSegmentStart,
   doubleTapSeekDelta,
   fullscreenAction,
+  healthyCompatibleRecovery,
   isApplePhoneDevice,
   itemDuration,
   initialCompatibleRecovery,
@@ -202,6 +204,7 @@ export class PlaybackController {
   #wakeLockBlockedSession = null;
   #pipRequestSession = null;
   #pipRequestToken = 0;
+  #pipRequestPending = false;
   #pipActiveSession = null;
   #fullscreenRequestSession = null;
   #fullscreenRequestKind = null;
@@ -274,6 +277,7 @@ export class PlaybackController {
     this.#cancelSource({ keepElement: false });
     this.#pipRequestSession = null;
     this.#pipRequestToken += 1;
+    this.#pipRequestPending = false;
     this.#pipActiveSession = null;
     this.#fullscreenRequestSession = null;
     this.#fullscreenRequestKind = null;
@@ -640,6 +644,7 @@ export class PlaybackController {
     this.#nativeHlsSuspendedSession = null;
     this.#pipRequestSession = null;
     this.#pipRequestToken += 1;
+    this.#pipRequestPending = false;
     this.#pipActiveSession = null;
     this.#fullscreenRequestSession = null;
     this.#fullscreenRequestKind = null;
@@ -1047,6 +1052,23 @@ export class PlaybackController {
     });
     this.#attachSource(source, this.#bindSourceEvents(source));
     this.#watchPresentedFrame(source, start - source.segmentOffset);
+    if (source.plan.sourceMode === SOURCE_MODES.COMPATIBLE) {
+      source.watchHealthyProgress({
+        isPlaying: () => {
+          const playback = this.#store.getState().playback;
+          return playback.sessionId === source.sessionId && playback.status === "playing"
+            && playback.intent === "playing" && !playback.autoplayBlocked
+            && playback.pendingSeekTime === null;
+        },
+        onHealthy: () => {
+          if (this.#source !== source || this.#store.getState().playback.sessionId !== source.sessionId) return;
+          this.#compatibleRecovery = healthyCompatibleRecovery(this.#compatibleRecovery);
+          // Renew attachment recovery only. Keep the negotiated codec/quality
+          // fallback and the source's bounded startup reopen count intact.
+          source.mediaSourceRetry = false;
+        },
+      });
+    }
   }
 
   #bindSourceEvents(source) {
@@ -1091,7 +1113,10 @@ export class PlaybackController {
     };
     listen("seeked", () => {
       if (!applyPendingSeek()) return;
-      if (mediaSourceDelivery) {
+      if (mediaSourceDelivery || (sourceMode === SOURCE_MODES.COMPATIBLE && player.readyState >= 2)) {
+        // WebKit can finish a native prepared-stream seek with a decoded
+        // frame and advancing playback, without another canplay/playing event.
+        // Settle that source's readiness while retaining paused user intent.
         void readyToPlay();
       } else if (sourceMode === SOURCE_MODES.ORIGINAL) {
         this.#releaseHeldVideoFrame();
@@ -1477,6 +1502,7 @@ export class PlaybackController {
           signal,
         );
         if (signal.aborted || sessionId !== this.#store.getState().playback.sessionId) return;
+        this.#compatibleRecovery = admittedCompatibleRecovery(this.#compatibleRecovery, payload.state);
         if (payload.state !== "idle" || registeredAtRequest) source.producerState = payload.state;
         source.lastProducerStatusAt = performance.now();
         if (payload.effective_recipe
@@ -1826,6 +1852,7 @@ export class PlaybackController {
         if (!current()) return;
         intent = this.#store.getState().playback.intent;
         producerState = payload.state;
+        this.#compatibleRecovery = admittedCompatibleRecovery(this.#compatibleRecovery, producerState);
         if (["queued", "cancelled", "idle"].includes(payload.state)) {
           const retryableProducerState = payload.state === "queued" || mediaCode !== 4;
           if (retryableProducerState && this.#scheduleCompatibleRetry({
@@ -2412,10 +2439,17 @@ export class PlaybackController {
     });
     this.#dom.fitButton.addEventListener("click", () => this.#setPreference("fill", !this.#store.getState().preferences.fill));
     this.#dom.pipButton.addEventListener("click", async () => {
+      // Serialize entry/exit requests: a second click must not orphan the first
+      // request's event ownership or let an older rejection undo a success.
+      if (this.#pipRequestPending) return;
       const sessionId = this.#store.getState().playback.sessionId;
       const requestToken = ++this.#pipRequestToken;
+      const exiting = Boolean(document.pictureInPictureElement);
+      const entryMessage = "Picture in picture is unavailable. You can keep watching in the player.";
+      const exitMessage = "Picture in picture could not close. Try closing its window.";
+      this.#pipRequestPending = true;
       try {
-        if (document.pictureInPictureElement) await document.exitPictureInPicture();
+        if (exiting) await document.exitPictureInPicture();
         else {
           this.#pipRequestSession = sessionId;
           await this.#dom.video.requestPictureInPicture();
@@ -2425,20 +2459,33 @@ export class PlaybackController {
             this.#pipRequestSession = null;
           }
         }
-      } catch (error) {
-        if (this.#pipRequestToken === requestToken) this.#pipRequestSession = null;
+        const playback = this.#store.getState().playback;
+        if (this.#pipRequestToken === requestToken && playback.sessionId === sessionId
+          && [entryMessage, exitMessage].includes(playback.message)) {
+          this.#store.dispatch({ type: "PLAYBACK_AUX", sessionId, values: { message: null } });
+        }
+      } catch {
+        if (this.#pipRequestToken !== requestToken) return;
+        this.#pipRequestSession = null;
         if (sessionId !== this.#store.getState().playback.sessionId) return;
-        this.#store.dispatch({ type: "PLAYBACK_ERROR", sessionId, error: playbackError("unknown", error?.message || "PiP request failed") });
+        // PiP is an optional presentation. Its denial leaves media, intent,
+        // source ownership and every automatic recovery allowance intact.
+        this.#store.dispatch({ type: "PLAYBACK_AUX", sessionId, values: {
+          message: exiting ? exitMessage : entryMessage,
+        } });
+      } finally {
+        if (this.#pipRequestToken === requestToken) this.#pipRequestPending = false;
       }
     });
     this.#dom.video.addEventListener("enterpictureinpicture", () => {
       const sessionId = this.#pipRequestSession;
+      if (sessionId === null || document.pictureInPictureElement !== this.#dom.video) return;
       this.#pipRequestSession = null;
-      if (sessionId === null) return;
       this.#pipActiveSession = sessionId;
       this.#store.dispatch({ type: "PLAYBACK_AUX", sessionId, values: { pip: true } });
     });
     this.#dom.video.addEventListener("leavepictureinpicture", () => {
+      if (document.pictureInPictureElement === this.#dom.video) return;
       const sessionId = this.#pipActiveSession;
       this.#pipActiveSession = null;
       if (sessionId === null) return;

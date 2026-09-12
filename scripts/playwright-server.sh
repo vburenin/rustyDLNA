@@ -104,6 +104,7 @@ if [ -n "${RUSTY_DLNA_PLAYWRIGHT_RUNTIME_RECORD:-}" ]; then
 fi
 
 cp -R -- "$ROOT/testdata/library" "$RUNTIME_DIR/library"
+node "$ROOT/web-tests/caption-conversion-fixtures.mjs" "$RUNTIME_DIR/library"
 CONFIG="$RUNTIME_DIR/rusty-dlna.toml"
 printf '%s\n' \
 	'friendly_name = "rustyDLNA-web-test"' \

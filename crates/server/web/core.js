@@ -1027,11 +1027,41 @@ export function apiErrorCategory(error) {
   return "unknown";
 }
 
-// A budget belongs to a selected title or explicit user restart, never to a
-// source generation or a successful media event. Busy admission has its own
-// bounded window and does not consume failures of an admitted producer.
+// A generation budget survives source replacement and brief playback. Only an
+// explicit user restart or sustained decoded progress renews it. Admission has
+// its own bounded window, ended by confirmed admission rather than decoding.
 export function initialCompatibleRecovery() {
   return { retries: 0, busyStartedAt: null, busyRetries: 0, pendingSession: null };
+}
+
+export function admittedCompatibleRecovery(recovery, producerState) {
+  if (!["starting", "producing", "ready", "complete"].includes(producerState)
+    || recovery.pendingSession !== null) return recovery;
+  return { ...recovery, busyStartedAt: null, busyRetries: 0 };
+}
+
+export function healthyCompatibleRecovery(recovery) {
+  // A failure already scheduled for replacement cannot be undone by a late
+  // decoded-frame observation on the abandoned element.
+  return recovery.pendingSession === null ? { ...recovery, retries: 0 } : recovery;
+}
+
+export const HEALTHY_DECODED_PROGRESS_MS = 30_000;
+
+// Each sample must include newly presented/decoded data from the same source.
+// Credit at most elapsed wall time AND rate-normalized media time. Event-loop
+// suspension, a seek jump, stalled media, or a rate change starts a fresh run.
+export function decodedProgressWindow(previous, { now, mediaTime, rate, eligible }) {
+  if (!eligible || !Number.isFinite(now) || !Number.isFinite(mediaTime)
+    || !Number.isFinite(rate) || rate <= 0) return null;
+  const fresh = { now, mediaTime, rate, healthyMs: 0 };
+  if (!previous || previous.rate !== rate) return fresh;
+  const elapsed = now - previous.now;
+  const decodedMs = (mediaTime - previous.mediaTime) * 1_000 / rate;
+  if (elapsed <= 0 || elapsed > 2_000 || decodedMs < elapsed * 0.5
+    || decodedMs > elapsed * 1.5) return fresh;
+  return { ...fresh, healthyMs: Math.min(HEALTHY_DECODED_PROGRESS_MS,
+    previous.healthyMs + Math.min(elapsed, decodedMs)) };
 }
 
 export function nextCompatibleRetry(recovery, { sessionId, busy = false, now }) {
