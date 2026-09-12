@@ -1,3 +1,6 @@
+import { PlaybackTiming } from "./playback-timing.js";
+import { ApiError } from "./api.js";
+import { PreviewCache } from "./preview-cache.js";
 import { PlaybackSource } from "./playback-source.js";
 import {
   SourceSelector, supportsNativeHlsDelivery, androidMediaSourceType,
@@ -12,6 +15,7 @@ import {
   mediaSourceStallReason,
   audioTrackLabel,
   bufferedSeekTarget,
+  bufferedRangeSecondsAhead,
   clockLabel,
   compatibleVideoDimensions,
   compatibleSegmentStart,
@@ -69,7 +73,6 @@ const COMPATIBLE_STARTUP_STALL_MS = 8_000;
 const NATIVE_HLS_STARTUP_STALL_MS = 12_000;
 const MAX_COMPATIBLE_SOURCE_RELOADS = 1;
 const MAX_HELD_VIDEO_FRAME_PIXELS = 4_194_304;
-const MAX_DECODED_TRICKPLAY_SHEETS = 2;
 function currentFullscreenElement() {
   return document.fullscreenElement
     || document.webkitFullscreenElement
@@ -171,7 +174,11 @@ export class PlaybackController {
   #mediaSourceObjectUrl = null;
   #trickplayController = null;
   #trickplayManifest = null;
-  #trickplayImages = new Map();
+  #trickplayItem = null;
+  #trickplayManifestRequested = false;
+  #trickplayCache = null;
+  #timing = null;
+  #pendingBufferedSeek = null;
   #trickplayTarget = null;
   #trickplayPreloadStarted = false;
   #seekTimer = null;
@@ -237,8 +244,10 @@ export class PlaybackController {
     this.render();
   }
 
-  async select(item, { preserveQueue = false, startAt = 0, signal = null } = {}) {
+  async select(item, { preserveQueue = false, startAt = 0, signal = null, timingStart = performance.now() } = {}) {
     if (signal?.aborted) return;
+    const timing = new PlaybackTiming("selection", timingStart);
+    timing.mark("selection");
     let preparationError = null;
     if (signal) {
       const prepared = await this.#prepareSelection(item, signal);
@@ -246,6 +255,7 @@ export class PlaybackController {
       item = prepared.item;
       preparationError = prepared.error;
     }
+    this.#timing = timing;
     this.#resetAutomaticTranscodeRecovery();
     if (!preserveQueue) {
       this.#store.dispatch({ type: "QUEUE_REPLACE", entries: [item], generation: null });
@@ -253,6 +263,7 @@ export class PlaybackController {
     this.#cancelTrickplay();
     this.#resetTouchGestures();
     this.#releaseHeldVideoFrame();
+    this.#api.abortItem();
     this.#cancelSource({ keepElement: false });
     this.#pipRequestSession = null;
     this.#pipRequestToken += 1;
@@ -275,6 +286,7 @@ export class PlaybackController {
     const enriched = signal ? item : await this.#enrichAudioTracks();
     if (sessionId !== this.#store.getState().playback.sessionId) return;
     item = enriched || item;
+    this.#timing?.mark("metadata_ready");
     this.#updateMediaSessionMetadata(item);
     const duration = itemDuration(item);
     const linkedStart = seekTarget(startAt, duration);
@@ -312,6 +324,9 @@ export class PlaybackController {
   globalTime() {
     const playback = this.#store.getState().playback;
     const player = this.activePlayer();
+    if (this.#pendingBufferedSeek?.source === this.#source && this.#pendingBufferedSeek?.timing === this.#timing) {
+      return this.#pendingBufferedSeek.target;
+    }
     if (!this.#source) return playback.currentTime;
     if (playback.pendingSeekTime !== null) return playback.pendingSeekTime;
     const local = Number.isFinite(player?.currentTime) ? player.currentTime : 0;
@@ -365,11 +380,13 @@ export class PlaybackController {
     await this.#attemptPlay(this.#source);
   }
 
-  seekTo(value) {
-    const state = this.#store.getState();
-    const { playback } = state;
+  async seekTo(value) {
+    let state = this.#store.getState();
+    let { playback } = state;
     if (!playback.item || !(playback.duration > 0)) return;
     const target = seekTarget(value, playback.duration);
+    this.#timing = new PlaybackTiming(playback.sourceMode === SOURCE_MODES.COMPATIBLE ? "seek_restarted" : "seek_original");
+    const timing = this.#timing;
     this.#resetAutomaticTranscodeRecovery();
     if (target >= playback.duration) {
       this.#finishPlayback();
@@ -390,12 +407,48 @@ export class PlaybackController {
     }
     if (playback.sourceMode !== SOURCE_MODES.COMPATIBLE) {
       if (Math.abs(this.globalTime() - target) > 0.05) this.#holdVideoFrame();
+      this.#watchPresentedFrame(this.#source, target);
       this.activePlayer().currentTime = target;
       this.#store.dispatch({ type: "PLAYBACK_TIME", sessionId: playback.sessionId, currentTime: target, duration: playback.duration });
       // Persist explicit seeks even while paused; a media engine may not emit a
       // timeupdate before the user chooses another title or closes the page.
       this.#progressWriter.schedule();
       return;
+    }
+    const source = this.#source;
+    const localTarget = target - playback.segmentOffset;
+    const sameSource = () => source?.active && source.plan.mediaSourceDelivery && source.sessionId === playback.sessionId
+      && source.negotiationEpoch === state.server.negotiationEpoch
+      && source.selectedAudio === playback.selectedAudio && source.plan.outputQuality === playback.outputQuality
+      && source.plan.streamNegotiation === playback.streamNegotiation
+      && !["idle", "cancelled", "failed"].includes(source.producerState)
+      && performance.now() - (source.lastProducerStatusAt ?? source.createdAt) < 120_000;
+    if (sameSource() && !source.mediaBuffer?.canSeek(localTarget)) {
+      const pending = source.mediaBuffer?.waitForSeek(localTarget);
+      if (pending) {
+        const waiting = { source, timing, target };
+        this.#pendingBufferedSeek = waiting;
+        try { await pending; }
+        finally { if (this.#pendingBufferedSeek === waiting) this.#pendingBufferedSeek = null; }
+        state = this.#store.getState();
+        if (this.#timing !== timing || this.#source !== source || !source.active
+          || state.playback.sessionId !== playback.sessionId) return;
+        playback = state.playback;
+      }
+    }
+    if (sameSource() && source.mediaBuffer?.canSeek(localTarget)) {
+      this.#timing.kind = "seek_buffered";
+      this.#holdVideoFrame();
+      this.#cancelSeekTimer();
+      this.#store.dispatch({ type: "PLAYBACK_TIME", sessionId: playback.sessionId, currentTime: target, duration: playback.duration });
+      this.#store.dispatch({ type: "PLAYBACK_AUX", sessionId: playback.sessionId, values: { pendingSeekTime: target } });
+      this.#store.dispatch({ type: "PLAYBACK_STATUS", sessionId: playback.sessionId, status: "seeking", intent: playback.intent, message: "Seeking…" });
+      this.#watchPresentedFrame(source, localTarget);
+      try {
+        source.player.currentTime = localTarget;
+        this.#progressWriter.schedule();
+        return;
+      } catch (_) { source.cancelPresentedFrame?.(); this.#timing.kind = "seek_restarted"; }
     }
     this.#holdVideoFrame();
     this.#cancelSeekTimer();
@@ -575,6 +628,7 @@ export class PlaybackController {
     this.#cancelTrickplay();
     this.#resetTouchGestures();
     this.#releaseHeldVideoFrame();
+    this.#api.abortItem();
     this.#cancelSource({ keepElement: false });
     this.#nativeHlsSuspendedSession = null;
     this.#pipRequestSession = null;
@@ -926,9 +980,11 @@ export class PlaybackController {
     const player = item.kind === "audio" ? this.#dom.audio : this.#dom.video;
     const plan = this.#sourceSelector.prepare(item, state, player, options);
     const source = new PlaybackSource({
-      item, player, plan, start, messageKind, mediaSourceRetry,
+      item, player, plan, start, messageKind, mediaSourceRetry, createdAt: performance.now(),
       sessionId: ++this.#session,
       playbackSessionId: this.#playbackSession,
+      selectedAudio: state.playback.selectedAudio,
+      negotiationEpoch: state.server.negotiationEpoch,
       requestedMode: state.preferences.streamMode,
       segmentOffset: plan.sourceMode === SOURCE_MODES.COMPATIBLE ? compatibleSegmentStart(start) : 0,
     });
@@ -950,6 +1006,9 @@ export class PlaybackController {
       return;
     }
     this.#captions.attach(item.captions || [], { segmentOffset: source.segmentOffset, signal: source.signal });
+    // Native load() restores playbackRate from defaultPlaybackRate, including
+    // when attaching an MSE object URL or replacing a compatible seek source.
+    player.defaultPlaybackRate = state.preferences.rate;
     player.playbackRate = state.preferences.rate;
     player.volume = state.preferences.volume / 100;
     player.muted = state.preferences.muted;
@@ -957,9 +1016,11 @@ export class PlaybackController {
     player.loop = state.preferences.loop && plan.sourceMode === SOURCE_MODES.ORIGINAL;
     player.disableRemotePlayback = false;
     player.removeAttribute("disableremoteplayback");
+    this.#timing?.mark("negotiation_start");
     const resolved = this.#sourceSelector.resolve(plan, item, state, player);
     source.plan = resolved instanceof Promise ? await resolved : resolved;
     if (!source.active) return;
+    this.#timing?.mark("negotiation_complete");
     if (this.#store.getState().server.negotiationEpoch !== state.server.negotiationEpoch) {
       return this.#loadSource(item, {
         ...options, intent: this.#store.getState().playback.intent, forceStreamNegotiation: null,
@@ -973,6 +1034,7 @@ export class PlaybackController {
         : undefined,
     });
     this.#attachSource(source, this.#bindSourceEvents(source));
+    this.#watchPresentedFrame(source, start - source.segmentOffset);
   }
 
   #bindSourceEvents(source) {
@@ -990,6 +1052,7 @@ export class PlaybackController {
     });
     listen("waiting", () => {
       status("waiting", { message: this.#store.getState().playback.message || "Buffering…" });
+      this.#startTrickplayPreload();
       if (sourceMode === SOURCE_MODES.ORIGINAL
         && requestedMode === STREAM_MODES.AUTO
         && state.server.capabilities.transcoding
@@ -1074,7 +1137,9 @@ export class PlaybackController {
       status("playing", { autoplayBlocked: false, intent: "playing", message: null });
     });
     listen("pause", () => {
-      if (player.ended) return;
+      // Native pause events are queued. A seek/restart can already have
+      // resumed this element by delivery; that stale event is not user intent.
+      if (!player.paused || player.ended) return;
       const playback = this.#store.getState().playback;
       if (!["loading", "waiting", "seeking", "error"].includes(playback.status)) {
         // Locking a device or backgrounding a browser pauses its media element
@@ -1095,6 +1160,7 @@ export class PlaybackController {
       // not expose a mutable `paused` value until real media has decoded.
       this.#progressWriter.schedule();
       this.#updateMediaSessionPosition();
+      this.#startTrickplayPreload();
     });
     listen("ratechange", () => {
       if (!Number.isFinite(player.playbackRate)) return;
@@ -1166,6 +1232,7 @@ export class PlaybackController {
       params.set("request", String(sessionId));
       sourceUrl = `${item.source_url}${item.source_url.includes("?") ? "&" : "?"}${params}`;
     }
+    this.#timing?.mark("source_request");
     let playerSourceUrl = sourceUrl;
     if (mediaSourceDelivery) {
       playerSourceUrl = this.#startMediaSourceDelivery(source, {
@@ -1178,6 +1245,7 @@ export class PlaybackController {
           const now = performance.now();
           source.mseProgress.preparationAt = now;
           source.mseProgress.firstFragmentAt ??= now;
+          this.#startTrickplayPreload();
           if (this.#store.getState().playback.pendingSeekTime !== null
             && applyPendingSeek() && player.readyState >= 3) void readyToPlay();
         },
@@ -1210,7 +1278,10 @@ export class PlaybackController {
     player.disableRemotePlayback = true;
     player.src = objectUrl;
     player.load();
-    const reportStartup = (event) => this.#reportStartup(source, event);
+    const reportStartup = (event) => {
+      if (event === "mse_playlist_received") source.mseRegistered = true;
+      this.#reportStartup(source, event);
+    };
     this.#monitorMediaSource(source);
     pumpMediaSource({
       player,
@@ -1221,6 +1292,9 @@ export class PlaybackController {
       reportStartup,
       pendingSeek,
       onBuffered,
+      copiedVideo: source.plan.streamNegotiation.video === "copy",
+      resourceMaxBytes: this.#store.getState().server.capabilities.mse_resource_max_bytes,
+      onController: (controller) => { source.mediaBuffer = controller; },
     })
       .catch((error) => {
         if (error?.name !== "AbortError") void this.#handleMediaError(source, error);
@@ -1271,10 +1345,92 @@ export class PlaybackController {
   }
 
   #reportStartup(source, event) {
+    this.#timing?.mark(event);
     if (source.plan.sourceMode !== SOURCE_MODES.COMPATIBLE) return;
     source.reportOnce(event, () => this.#api.reportTranscodeStartup(
       source.item.id, source.sessionId, source.playbackSessionId, event, source.signal,
     ));
+  }
+
+  #watchPresentedFrame(source, localTarget = null) {
+    if (!source?.active) return;
+    const timing = this.#timing;
+    const player = source.player;
+    source.cancelPresentedFrame?.();
+    let callback = null;
+    let cancelled = false;
+    let pendingFrame = null;
+    const cleanup = () => {
+      cancelled = true;
+      pendingFrame = null;
+      if (callback !== null) player.cancelVideoFrameCallback?.(callback);
+      player.removeEventListener("loadeddata", estimate);
+      player.removeEventListener("seeked", estimate);
+      player.removeEventListener("seeked", confirmSeek);
+      player.removeEventListener("playing", estimate);
+      source.signal.removeEventListener("abort", cleanup);
+    };
+    const matchesTarget = (mediaTime) => {
+      // Initial presentation callbacks may arrive after playback advances.
+      // The upper target bound rejects stale frames only for explicit seeks.
+      const afterSeekTarget = timing?.kind.startsWith("seek_") && mediaTime > localTarget + 0.5;
+      return Number.isFinite(mediaTime) && (localTarget === null || (mediaTime + 0.1 >= localTarget && !afterSeekTarget));
+    };
+    const requestFrame = () => {
+      callback = player.requestVideoFrameCallback((_, frame) => {
+        callback = null;
+        presented(false, frame.mediaTime);
+      });
+    };
+    const confirmSeek = () => {
+      if (cancelled || !source.active || this.#timing !== timing || !pendingFrame || player.seeking) return;
+      const frame = pendingFrame;
+      pendingFrame = null;
+      if (matchesTarget(player.currentTime)) presented(false, frame.mediaTime, frame.observedAt);
+      else requestFrame();
+    };
+    const presented = (estimated = false, mediaTime = player.currentTime, observedAt = performance.now()) => {
+      if (cancelled || !source.active || this.#timing !== timing) return;
+      if (!matchesTarget(mediaTime)) {
+        if (!estimated) requestFrame();
+        return;
+      }
+      if (player.seeking) {
+        // Some engines deliver the target frame before seeked. A paused
+        // element need not present another frame, so retain this observation
+        // and confirm its target when the pending seek completes.
+        if (!estimated) pendingFrame = { mediaTime, observedAt };
+        return;
+      }
+      source.hasPresentedFrame = true;
+      const newlyPresented = timing && !timing.finished;
+      timing?.finish(source, estimated, observedAt);
+      if (!estimated && source.plan.sourceMode === SOURCE_MODES.COMPATIBLE && newlyPresented) {
+        const event = timing.kind === "selection" ? "selection_to_frame" : "seek_to_frame";
+        void this.#api.reportTranscodeStartup(source.item.id, source.sessionId, source.playbackSessionId,
+          event, source.signal, timing.stages.first_presented_frame).catch(() => {});
+        if (timing.stages.negotiation_complete !== undefined && timing.stages.negotiation_start !== undefined) {
+          void this.#api.reportTranscodeStartup(source.item.id, source.sessionId, source.playbackSessionId,
+            "capability_negotiation", source.signal,
+            timing.stages.negotiation_complete - timing.stages.negotiation_start).catch(() => {});
+        }
+      }
+      this.#startTrickplayPreload();
+      cleanup();
+    };
+    const estimate = () => { if (player.readyState >= 2) presented(true); };
+    source.cancelPresentedFrame = cleanup;
+    source.signal.addEventListener("abort", cleanup, { once: true });
+    if (typeof player.requestVideoFrameCallback === "function") {
+      player.addEventListener("seeked", confirmSeek);
+      requestFrame();
+    } else {
+      // Engines without presentation callbacks expose only a decode-ready
+      // estimate. Reports keep that tier separate from presented frames.
+      player.addEventListener("loadeddata", estimate);
+      player.addEventListener("seeked", estimate);
+      player.addEventListener("playing", estimate);
+    }
   }
 
   #rebindPiPSourceSession(item, sessionId) {
@@ -1296,6 +1452,10 @@ export class PlaybackController {
       const current = this.#store.getState().playback;
       if (signal.aborted || sessionId !== current.sessionId
         || ["ended", "error"].includes(current.status)) return;
+      // The first status request can precede sourceopen and the playlist's
+      // server-side registration. Its idle response remains older evidence
+      // even if it arrives after that playlist or a presented frame.
+      const registeredAtRequest = !mediaSourceDelivery || source.mseRegistered === true;
       try {
         const payload = await this.#api.transcodeStatus(
           item.id,
@@ -1304,6 +1464,8 @@ export class PlaybackController {
           signal,
         );
         if (signal.aborted || sessionId !== this.#store.getState().playback.sessionId) return;
+        if (payload.state !== "idle" || registeredAtRequest) source.producerState = payload.state;
+        source.lastProducerStatusAt = performance.now();
         if (source.mseProgress && Number.isFinite(payload.produced_seconds)
           && payload.produced_seconds > source.mseProgress.producedSeconds) {
           source.mseProgress.producedSeconds = payload.produced_seconds;
@@ -1601,6 +1763,10 @@ export class PlaybackController {
 
   async #recoverSource(source, deliveryError) {
     const { sessionId, item, start, signal } = source;
+    if (deliveryError?.code === "resource_limit" || deliveryError?.name === "QuotaExceededError") {
+      this.#failSource(source, playbackError("resource_limit", deliveryError.message));
+      return;
+    }
     const { sourceMode, streamNegotiation } = source.plan;
     const mediaSourceRetry = source.mediaSourceRetry;
     const current = () => source.active;
@@ -1709,8 +1875,14 @@ export class PlaybackController {
 
   async #prepareSelection(item, signal) {
     if (item.stream_metadata_complete) return { item, error: null };
+    const generation = this.#store.getState().server.generation;
     try {
-      const payload = await this.#api.item(item.id, { enrich: true, signal });
+      const payload = await this.#api.item(item.id, { enrich: true, signal, generation });
+      if (payload.generation !== generation || this.#store.getState().server.generation !== generation) {
+        throw new ApiError("The library changed while this title was loading.", {
+          code: "catalog_changed", action: "retry_library",
+        });
+      }
       const tracks = payload.audio_tracks || item.audio_tracks || [];
       return {
         item: {
@@ -1724,6 +1896,9 @@ export class PlaybackController {
       };
     } catch (error) {
       if (error?.name === "AbortError") return { item, error: null };
+      // Other enrichment failures leave the generation-checked plain metadata
+      // playable. A catalog mismatch invalidates the linked prerequisites.
+      if (error?.code === "catalog_changed") throw error;
       return { item, error };
     }
   }
@@ -1731,9 +1906,13 @@ export class PlaybackController {
   async #enrichAudioTracks() {
     const state = this.#store.getState();
     const { item, sessionId, audioTracks } = state.playback;
+    const playbackSessionId = this.#playbackSession;
+    const catalogGeneration = state.server.generation;
     const current = () => {
       const playback = this.#store.getState().playback;
-      return playback.sessionId === sessionId && String(playback.item?.id) === String(item?.id);
+      // Enrichment belongs to the selected title. A seek, recovery, or mode
+      // change replaces its source without replacing that selection.
+      return this.#playbackSession === playbackSessionId && String(playback.item?.id) === String(item?.id);
     };
     if (!item) return null;
     if (state.playback.audioTracksStatus === "loading") return null;
@@ -1746,6 +1925,10 @@ export class PlaybackController {
     try {
       const payload = await this.#api.item(item.id, { enrich: true });
       if (!current()) return null;
+      if (this.#store.getState().server.generation !== catalogGeneration
+        || (payload.generation !== undefined && payload.generation !== catalogGeneration)) {
+        throw new Error("The library changed while loading audio-track details. Try again.");
+      }
       const tracks = payload.audio_tracks || audioTracks;
       const chapters = payload.chapters || item.chapters || [];
       const enriched = {
@@ -1755,12 +1938,13 @@ export class PlaybackController {
         chapters,
         stream_metadata_complete: true,
       };
-      this.#store.dispatch({ type: "AUDIO_TRACKS_SUCCESS", sessionId, item: enriched, tracks, chapters });
+      this.#store.dispatch({ type: "AUDIO_TRACKS_SUCCESS", sessionId: this.#store.getState().playback.sessionId,
+        item: enriched, tracks, chapters });
       return enriched;
     } catch (error) {
       if (!current()) return null;
       if (error?.name === "AbortError") return null;
-      this.#store.dispatch({ type: "AUDIO_TRACKS_ERROR", sessionId, error });
+      this.#store.dispatch({ type: "AUDIO_TRACKS_ERROR", sessionId: this.#store.getState().playback.sessionId, error });
       return item;
     }
   }
@@ -2170,8 +2354,10 @@ export class PlaybackController {
     this.#dom.speedControl.addEventListener("change", () => {
       const rate = Number(this.#dom.speedControl.value);
       this.#setPreference("rate", rate);
-      this.#dom.video.playbackRate = rate;
-      this.#dom.audio.playbackRate = rate;
+      for (const player of [this.#dom.video, this.#dom.audio]) {
+        player.defaultPlaybackRate = rate;
+        player.playbackRate = rate;
+      }
     });
     this.#dom.loopButton.addEventListener("click", () => {
       const loop = !this.#store.getState().preferences.loop;
@@ -2242,10 +2428,10 @@ export class PlaybackController {
     });
     this.#dom.audioTrackControls.addEventListener("change", () => this.#selectAudioTrack(Number(this.#dom.audioTrackControls.value)));
     this.#dom.audioTrackRetry.addEventListener("click", async () => {
-      const sessionId = this.#store.getState().playback.sessionId;
+      const playbackSessionId = this.#playbackSession;
       const enriched = await this.#enrichAudioTracks();
       const { playback, preferences } = this.#store.getState();
-      if (!enriched || playback.sessionId !== sessionId || playback.audioTracksStatus !== "ready") return;
+      if (!enriched || this.#playbackSession !== playbackSessionId || playback.audioTracksStatus !== "ready") return;
       if (playback.sourceMode === SOURCE_MODES.COMPATIBLE || preferences.streamMode !== STREAM_MODES.ORIGINAL) {
         this.#loadSource(enriched, {
           start: this.globalTime(),
@@ -2471,6 +2657,7 @@ export class PlaybackController {
     const preferences = this.#store.getState().preferences;
     for (const player of [this.#dom.video, this.#dom.audio]) {
       player.controls = false;
+      player.defaultPlaybackRate = preferences.rate;
       player.playbackRate = preferences.rate;
       player.volume = preferences.volume / 100;
       player.muted = preferences.muted;
@@ -2504,6 +2691,7 @@ export class PlaybackController {
   }
 
   #cancelSource({ keepElement = true, cancelTranscode = true } = {}) {
+    this.#pendingBufferedSeek = null;
     const playback = this.#store.getState().playback;
     this.#invalidateWakeLockSession();
     const abandonedRequest = cancelTranscode
@@ -2517,12 +2705,12 @@ export class PlaybackController {
       }
       : null;
     this.#progressWriter.flush();
+    this.#trickplayCache?.setAllowed(false);
     this.#source?.cancel();
     this.#source = null;
     if (playback.pendingSeekTime !== null) {
       this.#store.dispatch({ type: "PLAYBACK_AUX", sessionId: playback.sessionId, values: { pendingSeekTime: null } });
     }
-    this.#api.abortItem();
     if (this.#retryTimer !== null) window.clearTimeout(this.#retryTimer);
     this.#retryTimer = null;
     this.#cancelSeekTimer();
@@ -2589,7 +2777,10 @@ export class PlaybackController {
     this.#trickplayController?.abort();
     this.#trickplayController = null;
     this.#trickplayManifest = null;
-    this.#trickplayImages.clear();
+    this.#trickplayItem = null;
+    this.#trickplayManifestRequested = false;
+    this.#trickplayCache?.cancel();
+    this.#trickplayCache = null;
     this.#trickplayTarget = null;
     this.#trickplayPreloadStarted = false;
   }
@@ -2598,6 +2789,15 @@ export class PlaybackController {
     if (item?.kind !== "video" || !item.preview_url) return;
     const controller = new AbortController();
     this.#trickplayController = controller;
+    this.#trickplayCache = new PreviewCache((url, options) => this.#api.previewSheet(url, options));
+    this.#trickplayItem = item;
+  }
+
+  #fetchTrickplayManifest() {
+    const item = this.#trickplayItem;
+    const controller = this.#trickplayController;
+    if (!item || !controller || this.#trickplayManifestRequested) return;
+    this.#trickplayManifestRequested = true;
     void this.#api.preview(item.preview_url, { signal: controller.signal }).then((manifest) => {
       const playback = this.#store.getState().playback;
       if (controller.signal.aborted || this.#trickplayController !== controller
@@ -2614,43 +2814,26 @@ export class PlaybackController {
   #startTrickplayPreload() {
     const manifest = this.#trickplayManifest;
     const controller = this.#trickplayController;
-    if (!manifest || !controller || this.#trickplayPreloadStarted) return;
-    this.#trickplayPreloadStarted = true;
-    const urls = trickplayPreloadUrls(manifest.sheet_urls);
-    void this.#api.preloadPreviewSheets(urls, { signal: controller.signal }).catch(() => {
-      // On-demand image loading still works if speculative caching is denied.
-    });
-  }
-
-  #trickplayImage(url) {
-    const cached = this.#trickplayImages.get(url);
-    if (cached) {
-      this.#trickplayImages.delete(url);
-      this.#trickplayImages.set(url, cached);
-      return cached;
+    const source = this.#source;
+    if (!controller || !source?.hasPresentedFrame) {
+      this.#trickplayCache?.setAllowed(false);
+      return;
     }
-    const image = new Image();
-    image.decoding = "async";
-    const signal = this.#trickplayController?.signal;
-    const promise = this.#api.preloadPreviewSheets([url], { signal }).then(() => new Promise((resolve, reject) => {
-      image.addEventListener("load", () => resolve(image), { once: true });
-      image.addEventListener("error", reject, { once: true });
-      image.src = url;
+    const player = source.player;
+    const ranges = Array.from({ length: player.buffered.length }, (_, index) => ({
+      start: player.buffered.start(index), end: player.buffered.end(index),
     }));
-    const entry = { image, promise };
-    this.#trickplayImages.set(url, entry);
-    while (this.#trickplayImages.size > MAX_DECODED_TRICKPLAY_SHEETS) {
-      const oldest = this.#trickplayImages.keys().next().value;
-      if (oldest === url) break;
-      this.#trickplayImages.delete(oldest);
-    }
-    promise.catch(() => {
-      if (this.#trickplayImages.get(url) === entry) this.#trickplayImages.delete(url);
-    });
-    return entry;
+    const allowed = bufferedRangeSecondsAhead(ranges, player.currentTime) >= 3;
+    this.#trickplayCache?.setAllowed(allowed);
+    if (!allowed) return;
+    this.#fetchTrickplayManifest();
+    if (!manifest || this.#trickplayPreloadStarted) return;
+    this.#trickplayPreloadStarted = true;
+    this.#trickplayCache?.preload(trickplayPreloadUrls(manifest.sheet_urls));
   }
 
   #showTrickplayFrame(seconds) {
+    this.#fetchTrickplayManifest();
     const manifest = this.#trickplayManifest;
     const playback = this.#store.getState().playback;
     const frame = trickplayFrame(manifest, seconds);
@@ -2665,8 +2848,7 @@ export class PlaybackController {
       committed: false,
     };
     this.#trickplayTarget = target;
-    const entry = this.#trickplayImage(frame.url);
-    void entry.promise.then((image) => {
+    void this.#trickplayCache?.request(frame.url).then((image) => {
       if (this.#trickplayTarget !== target
         || this.#playbackSession !== target.playbackSessionId) return;
       const canvas = this.#dom.videoFrameHold;

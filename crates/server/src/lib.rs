@@ -172,6 +172,7 @@ pub struct App {
     pub(crate) remuxes: Mutex<HashMap<String, Arc<remux::RemuxJob>>>,
     pub(crate) ephemeral_cleanup: Arc<remux::EphemeralCleanupScheduler>,
     pub(crate) cache_maintenance: Mutex<()>,
+    pub(crate) transcode_cache: remux::CacheCoordinator,
     pub(crate) recent_remux_states: Mutex<HashMap<(i64, u64), remux::RecentRemuxState>>,
     pub(crate) web_playback_sessions: Mutex<HashMap<u64, remux::WebPlaybackSessionState>>,
     pub(crate) web_transcode_preparations: Mutex<HashMap<u64, remux::WebTranscodePreparation>>,

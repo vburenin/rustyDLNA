@@ -174,12 +174,33 @@ playlist, init, segment, or range requests made within one generation. Those
 resource reattachments also do not count as job/cache reuse or trigger another
 cache-maintenance pass while their producer remains active.
 
-`transcode.cache_bytes` reports the latest cache accounting snapshot of
-generated output and staging artifacts on disk. Atomic publication renames
-already-counted staging bytes; it does not add them again. Failed producer
-cleanup refreshes the snapshot, and completed ephemeral-output removal updates
-the gauge under the cache-maintenance lock. Active producers can grow between
-snapshots; quota enforcement inspects actual storage on its maintenance pass.
+`transcode.cache_bytes` reports generated output and staging bytes from an
+incremental inventory. Maintenance refreshes active artifacts and the requested
+cache candidate; publication transfers staging accounting to the completed path,
+and failure/ephemeral cleanup removes deleted bytes. A full reconciliation runs
+on demand at most once every 30 seconds, independently of producer count, and
+reconciles externally added or deleted completed files. Active producers can grow
+between observations. Admission checks actual active sizes and filesystem free
+space before initial exposure and again before final publication.
+
+Discovery and unlink I/O run outside the job registry. An eviction must reserve
+its exact destination and recheck current registered ownership before unlinking;
+a pending attachment reserves its candidate before admission. Active readers,
+producers and pending admissions therefore remain protected even when a directory
+snapshot is stale. The shared maintenance gate still coordinates image/video
+space checks. A slow filesystem can delay the request or producer doing a sweep
+and queued maintenance, while active attachments, status and cancellation can
+access the registry. Failed maintenance is reported as failure rather than a
+successful cached quota check.
+
+Existing maintenance counters remain available; `cache_scans` and
+`cache_scan_entries` distinguish full discovery from incremental checks.
+`cache_lock_wait`, `cache_registry_wait`, `cache_sweep_duration`, and
+`cache_maintenance_duration` expose bounded duration histograms. The explicit
+`cargo test -p rusty-dlna cache_scale_benchmark --lib -- --ignored --nocapture`
+benchmark creates disposable 100/1k/10k/100k-entry caches with 1/2/8 concurrent
+maintenance callers. It reports sample counts and variability; these filesystem
+measurements do not establish playback latency improvements.
 
 The same object reports separate `startup_to_initial_bytes_ms`,
 `startup_to_playlist_ready_ms`, Media Source playlist/init/first-fragment

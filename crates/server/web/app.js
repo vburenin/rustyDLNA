@@ -334,31 +334,59 @@ function navigationIsCurrent(epoch, controller) {
 }
 
 async function applyNavigation(navigation, { initial = false } = {}) {
+  const timingStart = initial ? 0 : performance.now();
   const epoch = ++navigationEpoch;
   navigationController?.abort();
   const controller = new AbortController();
   navigationController = controller;
   try {
-    let libraryRequest;
     if (initial) {
-      libraryRequest = library.start();
+      void library.start();
     } else {
       library.cancelPendingSearch();
-      libraryRequest = library.navigate(navigation, {
+      void library.navigate(navigation, {
         history: "none",
-        focusAfterLoad: true,
+        focusAfterLoad: !navigation.itemId,
         supersedePending: false,
       });
     }
-    // Fetch linked metadata concurrently, but retain the library capability
-    // prerequisite before choosing Original or Compatible playback.
-    const [, payload] = await Promise.all([
-      libraryRequest,
-      navigation.itemId ? api.item(navigation.itemId, { signal: controller.signal }) : null,
+    if (!navigation.itemId) return;
+    // The complete library continues loading independently. Only its validated
+    // first-page capabilities and the linked item's own metadata gate playback.
+    let capabilityRequest = library.capabilitiesReady;
+    let [capabilities, payload] = await Promise.all([
+      capabilityRequest,
+      api.item(navigation.itemId, { signal: controller.signal }),
     ]);
-    if (!navigationIsCurrent(epoch, controller) || !navigation.itemId) return;
+    // Retry can publish a newer first page without changing the URL epoch.
+    // Follow that prerequisite, with a bounded retry if publication races the
+    // generation-checked item request. Never wait for the complete list.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (!navigationIsCurrent(epoch, controller)) return;
+      if (capabilityRequest !== library.capabilitiesReady) {
+        capabilityRequest = library.capabilitiesReady;
+        capabilities = await capabilityRequest;
+      }
+      if (payload.generation !== capabilities.generation) {
+        payload = await api.item(navigation.itemId, { signal: controller.signal, generation: capabilities.generation });
+      }
+      if (capabilityRequest === library.capabilitiesReady
+        && capabilities.generation === store.getState().server.generation) break;
+    }
+    if (!navigationIsCurrent(epoch, controller)) return;
+    if (capabilityRequest !== library.capabilitiesReady || payload.generation !== capabilities.generation
+      || capabilities.generation !== store.getState().server.generation) throw new Error("Catalog generation changed.");
     payload.item.chapters = payload.chapters || [];
-    await player.select(payload.item, { startAt: navigation.start, signal: controller.signal });
+    const negotiationEpoch = store.getState().server.negotiationEpoch;
+    const stopWatching = store.subscribe((state) => {
+      if (state.server.generation !== capabilities.generation
+        || state.server.negotiationEpoch !== negotiationEpoch) controller.abort();
+    });
+    try {
+      await player.select(payload.item, { startAt: navigation.start, signal: controller.signal, timingStart });
+    } finally {
+      stopWatching();
+    }
     if (!navigationIsCurrent(epoch, controller)) return;
   } catch (_) {
     if (!navigationIsCurrent(epoch, controller)) return;

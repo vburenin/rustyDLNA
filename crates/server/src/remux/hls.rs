@@ -28,6 +28,11 @@ pub(super) struct Index {
     pending_fragment: Option<Fragment>,
     pending_segment: Option<Segment>,
     fragments: Vec<Segment>,
+    fragment_timing: Vec<Option<(f64, f64)>>,
+    timeline_end: Option<f64>,
+    timing_reliable: bool,
+    fragment_time: f64,
+    decode_start: f64,
     dependent_fragments: usize,
     segments: Vec<Segment>,
     finalized: bool,
@@ -118,6 +123,14 @@ impl Index {
                     let bytes = read_box(file, header)
                         .map_err(|error| format!("read fragmented MP4 movie fragment: {error}"))?;
                     let timing = parse_moof(&bytes, track, self.defaults.get(&track.id).copied())?;
+                    let contiguous = timing.decode_time.is_some_and(|start| {
+                        self.timeline_end
+                            .is_none_or(|end| (start - end).abs() <= 0.002)
+                    });
+                    self.timing_reliable = (self.fragments.is_empty() || self.timing_reliable)
+                        && contiguous
+                        && timing.reuse_safe;
+                    self.timeline_end = timing.decode_time.map(|start| start + timing.duration);
                     self.pending_fragment = Some(Fragment {
                         offset: header.offset,
                         duration: timing.duration,
@@ -260,6 +273,15 @@ impl Index {
         if fragments.is_empty() && !ended {
             return Err("fragmented MP4 has no new Media Source fragments".into());
         }
+        if self
+            .init_end
+            .is_some_and(|length| length > rusty_dlna_protocol::MSE_RESOURCE_MAX_BYTES)
+            || fragments
+                .iter()
+                .any(|fragment| fragment.length > rusty_dlna_protocol::MSE_RESOURCE_MAX_BYTES)
+        {
+            return Err("resource_limit: Media Source resource exceeds the byte budget".into());
+        }
         self.render_playlist(init_uri, segment_uri, fragments, false, after, ended)
     }
 
@@ -292,7 +314,16 @@ impl Index {
         output.push_str(&format!(
             "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n#EXT-X-MAP:URI=\"{init_uri}&hls_offset=0&hls_length={init_end}\"\n"
         ));
-        for segment in segments {
+        for (index, segment) in segments.iter().enumerate() {
+            if !independent {
+                if let Some(Some((start, decode_start))) =
+                    self.fragment_timing.get(media_sequence + index)
+                {
+                    output.push_str(&format!(
+                        "#EXT-X-RUSTY-TIMING:{start:.6},{decode_start:.6}\n"
+                    ));
+                }
+            }
             output.push_str(&format!(
                 "#EXTINF:{:.6},\n{}&hls_offset={}&hls_length={}\n",
                 segment.duration, segment_uri, segment.offset, segment.length
@@ -311,6 +342,14 @@ impl Index {
         if !fragment.random_access && self.pending_segment.is_none() {
             return Err("fragmented MP4 begins without a random-access point".into());
         }
+        if fragment.random_access {
+            self.decode_start = self.fragment_time;
+        }
+        self.fragment_timing.push(
+            self.timing_reliable
+                .then_some((self.fragment_time, self.decode_start)),
+        );
+        self.fragment_time += fragment.duration;
         self.fragments.push(Segment {
             offset: fragment.offset,
             length: end.saturating_sub(fragment.offset),
@@ -488,6 +527,8 @@ fn parse_trak(bytes: &[u8]) -> Result<Track, String> {
 #[derive(Clone, Copy, Debug)]
 struct FragmentTiming {
     duration: f64,
+    decode_time: Option<f64>,
+    reuse_safe: bool,
     random_access: bool,
 }
 
@@ -543,6 +584,18 @@ fn parse_traf(
     } else {
         trex.and_then(|defaults| defaults.flags)
     };
+    let decode_time = children
+        .iter()
+        .find(|child| &child.kind == b"tfdt")
+        .map(|tfdt| match tfdt.payload.first() {
+            Some(0) => be_u32(tfdt.payload, 4).map(u64::from),
+            Some(1) => be_u64(tfdt.payload, 4),
+            _ => Err("unsupported fragment decode time version".to_owned()),
+        })
+        .transpose()?
+        .filter(|ticks| *ticks <= (1_u64 << 53))
+        .map(|ticks| ticks as f64 / f64::from(selected.timescale));
+    let mut bounded_reordering = true;
     let mut duration = 0_u64;
     let mut first_flags = None;
     let mut samples_seen = 0_u64;
@@ -591,6 +644,14 @@ fn parse_traf(
                 first_flags = sample_flags;
             }
             if flags & 0x000800 != 0 {
+                let value = be_u32(trun.payload, offset)?;
+                let displacement = if trun.payload.first() == Some(&1) {
+                    i64::from(value as i32).unsigned_abs()
+                } else {
+                    u64::from(value)
+                };
+                bounded_reordering &=
+                    displacement <= u64::from(selected.timescale).saturating_mul(2);
                 offset += 4;
             }
             if offset > trun.payload.len() {
@@ -603,6 +664,8 @@ fn parse_traf(
         return Err("track fragment contains no samples".into());
     }
     Ok(Some(FragmentTiming {
+        decode_time,
+        reuse_safe: bounded_reordering && (!selected.video || first_flags.is_some()),
         duration: duration as f64 / f64::from(selected.timescale),
         random_access: first_flags.is_none_or(|flags| flags & 0x0001_0000 == 0),
     }))
@@ -702,7 +765,7 @@ pub(super) mod tests {
         let mvex = atom(b"mvex", &atom(b"trex", &trex));
         let mut bytes = atom(b"ftyp", b"iso6");
         bytes.extend(atom(b"moov", &[trak, mvex].concat()));
-        for non_sync in [false, true, false] {
+        for (index, non_sync) in [false, true, false].into_iter().enumerate() {
             let mut tfhd = [0_u8; 8];
             tfhd[4..8].copy_from_slice(&1_u32.to_be_bytes());
             let mut trun = [0_u8; 12];
@@ -712,6 +775,7 @@ pub(super) mod tests {
             let traf = atom(
                 b"traf",
                 &[
+                    full_atom(b"tfdt", 0, &(index as u32 * 1000).to_be_bytes()),
                     full_atom(b"tfhd", 0, &tfhd[4..]),
                     full_atom(b"trun", 0x000004, &trun[4..]),
                 ]
@@ -759,6 +823,9 @@ pub(super) mod tests {
         assert!(!mse_playlist.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
         assert_eq!(mse_playlist.matches("#EXTINF:1.000000,").count(), 3);
         assert!(mse_playlist.contains("delivery=mse_segment"));
+        assert!(mse_playlist.contains("#EXT-X-RUSTY-TIMING:0.000000,0.000000\n"));
+        assert!(mse_playlist.contains("#EXT-X-RUSTY-TIMING:1.000000,0.000000\n"));
+        assert!(mse_playlist.contains("#EXT-X-RUSTY-TIMING:2.000000,2.000000\n"));
 
         let delta = index
             .mse_playlist_after(
@@ -768,6 +835,7 @@ pub(super) mod tests {
             )
             .unwrap();
         assert!(delta.contains("#EXT-X-MEDIA-SEQUENCE:1"));
+        assert!(delta.contains("#EXT-X-RUSTY-TIMING:1.000000,0.000000\n"));
         assert_eq!(delta.matches("#EXTINF:1.000000,").count(), 2);
         assert!(delta.ends_with("#EXT-X-ENDLIST\n"));
 
@@ -781,6 +849,98 @@ pub(super) mod tests {
         assert!(exhausted.contains("#EXT-X-MEDIA-SEQUENCE:3"));
         assert!(!exhausted.contains("#EXTINF:"));
         assert!(exhausted.ends_with("#EXT-X-ENDLIST\n"));
+    }
+
+    #[test]
+    fn mse_resource_budget_rejects_oversized_fragments_without_splitting_dependencies() {
+        let limit = rusty_dlna_protocol::MSE_RESOURCE_MAX_BYTES;
+        for length in [limit - 1, limit, limit + 1] {
+            let mut index = Index {
+                init_end: Some(64),
+                finalized: true,
+                ..Index::default()
+            };
+            index
+                .push_fragment(
+                    Fragment {
+                        offset: 64,
+                        duration: 1.0,
+                        random_access: true,
+                    },
+                    64 + length,
+                )
+                .unwrap();
+            let result = index.mse_playlist_after("init", "segment", 0);
+            if length <= limit {
+                assert!(result.unwrap().contains(&format!("hls_length={length}")));
+            } else {
+                assert!(result.unwrap_err().starts_with("resource_limit:"));
+                assert_eq!(index.fragments.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn mse_seek_metadata_accepts_nonzero_decode_origin_and_stops_at_a_gap() {
+        let dir = TempDir::new("seek-timing");
+        let path = dir.path().join("stream.mp4");
+        for gap in [false, true] {
+            let mut bytes = fixture();
+            let offsets = bytes
+                .windows(4)
+                .enumerate()
+                .filter_map(|(offset, name)| (name == b"tfdt").then_some(offset + 8))
+                .collect::<Vec<_>>();
+            for (index, offset) in offsets.into_iter().enumerate() {
+                let time = 5000 + index as u32 * 1000 + if gap && index > 0 { 500 } else { 0 };
+                bytes[offset..offset + 4].copy_from_slice(&time.to_be_bytes());
+            }
+            std::fs::write(&path, bytes).unwrap();
+            let mut index = Index::default();
+            // These checks apply to growing output, before completed validation.
+            index.update(&path, false).unwrap();
+            let playlist = index.mse_playlist_after("init", "segment", 0).unwrap();
+            assert_eq!(
+                playlist.matches("#EXT-X-RUSTY-TIMING:").count(),
+                if gap { 1 } else { 3 }
+            );
+            assert!(playlist.contains("#EXT-X-RUSTY-TIMING:0.000000,0.000000"));
+        }
+    }
+
+    #[test]
+    fn mse_seek_prerequisites_require_sync_flags_and_bounded_reordering() {
+        let track = Track {
+            id: 1,
+            timescale: 1000,
+            video: true,
+        };
+        for flags in [None, Some(0)] {
+            for displacement in [0_u32, 2000, 2001] {
+                let mut samples = 1_u32.to_be_bytes().to_vec();
+                samples.extend(displacement.to_be_bytes());
+                let traf = [
+                    full_atom(b"tfhd", 0, &1_u32.to_be_bytes()),
+                    full_atom(b"tfdt", 0, &0_u32.to_be_bytes()),
+                    full_atom(b"trun", 0x000800, &samples),
+                ]
+                .concat();
+                let timing = parse_traf(
+                    &traf,
+                    track,
+                    Some(TrackDefaults {
+                        duration: Some(1000),
+                        flags,
+                    }),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(timing.reuse_safe, flags.is_some() && displacement <= 2000);
+                // Ordinary delivery remains available when seek prerequisites
+                // cannot be established; only buffered reuse is disabled.
+                assert_eq!(timing.duration, 1.0);
+            }
+        }
     }
 
     #[test]

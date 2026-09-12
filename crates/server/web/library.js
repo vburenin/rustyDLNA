@@ -22,6 +22,7 @@ export class LibraryController {
   #onSelect;
   #onNavigate;
   #request = 0;
+  #capabilitiesReady = Promise.resolve(null);
   #searchTimer = null;
   #continueController = null;
   #continueProgress = null;
@@ -50,6 +51,10 @@ export class LibraryController {
     return this.load();
   }
 
+  get capabilitiesReady() {
+    return this.#capabilitiesReady;
+  }
+
   cancelPendingSearch() {
     if (this.#searchTimer !== null) window.clearTimeout(this.#searchTimer);
     this.#searchTimer = null;
@@ -74,24 +79,29 @@ export class LibraryController {
 
   async load({ focusAfterLoad = false } = {}) {
     const requestId = ++this.#request;
+    let resolveCapabilities;
+    let rejectCapabilities;
+    this.#capabilitiesReady = new Promise((resolve, reject) => {
+      resolveCapabilities = resolve;
+      rejectCapabilities = reject;
+    });
+    // Ordinary library navigation has no linked selection awaiting this promise.
+    // Its error is still reported by the complete-library path below.
+    void this.#capabilitiesReady.catch(() => {});
+    const onFirstPage = (payload) => {
+      if (requestId !== this.#request) throw new DOMException("Library request replaced.", "AbortError");
+      this.#publishCapabilities(requestId, payload);
+      resolveCapabilities(payload);
+    };
     this.#store.dispatch({ type: "LIBRARY_LOADING", requestId });
     const current = this.#store.getState();
     this.render();
     if (current.navigation.view !== "continue") this.#continueProgress = null;
     try {
       const payload = current.navigation.view === "continue"
-        ? await this.#continueWatchingPage(current.navigation.query)
-        : await this.#api.librarySnapshot(current.navigation);
+        ? await this.#continueWatchingPage(current.navigation.query, onFirstPage)
+        : await this.#api.librarySnapshot(current.navigation, { onFirstPage });
       if (requestId !== this.#request) return;
-      const preferredQuality = this.#store.getState().preferences.quality;
-      const quality = reconcileQualityPreference(
-        preferredQuality,
-        payload.capabilities?.quality_profiles,
-      );
-      if (quality !== preferredQuality) {
-        savePreference("quality", quality);
-        this.#store.dispatch({ type: "PREFERENCE", name: "quality", value: quality });
-      }
       this.#store.dispatch({ type: "LIBRARY_SUCCESS", requestId, payload });
       if (current.navigation.view === "folders" && !current.navigation.folder) {
         this.#store.dispatch({ type: "NAVIGATE", navigation: { folder: payload.root_folder_id } });
@@ -101,10 +111,22 @@ export class LibraryController {
         this.#dom.libraryPanel.focus({ preventScroll: true });
       }
     } catch (error) {
+      rejectCapabilities(error);
       if (error?.name === "AbortError" || requestId !== this.#request) return;
       this.#store.dispatch({ type: "LIBRARY_ERROR", requestId, error });
       this.render();
     }
+  }
+
+  #publishCapabilities(requestId, payload) {
+    const preferredQuality = this.#store.getState().preferences.quality;
+    const quality = reconcileQualityPreference(preferredQuality, payload.capabilities?.quality_profiles);
+    if (quality !== preferredQuality) {
+      savePreference("quality", quality);
+      this.#store.dispatch({ type: "PREFERENCE", name: "quality", value: quality });
+    }
+    this.#store.dispatch({ type: "LIBRARY_CAPABILITIES", requestId, payload });
+    this.render();
   }
 
   render() {
@@ -147,6 +169,9 @@ export class LibraryController {
   #announceState(library, server, noun) {
     let message = "";
     if (library.status === "loading") {
+      // First-page capabilities can connect the server while this same list is
+      // still loading. Keep one announcement for that loading transition.
+      if (["Connecting to the library.", "Loading the library."].includes(this.#liveMessage)) return;
       message = server.state === "connecting" ? "Connecting to the library." : "Loading the library.";
     } else if (library.status === "error") {
       message = "The library is unavailable. Check the server connection and try again.";
@@ -162,7 +187,7 @@ export class LibraryController {
     this.#dom.libraryLive.textContent = message;
   }
 
-  async #continueWatchingPage(query) {
+  async #continueWatchingPage(query, onFirstPage) {
     this.#continueController?.abort();
     const controller = new AbortController();
     this.#continueController = controller;
@@ -186,7 +211,11 @@ export class LibraryController {
         generation,
         signal: controller.signal,
       });
-      first ||= page;
+      controller.signal.throwIfAborted();
+      if (!first) {
+        first = page;
+        onFirstPage(first);
+      }
       generation = page.generation;
       entries.push(...page.entries.filter((entry) => entry.entry_type === "media"));
     }

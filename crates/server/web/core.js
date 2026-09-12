@@ -439,6 +439,9 @@ export function parseHlsMediaPlaylist(value, baseHref) {
 
   let initUrl = null;
   let expectsSegment = false;
+  let duration = null;
+  let timing = null;
+  const segments = [];
   const segmentUrls = [];
   for (const line of lines.slice(1)) {
     if (line.startsWith("#EXT-X-MAP:")) {
@@ -446,24 +449,38 @@ export function parseHlsMediaPlaylist(value, baseHref) {
       const match = line.match(/^#EXT-X-MAP:URI="([^"]+)"$/);
       initUrl = match ? confinedResource(match[1], initDelivery, "mp4") : null;
       if (!initUrl) return null;
+    } else if (line.startsWith("#EXT-X-RUSTY-TIMING:")) {
+      if (timing !== null) return null;
+      const match = line.match(/^#EXT-X-RUSTY-TIMING:(\d+(?:\.\d+)?),(\d+(?:\.\d+)?)$/);
+      if (!match) return null;
+      const start = Number(match[1]);
+      const decodeStart = Number(match[2]);
+      if (!Number.isFinite(start) || !Number.isFinite(decodeStart) || decodeStart > start) return null;
+      timing = { start, decodeStart };
     } else if (line.startsWith("#EXTINF:")) {
       if (expectsSegment) return null;
+      duration = Number(line.slice(8).split(",")[0]);
+      if (!Number.isFinite(duration) || duration <= 0) return null;
       expectsSegment = true;
     } else if (line && !line.startsWith("#")) {
       if (!expectsSegment || segmentUrls.length >= 20_000) return null;
       const segment = confinedResource(line, segmentDelivery, "m4s");
       if (!segment) return null;
       segmentUrls.push(segment);
+      segments.push({ url: segment, duration, ...(timing || {}) });
+      timing = null;
       expectsSegment = false;
     }
   }
   const ended = lines.includes("#EXT-X-ENDLIST");
   if (!initUrl
+    || timing !== null
     || expectsSegment
     || (segmentUrls.length === 0 && !(mediaSourceDelivery && ended))) return null;
   return {
     initUrl,
     segmentUrls,
+    segments,
     ended,
   };
 }
@@ -889,6 +906,7 @@ const ERROR_MAP = Object.freeze({
   unsupported_direct: ["Your browser cannot play the original file.", ["try_compatible"]],
   transcode_disabled: ["Prepared streaming is disabled on this server.", ["play_original"]],
   transcode_busy: ["The server is preparing other media. Try again shortly.", ["retry"]],
+  resource_limit: ["This stream exceeds the available playback memory. Try Original playback or choose a smaller quality.", ["retry", "play_original"]],
   transcode_failed: ["The server could not prepare this title.", ["retry", "play_original"]],
   transcode_cancelled: ["Preparing this title was cancelled.", ["retry", "play_original"]],
   network: ["The server connection was interrupted.", ["retry"]],
@@ -1000,4 +1018,27 @@ export function playbackAudioTrackIndex(playback) {
   return playback.sourceMode === SOURCE_MODES.ORIGINAL
     ? originalAudioTrackIndex(playback.audioTracks)
     : playback.selectedAudio;
+}
+
+// Decoder prerequisites belong to the same continuous buffered interval. A
+// copied GOP may span many fragments; the server advertises its preceding RAP.
+// Server seek metadata is emitted only for reordering within two seconds.
+export function reusableMediaSourceSeek({ ranges, segments, target, copiedVideo, duration }) {
+  if (!Number.isFinite(target) || target < 0) return false;
+  const segment = segments.find((entry) => entry.start <= target && target < entry.end);
+  if (!segment) return false;
+  const decodeStart = segment.decodeStart;
+  if (!Number.isFinite(decodeStart) || decodeStart < 0 || decodeStart > target) return false;
+  const margin = copiedVideo ? 2 : 0.25;
+  const end = Math.min(target + margin, Number.isFinite(duration) && duration > target ? duration : Infinity);
+  return ranges.some((range) => range.start <= decodeStart + 0.05
+    && range.start <= target && range.end >= end && range.end > target);
+}
+
+// Charge the entire compressed fragment while any of it remains buffered.
+// Proportional estimates would underestimate bursty variable-bitrate media.
+export function retainedMediaSourceBytes(segments, ranges) {
+  return segments.reduce((sum, segment) => sum + (ranges.some((range) => (
+    segment.start < range.end && segment.end > range.start
+  )) ? segment.bytes : 0), 0);
 }

@@ -74,6 +74,10 @@ pub use trickplay::{
 };
 pub use xml::{escape_xml, escape_xml_into, escape_xml_text, escape_xml_text_into};
 
+/// Maximum bytes in one embedded-player Media Source init or movie-fragment resource.
+/// Copied decoder dependencies remain intact; oversized resources fail explicitly.
+pub const MSE_RESOURCE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 pub const SERVER_NAME: &str = "rustyDLNA";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 

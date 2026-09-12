@@ -1,10 +1,10 @@
 //! Transcode-cache discovery, accounting, and eviction.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::{remux::RemuxJob, App};
 
@@ -188,13 +188,15 @@ where
             finished.push((used, metadata.len(), path));
         }
     }
-    finished.sort_by_key(|entry| entry.0);
     let mut quota_reclaim = total.saturating_sub(quota_bytes);
     let mut free_shortfall = if minimum_free_bytes == 0 {
         0
     } else {
         minimum_free_bytes.saturating_sub(available_bytes(directory)?)
     };
+    if quota_reclaim > 0 || free_shortfall > 0 {
+        finished.sort_by_key(|entry| entry.0);
+    }
     for (_, bytes, path) in finished {
         if quota_reclaim == 0 && free_shortfall == 0 {
             break;
@@ -234,6 +236,12 @@ pub(crate) fn maintain_transcode_cache(
         protected,
         startup,
     )?;
+    tracing::debug!(
+        cache_bytes = report.bytes,
+        evicted_files = report.evicted_files,
+        evicted_bytes = report.evicted_bytes,
+        "transcode cache startup maintenance finished"
+    );
     if report.limits_satisfied {
         Ok(report.bytes)
     } else {
@@ -241,57 +249,378 @@ pub(crate) fn maintain_transcode_cache(
     }
 }
 
-pub(super) fn maintain_app_cache(
-    app: &App,
-    protected: &HashSet<PathBuf>,
-    startup: bool,
-) -> std::io::Result<u64> {
-    let _maintenance = crate::lock_recover(&app.cache_maintenance);
-    app.remux_metrics
-        .cache_maintenance
-        .fetch_add(1, Ordering::Relaxed);
-    match maintain_transcode_cache_report(
-        &app.cache_dir,
-        app.cfg.transcode.cache_max_mb.saturating_mul(1024 * 1024),
-        app.cfg.transcode.cache_max_age_days,
-        app.cfg.cache_min_free_mb.saturating_mul(1024 * 1024),
-        protected,
-        startup,
-    ) {
-        Ok(report) => {
-            app.remux_metrics
-                .cache_bytes
-                .store(report.bytes, Ordering::Relaxed);
-            app.remux_metrics
-                .cache_evicted_files
-                .fetch_add(report.evicted_files, Ordering::Relaxed);
-            app.remux_metrics
-                .cache_evicted_bytes
-                .fetch_add(report.evicted_bytes, Ordering::Relaxed);
-            if report.limits_satisfied {
-                Ok(report.bytes)
-            } else {
-                app.remux_metrics
-                    .cache_maintenance_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(unsatisfied_limits_error())
-            }
+// One reconciliation cadence for the process, independent of producer count.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+const RECENCY_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy)]
+struct CacheEntry {
+    bytes: u64,
+    used: SystemTime,
+    completed: bool,
+}
+
+#[derive(Default)]
+struct Inventory {
+    entries: HashMap<PathBuf, CacheEntry>,
+    bytes: u64,
+    swept: Option<Instant>,
+}
+
+impl Inventory {
+    fn replace(&mut self, path: PathBuf, entry: Option<CacheEntry>) {
+        if let Some(previous) = self.entries.remove(&path) {
+            self.bytes = self.bytes.saturating_sub(previous.bytes);
         }
-        Err(error) => {
-            app.remux_metrics
-                .cache_maintenance_failures
-                .fetch_add(1, Ordering::Relaxed);
-            Err(error)
+        if let Some(entry) = entry {
+            self.bytes = self.bytes.saturating_add(entry.bytes);
+            self.entries.insert(path, entry);
         }
     }
 }
 
-pub(super) fn enforce_active_cache_limits(app: &App) -> std::io::Result<u64> {
-    // Keep registration and the protected snapshot atomic. Every path that
-    // takes both locks follows map -> maintenance ordering.
+/// Reservations establish ownership before slow I/O and are checked together
+/// with the live job registry before eviction. No snapshot grants unlink rights.
+#[derive(Default)]
+pub(crate) struct CacheCoordinator {
+    inventory: Mutex<Inventory>,
+    reserved: Mutex<HashSet<PathBuf>>,
+    released: Condvar,
+}
+
+pub(super) struct Reservation<'a> {
+    coordinator: &'a CacheCoordinator,
+    path: PathBuf,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        crate::lock_recover(&self.coordinator.reserved).remove(&self.path);
+        self.coordinator.released.notify_all();
+    }
+}
+
+impl CacheCoordinator {
+    pub(super) fn reserve(&self, path: &Path) -> Result<Reservation<'_>, String> {
+        let deadline = Instant::now() + super::WEB_SUPERSEDED_JOB_HANDOFF;
+        let mut reserved = crate::lock_recover(&self.reserved);
+        while reserved.contains(path) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("transcode busy (cache output is being prepared)".into());
+            }
+            reserved = self
+                .released
+                .wait_timeout(reserved, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+        reserved.insert(path.to_owned());
+        Ok(Reservation {
+            coordinator: self,
+            path: path.to_owned(),
+        })
+    }
+
+    fn try_reserve(&self, path: &Path) -> Option<Reservation<'_>> {
+        crate::lock_recover(&self.reserved)
+            .insert(path.to_owned())
+            .then(|| Reservation {
+                coordinator: self,
+                path: path.to_owned(),
+            })
+    }
+}
+
+fn entry_from_metadata(
+    path: &Path,
+    metadata: std::fs::Metadata,
+) -> std::io::Result<Option<CacheEntry>> {
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let completed = generated_cache_mp4(path);
+    if !completed && !generated_intermediate(path) {
+        return Ok(None);
+    }
+    let mut used = metadata.modified()?;
+    if completed {
+        match std::fs::symlink_metadata(rusty_dlna_transcode::cache_stamp_path(path)) {
+            Ok(stamp) if stamp.is_file() => used = stamp.modified()?,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Some(CacheEntry {
+        bytes: metadata.len(),
+        used,
+        completed,
+    }))
+}
+
+fn read_entry(path: &Path) -> std::io::Result<Option<CacheEntry>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => entry_from_metadata(path, metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn discover(app: &App) -> std::io::Result<Inventory> {
+    let started = Instant::now();
+    #[cfg(test)]
+    run_test_hook(discovery_test_hooks(), &app.cache_dir);
+    app.remux_metrics
+        .cache_scans
+        .fetch_add(1, Ordering::Relaxed);
+    let mut inventory = Inventory::default();
+    for entry in std::fs::read_dir(&app.cache_dir)? {
+        let entry = entry?;
+        app.remux_metrics
+            .cache_scan_entries
+            .fetch_add(1, Ordering::Relaxed);
+        let path = entry.path();
+        if let Some(entry) = read_entry(&path)? {
+            inventory.bytes = inventory.bytes.saturating_add(entry.bytes);
+            inventory.entries.insert(path, entry);
+        }
+    }
+    inventory.swept = Some(Instant::now());
+    app.remux_metrics
+        .cache_sweep_duration
+        .record(started.elapsed());
+    Ok(inventory)
+}
+
+fn maintain_inventory(
+    app: &App,
+    requested: &HashSet<PathBuf>,
+    startup: bool,
+) -> std::io::Result<u64> {
+    let waited = Instant::now();
+    // The shared gate also orders derived-image admission/publication checks.
+    // No caller may hold the job registry while acquiring it.
+    let _maintenance = crate::lock_recover(&app.cache_maintenance);
+    app.remux_metrics.cache_lock_wait.record(waited.elapsed());
+    let mut inventory = crate::lock_recover(&app.transcode_cache.inventory);
+    let sweep = startup
+        || inventory
+            .swept
+            .is_none_or(|at| at.elapsed() >= SWEEP_INTERVAL);
+    if sweep {
+        *inventory = discover(app)?;
+    }
+    let waited = Instant::now();
     let jobs = crate::lock_recover(&app.remuxes);
-    let protected = active_artifacts(jobs.values());
-    maintain_app_cache(app, &protected, false)
+    app.remux_metrics
+        .cache_registry_wait
+        .record(waited.elapsed());
+    let active = active_artifacts(jobs.values());
+    drop(jobs);
+    // Only growing/registered artifacts and the admission candidate need fresh
+    // stats between sweeps. Completed entries retain incremental accounting.
+    for path in active.iter().chain(requested) {
+        inventory.replace(path.clone(), read_entry(path)?);
+    }
+    let quota = app.cfg.transcode.cache_max_mb.saturating_mul(1024 * 1024);
+    let minimum_free = app.cfg.cache_min_free_mb.saturating_mul(1024 * 1024);
+    let mut free_shortfall = if minimum_free == 0 {
+        0
+    } else {
+        minimum_free.saturating_sub(crate::available_filesystem_bytes(&app.cache_dir)?)
+    };
+    let max_age =
+        Duration::from_secs(u64::from(app.cfg.transcode.cache_max_age_days).saturating_mul(86_400));
+    let now = SystemTime::now();
+    if sweep || inventory.bytes > quota || free_shortfall > 0 {
+        let pressure = inventory.bytes > quota || free_shortfall > 0;
+        let mut candidates = inventory
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.completed
+                    && (pressure || now.duration_since(entry.used).unwrap_or_default() > max_age)
+            })
+            .map(|(path, entry)| (path.clone(), *entry))
+            .collect::<Vec<_>>();
+        if inventory.bytes > quota || free_shortfall > 0 {
+            candidates.sort_unstable_by_key(|(_, entry)| entry.used);
+        }
+        #[cfg(test)]
+        run_test_hook(eviction_test_hooks(), &app.cache_dir);
+        // A recently touched candidate is deferred behind the original LRU
+        // candidates, then reconsidered if quota still requires reclamation.
+        for _ in 0..2 {
+            let mut refreshed = Vec::new();
+            for (path, entry) in candidates {
+                let aged = now.duration_since(entry.used).unwrap_or_default() > max_age;
+                if !aged && inventory.bytes <= quota && free_shortfall == 0 {
+                    continue;
+                }
+                let Some(_reservation) = app.transcode_cache.try_reserve(&path) else {
+                    continue;
+                };
+                // Registration must reserve this exact destination before touching
+                // it. Keep that reservation through unlink, after releasing the map.
+                let waited = Instant::now();
+                let jobs = crate::lock_recover(&app.remuxes);
+                app.remux_metrics
+                    .cache_registry_wait
+                    .record(waited.elapsed());
+                let protected = jobs.values().any(|job| job.dest == path);
+                drop(jobs);
+                if protected || requested.contains(&path) {
+                    continue;
+                }
+                // Recency can have advanced since discovery; readers hold the
+                // reservation while touching the stamp. Re-evaluate age/LRU safely.
+                let current = read_entry(&path)?;
+                if let Some(current) = current.filter(|current| current.used > entry.used) {
+                    inventory.replace(path.clone(), Some(current));
+                    refreshed.push((path, current));
+                    continue;
+                }
+                let removed = match std::fs::remove_file(&path) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error),
+                };
+                let _ = std::fs::remove_file(rusty_dlna_transcode::cache_stamp_path(&path));
+                inventory.replace(path, None);
+                if removed {
+                    app.remux_metrics
+                        .cache_evicted_files
+                        .fetch_add(1, Ordering::Relaxed);
+                    app.remux_metrics.cache_evicted_bytes.fetch_add(
+                        current.map_or(entry.bytes, |entry| entry.bytes),
+                        Ordering::Relaxed,
+                    );
+                }
+                if free_shortfall > 0 {
+                    free_shortfall = minimum_free
+                        .saturating_sub(crate::available_filesystem_bytes(&app.cache_dir)?);
+                }
+            }
+            if inventory.bytes <= quota && free_shortfall == 0 {
+                break;
+            }
+            refreshed.sort_unstable_by_key(|(_, entry)| entry.used);
+            candidates = refreshed;
+        }
+    }
+    app.remux_metrics
+        .cache_bytes
+        .store(inventory.bytes, Ordering::Relaxed);
+    if inventory.bytes > quota || free_shortfall > 0 {
+        Err(unsatisfied_limits_error())
+    } else {
+        Ok(inventory.bytes)
+    }
+}
+
+pub(super) fn maintain_app_cache(
+    app: &App,
+    requested: &HashSet<PathBuf>,
+    startup: bool,
+) -> std::io::Result<u64> {
+    let started = Instant::now();
+    app.remux_metrics
+        .cache_maintenance
+        .fetch_add(1, Ordering::Relaxed);
+    let result = maintain_inventory(app, requested, startup);
+    app.remux_metrics
+        .cache_maintenance_duration
+        .record(started.elapsed());
+    if result.is_err() {
+        app.remux_metrics
+            .cache_maintenance_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    result
+}
+
+pub(super) fn enforce_active_cache_limits(app: &App) -> std::io::Result<u64> {
+    maintain_app_cache(app, &HashSet::new(), false)
+}
+
+/// Caller holds shared maintenance gate; publication and deletion do not scan.
+pub(super) fn refresh_artifacts(app: &App, paths: impl IntoIterator<Item = PathBuf>) {
+    let mut inventory = crate::lock_recover(&app.transcode_cache.inventory);
+    for path in paths {
+        match read_entry(&path) {
+            Ok(entry) => inventory.replace(path, entry),
+            Err(_) => inventory.swept = None,
+        }
+    }
+    app.remux_metrics
+        .cache_bytes
+        .store(inventory.bytes, Ordering::Relaxed);
+}
+
+/// Final admission while the shared image/video gate is held. The preceding
+/// maintenance may have released that gate before publication acquired it.
+pub(super) fn check_publication_limits(app: &App, job: &RemuxJob) -> std::io::Result<()> {
+    refresh_artifacts(app, [job.part.clone(), job.dest.clone()]);
+    let bytes = crate::lock_recover(&app.transcode_cache.inventory).bytes;
+    let quota = app.cfg.transcode.cache_max_mb.saturating_mul(1024 * 1024);
+    let minimum_free = app.cfg.cache_min_free_mb.saturating_mul(1024 * 1024);
+    if bytes > quota
+        || (minimum_free > 0 && crate::available_filesystem_bytes(&app.cache_dir)? < minimum_free)
+    {
+        return Err(unsatisfied_limits_error());
+    }
+    Ok(())
+}
+
+/// Called from blocking delivery/admission work with a live job or reservation.
+/// Touch only stamp mtime: validated output identity and validators stay stable.
+pub(super) fn touch_recency(dest: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Ok(stamp) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(rusty_dlna_transcode::cache_stamp_path(dest))
+    else {
+        return;
+    };
+    let Ok(metadata) = stamp.metadata() else {
+        return;
+    };
+    if !metadata.is_file() {
+        return;
+    }
+    let now = SystemTime::now();
+    if metadata
+        .modified()
+        .is_ok_and(|modified| now.duration_since(modified).unwrap_or_default() >= RECENCY_INTERVAL)
+    {
+        let _ = stamp.set_modified(now);
+    }
+}
+
+#[cfg(test)]
+type DiscoveryHook = Box<dyn FnOnce() + Send>;
+#[cfg(test)]
+fn discovery_test_hooks() -> &'static Mutex<HashMap<PathBuf, DiscoveryHook>> {
+    static HOOKS: std::sync::OnceLock<Mutex<HashMap<PathBuf, DiscoveryHook>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn eviction_test_hooks() -> &'static Mutex<HashMap<PathBuf, DiscoveryHook>> {
+    static HOOKS: std::sync::OnceLock<Mutex<HashMap<PathBuf, DiscoveryHook>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn run_test_hook(hooks: &Mutex<HashMap<PathBuf, DiscoveryHook>>, directory: &Path) {
+    let hook = crate::lock_recover(hooks).remove(directory);
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 #[cfg(test)]
@@ -545,5 +874,360 @@ mod tests {
 
         assert_eq!(error.to_string(), "metadata failed");
         assert!(output.exists());
+    }
+    fn test_app(directory: &Path) -> Arc<App> {
+        let mut config = crate::Config {
+            cache_dir: Some(directory.display().to_string()),
+            rescan_secs: 0,
+            cache_min_free_mb: 0,
+            ..crate::Config::default()
+        };
+        config.transcode.enable = true;
+        config.transcode.cache_max_mb = 1;
+        Arc::new(App::from_config(config, 18200, 11900, directory))
+    }
+
+    fn test_job(directory: &Path, id: i64) -> Arc<RemuxJob> {
+        use super::super::{hls, RemuxState, WebStartupObservations};
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+        let dest = directory.join(format!("{id}-hdr10-{id:064x}.mp4"));
+        Arc::new(RemuxJob {
+            detail_id: id,
+            web_request_ids: Mutex::new(HashSet::new()),
+            web_sessions: Mutex::new(HashMap::new()),
+            web: true,
+            web_spec: None,
+            cache_hit: false,
+            registry_finalized: AtomicBool::new(false),
+            producer_finished: AtomicBool::new(false),
+            output: Mutex::new(None),
+            startup_observations: WebStartupObservations::default(),
+            part: rusty_dlna_transcode::cache_part(&dest),
+            dest,
+            state: Mutex::new(RemuxState::Growing),
+            changed: tokio::sync::Notify::new(),
+            cancelled: AtomicBool::new(false),
+            clients: AtomicUsize::new(1),
+            ever_had_client: AtomicBool::new(true),
+            client_epoch: AtomicU64::new(1),
+            disconnect_deadline: Mutex::new(None),
+            cacheable: true,
+            started: Instant::now(),
+            hls_index: Mutex::new(hls::Index::default()),
+        })
+    }
+
+    #[test]
+    fn active_growth_and_deletion_are_accounted_without_rescanning_per_producer() {
+        for producers in [1, 2, 8] {
+            let directory = TempDir::new("incremental");
+            let app = test_app(&directory);
+            let jobs = (0..producers)
+                .map(|id| test_job(&directory, id))
+                .collect::<Vec<_>>();
+            for job in &jobs {
+                std::fs::write(&job.part, b"x").unwrap();
+                crate::lock_recover(&app.remuxes).insert(job.detail_id.to_string(), job.clone());
+            }
+            assert_eq!(enforce_active_cache_limits(&app).unwrap(), producers as u64);
+            for job in &jobs {
+                std::fs::write(&job.part, [0; 100]).unwrap();
+            }
+            std::thread::scope(|scope| {
+                for _ in 0..producers {
+                    let app = &app;
+                    scope.spawn(move || {
+                        assert_eq!(
+                            enforce_active_cache_limits(app).unwrap(),
+                            producers as u64 * 100
+                        )
+                    });
+                }
+            });
+            assert_eq!(app.remux_metrics.cache_scans.load(Ordering::Relaxed), 1);
+            for job in &jobs {
+                std::fs::remove_file(&job.part).unwrap();
+            }
+            assert_eq!(enforce_active_cache_limits(&app).unwrap(), 0);
+            assert_eq!(app.remux_metrics.cache_scans.load(Ordering::Relaxed), 1);
+            crate::lock_recover(&app.remuxes).clear();
+        }
+    }
+
+    #[test]
+    fn blocked_metadata_leaves_registration_status_and_cancellation_responsive_with_artwork() {
+        let directory = TempDir::new("blocked-metadata");
+        let app = test_app(&directory);
+        let job = test_job(&directory, 1);
+        std::fs::write(&job.part, [0; 100]).unwrap();
+        crate::lock_recover(&app.remuxes).insert("active".into(), job.clone());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        crate::lock_recover(discovery_test_hooks()).insert(
+            directory.0.clone(),
+            Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }),
+        );
+        let worker_app = app.clone();
+        let worker = std::thread::spawn(move || enforce_active_cache_limits(&worker_app));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            app.remuxes.try_lock().is_ok(),
+            "blocked metadata must not own the registry"
+        );
+        assert_eq!(super::super::runtime_status(&app).active, 1);
+        let mut spec = super::super::tests::job_spec(&directory, "active", Vec::new());
+        spec.dest = job.dest.clone();
+        spec.job_key = "active".into();
+        let attached = super::super::attach_for_client(app.clone(), spec).unwrap();
+        assert!(Arc::ptr_eq(&attached, &job));
+        job.cancel();
+        assert!(job.cancelled.load(Ordering::Acquire));
+        let images = directory.join("derived-images");
+        std::fs::create_dir_all(&images).unwrap();
+        let image_app = app.clone();
+        let image_worker = std::thread::spawn(move || {
+            let key = "a".repeat(64);
+            let _active = image_app
+                .derived_images
+                .activate(&key, &image_app.cache_maintenance);
+            let dest = images.join(format!("{key}.jpg"));
+            std::fs::write(&dest, [0; 200]).unwrap();
+            let report = image_app
+                .derived_images
+                .maintain(&image_app.cache_maintenance, &images, 1024, 30, 0)
+                .unwrap();
+            assert!(report.limits_satisfied);
+            assert!(dest.exists());
+        });
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), 100);
+        image_worker.join().unwrap();
+        assert!(job.part.exists());
+        crate::lock_recover(&app.remuxes).clear();
+    }
+
+    #[test]
+    fn eviction_rechecks_live_registry_after_candidate_snapshot() {
+        let directory = TempDir::new("stale-snapshot");
+        let app = test_app(&directory);
+        let job = test_job(&directory, 1);
+        let victim = test_job(&directory, 2);
+        std::fs::write(&job.dest, vec![0; 700_000]).unwrap();
+        std::fs::write(&victim.dest, vec![0; 700_000]).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        crate::lock_recover(eviction_test_hooks()).insert(
+            directory.0.clone(),
+            Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }),
+        );
+        let worker_app = app.clone();
+        let worker = std::thread::spawn(move || enforce_active_cache_limits(&worker_app));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        {
+            let _reservation = app.transcode_cache.reserve(&job.dest).unwrap();
+            crate::lock_recover(&app.remuxes).insert("new-reader".into(), job.clone());
+        }
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap(), 700_000);
+        assert!(job.dest.exists());
+        assert!(!victim.dest.exists());
+        crate::lock_recover(&app.remuxes).clear();
+    }
+
+    #[test]
+    fn pending_admission_reserves_candidate_and_external_deletion_converges_at_sweep() {
+        let directory = TempDir::new("reserved-candidate");
+        let app = test_app(&directory);
+        let job = test_job(&directory, 1);
+        let victim = test_job(&directory, 2);
+        std::fs::write(&job.dest, vec![0; 700_000]).unwrap();
+        std::fs::write(&victim.dest, vec![0; 700_000]).unwrap();
+        let reservation = app.transcode_cache.reserve(&job.dest).unwrap();
+        assert_eq!(enforce_active_cache_limits(&app).unwrap(), 700_000);
+        assert!(job.dest.exists());
+        assert!(!victim.dest.exists());
+        drop(reservation);
+        std::fs::remove_file(&job.dest).unwrap();
+        crate::lock_recover(&app.transcode_cache.inventory).swept =
+            Some(Instant::now() - SWEEP_INTERVAL);
+        assert_eq!(enforce_active_cache_limits(&app).unwrap(), 0);
+        assert_eq!(app.remux_metrics.cache_scans.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn throttled_recency_does_not_change_output_or_stamp_contents() {
+        let directory = TempDir::new("recency");
+        let output = directory.join(format!("1-hdr10-{}.mp4", "a".repeat(64)));
+        std::fs::write(&output, [0; 128]).unwrap();
+        let key = "a".repeat(64);
+        rusty_dlna_transcode::write_cache_stamp_for_key(&output, &key).unwrap();
+        let stamp = rusty_dlna_transcode::cache_stamp_path(&output);
+        let old = SystemTime::now() - RECENCY_INTERVAL * 2;
+        std::fs::File::open(&stamp)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let original_stamp = std::fs::read(&stamp).unwrap();
+        let original_output = std::fs::metadata(&output).unwrap().modified().unwrap();
+        touch_recency(&output);
+        let used = std::fs::metadata(&stamp).unwrap().modified().unwrap();
+        assert!(used > old);
+        touch_recency(&output);
+        assert_eq!(std::fs::metadata(&stamp).unwrap().modified().unwrap(), used);
+        assert_eq!(std::fs::read(&stamp).unwrap(), original_stamp);
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().modified().unwrap(),
+            original_output
+        );
+        assert!(rusty_dlna_transcode::cache_is_fresh_for_key(&output, &key));
+    }
+
+    #[test]
+    fn recently_used_unprotected_output_can_still_satisfy_quota_pressure() {
+        let directory = TempDir::new("recency-pressure");
+        let app = test_app(&directory);
+        let output = directory.join(format!("42-hdr10-{}.mp4", "a".repeat(64)));
+        std::fs::write(&output, vec![0; 700_000]).unwrap();
+        rusty_dlna_transcode::write_cache_stamp_for_key(&output, &"a".repeat(64)).unwrap();
+        let stamp = rusty_dlna_transcode::cache_stamp_path(&output);
+        std::fs::File::open(stamp)
+            .unwrap()
+            .set_modified(SystemTime::now() - RECENCY_INTERVAL * 2)
+            .unwrap();
+        assert_eq!(enforce_active_cache_limits(&app).unwrap(), 700_000);
+        touch_recency(&output);
+        let job = test_job(&directory, 1);
+        std::fs::write(&job.part, vec![0; 700_000]).unwrap();
+        crate::lock_recover(&app.remuxes).insert("active".into(), job.clone());
+        assert_eq!(enforce_active_cache_limits(&app).unwrap(), 700_000);
+        assert!(!output.exists());
+        assert!(job.part.exists());
+        crate::lock_recover(&app.remuxes).clear();
+    }
+
+    #[tokio::test]
+    async fn raw_hls_and_mse_resource_reads_refresh_the_same_throttled_recency() {
+        use tokio::io::AsyncReadExt;
+        let directory = TempDir::new("delivery-recency");
+        let app = test_app(&directory);
+        let key = "d".repeat(64);
+        let output = directory.join(format!("42-hdr10-{key}.mp4"));
+        std::fs::write(&output, [0; 128]).unwrap();
+        rusty_dlna_transcode::write_cache_stamp_for_key(&output, &key).unwrap();
+        let stamp = rusty_dlna_transcode::cache_stamp_path(&output);
+        let stamp_contents = std::fs::read(&stamp).unwrap();
+        let modified = std::fs::metadata(&output).unwrap().modified().unwrap();
+        let mut spec = super::super::tests::job_spec(&directory, &key, Vec::new());
+        spec.dest = output.clone();
+        spec.job_key = "web:42:recency".into();
+        for delivery in ["", "hls_init", "mse_init"] {
+            let old = SystemTime::now() - RECENCY_INTERVAL * 2;
+            std::fs::File::open(&stamp)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            let query = if delivery.is_empty() {
+                String::new()
+            } else {
+                format!("?delivery={delivery}&hls_offset=0&hls_length=8")
+            };
+            let request = rusty_dlna_http::HttpRequest::parse_headers(&format!(
+                "GET /web/media/42.mp4{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            ))
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_app = app.clone();
+            let served_spec = spec.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                super::super::serve_remux(&server_app, &mut socket, &request, served_spec)
+                    .await
+                    .unwrap();
+            });
+            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            server.await.unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200 OK"), "{delivery}");
+            assert!(
+                std::fs::metadata(&stamp).unwrap().modified().unwrap() > old,
+                "{delivery}"
+            );
+            assert_eq!(std::fs::read(&stamp).unwrap(), stamp_contents);
+            assert_eq!(
+                std::fs::metadata(&output).unwrap().modified().unwrap(),
+                modified
+            );
+            assert!(rusty_dlna_transcode::cache_is_fresh_for_key(&output, &key));
+        }
+        super::super::shutdown_ephemeral_cleanups(&app);
+        crate::lock_recover(&app.remuxes).clear();
+    }
+
+    /// Filesystem/registry microbenchmark, not a playback latency claim.
+    /// Run with --ignored --nocapture; generated files are always temporary.
+    #[test]
+    #[ignore = "100/1k/10k/100k cache benchmark; run explicitly"]
+    fn cache_scale_benchmark() {
+        for entries in [100, 1_000, 10_000, 100_000] {
+            let directory = TempDir::new("scale-benchmark");
+            let mut config = crate::Config {
+                cache_dir: Some(directory.display().to_string()),
+                rescan_secs: 0,
+                cache_min_free_mb: 0,
+                ..crate::Config::default()
+            };
+            config.transcode.enable = true;
+            let app = Arc::new(App::from_config(config, 18200, 11900, &directory));
+            for id in 0..entries {
+                let output = directory.join(format!("{id}-hdr10-{id:064x}.mp4"));
+                std::fs::write(output, b"x").unwrap();
+            }
+            for producers in [1, 2, 8] {
+                let mut samples = Vec::new();
+                let scans_before = app.remux_metrics.cache_maintenance.load(Ordering::Relaxed);
+                let full_scans_before = app.remux_metrics.cache_scans.load(Ordering::Relaxed);
+                for _ in 0..9 {
+                    let barrier = std::sync::Barrier::new(producers);
+                    let elapsed = std::thread::scope(|scope| {
+                        let handles = (0..producers)
+                            .map(|_| {
+                                let app = &app;
+                                let barrier = &barrier;
+                                scope.spawn(move || {
+                                    barrier.wait();
+                                    let start = std::time::Instant::now();
+                                    enforce_active_cache_limits(app).unwrap();
+                                    start.elapsed().as_secs_f64() * 1000.0
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        handles
+                            .into_iter()
+                            .map(|handle| handle.join().unwrap())
+                            .collect::<Vec<_>>()
+                    });
+                    samples.extend(elapsed);
+                }
+                samples.sort_by(f64::total_cmp);
+                let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+                let deviation = (samples
+                    .iter()
+                    .map(|sample| (sample - mean).powi(2))
+                    .sum::<f64>()
+                    / samples.len() as f64)
+                    .sqrt();
+                let percentile =
+                    |p: f64| samples[((samples.len() - 1) as f64 * p).round() as usize];
+                println!("cache_benchmark entries={entries} producers={producers} n={} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} mean_ms={mean:.3} stddev_ms={deviation:.3} maintenance_calls={} full_scans={} p99_reliable=false conditions=warm-generated-one-byte-unstamped-files", samples.len(), percentile(0.5), percentile(0.95), samples.last().unwrap(), app.remux_metrics.cache_maintenance.load(Ordering::Relaxed) - scans_before, app.remux_metrics.cache_scans.load(Ordering::Relaxed) - full_scans_before);
+            }
+        }
     }
 }

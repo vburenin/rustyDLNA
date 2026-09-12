@@ -139,6 +139,8 @@ pub fn route(method: &str, path: &str) -> HttpRoute {
         | "/web/api.js"
         | "/web/core.js"
         | "/web/captions.js"
+        | "/web/playback-timing.js"
+        | "/web/preview-cache.js"
         | "/web/media-source.js"
         | "/web/playback-source.js"
         | "/web/source-selection.js"

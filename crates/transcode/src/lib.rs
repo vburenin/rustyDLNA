@@ -2827,10 +2827,43 @@ fn transcode_cache_identity_file_controlled_with_ffmpeg(
     ffmpeg_path: &std::path::Path,
     control: ToolQueryControl<'_>,
 ) -> Result<Option<TranscodeCacheIdentity>, ToolQueryError> {
-    let Some(source) = source_identity_file(file, identity_path) else {
+    transcode_cache_identity_file_controlled_observed(
+        file,
+        identity_path,
+        plan,
+        remux_p8,
+        ffmpeg_path,
+        control,
+        &mut |_, _| {},
+    )
+}
+
+/// Fixed preparation phases observed without changing cache identity or helper policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityPreparationStage {
+    SourceSample,
+    ToolIdentity,
+}
+
+fn transcode_cache_identity_file_controlled_observed(
+    file: &std::fs::File,
+    identity_path: &std::path::Path,
+    plan: &TranscodePlan,
+    remux_p8: bool,
+    ffmpeg_path: &std::path::Path,
+    control: ToolQueryControl<'_>,
+    observe: &mut impl FnMut(IdentityPreparationStage, std::time::Duration),
+) -> Result<Option<TranscodeCacheIdentity>, ToolQueryError> {
+    let started = std::time::Instant::now();
+    let source = source_identity_file(file, identity_path);
+    observe(IdentityPreparationStage::SourceSample, started.elapsed());
+    let Some(source) = source else {
         return Ok(None);
     };
-    let ffmpeg = tool_snapshot(ffmpeg_path, ToolVersionFlavor::Ffmpeg, Some(control))?;
+    let started = std::time::Instant::now();
+    let ffmpeg = tool_snapshot(ffmpeg_path, ToolVersionFlavor::Ffmpeg, Some(control));
+    observe(IdentityPreparationStage::ToolIdentity, started.elapsed());
+    let ffmpeg = ffmpeg?;
     let profile8_toolchain = if remux_p8 {
         Some(Profile8ToolchainSnapshot::query_with_ffmpeg(
             ffmpeg.clone(),
@@ -2988,6 +3021,27 @@ pub fn browser_transcode_cache_identity_file_controlled(
 ) -> Result<Option<TranscodeCacheIdentity>, ToolQueryError> {
     transcode_cache_identity_file_controlled(file, identity_path, plan, false, control)
         .map(|identity| identity.map(|identity| identity.with_browser_options(plan, options)))
+}
+
+/// Controlled browser preparation with elapsed durations from the same monotonic clock.
+pub fn browser_transcode_cache_identity_file_observed(
+    file: &std::fs::File,
+    identity_path: &std::path::Path,
+    plan: &TranscodePlan,
+    options: BrowserOutputOptions,
+    control: ToolQueryControl<'_>,
+    mut observe: impl FnMut(IdentityPreparationStage, std::time::Duration),
+) -> Result<Option<TranscodeCacheIdentity>, ToolQueryError> {
+    transcode_cache_identity_file_controlled_observed(
+        file,
+        identity_path,
+        plan,
+        false,
+        std::path::Path::new("ffmpeg"),
+        control,
+        &mut observe,
+    )
+    .map(|identity| identity.map(|identity| identity.with_browser_options(plan, options)))
 }
 
 fn transcode_cache_key_from_identity(

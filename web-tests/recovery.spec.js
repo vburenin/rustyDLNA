@@ -25,7 +25,7 @@ async function syntheticLibrary(page, entry = item, entries = [entry]) {
     library_state: "ready", entries, total: entries.length, offset: 0, limit: 200, generation: 1, has_more: false,
   } }));
   await page.route("**/api/web/item/*", (route) => route.fulfill({ json: {
-    schema_version: 2, id: entry.id, item: entry, audio_tracks: entry.audio_tracks, chapters: [],
+    schema_version: 2, generation: 1, id: entry.id, item: entry, audio_tracks: entry.audio_tracks, chapters: [],
   } }));
   await page.route("**/api/web/transcode/*", (route) => route.fulfill({ json: {
     schema_version: 2, state: "producing", retry_after_seconds: null,
@@ -356,9 +356,27 @@ for (const entryPoint of ["seek", "deep link"]) {
 }
 
 for (const producerState of ["failed", "producing"]) {
-  test(`a truncated portable stream with a ${producerState} producer preserves progress and stops without advancing the queue`, async ({ page }) => {
+  test(`a truncated portable stream with a ${producerState} producer preserves progress and stops without advancing the queue`, async ({ page }, testInfo) => {
     await syntheticLibrary(page, item, [item, { ...item, id: "2", title: "Next fixture" }]);
     await page.addInitScript(() => {
+      const events = window.__recoveryMediaEvents = [];
+      const record = (type, video, detail = null) => {
+        events.push({ type, detail, at: performance.now(), time: video.currentTime, paused: video.paused,
+          ended: video.ended, ready: video.readyState, seeking: video.seeking,
+          request: video.src ? new URL(video.src).searchParams.get("request") : null });
+        if (events.length > 128) events.shift();
+      };
+      for (const type of ["play", "playing", "pause", "ended", "loadedmetadata", "canplay", "error", "seeked"]) {
+        document.addEventListener(type, (event) => {
+          if (event.target instanceof HTMLMediaElement) record(type, event.target, event.isTrusted);
+        }, true);
+      }
+      const play = HTMLMediaElement.prototype.play;
+      HTMLMediaElement.prototype.play = function (...args) {
+        record("play-call", this);
+        return play.apply(this, args).then((value) => { record("play-resolved", this); return value; },
+          (error) => { record("play-rejected", this, error.name); throw error; });
+      };
       localStorage.setItem("rustydlna.stream", "compat");
       localStorage.setItem("rustydlna.autoplay", "true");
       localStorage.setItem("rustydlna.webProgress.v1", JSON.stringify({
@@ -401,7 +419,11 @@ for (const producerState of ["failed", "producing"]) {
     await page.getByRole("button", { name: "Play Recovery fixture" }).click();
     await expect(page.locator("#queue-position")).toHaveText("Item 1 of 2");
     await page.locator("#resume-button").click();
-    await expect(page.locator("#player-message")).toContainText("The server could not prepare this title.");
+    await expect(page.locator("#player-message")).toContainText("The server could not prepare this title.").catch(async (error) => {
+      await testInfo.attach("recovery-media-events", { contentType: "application/json",
+        body: JSON.stringify(await page.evaluate(() => window.__recoveryMediaEvents), null, 2) });
+      throw error;
+    });
     const expectedGenerations = producerState === "failed" ? 1 : 4;
     expect(checksAfterEnd).toBeGreaterThan(0);
     // Native loaders may request a URL several times (for example for ranges).

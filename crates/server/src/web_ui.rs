@@ -19,6 +19,8 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
 const API_JS: &str = include_str!("../web/api.js");
+const PLAYBACK_TIMING_JS: &str = include_str!("../web/playback-timing.js");
+const PREVIEW_CACHE_JS: &str = include_str!("../web/preview-cache.js");
 const MEDIA_SOURCE_JS: &str = include_str!("../web/media-source.js");
 const PLAYBACK_SOURCE_JS: &str = include_str!("../web/playback-source.js");
 const SOURCE_SELECTION_JS: &str = include_str!("../web/source-selection.js");
@@ -87,7 +89,7 @@ const WEB_SCHEMA_VERSION: u8 = 2;
 // Change when a browser API representation can differ without a catalog
 // generation change. This keeps conditional requests from reusing capability
 // or media metadata cached from an older rustyDLNA build.
-const WEB_API_CACHE_REVISION: u8 = 7;
+const WEB_API_CACHE_REVISION: u8 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WebItemId(i64);
@@ -133,6 +135,7 @@ struct WebCapabilities {
     video_outputs: Vec<WebVideoOutput>,
     ai_upscale: Option<WebAiUpscaleCapability>,
     native_downloads: bool,
+    mse_resource_max_bytes: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -219,6 +222,7 @@ struct WebLibraryPage {
 #[derive(Serialize)]
 struct WebItemDetails {
     schema_version: u8,
+    generation: u32,
     id: WebItemId,
     item: WebMediaItem,
     audio_tracks: Vec<WebAudioTrack>,
@@ -486,6 +490,7 @@ fn web_capabilities(app: &App) -> WebCapabilities {
             .collect(),
         video_outputs,
         native_downloads: app.cfg.transcode.enable,
+        mse_resource_max_bytes: rusty_dlna_protocol::MSE_RESOURCE_MAX_BYTES,
         ai_upscale: (!app.ai_upscale_profiles.is_empty()).then(|| WebAiUpscaleCapability {
             label: "AI upscale",
             max_scale: 2,
@@ -527,6 +532,15 @@ fn api_error(
 }
 
 pub(crate) fn transcode_stream_error(status_code: u16, code: &'static str) -> HttpResponse {
+    if code == "resource_limit" {
+        return api_error(
+            status_code,
+            code,
+            "This stream exceeds the playback memory limit. Try the original file.",
+            false,
+            Some("play_original"),
+        );
+    }
     match code {
         "transcode_busy" => {
             let mut response = api_error(
@@ -601,6 +615,8 @@ pub(crate) fn asset(app: &App, path: &str) -> HttpResponse {
         "/web/app.css" => ("text/css; charset=utf-8", APP_CSS),
         "/web/app.js" => ("text/javascript; charset=utf-8", APP_JS),
         "/web/api.js" => ("text/javascript; charset=utf-8", API_JS),
+        "/web/playback-timing.js" => ("text/javascript; charset=utf-8", PLAYBACK_TIMING_JS),
+        "/web/preview-cache.js" => ("text/javascript; charset=utf-8", PREVIEW_CACHE_JS),
         "/web/media-source.js" => ("text/javascript; charset=utf-8", MEDIA_SOURCE_JS),
         "/web/playback-source.js" => ("text/javascript; charset=utf-8", PLAYBACK_SOURCE_JS),
         "/web/source-selection.js" => ("text/javascript; charset=utf-8", SOURCE_SELECTION_JS),
@@ -1633,7 +1649,7 @@ pub(crate) fn item(app: &App, req: &HttpRequest) -> HttpResponse {
         return not_found();
     }
     let params = QueryParams::parse(&req.query);
-    if params.has_unknown(&["enrich"]) {
+    if params.has_unknown(&["enrich", "generation"]) {
         return api_error(
             400,
             "invalid_parameter",
@@ -1655,6 +1671,18 @@ pub(crate) fn item(app: &App, req: &HttpRequest) -> HttpResponse {
             )
         }
     };
+    let requested_generation = match params.optional_u32("generation") {
+        Ok(value) => value,
+        Err(_) => {
+            return api_error(
+                400,
+                "invalid_generation",
+                "The catalog generation must be a non-negative whole number.",
+                false,
+                None,
+            )
+        }
+    };
     let Some(id) = web_item_id(&req.path) else {
         return api_error(
             400,
@@ -1665,6 +1693,16 @@ pub(crate) fn item(app: &App, req: &HttpRequest) -> HttpResponse {
         );
     };
     let catalog = read_recover(&app.catalog);
+    let generation = app.update_id.load(Ordering::Acquire);
+    if requested_generation.is_some_and(|requested| requested != generation) {
+        return api_error(
+            409,
+            "catalog_changed",
+            "The library changed while this title was loading. Refresh the list and try again.",
+            true,
+            Some("retry_library"),
+        );
+    }
     let Some(item) = catalog.get_item_by_detail(id).cloned() else {
         return api_error(
             404,
@@ -1676,7 +1714,6 @@ pub(crate) fn item(app: &App, req: &HttpRequest) -> HttpResponse {
     };
     #[cfg(test)]
     pause_item_snapshot_if_requested(app, id);
-    let generation = app.update_id.load(Ordering::Acquire);
     drop(catalog);
     let etag = format!(
         "W/\"web-v{WEB_SCHEMA_VERSION}-r{WEB_API_CACHE_REVISION}-{generation}-item-{id}{}\"",
@@ -1773,6 +1810,7 @@ pub(crate) fn item(app: &App, req: &HttpRequest) -> HttpResponse {
         200,
         &WebItemDetails {
             schema_version: WEB_SCHEMA_VERSION,
+            generation,
             id: id.into(),
             item: item_dto,
             audio_tracks,
@@ -2174,6 +2212,23 @@ pub(crate) fn preview(app: &App, req: &HttpRequest) -> HttpResponse {
     }
 }
 
+/// Read an already validated media request's correlation tuple using the same
+/// bounded, duplicate-rejecting query parser as admission and status routes.
+pub(crate) fn playback_timing_key(
+    req: &HttpRequest,
+    detail_id: i64,
+) -> Option<crate::remux::performance::TimingKey> {
+    let params = QueryParams::parse(&req.query);
+    if params.invalid {
+        return None;
+    }
+    Some((
+        detail_id,
+        params.optional_u64("session").ok()??,
+        params.optional_u64("request").ok()??,
+    ))
+}
+
 pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
     if !app.cfg.web.enable {
         return not_found();
@@ -2194,7 +2249,7 @@ pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
         );
     }
     let params = QueryParams::parse(&req.query);
-    if params.has_unknown(&["request", "session", "event"]) {
+    if params.has_unknown(&["request", "session", "event", "elapsed_ms"]) {
         return api_error(
             400,
             "invalid_parameter",
@@ -2227,7 +2282,33 @@ pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
             )
         }
     };
-    let startup_event = if startup_report {
+    let browser_stage = match params.get("event") {
+        Some("selection_to_frame") => Some(crate::remux::performance::Stage::SelectionToFrame),
+        Some("seek_to_frame") => Some(crate::remux::performance::Stage::SeekToFrame),
+        Some("capability_negotiation") => {
+            Some(crate::remux::performance::Stage::CapabilityNegotiation)
+        }
+        _ => None,
+    };
+    let browser_elapsed = match params.optional_u64("elapsed_ms") {
+        Ok(value)
+            if value.is_none_or(|value| value <= 120_000)
+                && (value.is_some() == browser_stage.is_some())
+                && (value.is_none() || startup_report) =>
+        {
+            value
+        }
+        _ => {
+            return api_error(
+                400,
+                "invalid_timing",
+                "The playback duration is invalid.",
+                false,
+                None,
+            )
+        }
+    };
+    let startup_event = if startup_report && browser_stage.is_none() {
         let Some(event) = params
             .get("event")
             .and_then(crate::remux::WebStartupEvent::from_wire)
@@ -2289,6 +2370,16 @@ pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
         if let Some(request_id) = request_id {
             crate::remux::keep_web_request_alive(app, id, session_id, request_id);
         }
+    }
+    if let Some((stage, elapsed)) = browser_stage.zip(browser_elapsed) {
+        crate::remux::record_browser_timing(
+            app,
+            id,
+            session_id.unwrap_or_default(),
+            request_id.unwrap_or_default(),
+            stage,
+            elapsed,
+        );
     }
     if let Some(event) = startup_event {
         crate::remux::record_web_startup_event(
@@ -2385,6 +2476,7 @@ fn quality_within_ai_scale_limit(
 }
 
 pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpResponse {
+    let preparation_started = std::time::Instant::now();
     if !app.cfg.web.enable {
         return not_found();
     }
@@ -2482,6 +2574,19 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             )
         }
     };
+    use crate::remux::performance::Stage;
+    let timing_key = session_id
+        .zip(request_id)
+        .map(|(session, request)| (id, session, request));
+    if let Some(key) = timing_key {
+        app.remux_metrics
+            .performance
+            .begin_at(key, preparation_started);
+    }
+    let _preparation =
+        app.remux_metrics
+            .performance
+            .timer_at(timing_key, Stage::Preparation, preparation_started);
     let source_mode = match params.get("mode").unwrap_or("compatible") {
         "direct" => "direct",
         "compatible" => "compatible",
@@ -2573,6 +2678,11 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         delivery,
         "hls_init" | "hls_segment" | "mse_init" | "mse_segment"
     );
+    if delivery.starts_with("mse_")
+        && hls_length.is_some_and(|length| length > rusty_dlna_protocol::MSE_RESOURCE_MAX_BYTES)
+    {
+        return transcode_stream_error(413, "resource_limit");
+    }
     let valid_hls_range = matches!(
         (hls_offset, hls_length),
         (Some(_), Some(1..=MAX_HLS_RESOURCE_BYTES))
@@ -3056,6 +3166,10 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
     let (source_file, source_path, cache_identity) = if let Some(prepared) = prepared {
         prepared
     } else {
+        let source_open = app
+            .remux_metrics
+            .performance
+            .timer(timing_key, Stage::SourceOpen);
         let configured_path =
             rusty_dlna_scan::rebase_media_path_for_config(&item.path, &app.scan_cfg);
         let opened = match rusty_dlna_scan::open_allowed_file(&configured_path, &app.scan_cfg) {
@@ -3080,18 +3194,33 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
                 );
             }
         };
+        drop(source_open);
         let tool_control = ToolQueryControl::new(
             &app.helpers,
             &app.scan_cfg.cancellation,
             Duration::from_secs(app.cfg.helper_queue_timeout_secs),
         );
         let cache_identity =
-            match rusty_dlna_transcode::browser_transcode_cache_identity_file_controlled(
+            match rusty_dlna_transcode::browser_transcode_cache_identity_file_observed(
                 &opened.file,
                 &opened.resolved_path,
                 &plan,
                 browser_options,
                 tool_control,
+                |stage, elapsed| {
+                    app.remux_metrics.performance.record(
+                        timing_key,
+                        match stage {
+                            rusty_dlna_transcode::IdentityPreparationStage::SourceSample => {
+                                Stage::SourceSample
+                            }
+                            rusty_dlna_transcode::IdentityPreparationStage::ToolIdentity => {
+                                Stage::ToolIdentity
+                            }
+                        },
+                        elapsed,
+                    )
+                },
             ) {
                 Ok(Some(identity)) => identity,
                 Ok(None) => {

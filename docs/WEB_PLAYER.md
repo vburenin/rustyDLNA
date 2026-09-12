@@ -96,8 +96,13 @@ replace the current history entry rather than adding Back-button stops.
 Navigation uses a request epoch: when newer Back/Forward or in-page navigation
 or selection supersedes a linked title that is still loading or being enriched,
 the older request cannot select, focus, message, or start that title. Linked
-item details load alongside the library request; playback waits for the server
-capabilities before choosing a source. Queue changes also update the URL,
+item details load alongside the library request. Playback waits only for the
+validated first page's capabilities and item metadata from that same catalog
+generation. Later library pages continue in the background; a failure on a later
+page offers library retry without preventing linked playback. A linked selection
+keeps a singleton queue. Card selection retains the complete loaded-list snapshot.
+A changed generation causes a guarded item refetch; a superseded navigation
+cannot start playback or move focus. Queue changes also update the URL,
 page title, and current library card without adding history entries.
 
 Metadata titles from NFO files or tags are primary. The filename is shown only
@@ -179,6 +184,8 @@ fullscreen, captions, audio tracks, chapters, stream mode, and compatible
 quality. The player toolbar shows the active transcoded-quality shortcut; it
 opens a dedicated, scrollable chooser with every advertised profile, including
 480p and 360p. Playback settings retains the same selector.
+The saved speed applies from the first presented frame and survives source
+loads, buffered seeks, compatible restarts and pause/resume.
 
 Playback settings also offers a browser-local **Encoding preset**, independent
 of quality/resolution: **Balanced** (default), **Fast start** (less encoder
@@ -390,14 +397,27 @@ AirPlay. Browser MP4 output does not carry FFmpeg's implicit chapter text track:
 chapter navigation continues to use catalog metadata while the native stream
 contains exactly its declared video and audio tracks.
 
-Chrome for Android retains ordinary MP4 delivery when compatible video can be
-copied. When video must be encoded, the player feeds finite initialization and
-media fragments through Media Source, avoiding a failed native growing-file
-startup attempt. Exact HEVC Main 10/HDR10 SourceBuffer support keeps an HDR
+Chrome for Android uses finite Media Source initialization and movie fragments
+for compatible video when the browser supports the selected SourceBuffer type.
+Supported video and AAC remain copied; encoding follows the existing independent
+stream negotiation. Exact HEVC Main 10/HDR10 SourceBuffer support keeps an HDR
 output; otherwise the output is H.264 SDR. Auto uses the server-designated
 mobile fallback profile, while an explicit quality is preserved.
-The fragment path keeps only a bounded window ahead of and behind playback;
-seeks remain generation-safe compatible-stream restarts. A native MP4 that
+The fragment path bounds both buffered duration and estimated compressed bytes.
+A nearby MSE seek reuses the source only when its selected tracks, quality,
+capabilities, and active generation still match and the required decoder data is
+buffered. The server's per-fragment `#EXT-X-RUSTY-TIMING` metadata identifies the
+preceding random-access point. Copied video requires that point through two
+seconds after the target; encoded video requires a quarter-second forward margin.
+If an owned buffer operation is still completing, the seek can wait up to 100 ms
+before rechecking source ownership and the actual remaining decoder data. A newer
+seek or source cancellation invalidates that pending decision.
+Missing metadata, timestamp gaps, evicted data, stale sources, and changed settings
+retain the generation-safe restart path. Source-local time is mapped through the
+current global segment offset, with initial priming learned once per source.
+Eligible seeks preserve playing/paused intent, captions, loop, progress, rate,
+volume and mute, and fetch no new initialization or generation. Native HLS and raw
+MP4 keep their existing seek behavior. A native MP4 that
 unexpectedly fails can still enter the same recovery path. Working copied-video
 titles and the saved quality preference are unchanged.
 
@@ -433,6 +453,12 @@ each nonempty body chunk must arrive within 15 seconds. The entire request
 is limited to 180 seconds for a playlist and 120 seconds for media. Bodies are
 counted while streaming, including responses without `Content-Length`: playlists
 are capped at 4 MiB, media resources at 32 MiB, and either at 65,536 reads.
+The server advertises `capabilities.mse_resource_max_bytes` and applies the same
+32 MiB ceiling before advertising or serving an MSE resource. A complete copied
+fragment that exceeds that ceiling returns `resource_limit`; rustyDLNA preserves
+its GOP and offers Original playback rather than silently changing quality.
+Native HLS retains its separate 64 MiB resource ceiling. These delivery checks do
+not change encoded output or its cache identity.
 Source opening and each SourceBuffer append/remove operation have a 20-second
 completion deadline. The producer-status request used by recovery also has a
 15-second deadline, including its body.
@@ -454,8 +480,14 @@ one fresh Media Source attachment at the same position and quality. That
 reattachment adopts the existing producer instead of cancelling it first. The
 forward buffer is limited to about ten seconds and retains about five seconds
 behind playback; initial audio priming or reordered-video timestamp gaps are
-counted in that limit even before the media clock advances. This keeps copied
-UHD streams below practical browser SourceBuffer quotas. If copied
+counted in that limit even before the media clock advances. Initialization and
+retained movie fragments also have a 96 MiB compressed-byte budget; a fragment
+remains fully charged until it is evicted. This is an estimate of encoded data,
+not a measurement or guarantee of the browser's decoded surfaces. Eviction
+preserves copied-video random-access prerequisites. Quota pressure can prune
+behind playback and retry within the existing operation deadline. A paused seek
+may prune toward its target; if its required decoder data cannot fit, it reports a
+resource error without invoking codec or lossy-quality fallback. If copied
 HEVC remains unreliable and the browser accepts the advertised encoded-HDR
 SourceBuffer type, the next recovery re-encodes to independently keyed HEVC
 HDR10 at the same quality. Portable H.264/AAC is the final fallback if that HDR
@@ -692,12 +724,21 @@ not a server setting. The operator generator is
 frames per title: typically 1 second for 20 minutes, 2 seconds for 45 minutes,
 3 seconds for 90 minutes to 2 hours, and 5 seconds for 3 hours. Large or
 portrait frames that fit fewer samples within 256 sheets use the corresponding
-longer layout-aware interval. Up to eight compressed sheets are warmed into the
-browser cache after title selection. For larger layouts, those eight are sampled
-evenly across the title and every other sheet remains available on demand. A
+longer layout-aware interval. Speculative manifest and sheet loading waits for
+first-frame presentation and at least three seconds of buffered media. An active
+scrub target may load immediately. Up to eight speculative sheets are sampled
+evenly across the title; every other sheet remains available on demand. One worker
+fetches and decodes at a time, with one pending latest scrub target. New targets
+cancel stale work, and repeated targets share a request. A
 failed cached response is refreshed once before the preview falls back to the
 last decoded video frame.
-Only two decoded sheets are retained. A selected preview stays visible through
+Only two sheets are retained. Existing images and the next decode share a 64 MiB
+budget for estimated RGBA pixels and data-URL text. A bounded JPEG header check
+verifies dimensions before decoding; each sheet permits at most 4,096 pixels per
+edge and 12 million pixels. One compressed body of at most 16 MiB and a 256 KiB
+header buffer can additionally be held, with bounded reads and fetch/decode
+deadlines. These are application estimates rather than browser heap guarantees.
+A selected preview stays visible through
 the direct seek or compatible source replacement and is removed only when the
 real target frame is displayable. Missing, stale, or invalid sidecars silently
 use the last decoded frame instead.
@@ -761,7 +802,12 @@ the player starts Compatible playback when necessary to enforce that choice;
 explicit Original mode keeps and displays the file's original/default track.
 A successful metadata retry re-negotiates Auto or Prepared playback to apply
 the preferred audio track, preserving the title session, position, and pause
-intent. Explicit track choices survive later metadata updates, including when
+intent. The request survives source replacement for the same selected title;
+selecting another title or stopping playback cancels it. A catalog change while
+it is pending produces a retryable error instead of applying stale details.
+Initial linked enrichment must match the generation of its item and capabilities
+before the player commits that selection.
+Explicit track choices survive later metadata updates, including when
 the chosen index was previously the default. If no English tag is present, the
 marked default and existing codec fallback order are kept.
 When transcoding is disabled, the track selector is disabled and no recovery,
@@ -851,10 +897,10 @@ used in item, media, caption, preview, and transcode-status URLs.
 |---|---|
 | `/` | Player, or status page when the player is disabled |
 | `/web/app.css` | Embedded stylesheet |
-| `/web/{app,api,core,library,player,preferences,store,captions,media-source,playback-source,source-selection}.js` | Embedded ES modules |
+| `/web/{app,api,core,library,player,preferences,store,captions,media-source,playback-source,source-selection,playback-timing,preview-cache}.js` | Embedded ES modules |
 | `/api/web/library` | Versioned folder, flat-library, or bounded Continue Watching hydration page, plus server root, capabilities, generation, and item DTOs |
-| `/api/web/item/{id}` | One item; `enrich=1` explicitly probes legacy stream metadata |
-| `/api/web/transcode/{id}?session={session_id}&request={generation_id}` | GET returns generation-scoped `queued`, `starting`, `producing`, `ready`, `cancelled`, or `failed` state plus optional `produced_seconds` measured from complete output-fragment timestamps; POST with a bounded startup `event` records the current generation's server-clock timing; DELETE records and cancels an abandoned generation |
+| `/api/web/item/{id}` | One item and its catalog `generation`; optional `generation` requires a matching snapshot (409 otherwise); `enrich=1` explicitly probes legacy stream metadata |
+| `/api/web/transcode/{id}?session={session_id}&request={generation_id}` | GET returns generation-scoped `queued`, `starting`, `producing`, `ready`, `cancelled`, or `failed` state plus optional `produced_seconds` measured from complete output-fragment timestamps; POST with a bounded startup `event` records the current generation's server-clock observation, or `selection_to_frame`, `seek_to_frame`, and `capability_negotiation` with an integer `elapsed_ms` from 0–120,000 records browser-local elapsed time; DELETE records and cancels an abandoned generation |
 | `/web/download/{id}` | Original video as an attachment, with byte ranges and the source filename |
 | `/web/media/{id}.mp4?mode=direct` | Original jailed media with byte ranges |
 | `/web/media/{id}.mp4?...` | Compatible stream with validated audio track, start, quality, negotiated `video_mode`/`video_output`/`audio_mode`, reason, playback session, and generation parameters |
@@ -985,6 +1031,82 @@ default gateway bind is `127.0.0.1:8201`; a reverse proxy in another container c
 verifies both the allowed browser paths and denied DLNA surface.
 `restart-web.sh` rebuilds and recreates only the gateway, waits for it to become
 healthy, runs that smoke test, and leaves the DLNA service untouched.
+
+## Playback measurements
+
+`playbackTimingSnapshot()` in `/web/playback-timing.js` exposes at most 64 recent
+browser-local records and fixed histograms. Selection starts before capability
+negotiation; a linked navigation includes metadata and first-page capabilities.
+`requestVideoFrameCallback` supplies presented-frame completion. Browsers without
+that API use explicitly marked estimates, kept in separate histograms. Original
+playback records remain browser-local; compatible durations also reach the
+owning server generation when the elapsed value is within 0–120,000 ms. Longer
+durations remain in the local record and are not clipped into a shorter server
+measurement. Browser and server clock origins are never subtracted.
+
+`/api/status` retains existing startup fields and adds fixed duration buckets,
+cache operation counts, and `transcode.web_player.performance`. Preparation,
+source open/sample, tool identity, admission, helper attempts, server-observed
+first complete fragment, and playlist readiness are distinct observations.
+The recent server record is bounded to 64 generations; paths, titles, session
+IDs, and request IDs are absent from metric labels and exported records.
+
+`node scripts/playback-benchmark.mjs --help` describes the generated-fixture
+benchmark. Run it against each saved server binary under matching conditions;
+reports, logs, and media belong in temporary storage. The CPU subset covers
+Original, cold/warm Compatible, attachment, and buffered/restarted seeks, with
+explicit recipe, display/delivery, concurrency, cache conditions, versions, and
+resource-sampling limitations. Percentiles include sample counts and variability;
+small-sample p95/p99 values are descriptive observations, not reliable tail
+estimates. Dedicated HDR/Dolby Vision, GPU, device, and storage tiers require
+separate measurements and are reported as unavailable when not exercised.
+
+For an ordinary CPU smoke run after building the server:
+
+```sh
+node scripts/playback-benchmark.mjs --samples=2 --recipes=copy,audio,video,both --size=640x360 --output=/tmp/playback-smoke.json
+```
+
+Use at least ten independent trials for a before/after comparison, saving the
+baseline executable before editing its embedded assets. Pass `--binary` for each
+executable, its `--build-profile=debug|release`, and
+`--compare=/tmp/playback-before.json` to the after run. Comparisons
+reject mismatched workload/environment conditions. Default engineering guard
+bands flag median increases exceeding both 25% and 50 ms, and observed p95
+increases exceeding both 30% and 100 ms; these are configurable thresholds, not
+statistical confidence. Fewer than ten trials cannot gate a regression; p99
+gating is disabled below 1,000 independent trials and is still an engineering
+threshold rather than a confidence interval. Concurrent viewers from one
+trial are correlated. Repeat flagged workloads under matching idle conditions.
+
+`--concurrency=1|2|4`, `--fps=24|30|60`, `--rate=1|2` and `--size` select generated
+tiers. A supplied 35–600-second `--fixture` is copied into the temporary library;
+`--tier` labels the intended coverage and `--encoder` selects an existing server
+encoder. Actual negotiation, output probes and frame checks establish which tier
+ran. They do not force a GPU/HDR/Dolby Vision pipeline. The CPU subset deliberately
+ends audio before video; audio-only final fragments remain a separate index
+limitation and are recorded in each report. Resource sampling includes the
+harness, browser, server and live descendants at approximately 100-ms intervals;
+short-lived helpers may be missed, and summed RSS is not unique physical memory.
+The report records actual media-element speed at presentation, seek completion
+and sustained-window boundaries and rejects a mismatch with the requested speed.
+Media-clock progression and dropped-frame observations remain separate checks;
+a selected 2× rate alone does not establish sustained 2× playback. Cumulative
+process-sampling time is observer overhead, separate from measured window duration
+and browser latency.
+
+The separate linked-navigation benchmark injects 600-ms page latency into
+400-card and 10,000-card libraries while serving generated media from memory:
+
+```sh
+RUSTY_DLNA_LINK_BENCHMARK_REPORT=/tmp/linked-after.jsonl npx playwright test web-tests/linked-startup.spec.js --grep 'measure linked startup' --project=chromium --workers=1 --repeat-each=8
+```
+
+Set `RUSTY_DLNA_PLAYWRIGHT_SERVER_PROGRAM` to a saved baseline executable for
+the before run and choose a different JSONL report path. Each record includes
+the fixture hash, versions, hardware, delay, media-request timing and presented
+frame timing. Run these measurements separately from the workspace gate and
+other browser workloads; list-rendering completion is separate from link-to-frame.
 
 ## Browser support and verification
 

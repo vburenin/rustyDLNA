@@ -45,6 +45,7 @@ export function initialState(navigation, preferences) {
         ai_upscale: null,
       },
       negotiationEpoch: 0,
+      generation: null,
       state: "connecting",
     },
     library: {
@@ -131,6 +132,7 @@ function reduce(state, action) {
           entries: [],
         },
       };
+    case "LIBRARY_CAPABILITIES":
     case "LIBRARY_SUCCESS": {
       if (action.requestId !== state.library.requestId) return state;
       const entries = action.payload.entries;
@@ -144,10 +146,11 @@ function reduce(state, action) {
           name: action.payload.server_name,
           rootFolderId: action.payload.root_folder_id,
           capabilities,
+          generation: action.payload.generation,
           negotiationEpoch: state.server.negotiationEpoch + Number(negotiationChanged),
           state: action.payload.library_state === "empty" ? "empty" : "ready",
         },
-        library: {
+        library: action.type === "LIBRARY_CAPABILITIES" ? state.library : {
           ...state.library,
           status: "ready",
           entries,

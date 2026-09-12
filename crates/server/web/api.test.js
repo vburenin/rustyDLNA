@@ -67,6 +67,7 @@ test("incomplete pages cannot silently publish a partial snapshot", async (t) =>
   for (const patch of [
     { entries: [] }, { offset: 1 }, { limit: 0 }, { limit: 201 },
     { total: -1 }, { total: 1.5 }, { has_more: false },
+    { generation: null }, { generation: -1 }, { generation: 0x1_0000_0000 },
   ]) {
     await t.test(JSON.stringify(patch), async (t) => {
       t.mock.method(globalThis, "fetch", async () => response({ ...page(0, 201), ...patch }));
@@ -118,4 +119,69 @@ test("replacing a snapshot rejects late pages even when fetch ignores cancellati
   releaseOld();
   await rejected;
   assert.equal(current.entries.length, 1);
+});
+
+test("validated first-page capabilities are available while later metadata is held", async (t) => {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let firstPage;
+  let complete = false;
+  t.mock.method(globalThis, "fetch", async (input) => {
+    const offset = Number(new URL(input, "http://localhost").searchParams.get("offset"));
+    if (offset > 0) await held;
+    return response({ ...page(offset, 400), capabilities: { transcoding: true } });
+  });
+  const snapshot = new WebApi().librarySnapshot(navigation, {
+    onFirstPage: (payload) => { firstPage = payload; },
+  }).then((payload) => { complete = true; return payload; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(firstPage.generation, 17);
+  assert.equal(firstPage.capabilities.transcoding, true);
+  assert.equal(complete, false);
+  release();
+  assert.equal((await snapshot).entries.length, 400);
+});
+
+test("invalid or superseded first pages cannot publish capabilities", async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => response({ ...page(0, 201), entries: [] }));
+  await assert.rejects(new WebApi().librarySnapshot(navigation, {
+    onFirstPage: () => { calls += 1; },
+  }), { code: "invalid_page" });
+  assert.equal(calls, 0);
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  t.mock.method(globalThis, "fetch", async () => { await held; return response(page(0, 1)); });
+  const api = new WebApi();
+  const old = api.librarySnapshot(navigation, { onFirstPage: () => { calls += 1; } });
+  const rejected = assert.rejects(old, { name: "AbortError" });
+  api.abortLibrary();
+  release();
+  await rejected;
+  assert.equal(calls, 0);
+});
+
+test("a later-page failure preserves the already published capability snapshot", async (t) => {
+  let published;
+  t.mock.method(globalThis, "fetch", async (input) => {
+    if (new URL(input, "http://localhost").searchParams.get("offset") !== "0") throw new Error("unavailable");
+    return response(page(0, 400));
+  });
+  await assert.rejects(new WebApi().librarySnapshot(navigation, {
+    onFirstPage: (payload) => { published = payload; },
+  }), /unavailable/);
+  assert.equal(published.generation, 17);
+});
+
+test("linked item requests can require the capability catalog generation", async (t) => {
+  t.mock.method(globalThis, "fetch", async (input, { signal }) => {
+    const url = new URL(input, "http://localhost");
+    assert.equal(url.pathname, "/api/web/item/9007199254740993");
+    assert.equal(url.searchParams.get("generation"), "17");
+    assert.equal(url.searchParams.get("enrich"), "1");
+    assert.equal(signal.aborted, false);
+    return response({ schema_version: 2, generation: 17 });
+  });
+  const payload = await new WebApi().item("9007199254740993", { generation: 17, enrich: true });
+  assert.equal(payload.generation, 17);
 });

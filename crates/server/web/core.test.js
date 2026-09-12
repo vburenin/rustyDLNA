@@ -688,6 +688,7 @@ test("HLS media playlists expose only confined fixed fragmented-MP4 resources", 
   assert.deepEqual(parseHlsMediaPlaylist(playlist, "https://movies.example/web/media/42.m3u8"), {
     initUrl: "https://movies.example/web/media/42.mp4?request=7&delivery=hls_init&hls_offset=0&hls_length=1024",
     segmentUrls: ["https://movies.example/web/media/42.m4s?request=7&delivery=hls_segment&hls_offset=1024&hls_length=4096"],
+    segments: [{ url: "https://movies.example/web/media/42.m4s?request=7&delivery=hls_segment&hls_offset=1024&hls_length=4096", duration: 2 }],
     ended: true,
   });
   assert.equal(parseHlsMediaPlaylist(playlist.replace("/web/media/42.m4s", "https://evil.example/video.m4s"), "https://movies.example/playlist.m3u8"), null);
@@ -702,6 +703,7 @@ test("HLS media playlists expose only confined fixed fragmented-MP4 resources", 
     {
       initUrl: "https://movies.example/web/media/42.mp4?request=7&delivery=mse_init&hls_offset=0&hls_length=1024",
       segmentUrls: ["https://movies.example/web/media/42.m4s?request=7&delivery=mse_segment&hls_offset=1024&hls_length=4096"],
+      segments: [{ url: "https://movies.example/web/media/42.m4s?request=7&delivery=mse_segment&hls_offset=1024&hls_length=4096", duration: 2 }],
       ended: true,
     },
   );
@@ -725,6 +727,7 @@ test("HLS media playlists expose only confined fixed fragmented-MP4 resources", 
     {
       initUrl: "https://movies.example/web/media/42.mp4?request=7&delivery=mse_init&hls_offset=0&hls_length=1024",
       segmentUrls: [],
+      segments: [],
       ended: true,
     },
   );

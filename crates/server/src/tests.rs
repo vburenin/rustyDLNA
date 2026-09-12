@@ -935,9 +935,10 @@ fn web_item_samples_item_and_generation_under_one_catalog_snapshot() {
     assert_eq!(response.status, 200);
     let json: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(json["item"]["title"], old_title);
+    assert_eq!(json["generation"], old_generation);
     assert_eq!(
         resp_header(&response, "ETag"),
-        Some(format!("W/\"web-v2-r7-{old_generation}-item-{detail_id}\"").as_str())
+        Some(format!("W/\"web-v2-r8-{old_generation}-item-{detail_id}\"").as_str())
     );
     done_rx.recv().unwrap().unwrap();
     publisher.join().unwrap();
@@ -952,6 +953,45 @@ fn web_item_samples_item_and_generation_under_one_catalog_snapshot() {
             .title,
         new_title
     );
+}
+
+#[test]
+fn web_item_generation_guard_matches_the_capability_snapshot() {
+    let app = testdata_app();
+    let generation = app.update_id.load(Ordering::Acquire);
+    let detail_id = read_recover(&app.catalog)
+        .items
+        .values()
+        .find(|item| item.title == "Fixture Movie")
+        .unwrap()
+        .detail_id;
+    let response = app.handle(&req(&get(
+        &format!("/api/web/item/{detail_id}?generation={generation}"),
+        "LinkedStartup/1.0",
+    )));
+    assert_eq!(response.status, 200);
+    let json: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(json["generation"], generation);
+    let stale_generation = rusty_dlna_protocol::soap::next_system_update_id(generation);
+    let response = app.handle(&req(&get(
+        &format!("/api/web/item/{detail_id}?generation={stale_generation}"),
+        "LinkedStartup/1.0",
+    )));
+    assert_eq!(response.status, 409);
+    let json: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(json["error"]["code"], "catalog_changed");
+    for query in [
+        "generation=-1",
+        "generation=nope",
+        "generation=4294967296",
+        "generation=0&generation=1",
+    ] {
+        let response = app.handle(&req(&get(
+            &format!("/api/web/item/{detail_id}?{query}"),
+            "LinkedStartup/1.0",
+        )));
+        assert_eq!(response.status, 400, "{query}");
+    }
 }
 
 #[test]
@@ -5805,6 +5845,8 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     for asset in [
         "/web/app.js",
         "/web/api.js",
+        "/web/playback-timing.js",
+        "/web/preview-cache.js",
         "/web/core.js",
         "/web/captions.js",
         "/web/media-source.js",
@@ -5871,8 +5913,8 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     )));
     assert_eq!(folders.status, 200);
     let folders_etag = resp_header(&folders, "ETag").unwrap().to_owned();
-    assert!(folders_etag.starts_with("W/\"web-v2-r7-"), "{folders_etag}");
-    let stale_capability_etag = folders_etag.replacen("-r7-", "-r6-", 1);
+    assert!(folders_etag.starts_with("W/\"web-v2-r8-"), "{folders_etag}");
+    let stale_capability_etag = folders_etag.replacen("-r8-", "-r7-", 1);
     let stale_conditional = req(&format!(
         "GET /api/web/library?view=folders&folder=64&offset=0&limit=200 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\nIf-None-Match: {stale_capability_etag}\r\n\r\n"
     ));
@@ -6857,6 +6899,23 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
             "fixed HLS resource must attach to the browser job: {resource}"
         );
     }
+    for length in [
+        rusty_dlna_protocol::MSE_RESOURCE_MAX_BYTES - 1,
+        rusty_dlna_protocol::MSE_RESOURCE_MAX_BYTES,
+        rusty_dlna_protocol::MSE_RESOURCE_MAX_BYTES + 1,
+    ] {
+        let response = app.handle(&req(&get(&format!(
+            "/web/media/{}.m4s?quality=data_saver&delivery=mse_segment&hls_offset=0&hls_length={length}", dvp7.detail_id
+        ), "Browser/1.0")));
+        if length <= rusty_dlna_protocol::MSE_RESOURCE_MAX_BYTES {
+            assert!(response.remux_job.is_some());
+        } else {
+            assert_eq!(response.status, 413);
+            assert!(response.remux_job.is_none());
+            let error: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(error["error"]["code"], "resource_limit");
+        }
+    }
     assert_eq!(
         app.handle(&req(&get(
             &format!("/web/media/{}.mp4?quality=ultra", dvp7.detail_id),
@@ -6933,6 +6992,20 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         .status,
         400
     );
+    for (query, expected_status) in [
+        ("event=selection_to_frame&elapsed_ms=0", 200),
+        ("event=selection_to_frame&elapsed_ms=120000", 200),
+        ("event=selection_to_frame&elapsed_ms=120001", 400),
+        ("event=selection_to_frame&elapsed_ms=-1", 400),
+        ("event=selection_to_frame&elapsed_ms=2&elapsed_ms=3", 400),
+        ("event=selection_to_frame", 400),
+        ("event=canplay&elapsed_ms=2", 400),
+    ] {
+        let response = app.handle(&req(&format!(
+            "POST /api/web/transcode/{}?request=78&session=12&{query} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nContent-Length: 0\r\n\r\n", dvp7.detail_id
+        )));
+        assert_eq!(response.status, expected_status, "{query}");
+    }
     let unscoped_cancel = app.handle(&req(&format!(
         "DELETE /api/web/transcode/{} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\n\r\n",
         dvp7.detail_id

@@ -1,9 +1,9 @@
 # Plan: project quality and streaming performance
 
-- Status: bundle A (R01–R05) implemented; configured workspace and release gates
-  pass, and the complete four-worker browser matrix passes. Earlier parallel
-  browser failures and unresolved FFmpeg 6 helper crashes are recorded below.
-  Other bundles remain proposed work.
+- Status: bundles A (R01–R05) and B (P01–P04/P11) implemented. Bundle B
+  measurement and verification limits are recorded below; other bundles remain
+  proposed work. Bundle A's earlier parallel-browser failures and unresolved
+  FFmpeg 6 helper crashes remain part of the verification record.
 - Baseline: `def6a7e` (`Treat native playback quality as a ceiling`), initially clean worktree.
 - Scope: all eight Rust crates, embedded browser, operator tools, deployment,
   CI/release, fixtures, fuzzing, benchmarks, and authoritative documentation.
@@ -12,7 +12,8 @@
   and the configured quality gates.
 - This is the local plan file explicitly requested by the user. Finding evidence
   and source locations below describe the original review baseline; each R01–R05
-  implementation note records the resulting behavior and verification limits.
+  and P01–P04/P11 implementation note records the resulting behavior and
+  verification limits.
 
 ## Goal
 
@@ -31,8 +32,10 @@ promised without representative measurements.
 - The original review was read-only. The subsequent authorized implementation
   covers bundle A, its regressions and documentation, including the user's request
   to use current stable Rust. The user subsequently authorized committing and
-  pushing bundle A. No live configuration change, deployment, or modification
-  of an existing media library is authorized.
+  pushing bundle A. Bundle B implementation, regression tests, benchmarks and
+  documentation are authorized; committing, pushing and deployment are not.
+  No live configuration change or modification of an existing media library is
+  authorized.
 - No blanket reduction of probe limits, encoder quality, HDR preservation, or
   security checks to make benchmark numbers smaller.
 - No claim that passing tests certifies every renderer, GPU, malformed file, or
@@ -94,7 +97,7 @@ experiments, not a formal proof or a claim that every production combination ran
 | New compatible generation | Source open/sample, cached-or-new tool fingerprint, plan/key, cache maintenance, helper/title admission, FFmpeg, growth observation, complete fragment/index, browser decode | P01/P02 expose/remove hidden setup costs; R03 prevents silent client hangs |
 | Active generation attachment | Reuses immutable source/spec/tool identity and skips new-job scan work | Registry contention can still delay it; avoid duplicating checks per segment |
 | Warm completed output | Identity/stamp check and pinned open; **no repeated FFprobe on cache hit** | P02 maintenance and P06 rebuilding indexes remain |
-| Compatible seek | Same-plan preparation can be reused; separate timeline identity; browser still reloads | P04 can avoid reload inside an already usable buffer |
+| Compatible seek | MSE reuses buffered media when timeline, decoder prerequisites and source semantics match; other seeks restart | P04 avoids source replacement for eligible buffered seeks |
 | Encoded indexed output | One-second forced IDRs, 30-second initial burst then 1x pacing | Preserve known startup/timing fixes; measure P07 rate/concurrency behavior |
 | P7 → P8 remap | Sequential whole-file stages, then final validation/publication | P09 is a substantially larger change than ordinary remux tuning |
 
@@ -138,6 +141,152 @@ experiments, not a formal proof or a claim that every production combination ran
 - Tracked fixtures, lockfiles and live configuration remain unchanged. Validation
   performed no deployments or user-media writes; source commit/push is authorized
   for the subsequent handoff.
+
+## Bundle B measurements and verification
+
+The bundle B baseline was the clean bundle A commit `83012dc`, with a saved
+unchanged executable before performance edits. Baseline web units passed 72/72
+and remux tests 90/90. Its complete four-worker browser run had 661 passes,
+114 intentional skips and one Firefox deep-link enrichment failure. That failure
+was retained for investigation and the unchanged assertion is in the final matrix.
+It recurred in WebKit after the rate correction. A deterministic held-response
+test reproduced the cause: same-title source replacement aborted enrichment and
+left its loading state stuck. Enrichment now belongs to the selected title;
+source changes preserve it, selection/stop cancel it, and catalog changes reject
+stale completion. The original test now uses matching metadata/media and a
+completed mocked producer while retaining real successful server enrichment.
+The final focused retry/navigation suite passed 84/84 cases across four browsers.
+Two additional regressions reproduced a server catalog change between the plain
+linked item and its enrichment while the browser still held the earlier library
+generation. Linked enrichment now carries that generation precondition and
+rejects mismatched responses before committing playback.
+
+Final `./scripts/agent-verify.sh` passed on Rust 1.98.1: 121 Python tests,
+100 web unit tests, workspace tests, formatting, Clippy with warnings denied,
+Rust documentation checks, fixture checksums, CLI checks, eight enabled socket
+E2E tests and port isolation. The server suite passed 313 tests; its cache-scale
+benchmark is intentionally ignored by the ordinary gate and was run separately.
+The scanner's unrelated 50k-row benchmark remains ignored. The final complete
+four-worker Playwright matrix passed 738 tests with 146 explicit platform/API
+skips and zero failures across 884 cases in 6.0 minutes. The default 16-worker
+matrix was not run. An earlier socket gate failed because a concurrently running
+browser server shared test port 18201; sequential execution resolved that test
+collision, and all eight final socket cases passed.
+
+The first integrated B matrix had 688 passes, 126 skips and six failures.
+First-page capability publication caused duplicate loading announcements, fixed
+without weakening the announcement test. WebKit recovery was reproduced under
+repetition: a queued pause event arrived while the element was playing and
+incorrectly changed saved intent. Checking the element's current pause state
+fixed it; the regression then passed 16/16 repetitions. Page-50 startup and frame
+presentation passed before release, but WebKit exceeded the separate 7.5-second
+10k-card rendering assertion. Its trace eventually showed all 10k cards, hidden
+loading state and the singleton queue. Only that post-release assertion now has
+a 30-second settling budget; full-list rendering remains expensive. Review also
+added regressions for delayed first-frame callbacks, overlapping preview work,
+predecode JPEG bounds and a library retry changing the pending linked generation.
+
+One FFmpeg 6 Dolby Vision helper SIGSEGV was logged in the first integrated
+matrix. Bundle A had previously recorded similar crashes, but this B baseline
+run logged none. The final passing matrix logged three such crashes. The cause
+remains unresolved. The failing input is the checked-in, checksum-matched
+Profile 7/TrueHD fixture; an inspected attempt crashed during software conversion
+to H.264 SDR/AAC after emitting 259 frames. The fixture contains real BL/EL/RPU
+data, and this is not an expected invalid-input rejection. Passing assertions
+cannot certify crash-free helper execution. No FFmpeg output arguments, stream-copy decisions,
+encoder quality settings or output-cache identity were changed by B.
+The final browser log is `/tmp/rustydlna-bundle-b-playwright-final.log`; the
+finished-source gate log is `/tmp/rustydlna-bundle-b-agent-verify-complete.log`.
+
+The final matched playback comparison used ten independent trials per workload:
+generated 40-second 1280×720/24-fps SDR H.264/AAC, reordered copied video,
+one Chromium viewer at 1×, debug binaries, Ryzen 9 5950X, FFmpeg 6.1.1,
+and ext4 with the OS page cache warmed by fixture generation. Cold means empty
+derived output and a fresh server/tool cache; warm requires validated completed
+output and no new media helper. Binary hashes, output recipes, dimensions,
+color metadata and bounded decoded-frame hashes are recorded and compared.
+
+| Workload | Median ms, before → after | Observed p95 ms, before → after | Sample SD ms, before → after |
+| --- | ---: | ---: | ---: |
+| Original selection | 36.10 → 34.10 | 44.72 → 45.54 | 6.51 → 7.22 |
+| Cold Compatible selection | 169.65 → 178.35 | 209.90 → 220.48 | 19.66 → 25.16 |
+| Warm Compatible selection | 54.75 → 52.75 | 60.99 → 63.39 | 6.51 → 5.09 |
+| Nearby playing seek | 519.20 → 69.95 | 528.42 → 78.69 | 9.85 → 6.95 |
+| Nearby paused seek | 525.05 → 75.60 | 535.48 → 79.56 | 7.55 → 4.77 |
+| Restarted seek | 507.40 → 544.40 | 564.75 → 558.74 | 30.64 → 28.94 |
+
+All ten final nearby trials of each intent reused the source; all ten far seeks
+restarted. Cold startup and restarted-seek medians were slower in this run; there
+is no general startup-speedup claim. Ten trials do not establish reliable p95/p99
+tails. The earlier after run reused only three of ten nearby seeks per intent;
+its retained report exposed the initial-idle and busy-buffer races fixed above.
+The primary pair is `/tmp/rustydlna-bundle-b-playback-before.json` and
+`/tmp/rustydlna-bundle-b-playback-rate-verified.json`. The latter verifies actual
+speed at presentation, seek completion and sustained-window boundaries. The saved
+baseline did not capture first-frame speed; its requested 1× and sustained 1×
+observations are the available rate evidence. Copy producers finished too
+quickly for observable active attachment or cancellation; those cases are marked
+unavailable for this recipe, not counted as successful cancellation samples.
+These measurements precede the final enrichment-ownership fix; their generated
+fixtures already have complete metadata and do not enter that retry path.
+
+In matching sampled cold-start resource windows, median server/helper CPU was
+0.180→0.185 seconds (sample SD 0.055→0.056 seconds), median sampled peak RSS
+45.35→45.88 MB, physical reads zero and writes 37.03 MB for both. Browser CPU
+was 0.510→0.495 seconds; median sampled peak RSS was 689.99→691.68 MB and writes
+36.99→38.71 MB. Nearby-seek browser CPU was 0.395→0.190 seconds (SD
+0.042→0.018), sampled peak RSS 755.11→719.90 MB and writes 35.61→14.32 MB.
+These are whole-window observations, not hard memory bounds or isolated server
+efficiency claims. Process sampling can miss short-lived helpers and peaks;
+summed RSS includes shared pages. Its cumulative cold-window sampling overhead
+was about 333→328 ms, recorded separately from playback latency. Two-second
+cold-playback samples sustained approximately 1.000× with zero reported dropped
+frames on both binaries. This does not establish prolonged-load behavior.
+
+The matched one-trial CPU recipe subset exercised video copy/audio encode,
+video encode/audio copy and both encode, with actual attachment to a live
+producer, output validation and cancellation/reaping. Cancellation before→after
+was respectively 407→319, 356→356 and 358→347 ms. These single observations
+provide functional coverage, not cancellation-performance conclusions.
+Those recipe measurements preceded the final saved-rate correction; the final
+binary has separate 1×/2× measurements and the complete verification gate.
+
+The requested 2× viewer trials initially advanced at 1× on both binaries. They
+are excluded from successful 2× coverage. A real-browser regression reproduced
+native source loading resetting the actual rate while the saved preference and
+selector still displayed 2×. Source loads now preserve the selected native
+default rate, and the harness records/asserts actual rate. A bounded unchanged-
+baseline reproduction fails that assertion and is retained. After-only 720p
+checks with two viewers/30 fps and four viewers/60 fps preserved 2× at startup
+and across playing/paused/restarted seeks; all six and twelve sustained windows
+respectively passed the progression screen (1.9925–2.0046× and 1.9957–2.0054×).
+Each is one trial with correlated viewers. Dropped frames ranged from 0–15 and
+122–128 per two-second window respectively. This establishes rate and seek
+functionality, not smooth 120-fps presentation or comparable 2× baseline
+performance. The report comparator now rejects recorded rate mismatches or failed
+sustained-progression screens; endpoint-limited windows remain inconclusive.
+
+Cache reports use generated entries and the actual maintenance API; the linked
+browser reports use generated decodable media and controlled page delay. Reports,
+temporary libraries and logs stay outside Git under `/tmp/rustydlna-*`. Cache
+operation counts alone do not support a playback speedup. Small-sample playback
+p95/p99 remain descriptive, and CPU/memory/I/O claims require matching sampling
+windows and conditions. The saved bundle A binary exposes its existing server
+phases; the new detailed source/tool/admission/helper breakdown is available only
+after instrumentation. Those new stages are not a before/after substage comparison.
+The existing selected findings below retain their
+original review evidence after their implementation notes.
+
+Dedicated GPU/HDR/Dolby Vision presentation, P7/P8 conversion performance,
+physical devices, cold storage/page-cache drops, concurrent scanner/artwork
+playback benchmarks and prolonged resource pressure are not established by the
+CPU subset. Concurrent artwork/cache ownership is covered behaviorally. The
+generated CPU clips end audio before video: an exploratory audio-longest clip
+exposed the existing selected-video-track tail indexing limitation, which is
+reported rather than counted as a successful warm-MSE trial. Privileged network
+namespace, Docker release smoke, ARM64, soak and fuzz campaigns were not run for
+this scoped change. Local `cargo-audit`, `cargo-deny` and `cargo-machete` remain
+unavailable; standalone JavaScript/Python lint/type checking remains unconfigured.
 
 ## Original review evidence and verification
 
@@ -393,6 +542,18 @@ verify the source-side consistency fix.
 
 ### P01 — Establish end-to-end preparation and playback benchmarks
 
+**Implemented; measured CPU subset, broader tiers remain unmeasured.** Browser
+selection/seek records include capability negotiation and presented-frame
+completion; estimated completions remain separate. Server preparation,
+source/tool identity, cache/registry wait, admission, helper attempts and the
+first complete fragment have bounded records and fixed histograms. Existing
+metrics remain; exported records contain no paths, titles or request identities,
+and elapsed browser durations never subtract a server clock. The temporary-fixture
+harness records actual delivery/recipe, output checks, cache state, environment,
+resources, cancellation and variability. Small-sample tail values are explicitly
+descriptive. See [measurement usage and limits](docs/WEB_PLAYER.md#playback-measurements)
+and the bundle B verification above. No encoder quality or cache identity changed.
+
 **P1 · Code-backed measurement gap · M.** Existing metrics already record initial
 bytes, playlist availability, MSE stages, canplay, and playing. However,
 `crates/server/src/remux.rs:141–168` stores only count/sum/max, and the job clock
@@ -428,6 +589,25 @@ because an FFmpeg command finishes faster while output quality or playback worse
 This work can run alongside R01–R05; it is the prerequisite for changing defaults.
 
 ### P02 — Remove repeated cache scans from the global job lock
+
+**Implemented.** One on-demand inventory sweep per 30 seconds replaces repeated
+per-producer discovery. Incremental growth/publication/deletion accounting and
+fresh free-space checks preserve admission. Exact-path reservations plus a live
+registry ownership check protect eviction; slow discovery and unlinking do not
+hold the job registry. Images share quota coordination. Raw/HLS/MSE recency
+touches only the validated stamp, throttled to once per minute, preserving output
+metadata and cache validation. Concurrency regressions cover blocked discovery,
+stale snapshots, admission/publication/cancellation, external deletion and recency.
+The actual maintenance API scale check covers 100/1k/10k/100k entries and 1/2/8
+callers. At 100k entries/eight callers, 72 between-sweep calls had p50/p95
+0.023/0.056 ms versus baseline 3326.985/5868.104 ms; standard deviations were
+0.018 and 1725.856 ms respectively. One initial inventory discovery took
+1191.732 ms; nine baseline single-caller scans had median 670.918 ms, maximum
+1148.830 ms and standard deviation 156.769 ms. This does not establish reliable
+cold-sweep tail behavior or a cold-start speedup. These are maintenance timings,
+not playback speedups. Inventory uses
+O(entries) memory and the maintenance caller can still wait on storage. See
+[cache operations](docs/OPERATIONS.md).
 
 **P1 · Measured isolated cost · M/L.**
 `crates/server/src/remux/cache.rs:110–225` enumerates/stats the cache and sorts
@@ -475,6 +655,19 @@ and accounting converges after failures. Compare tail latency and cancellation t
 
 ### P03 — Start linked playback before the full library finishes loading
 
+**Implemented and measured.** Linked item metadata and first-page capabilities
+start selection independently of complete list publication. The item API adds a
+generation and optional generation precondition; navigation epochs, aborts and
+generation checks prevent stale selection. Linked queues remain singleton, card
+queues retain their full snapshot, and later-page errors do not block a valid
+link. Holding page 2 or 50 is covered in all browser projects. With generated
+320×180/24-fps SDR H.264 original media and 600-ms routed page latency, eight
+samples per workload measured median link-to-presented-frame 806→171.75 ms for
+400 cards and 5253→161.45 ms for 10k cards. Standard deviations were
+8.39→12.68 ms and 128.11→15.93 ms respectively. Every after sample presented a
+frame before held-page release; no baseline sample did. These controlled browser
+results do not establish hardware, storage, CPU/memory or reliable p99 gains.
+
 **P1 · Reproduced dependency · S/M.** `crates/server/web/app.js:355` waits for the
 complete library request before selecting a linked item. `api.js:84–130` fetches
 every page (50 requests for 10,000 cards), and library capabilities become available
@@ -497,6 +690,22 @@ history and ordinary card playback remain correct. Compare link-to-frame at
 controlled latency for small and large libraries. No full virtualization is needed.
 
 ### P04 — Reuse buffered compatible playback for nearby seeks
+
+**Implemented for MSE.** The client retains the source only with matching track,
+quality, negotiation/source ownership and an unexpired lease, plus a buffered
+target and known decoder prerequisites. Server fragment metadata requires
+continuous decode times, known sync flags and bounded reordering. Copied video
+retains the preceding random-access point and two seconds of forward decoder
+margin; uncertain timing, gaps, eviction or source changes restart. Tests cover
+real reordered copied video, nonzero source offsets, paused/rapid seeks,
+captions, loop, rate/volume and source replacement, and assert no cancellation,
+initialization fetch or new generation on eligible seeks. Native HLS/raw seek
+semantics are unchanged. Playback measurements and limitations appear above.
+The matched playback run also exposed unnecessary restarts from a status poll
+that preceded playlist registration and from transient owned buffer operations.
+Pre-registration idle responses no longer establish source expiry; later idle
+responses still do. Busy eligible seeks wait at most 100 ms, retain accumulated
+relative intent, and recheck ownership and actual decoder data before reuse.
 
 **P2 · Code-backed · M.** `crates/server/web/player.js:368–427` always tears down
 compatible playback and waits a 400 ms debounce before reloading, even when the
@@ -675,6 +884,22 @@ SDR/portable artifact is served as requested HDR/hardware output. Validate the
 existing early-status/output-pin fallback race regression. Depends on R02/P01.
 
 ### P11 — Align MSE byte limits and prioritize media over preview preloading
+
+**Implemented with explicit resource-limit handling.** Server MSE advertisement
+and resources share the client's 32-MiB bound; native HLS retains its distinct
+64-MiB bound. Oversized copied fragments are rejected as resource limits without
+splitting decoder dependencies or silently selecting lossy output. The client
+accounts whole retained fragments against a 96-MiB estimate and preserves bundle
+A's bounded streaming reads/deadlines, including absent Content-Length. Quota
+retries prune only safe ranges and retain paused-seek intent. Preview manifests
+and speculative sheets wait for a presented frame plus three seconds buffered;
+the active scrub target can proceed. One fetch/decode worker, one latest scrub
+target, eight speculative references and two retained images bound work. JPEG
+dimensions are checked before decoding; existing images and the next decode
+share a 64-MiB RGBA/data-URL estimate, plus one 16-MiB compressed body and a
+256-KiB header buffer. Boundary/quota tests and 100
+rapid targets cover those limits. This is an application estimate, not a hard
+browser-process memory limit; real bursty UHD/device tiers remain unmeasured.
 
 **P2 · Code-backed bounds mismatch/opportunity · M.** The server allows resources
 up to 64 MiB (`crates/server/src/web_ui.rs:85`, `:2591`), but the MSE browser rejects

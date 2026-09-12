@@ -21,11 +21,12 @@ use crate::App;
 
 mod cache;
 mod hls;
+pub(crate) mod performance;
 #[cfg(test)]
 mod validation_tests;
 
-pub(crate) use cache::maintain_transcode_cache;
 use cache::{enforce_active_cache_limits, maintain_app_cache};
+pub(crate) use cache::{maintain_transcode_cache, CacheCoordinator};
 
 const FIRST_BYTES: u64 = 16 * 1024;
 const FIRST_WAIT: Duration = Duration::from_secs(30);
@@ -110,6 +111,7 @@ fn run_profile8_pipeline(
 
 #[derive(Debug)]
 pub(crate) struct RemuxMetrics {
+    pub(crate) performance: performance::PerformanceMetrics,
     completed: AtomicU64,
     failed: AtomicU64,
     cancelled: AtomicU64,
@@ -121,6 +123,12 @@ pub(crate) struct RemuxMetrics {
     cache_evicted_files: AtomicU64,
     cache_evicted_bytes: AtomicU64,
     cache_bytes: AtomicU64,
+    cache_scans: AtomicU64,
+    cache_scan_entries: AtomicU64,
+    cache_lock_wait: AtomicDurationMetric,
+    cache_registry_wait: AtomicDurationMetric,
+    cache_sweep_duration: AtomicDurationMetric,
+    cache_maintenance_duration: AtomicDurationMetric,
     web_requests: AtomicU64,
     web_seek_restarts: AtomicU64,
     web_cache_reuses: AtomicU64,
@@ -140,34 +148,61 @@ pub(crate) struct RemuxMetrics {
 }
 
 #[derive(Debug, Default)]
-struct AtomicDurationMetric {
+pub(crate) struct AtomicDurationMetric {
     count: AtomicU64,
     sum_ms: AtomicU64,
     max_ms: AtomicU64,
+    buckets: [AtomicU64; 16],
 }
 
 impl AtomicDurationMetric {
-    fn record(&self, elapsed: Duration) {
+    pub(crate) fn record(&self, elapsed: Duration) {
         let millis = rusty_dlna_helper::duration_millis_saturating(elapsed);
         self.count.fetch_add(1, Ordering::Relaxed);
         self.sum_ms.fetch_add(millis, Ordering::Relaxed);
         self.max_ms.fetch_max(millis, Ordering::Relaxed);
+        let bucket = DURATION_BUCKET_BOUNDS_MS
+            .iter()
+            .position(|bound| millis <= *bound)
+            .unwrap_or(15);
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
-    fn snapshot(&self) -> DurationMetric {
+    pub(crate) fn snapshot(&self) -> DurationMetric {
         DurationMetric {
             count: self.count.load(Ordering::Relaxed),
             sum_ms: self.sum_ms.load(Ordering::Relaxed),
             max_ms: self.max_ms.load(Ordering::Relaxed),
+            buckets: std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed)),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) const DURATION_BUCKET_BOUNDS_MS: [u64; 16] = [
+    1,
+    2,
+    5,
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1000,
+    2500,
+    5000,
+    10000,
+    30000,
+    120000,
+    u64::MAX,
+];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct DurationMetric {
     pub count: u64,
     pub sum_ms: u64,
     pub max_ms: u64,
+    pub buckets: [u64; 16],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -187,6 +222,12 @@ pub(crate) struct RemuxStatus {
     pub cache_evicted_bytes_total: u64,
     pub cache_bytes: u64,
     pub oldest_job_secs: u64,
+    pub cache_scans: u64,
+    pub cache_scan_entries: u64,
+    pub cache_lock_wait: DurationMetric,
+    pub cache_registry_wait: DurationMetric,
+    pub cache_sweep_duration: DurationMetric,
+    pub cache_maintenance_duration: DurationMetric,
     pub web_requests_total: u64,
     pub web_seek_restarts_total: u64,
     pub web_cache_reuses_total: u64,
@@ -208,6 +249,7 @@ pub(crate) struct RemuxStatus {
 impl RemuxMetrics {
     pub(crate) fn new(cache_bytes: u64) -> Self {
         Self {
+            performance: performance::PerformanceMetrics::default(),
             completed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             cancelled: AtomicU64::new(0),
@@ -219,6 +261,12 @@ impl RemuxMetrics {
             cache_evicted_files: AtomicU64::new(0),
             cache_evicted_bytes: AtomicU64::new(0),
             cache_bytes: AtomicU64::new(cache_bytes),
+            cache_scans: AtomicU64::new(0),
+            cache_scan_entries: AtomicU64::new(0),
+            cache_lock_wait: AtomicDurationMetric::default(),
+            cache_registry_wait: AtomicDurationMetric::default(),
+            cache_sweep_duration: AtomicDurationMetric::default(),
+            cache_maintenance_duration: AtomicDurationMetric::default(),
             web_requests: AtomicU64::new(0),
             web_seek_restarts: AtomicU64::new(0),
             web_cache_reuses: AtomicU64::new(0),
@@ -838,16 +886,21 @@ impl RemuxJob {
 }
 
 fn remove_ephemeral_output(app: &App, job: &RemuxJob) {
+    let Ok(_reservation) = app.transcode_cache.reserve(&job.dest) else {
+        return;
+    };
     let _maintenance = crate::lock_recover(&app.cache_maintenance);
-    let bytes = job
-        .dest
-        .metadata()
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    if std::fs::remove_file(&job.dest).is_ok() {
-        app.remux_metrics.subtract_cache_bytes(bytes);
+    // A replacement may have registered while expired cleanup waited. Its
+    // destination belongs to it; never delete a successor's bytes.
+    if crate::lock_recover(&app.remuxes)
+        .values()
+        .any(|current| current.dest == job.dest && !std::ptr::eq(current.as_ref(), job))
+    {
+        return;
     }
+    let _ = std::fs::remove_file(&job.dest);
     let _ = std::fs::remove_file(rusty_dlna_transcode::cache_stamp_path(&job.dest));
+    cache::refresh_artifacts(app, [job.dest.clone()]);
 }
 
 fn schedule_ephemeral_cleanup(app: &Arc<App>, job: &RemuxJob, retention: Duration) {
@@ -867,6 +920,7 @@ fn schedule_ephemeral_cleanup(app: &Arc<App>, job: &RemuxJob, retention: Duratio
 
 fn sweep_ephemeral_cleanups(app: &App, now: Instant, force: bool) -> Option<Instant> {
     let mut next = None;
+    let mut expired = Vec::new();
     let mut jobs = crate::lock_recover(&app.remuxes);
     jobs.retain(|_, job| {
         if !job.web || !matches!(job.state(), RemuxState::Complete) {
@@ -886,7 +940,7 @@ fn sweep_ephemeral_cleanups(app: &App, now: Instant, force: bool) -> Option<Inst
         }
         *deadline = None;
         if !job.cacheable {
-            remove_ephemeral_output(app, job);
+            expired.push(job.clone());
         }
         tracing::debug!(
             id = job.detail_id,
@@ -895,6 +949,10 @@ fn sweep_ephemeral_cleanups(app: &App, now: Instant, force: bool) -> Option<Inst
         );
         false
     });
+    drop(jobs);
+    for job in expired {
+        remove_ephemeral_output(app, &job);
+    }
     next
 }
 
@@ -1077,6 +1135,18 @@ fn spawn_ffmpeg(
                     break;
                 }
                 if let Some(fallback) = fallback {
+                    if kind == "alternate hardware" {
+                        app.remux_metrics
+                            .performance
+                            .fallbacks_hardware
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        app.remux_metrics
+                            .performance
+                            .fallbacks_portable
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+
                     tracing::warn!(
                         id,
                         dest = %dest.display(),
@@ -1196,6 +1266,15 @@ fn run_ffmpeg_growing(
     };
     use std::ops::ControlFlow;
 
+    let key = job
+        .web_spec
+        .as_ref()
+        .and_then(|spec| spec.web_session_id.zip(spec.web_request_id))
+        .map(|(session, request)| (job.detail_id, session, request));
+    let _attempt_timing = app
+        .remux_metrics
+        .performance
+        .timer(key, performance::Stage::HelperAttempt);
     let Some(executable) = args.first() else {
         return Err("empty transcode command".into());
     };
@@ -1539,10 +1618,14 @@ fn publish_finished_output(
     }
     // The completed bytes remain protected staging artifacts during the quota check.
     enforce_active_cache_limits(app).map_err(|error| format!("transcode cache limits: {error}"))?;
-    // Cancellation and lease expiry take this lock too: publication and cancellation
-    // have one ordering through the final Complete transition.
-    let _completion = crate::lock_recover(&job.disconnect_deadline);
+    // Acquire the shared gate before the completion lock: maintenance may
+    // briefly inspect the registry, whose cancellation paths take completion.
+    // Publication never reacquires the registry while holding either lock.
     let _maintenance = crate::lock_recover(&app.cache_maintenance);
+    // Cancellation and publication retain one ordering through Complete.
+    let _completion = crate::lock_recover(&job.disconnect_deadline);
+    cache::check_publication_limits(app, job)
+        .map_err(|error| format!("transcode cache limits: {error}"))?;
     let _publication = crate::lock_recover(&job.output);
     let file = crate::lock_recover(&output);
     if job.cancelled.load(Ordering::Acquire) {
@@ -1584,6 +1667,7 @@ fn publish_finished_output(
         let _ = std::fs::remove_file(rusty_dlna_transcode::cache_stamp_path(&job.dest));
         let _ = std::fs::remove_file(&job.dest);
     }
+    cache::refresh_artifacts(app, [job.part.clone(), job.dest.clone()]);
     publish_result?;
     tracing::info!(id = job.detail_id, bytes = snapshot.bytes, "remux job done");
     job.transition(RemuxState::Complete);
@@ -1694,6 +1778,17 @@ fn attach_job_attempt(
     spec: &RemuxJobSpec,
     register_client: bool,
 ) -> Result<RemuxAttachment, String> {
+    let key = spec
+        .web_session_id
+        .zip(spec.web_request_id)
+        .map(|(session, request)| (spec.detail_id, session, request));
+    let _admission_timing = app
+        .remux_metrics
+        .performance
+        .timer(key, performance::Stage::Admission);
+    // Reserve before the registry: maintenance can discover outside the map and
+    // only unlink destinations for which it owns an exclusive reservation.
+    let _reservation = app.transcode_cache.reserve(&spec.dest)?;
     let web = spec.job_key.starts_with("web:");
     let mut newer_generation = false;
     let mut superseded_producer = false;
@@ -1831,7 +1926,13 @@ fn attach_job_attempt(
                 job.client_epoch.fetch_add(1, Ordering::AcqRel);
                 *disconnect_deadline = None;
             }
-            return Ok(RemuxAttachment::Ready(job.clone()));
+            let job = job.clone();
+            drop(disconnect_deadline);
+            drop(map);
+            if job.is_complete() {
+                cache::touch_recency(&job.dest);
+            }
+            return Ok(RemuxAttachment::Ready(job));
         }
         drop(disconnect_deadline);
         if !job.producer_finished.load(Ordering::Acquire) {
@@ -1843,10 +1944,34 @@ fn attach_job_attempt(
     // protected set. Resource reattachments above therefore need neither a
     // cache-directory scan nor a quota decision. New producers and reopened
     // completed outputs still pass the normal bounded cache gate.
-    let protected = cache::active_artifacts(map.values());
-    maintain_app_cache(&app, &protected, false)
+    drop(map);
+    // Keep the requested candidate protected even before it becomes a live job.
+    // Discovery, validation, stale eviction and admission never hold the map.
+    let fresh = spec.cacheable && cache_is_fresh_for_key(&spec.dest, &spec.cache_key);
+    if !fresh {
+        if spec.dest.is_file() {
+            let _maintenance = crate::lock_recover(&app.cache_maintenance);
+            tracing::info!(
+                id = spec.detail_id,
+                dest = %spec.dest.display(),
+                "stale remux cache, rebuilding"
+            );
+            if let Ok(metadata) = spec.dest.metadata() {
+                if std::fs::remove_file(&spec.dest).is_ok() {
+                    app.remux_metrics.subtract_cache_bytes(metadata.len());
+                }
+            }
+            let _ = std::fs::remove_file(cache_part(&spec.dest));
+            cache::refresh_artifacts(&app, [spec.dest.clone(), cache_part(&spec.dest)]);
+        }
+        // A cache hit returned above. Any remaining stamp is stale or orphaned and
+        // must not make newly produced fallback bytes fresh under the primary key.
+        let _ = std::fs::remove_file(rusty_dlna_transcode::cache_stamp_path(&spec.dest));
+    }
+    let requested = HashSet::from([spec.dest.clone()]);
+    maintain_app_cache(&app, &requested, false)
         .map_err(|error| format!("transcode cache limits: {error}"))?;
-    if spec.cacheable && cache_is_fresh_for_key(&spec.dest, &spec.cache_key) {
+    if fresh {
         app.remux_metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
         if new_web_generation {
             app.remux_metrics
@@ -1889,29 +2014,10 @@ fn attach_job_attempt(
         });
         job.open_output()
             .map_err(|error| format!("open completed remux: {error}"))?;
-        if register_client {
-            job.attach_client();
-            map.insert(spec.job_key.clone(), job.clone());
-        }
+        register_admitted_job(&app, spec, &job, register_client, register_client)?;
+        cache::touch_recency(&job.dest);
         return Ok(RemuxAttachment::Ready(job));
     }
-    if spec.dest.is_file() {
-        let _maintenance = crate::lock_recover(&app.cache_maintenance);
-        tracing::info!(
-            id = spec.detail_id,
-            dest = %spec.dest.display(),
-            "stale remux cache, rebuilding"
-        );
-        if let Ok(metadata) = spec.dest.metadata() {
-            if std::fs::remove_file(&spec.dest).is_ok() {
-                app.remux_metrics.subtract_cache_bytes(metadata.len());
-            }
-        }
-        let _ = std::fs::remove_file(cache_part(&spec.dest));
-    }
-    // A cache hit returned above. Any remaining stamp is stale or orphaned and
-    // must not make newly produced fallback bytes fresh under the primary key.
-    let _ = std::fs::remove_file(rusty_dlna_transcode::cache_stamp_path(&spec.dest));
     app.remux_metrics
         .cache_misses
         .fetch_add(1, Ordering::Relaxed);
@@ -1987,13 +2093,9 @@ fn attach_job_attempt(
         started: Instant::now(),
         hls_index: Mutex::new(hls::Index::default()),
     });
-    map.insert(spec.job_key.clone(), job.clone());
-    if register_client {
-        job.attach_client();
-    }
-    drop(map);
+    register_admitted_job(&app, spec, &job, register_client, true)?;
     spawn_ffmpeg(
-        app,
+        app.clone(),
         spec.clone(),
         job.clone(),
         helper_permit,
@@ -2001,6 +2103,35 @@ fn attach_job_attempt(
         ai_upscale_permit,
     );
     Ok(RemuxAttachment::Ready(job))
+}
+
+// Recheck cancellation after unlocked filesystem/admission work. Reservation
+// ownership prevents another producer for this destination during the gap.
+fn register_admitted_job(
+    app: &App,
+    spec: &RemuxJobSpec,
+    job: &Arc<RemuxJob>,
+    register_client: bool,
+    retain: bool,
+) -> Result<(), String> {
+    let sessions = crate::lock_recover(&app.web_playback_sessions);
+    if let Some((session_id, request_id)) = spec.web_session_id.zip(spec.web_request_id) {
+        if sessions
+            .get(&session_id)
+            .is_none_or(|state| state.cancelled || state.latest_request_id != request_id)
+        {
+            return Err(WEB_REQUEST_CANCELLED.into());
+        }
+    }
+    let mut map = crate::lock_recover(&app.remuxes);
+    drop(sessions);
+    if register_client {
+        job.attach_client();
+    }
+    if retain {
+        map.insert(spec.job_key.clone(), job.clone());
+    }
+    Ok(())
 }
 
 fn browser_preparation_options(mut options: BrowserOutputOptions) -> BrowserOutputOptions {
@@ -2246,6 +2377,34 @@ pub(crate) fn keep_web_request_alive(
         touch_web_transcode_preparation(app, detail_id, session_id);
     }
     retained
+}
+
+pub(crate) fn record_browser_timing(
+    app: &App,
+    detail_id: i64,
+    session_id: u64,
+    request_id: u64,
+    stage: performance::Stage,
+    elapsed_ms: u64,
+) -> bool {
+    let key = (detail_id, session_id, request_id);
+    if elapsed_ms > 120_000 || !app.remux_metrics.performance.contains(key) {
+        return false;
+    }
+    let jobs = crate::lock_recover(&app.remuxes);
+    let owns = jobs.values().any(|job| {
+        job.web
+            && job.detail_id == detail_id
+            && job.owns_web_request(Some(session_id), request_id)
+            && !job.cancelled.load(Ordering::Acquire)
+            && !matches!(job.state(), RemuxState::Failed(_) | RemuxState::Cancelled)
+    });
+    if owns {
+        app.remux_metrics
+            .performance
+            .record(Some(key), stage, Duration::from_millis(elapsed_ms));
+    }
+    owns
 }
 
 /// Record the first occurrence of a browser startup phase for an active source
@@ -2638,6 +2797,8 @@ async fn serve_fragment_playlist(
             .as_ref()
             .is_some_and(|spec| spec.hls_all_fragments_independent);
     let (init_uri, segment_uri, mse_after) = fragment_resource_uris(req, playlist_delivery)?;
+    let timing_key = crate::web_ui::playback_timing_key(req, job.detail_id);
+    let mut first_fragment_observed = false;
     let playlist = loop {
         match job.state() {
             RemuxState::Failed(error) => return Err(error.into()),
@@ -2658,32 +2819,51 @@ async fn serve_fragment_playlist(
         let index_job = job.clone();
         let init_uri = init_uri.clone();
         let segment_uri = segment_uri.clone();
+        let observe_fragment = !first_fragment_observed;
         let indexed = tokio::task::spawn_blocking(move || {
             let output = index_job
                 .open_output()
                 .map_err(|error| format!("open HLS media: {error}"))?;
             let mut file = crate::lock_recover(&output);
             let mut index = crate::lock_recover(&index_job.hls_index);
-            index.update_file(&mut file, complete).and_then(|()| {
-                if media_source {
-                    index
-                        .has_mse_fragments_after(mse_after, complete)
-                        .then(|| index.mse_playlist_after(&init_uri, &segment_uri, mse_after))
-                        .transpose()
-                } else if all_fragments_independent {
-                    index
-                        .has_independent_startup_buffer(complete)
-                        .then(|| index.independent_fragment_playlist(&init_uri, &segment_uri))
-                        .transpose()
-                } else {
-                    index
-                        .has_startup_buffer(complete)
-                        .then(|| index.playlist(&init_uri, &segment_uri))
-                        .transpose()
-                }
-            })
+            index.update_file(&mut file, complete)?;
+            let observed = (observe_fragment && index.produced_duration_seconds().is_some())
+                .then(Instant::now);
+            let playlist = if media_source {
+                index
+                    .has_mse_fragments_after(mse_after, complete)
+                    .then(|| index.mse_playlist_after(&init_uri, &segment_uri, mse_after))
+                    .transpose()
+            } else if all_fragments_independent {
+                index
+                    .has_independent_startup_buffer(complete)
+                    .then(|| index.independent_fragment_playlist(&init_uri, &segment_uri))
+                    .transpose()
+            } else {
+                index
+                    .has_startup_buffer(complete)
+                    .then(|| index.playlist(&init_uri, &segment_uri))
+                    .transpose()
+            };
+            Ok::<_, String>((observed, playlist))
         })
         .await?;
+        let indexed = match indexed {
+            Ok((observed, playlist)) => {
+                if let Some(observed) = observed {
+                    first_fragment_observed = true;
+                    if let Some(key) = timing_key {
+                        app.remux_metrics.performance.since_entry_at(
+                            key,
+                            performance::Stage::FirstCompleteFragment,
+                            observed,
+                        );
+                    }
+                }
+                playlist
+            }
+            Err(error) => Err(error),
+        };
         match indexed {
             Ok(Some(playlist)) => break playlist,
             Ok(None) if !complete && Instant::now() < deadline => {
@@ -2709,6 +2889,12 @@ async fn serve_fragment_playlist(
             }
             Ok(None) => return Err("transcode produced no complete media segment".into()),
             Err(error) => {
+                if error.starts_with("resource_limit:") {
+                    let response = crate::web_ui::transcode_stream_error(413, "resource_limit");
+                    write_remux_response(app, sock, response, head).await?;
+                    return Ok(());
+                }
+
                 // The producer removes its partial file immediately after
                 // publishing Cancelled. If cleanup wins this race, retain the
                 // cancellation contract instead of reporting the missing
@@ -2980,6 +3166,12 @@ pub(crate) fn runtime_status(app: &App) -> RemuxStatus {
             .load(Ordering::Relaxed),
         cache_bytes: app.remux_metrics.cache_bytes.load(Ordering::Relaxed),
         oldest_job_secs,
+        cache_scans: app.remux_metrics.cache_scans.load(Ordering::Relaxed),
+        cache_scan_entries: app.remux_metrics.cache_scan_entries.load(Ordering::Relaxed),
+        cache_lock_wait: app.remux_metrics.cache_lock_wait.snapshot(),
+        cache_registry_wait: app.remux_metrics.cache_registry_wait.snapshot(),
+        cache_sweep_duration: app.remux_metrics.cache_sweep_duration.snapshot(),
+        cache_maintenance_duration: app.remux_metrics.cache_maintenance_duration.snapshot(),
         web_requests_total: app.remux_metrics.web_requests.load(Ordering::Relaxed),
         web_seek_restarts_total: app.remux_metrics.web_seek_restarts.load(Ordering::Relaxed),
         web_cache_reuses_total: app.remux_metrics.web_cache_reuses.load(Ordering::Relaxed),
@@ -3024,6 +3216,7 @@ async fn serve_finished(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let metadata_job = job.clone();
     let (size, etag) = tokio::task::spawn_blocking(move || {
+        cache::touch_recency(&metadata_job.dest);
         let output = metadata_job.open_output()?;
         let file = crate::lock_recover(&output);
         let metadata = file.metadata()?;
@@ -3038,11 +3231,7 @@ async fn serve_finished(
                     .metadata()
                     .ok()
                     .filter(|metadata| metadata.is_file())?;
-                let etag = rusty_dlna_http::range::completed_cache_etag(&metadata, &stamp_metadata);
-                // Output timestamps are part of its validated identity. Record
-                // cache recency on the stamp without rewriting its contents.
-                let _ = stamp.set_modified(std::time::SystemTime::now());
-                etag
+                rusty_dlna_http::range::completed_cache_etag(&metadata, &stamp_metadata)
             });
         Ok::<_, std::io::Error>((metadata.len(), etag))
     })
@@ -3727,6 +3916,7 @@ mod tests {
                 count: 2,
                 sum_ms: 10,
                 max_ms: 7,
+                buckets: [0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             }
         );
 
@@ -3757,6 +3947,179 @@ mod tests {
         assert_eq!(status.web_startup_mse_first_fragment_appended.count, 1);
         assert_eq!(status.web_startup_canplay.count, 1);
         assert_eq!(status.web_startup_playing.count, 1);
+    }
+
+    #[test]
+    fn browser_elapsed_reports_require_current_ownership_and_bounded_duration() {
+        let dir = temp_dir("browser-elapsed-ownership");
+        let app = test_app(&dir, 1);
+        let (_, job) = completed_ephemeral_job(&app, &dir, 42);
+        job.add_web_request(Some(12), Some(77)).unwrap();
+        let metrics = &app.remux_metrics.performance;
+        for key in [(42, 12, 77), (42, 12, 78), (42, 13, 77), (43, 12, 77)] {
+            metrics.begin(key);
+        }
+        use performance::Stage;
+        assert!(!record_browser_timing(
+            &app,
+            42,
+            12,
+            78,
+            Stage::SelectionToFrame,
+            10
+        ));
+        assert!(!record_browser_timing(
+            &app,
+            42,
+            13,
+            77,
+            Stage::SelectionToFrame,
+            10
+        ));
+        assert!(!record_browser_timing(
+            &app,
+            43,
+            12,
+            77,
+            Stage::SelectionToFrame,
+            10
+        ));
+        assert!(!record_browser_timing(
+            &app,
+            42,
+            12,
+            77,
+            Stage::SelectionToFrame,
+            120_001
+        ));
+        assert!(record_browser_timing(
+            &app,
+            42,
+            12,
+            77,
+            Stage::SelectionToFrame,
+            120_000
+        ));
+        assert!(record_browser_timing(
+            &app,
+            42,
+            12,
+            77,
+            Stage::SelectionToFrame,
+            10
+        ));
+        assert!(record_browser_timing(
+            &app,
+            42,
+            12,
+            77,
+            Stage::SeekToFrame,
+            10
+        ));
+        assert!(record_browser_timing(
+            &app,
+            42,
+            12,
+            77,
+            Stage::SeekToFrame,
+            20
+        ));
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot["stages_ms"]["selection_to_frame"]["count"], 1);
+        assert_eq!(
+            snapshot["stages_ms"]["selection_to_frame"]["sum_ms"],
+            120_000
+        );
+        assert_eq!(snapshot["stages_ms"]["seek_to_frame"]["count"], 2);
+        job.cancel();
+        assert!(!record_browser_timing(
+            &app,
+            42,
+            12,
+            77,
+            Stage::SeekToFrame,
+            30
+        ));
+        assert_eq!(metrics.snapshot()["stages_ms"]["seek_to_frame"]["count"], 2);
+        crate::lock_recover(&app.remuxes).clear();
+    }
+
+    #[tokio::test]
+    async fn first_fragment_timing_precedes_playlist_threshold_and_uses_request_owner() {
+        use tokio::io::AsyncReadExt;
+        let dir = temp_dir("first-fragment-observation");
+        let app = test_app(&dir, 1);
+        let mut bytes = hls::tests::fixture();
+        // Shorten the selected track's sample duration to 250 ms, retaining
+        // one complete fragment below the one-second playlist threshold.
+        let trex = bytes.windows(4).position(|value| value == b"trex").unwrap();
+        bytes[trex + 16..trex + 20].copy_from_slice(&250_u32.to_be_bytes());
+        let mut end = 0;
+        loop {
+            let size = u32::from_be_bytes(bytes[end..end + 4].try_into().unwrap()) as usize;
+            let media = &bytes[end + 4..end + 8] == b"mdat";
+            end += size;
+            if media {
+                break;
+            }
+        }
+        let job = growing_test_job(&dir, 42, &bytes[..end]);
+        app.remux_metrics.performance.begin((42, 1, 10));
+        app.remux_metrics.performance.begin((42, 2, 20));
+        let request = HttpRequest::parse_headers("GET /web/media/42.m3u8?delivery=mse&session=2&request=20 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_app = app.clone();
+        let served = job.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            serve_fragment_playlist(&server_app, &mut socket, &request, &served, false, true)
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = app.remux_metrics.performance.snapshot();
+                if snapshot["stages_ms"]["preparation_to_first_complete_fragment"]["count"] == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first complete fragment observation does not await a playable playlist");
+        let snapshot = app.remux_metrics.performance.snapshot();
+        assert!(
+            snapshot["recent"][0]["stages_ms"]["preparation_to_first_complete_fragment"].is_null()
+        );
+        assert!(
+            snapshot["recent"][1]["stages_ms"]["preparation_to_first_complete_fragment"].is_u64()
+        );
+        assert_eq!(runtime_status(&app).web_startup_playlist_ready.count, 0);
+        job.cancel();
+        job.transition(RemuxState::Cancelled);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server.await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 409"));
+    }
+
+    #[test]
+    fn playlist_timing_key_uses_current_request_and_rejects_duplicate_or_invalid_fields() {
+        for (query, expected) in [
+            ("session=12&request=78&delivery=mse", Some((42, 12, 78))),
+            ("session=%31%32&request=78&delivery=mse", Some((42, 12, 78))),
+            ("session=12&request=77&request=78", None),
+            ("session=12&request=bad", None),
+            ("request=78", None),
+        ] {
+            let req = HttpRequest::parse_headers(&format!(
+                "GET /web/media/42.m3u8?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            ))
+            .unwrap();
+            assert_eq!(crate::web_ui::playback_timing_key(&req, 42), expected);
+        }
     }
 
     #[test]
@@ -3954,7 +4317,8 @@ mod tests {
 
         let victim = dir.join(format!("43-hdr10-{}.mp4", "b".repeat(64)));
         std::fs::write(&victim, vec![2u8; 600_000]).unwrap();
-        enforce_active_cache_limits(&app).unwrap();
+        // Simulate the reconciliation cadence after this external fixture write.
+        maintain_app_cache(&app, &HashSet::new(), true).unwrap();
         assert!(dest.exists(), "active cache hit must remain protected");
         assert!(!victim.exists());
 
@@ -3986,7 +4350,8 @@ mod tests {
             .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(10))
             .unwrap();
         std::fs::write(&victim, vec![3u8; 600_000]).unwrap();
-        enforce_active_cache_limits(&app).unwrap();
+        // Simulate the reconciliation cadence after this external fixture write.
+        maintain_app_cache(&app, &HashSet::new(), true).unwrap();
         assert!(!dest.exists(), "unprotected oldest output may be evicted");
         assert!(!rusty_dlna_transcode::cache_stamp_path(&dest).exists());
         assert!(victim.exists());
@@ -4047,7 +4412,8 @@ mod tests {
             &"d".repeat(64),
         );
         std::fs::write(&victim, vec![2u8; 600_000]).unwrap();
-        enforce_active_cache_limits(&app).unwrap();
+        // Simulate the reconciliation cadence after this external fixture write.
+        maintain_app_cache(&app, &HashSet::new(), true).unwrap();
         assert!(dest.exists(), "the actively served output was evicted");
         assert!(!victim.exists());
 

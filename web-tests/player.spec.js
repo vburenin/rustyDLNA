@@ -1429,12 +1429,23 @@ test("ordinary tab navigation preserves an already committed linked title", asyn
   await expect(page.locator("#now-playing-title")).toHaveText(title);
 });
 
-test("a current deep-link enrichment failure remains playable and retryable", async ({ page }) => {
+for (const change of ["none", "source", "catalog", "stop"]) test({
+  none: "a current deep-link enrichment failure remains playable and retryable",
+  source: "deep-link enrichment retry survives replacement of the same title source",
+  catalog: "deep-link enrichment retry rejects a changed catalog",
+  stop: "closing linked playback cancels pending enrichment retry",
+}[change], async ({ page }) => {
+  await usePreference(page, "stream", "compat");
   await page.goto("/?view=video");
-  const card = page.locator("[data-media-id]").first();
+  // Match metadata to the served MP4. The first library title can be a Dolby
+  // Vision clip with a different duration and unrelated enrichment costs.
+  const card = page.locator(".media-card", { has: page.locator(".card-title", { hasText: /^tagged$/ }) });
   const itemId = await card.getAttribute("data-media-id");
   const title = (await card.locator(".card-title").textContent()).trim();
   let enrichmentAttempts = 0;
+  let releaseRetry;
+  const retryGate = new Promise((resolve) => { releaseRetry = resolve; });
+  let retryCompleted = false;
   await page.route(`**/api/web/item/${itemId}*`, async (route) => {
     const url = new URL(route.request().url());
     if (url.searchParams.get("enrich") === "1") {
@@ -1455,7 +1466,14 @@ test("a current deep-link enrichment failure remains playable and retryable", as
         });
         return;
       }
-      await route.fallback();
+      // Keep successful enrichment real, and distinguish a pending backend
+      // response from one lost by the player after a source replacement.
+      const response = await route.fetch();
+      expect(response.status()).toBe(200);
+      expect((await response.json()).item.stream_metadata_complete).toBe(true);
+      retryCompleted = true;
+      if (change !== "none") await retryGate;
+      await route.fulfill({ response });
       return;
     }
     const response = await route.fetch();
@@ -1463,9 +1481,15 @@ test("a current deep-link enrichment failure remains playable and retryable", as
     payload.item.stream_metadata_complete = false;
     await route.fulfill({ response, json: payload });
   });
-  await serveFixtureMedia(page);
+  const mediaRequests = [];
+  await serveFixtureMedia(page, (url) => mediaRequests.push(url));
+  // A fully supplied fixture has a completed producer, not the real server's
+  // idle registry (which would legitimately restart the mocked media).
+  await page.route("**/api/web/transcode/*", (route) => route.fulfill({
+    json: { schema_version: 2, state: "complete", retry_after_seconds: null },
+  }));
 
-  await page.goto(`/?view=video&item=${itemId}&t=5`);
+  await page.goto(`/?view=video&item=${itemId}`);
   await expect(page.locator("#now-playing-title")).toHaveText(title);
   await expect(page).toHaveURL(new RegExp(`item=${itemId}`));
   await expect(page.locator("#video-player")).toHaveAttribute("src", /web\/media\//);
@@ -1474,7 +1498,42 @@ test("a current deep-link enrichment failure remains playable and retryable", as
   await expect(page.locator("#audio-track-retry")).toBeVisible();
   await page.locator("#audio-track-retry").click();
   await expect(page.locator("#audio-track-retry")).toBeHidden();
-  await expect(page.locator("#audio-track-status")).toBeHidden();
+  if (change !== "none") {
+    await expect.poll(() => retryCompleted).toBe(true);
+    await expect(page.locator("#audio-track-status")).toHaveText("Loading audio tracks…");
+    if (change === "source") {
+      await page.locator('input[name="stream-mode"][value="direct"]').check();
+      await expect.poll(() => mediaRequests.some((url) => url.searchParams.get("mode") === "direct")).toBe(true);
+    } else if (change === "catalog") {
+      await page.route("**/api/web/library?**", async (route) => {
+        const response = await route.fetch();
+        const payload = await response.json();
+        payload.generation += 1;
+        await route.fulfill({ response, json: payload });
+      });
+      await page.locator('#advanced-playback-dialog button[value="close"]').click();
+      await page.getByRole("tab", { name: "Audio" }).click();
+      await expect(page.locator("#loading")).toBeHidden();
+      await openAdvancedPlayback(page);
+    } else {
+      await page.locator('#advanced-playback-dialog button[value="close"]').click();
+      await page.locator("#close-player-button").click();
+      await expect(page.locator("#now-playing-title")).toHaveText("Nothing selected");
+    }
+    releaseRetry();
+  }
+  if (change === "catalog") {
+    await expect(page.locator("#audio-track-status")).toContainText("unavailable");
+    await expect(page.locator("#audio-track-retry")).toBeVisible();
+    await expect(page.locator("#now-playing-title")).toHaveText(title);
+  } else {
+    await expect(page.locator("#audio-track-status")).toBeHidden();
+    if (change === "stop") {
+      await expect(page.locator("#video-player")).not.toHaveAttribute("src", /web\/media\//);
+      await expect(page.locator("#now-playing-title")).toHaveText("Nothing selected");
+    }
+  }
+  expect(retryCompleted).toBe(true);
   expect(enrichmentAttempts).toBe(2);
 });
 
@@ -4862,6 +4921,12 @@ test("timeline scrubbing shows the nearest sprite until replacement video is rea
       }),
     });
   });
+  const sheets = Object.fromEntries(await Promise.all(["red", "blue"].map(async (color) => {
+    const { stdout } = await execFileAsync("ffmpeg", ["-nostdin", "-v", "error", "-f", "lavfi", "-i",
+      `color=c=${color}:s=2880x3780`, "-frames:v", "1", "-threads", "1", "-c:v", "mjpeg", "-q:v", "2",
+      "-f", "image2pipe", "pipe:1"], { encoding: null, timeout: 10_000, maxBuffer: 1024 * 1024 });
+    return [color, stdout];
+  })));
   let selectedSheetAttempts = 0;
   await page.route("**/web/preview/*/*/*.jpg", async (route) => {
     const blue = new URL(route.request().url()).pathname.endsWith("/4.jpg");
@@ -4871,14 +4936,14 @@ test("timeline scrubbing shows the nearest sprite until replacement video is rea
     }
     await route.fulfill({
       status: 200,
-      contentType: "image/svg+xml",
-      body: `<svg xmlns="http://www.w3.org/2000/svg" width="2880" height="3780"><rect width="2880" height="3780" fill="${blue ? "#0000ff" : "#ff0000"}"/></svg>`,
+      contentType: "image/jpeg",
+      body: sheets[blue ? "blue" : "red"],
     });
   });
 
   await openLibrary(page);
   await selectTaggedVideo(page);
-  await expect.poll(() => previewRequests).toBe(1);
+  expect(previewRequests).toBe(0);
   await expect.poll(() => page.locator("#video-player").evaluate((video) => (
     video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
   ))).toBe(true);
@@ -4886,13 +4951,18 @@ test("timeline scrubbing shows the nearest sprite until replacement video is rea
     timeline.value = "303";
     timeline.dispatchEvent(new Event("input", { bubbles: true }));
   });
+  await expect.poll(() => previewRequests).toBe(1);
   const heldFrame = page.locator("#video-frame-hold");
   await expect.poll(() => heldFrame.evaluate((canvas) => canvas.width)).toBe(960);
   expect(selectedSheetAttempts).toBeGreaterThanOrEqual(2);
-  expect(await heldFrame.evaluate((canvas) => {
+  const pixel = await heldFrame.evaluate((canvas) => {
     const pixel = canvas.getContext("2d").getImageData(480, 270, 1, 1).data;
     return [...pixel];
-  })).toEqual([0, 0, 255, 255]);
+  });
+  expect(pixel[0]).toBeLessThanOrEqual(2);
+  expect(pixel[1]).toBeLessThanOrEqual(2);
+  expect(pixel[2]).toBeGreaterThanOrEqual(252);
+  expect(pixel[3]).toBe(255);
 
   await page.locator("#timeline").evaluate((timeline) => {
     timeline.dispatchEvent(new Event("change", { bubbles: true }));

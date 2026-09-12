@@ -310,6 +310,7 @@ fn status_value(app: &App, detailed: bool) -> (Health, Value) {
         Value::Null
     };
     let web_player = json!({
+        "performance": app.remux_metrics.performance.snapshot(),
         "requests_total": remux.web_requests_total,
         "seek_restarts_total": remux.web_seek_restarts_total,
         "cache_reuses_total": remux.web_cache_reuses_total,
@@ -323,6 +324,7 @@ fn status_value(app: &App, detailed: bool) -> (Health, Value) {
             "count": remux.web_startup_initial_bytes.count,
             "sum_ms": remux.web_startup_initial_bytes.sum_ms,
             "max_ms": remux.web_startup_initial_bytes.max_ms,
+            "buckets": remux.web_startup_initial_bytes.buckets,
         },
         // Compatibility alias for operators consuming the previous status
         // shape. Despite its historical name, this phase has always measured
@@ -331,46 +333,55 @@ fn status_value(app: &App, detailed: bool) -> (Health, Value) {
             "count": remux.web_startup_initial_bytes.count,
             "sum_ms": remux.web_startup_initial_bytes.sum_ms,
             "max_ms": remux.web_startup_initial_bytes.max_ms,
+            "buckets": remux.web_startup_initial_bytes.buckets,
         },
         "startup_to_playlist_ready_ms": {
             "count": remux.web_startup_playlist_ready.count,
             "sum_ms": remux.web_startup_playlist_ready.sum_ms,
             "max_ms": remux.web_startup_playlist_ready.max_ms,
+            "buckets": remux.web_startup_playlist_ready.buckets,
         },
         "startup_to_mse_playlist_received_ms": {
             "count": remux.web_startup_mse_playlist_received.count,
             "sum_ms": remux.web_startup_mse_playlist_received.sum_ms,
             "max_ms": remux.web_startup_mse_playlist_received.max_ms,
+            "buckets": remux.web_startup_mse_playlist_received.buckets,
         },
         "startup_to_mse_init_fetched_ms": {
             "count": remux.web_startup_mse_init_fetched.count,
             "sum_ms": remux.web_startup_mse_init_fetched.sum_ms,
             "max_ms": remux.web_startup_mse_init_fetched.max_ms,
+            "buckets": remux.web_startup_mse_init_fetched.buckets,
         },
         "startup_to_mse_init_appended_ms": {
             "count": remux.web_startup_mse_init_appended.count,
             "sum_ms": remux.web_startup_mse_init_appended.sum_ms,
             "max_ms": remux.web_startup_mse_init_appended.max_ms,
+            "buckets": remux.web_startup_mse_init_appended.buckets,
         },
         "startup_to_mse_first_fragment_fetched_ms": {
             "count": remux.web_startup_mse_first_fragment_fetched.count,
             "sum_ms": remux.web_startup_mse_first_fragment_fetched.sum_ms,
             "max_ms": remux.web_startup_mse_first_fragment_fetched.max_ms,
+            "buckets": remux.web_startup_mse_first_fragment_fetched.buckets,
         },
         "startup_to_mse_first_fragment_appended_ms": {
             "count": remux.web_startup_mse_first_fragment_appended.count,
             "sum_ms": remux.web_startup_mse_first_fragment_appended.sum_ms,
             "max_ms": remux.web_startup_mse_first_fragment_appended.max_ms,
+            "buckets": remux.web_startup_mse_first_fragment_appended.buckets,
         },
         "startup_to_canplay_ms": {
             "count": remux.web_startup_canplay.count,
             "sum_ms": remux.web_startup_canplay.sum_ms,
             "max_ms": remux.web_startup_canplay.max_ms,
+            "buckets": remux.web_startup_canplay.buckets,
         },
         "startup_to_playing_ms": {
             "count": remux.web_startup_playing.count,
             "sum_ms": remux.web_startup_playing.sum_ms,
             "max_ms": remux.web_startup_playing.max_ms,
+            "buckets": remux.web_startup_playing.buckets,
         },
     });
     let value = json!({
@@ -454,6 +465,13 @@ fn status_value(app: &App, detailed: bool) -> (Health, Value) {
             "cache_evicted_files_total": remux.cache_evicted_files_total,
             "cache_evicted_bytes_total": remux.cache_evicted_bytes_total,
             "cache_bytes": remux.cache_bytes,
+            "cache_scans": remux.cache_scans,
+            "cache_scan_entries": remux.cache_scan_entries,
+            "cache_lock_wait": remux.cache_lock_wait,
+            "cache_registry_wait": remux.cache_registry_wait,
+            "cache_sweep_duration": remux.cache_sweep_duration,
+            "cache_maintenance_duration": remux.cache_maintenance_duration,
+            "duration_bucket_bounds_ms": crate::remux::DURATION_BUCKET_BOUNDS_MS,
             "oldest_job_seconds": remux.oldest_job_secs,
             "web_player": web_player,
             "max_jobs": app.cfg.transcode.max_jobs,

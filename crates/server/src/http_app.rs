@@ -587,6 +587,7 @@ impl AppPreflight {
             remuxes: Mutex::new(HashMap::new()),
             ephemeral_cleanup: Arc::new(remux::EphemeralCleanupScheduler::new()),
             cache_maintenance: Mutex::new(()),
+            transcode_cache: remux::CacheCoordinator::default(),
             recent_remux_states: Mutex::new(HashMap::new()),
             web_playback_sessions: Mutex::new(HashMap::new()),
             web_transcode_preparations: Mutex::new(HashMap::new()),

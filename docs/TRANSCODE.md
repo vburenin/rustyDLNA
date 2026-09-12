@@ -343,12 +343,18 @@ unpublished final file/stamp.
 Growing-fragment delivery continues to use its existing incremental index while
 the producer is running.
 
-Finished GET/HEAD requests update the completion stamp's modification time for
-cache recency, preserving the validated media's timestamps and stamp contents.
+Finished raw-MP4 GET/HEAD requests and completed HLS/Media Source attachments
+refresh cache recency on the completion stamp, with writes throttled to once per
+minute. This preserves the validated media's timestamps and stamp contents.
 Age and quota eviction use that recency time, falling back to the media's age
 for unstamped output. Resume validators include the immutable media identity and
 stable stamp identity, so ordinary reads retain both reusable-cache status and
-the same `ETag`; changed media still invalidates both.
+the same `ETag`; changed media still invalidates both. Requested completed output
+is reserved before admission, so an older candidate cannot be evicted while its
+new reader is being registered. Active generations remain protected regardless
+of the recency timestamp. Full cache discovery follows one process-wide
+30-second reconciliation cadence; active artifact sizes and final publication
+accounting are refreshed separately.
 
 Cache identities include the effective codec, audio, browser-quality, HDR
 preservation, Dolby Vision, source, and tool-version inputs. Tool versions are

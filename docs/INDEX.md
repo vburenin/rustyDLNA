@@ -41,6 +41,7 @@ All commands below run from the **repository root**. The agent wrapper invokes
 | Python tests | `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s contrib/library/tests -p 'test_*.py'` and the same command with `-s scripts/tests` | `scripts/check.sh` |
 | Rust documentation | `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked` | `scripts/check.sh` |
 | Build (optional, separate) | `cargo build --locked -p rusty-dlna` | `.github/workflows/ci.yml`, privileged SSDP job |
+| Generated playback benchmark (optional CPU/device tiers) | `node scripts/playback-benchmark.mjs --help` | `docs/WEB_PLAYER.md` |
 | Full web suite (additional CI check) | `npm run test:web` | `package.json`, `.github/workflows/ci.yml`, browser job |
 
 Rust type checking is covered by Clippy; no separate typecheck task is declared.
@@ -63,7 +64,9 @@ not install dependencies.
   and selects it with `rustup default 1.98.1`. Cargo test/doc/run commands in
   the quality gate use `--locked` and the workspace lockfile.
 - Node.js **20 or newer** with npm is required by `AGENTS.md` and the gate;
-  existing CI pins **22.19.0**. Web unit tests need no npm dependency install.
+  existing CI pins **22.19.0**. Run the canonical gate and Playwright sequentially:
+  their isolated test-port ranges both include 18201; simultaneous harnesses can
+  interfere with shutdown assertions. Web unit tests need no npm dependency install.
   The browser job uses `npm ci` and
   `npx playwright install --with-deps chromium firefox webkit` before
   `npm run test:web`.

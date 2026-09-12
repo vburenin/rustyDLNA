@@ -81,7 +81,7 @@ export class WebApi {
     return responseJson(response);
   }
 
-  async librarySnapshot(navigation) {
+  async librarySnapshot(navigation, { onFirstPage = () => {} } = {}) {
     this.abortLibrary();
     const controller = new AbortController();
     this.#libraryController = controller;
@@ -95,7 +95,8 @@ export class WebApi {
         if (page.generation !== generation || page.total !== total) {
           throw new ApiError("The library changed while loading.", { code: "catalog_changed" });
         }
-        if (!Number.isSafeInteger(total) || total < 0
+        if (!Number.isSafeInteger(generation) || generation < 0 || generation > 0xffff_ffff
+          || !Number.isSafeInteger(total) || total < 0
           || !Number.isSafeInteger(limit) || limit < 1 || limit > 200
           || page.offset !== offset || !Array.isArray(page.entries)
           || page.entries.length !== Math.min(limit, total - offset)
@@ -104,6 +105,7 @@ export class WebApi {
         }
       };
       validate(first, 0);
+      onFirstPage(first);
       const pages = [first.entries];
       let nextOffset = limit;
       // Keep requests bounded while collecting one generation before publishing
@@ -143,11 +145,14 @@ export class WebApi {
     return responseJson(response);
   }
 
-  async item(id, { signal = null, enrich = false } = {}) {
+  async item(id, { signal = null, enrich = false, generation = null } = {}) {
     if (!signal) this.abortItem();
     const controller = signal ? null : new AbortController();
     if (controller) this.#itemController = controller;
-    const query = enrich ? "?enrich=1" : "";
+    const params = new URLSearchParams();
+    if (enrich) params.set("enrich", "1");
+    if (generation !== null && generation !== undefined) params.set("generation", String(generation));
+    const query = params.size ? `?${params}` : "";
     const response = await fetch(`/api/web/item/${encodeURIComponent(String(id))}${query}`, {
       headers: { Accept: "application/json" },
       signal: signal || controller.signal,
@@ -157,40 +162,75 @@ export class WebApi {
 
   async preview(url, { signal = null } = {}) {
     const response = await fetch(url, {
+      priority: "low",
       headers: { Accept: "application/json" },
       signal,
     });
     return responseJson(response);
   }
 
-  async preloadPreviewSheets(urls, { signal = null } = {}) {
-    for (const url of urls) {
-      let failure = null;
-      for (const cache of ["force-cache", "reload"]) {
-        try {
-          const response = await fetch(url, {
-            headers: { Accept: "image/jpeg" },
-            cache,
-            signal,
-          });
-          await response.arrayBuffer();
-          if (response.ok) {
-            failure = null;
-            break;
+  async previewSheet(url, { signal = null } = {}) {
+    const limit = 16 * 1024 * 1024;
+    let failure;
+    for (const cache of ["force-cache", "reload"]) {
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      if (signal?.aborted) controller.abort();
+      else signal?.addEventListener("abort", abort, { once: true });
+      const timer = window.setTimeout(abort, 15_000);
+      let reader;
+      let completed = false;
+      let rejectAbort;
+      const aborted = new Promise((_, reject) => { rejectAbort = reject; });
+      const onAbort = () => rejectAbort(new DOMException("Preview was cancelled.", "AbortError"));
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+      if (controller.signal.aborted) onAbort();
+      try {
+        return await Promise.race([aborted, (async () => {
+          const response = await fetch(url, { headers: { Accept: "image/jpeg" }, cache,
+            priority: "low", signal: controller.signal });
+          if (controller.signal.aborted) {
+            void response.body?.cancel().catch(() => {});
+            throw new DOMException("Preview was cancelled.", "AbortError");
           }
-          failure = new ApiError("A timeline preview image could not be loaded.", {
-            status: response.status,
-            code: "preview_unavailable",
-            recoverable: true,
+          if (!response.ok) throw new ApiError("A timeline preview image could not be loaded.", {
+            status: response.status, code: "preview_unavailable", recoverable: true,
             technical: `HTTP ${response.status}`,
           });
-        } catch (error) {
-          if (signal?.aborted) throw error;
-          failure = error;
-        }
+          if (Number(response.headers.get("content-length")) > limit || !response.body) {
+            throw new Error("Preview image exceeds its resource budget.");
+          }
+          reader = response.body.getReader();
+          const chunks = [];
+          let length = 0;
+          let reads = 0;
+          while (true) {
+            const { value, done } = await Promise.race([aborted, reader.read()]);
+            if (done) break;
+            length += value.byteLength;
+            if (length > limit || ++reads > 65_536) throw new Error("Preview image exceeds its resource budget.");
+            if (value.byteLength) chunks.push(value);
+          }
+          if (!length) throw new Error("Preview image is empty.");
+          completed = true;
+          return new Blob(chunks, { type: response.headers.get("content-type") || "image/jpeg" });
+        })()]);
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        failure = error;
+      } finally {
+        window.clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        if (!completed) { controller.abort(); void reader?.cancel().catch(() => {}); }
+        controller.signal.removeEventListener("abort", onAbort);
+        try { reader?.releaseLock(); } catch (_) { /* Pending cancellation. */ }
       }
-      if (failure) throw failure;
     }
+    throw failure;
+  }
+
+  async preloadPreviewSheets(urls, { signal = null } = {}) {
+    for (const url of urls) await this.previewSheet(url, { signal });
   }
 
   async transcodeStatus(id, requestId = null, sessionId = null, signal = null) {
@@ -229,12 +269,14 @@ export class WebApi {
     }
   }
 
-  async reportTranscodeStartup(id, requestId, sessionId, event, signal = null) {
+  async reportTranscodeStartup(id, requestId, sessionId, event, signal = null, elapsedMs = null) {
+    if (elapsedMs !== null && (!Number.isFinite(elapsedMs) || elapsedMs < 0 || elapsedMs > 120_000)) return;
     const params = new URLSearchParams({
       request: String(requestId),
       session: String(sessionId),
       event: String(event),
     });
+    if (Number.isFinite(elapsedMs)) params.set("elapsed_ms", String(Math.round(elapsedMs)));
     const response = await fetch(`/api/web/transcode/${encodeURIComponent(String(id))}?${params}`, {
       method: "POST",
       headers: { Accept: "application/json" },
