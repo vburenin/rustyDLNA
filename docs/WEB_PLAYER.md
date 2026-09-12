@@ -1077,7 +1077,31 @@ playback. Responses use a bounded, header-safe UTF-8 attachment filename,
 
 ### Native offline copies
 
-Native clients can send `X-RustyDLNA-Download: resumable` on compatible MP4 GETs.
+Native clients can send `X-RustyDLNA-Download: progressive` with a byte Range
+on compatible MP4 GETs. The server supplies available, pinned output in bounded
+HTTP 206 responses (at most 64 MiB), with an exact Content-Length, a stable
+ETag, and `X-RustyDLNA-Download: progressive`. Preparation and file delivery
+overlap. The validator binds the output inode and creation identity, remaining
+stable across final rename, cache reattachment, and server restart. Filesystems
+without stable creation metadata use finalized-only delivery. Growing output
+uses `Content-Range: bytes start-end/*`; finalized
+output supplies the complete total. Clients retain each received prefix
+durably and request its next offset with If-Match. A changed producer rejects
+that precondition instead of joining different outputs. Native resume data can
+also recover inside a single interrupted range using Range and If-Range.
+After a growing response has already delivered the final byte, a subsequent
+range at EOF returns HTTP 416 with `Content-Range: bytes */total`, the same ETag,
+and the progressive marker. Only an exactly matching retained prefix can use
+that response as proof of byte completion. Partial output is never proof of a
+complete playable file; native clients still inspect the assembled media.
+The producer stays bounded and survives gaps between native range requests;
+explicit generation cancellation still stops it. Before bytes become available,
+an empty `preparing` HTTP 202 schedules another attempt without spending a
+transport-failure retry. Browser playback and HEAD probes keep their existing
+behavior.
+
+Clients requiring finalized-only delivery can instead send
+`X-RustyDLNA-Download: resumable` on compatible MP4 GETs.
 While the exact generation is preparing, the server returns an empty HTTP 202
 with `X-RustyDLNA-Download: preparing` and `Retry-After: 30`. The client schedules
 another background request to the same URL; this is preparation, not a failed

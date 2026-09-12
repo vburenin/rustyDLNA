@@ -2802,7 +2802,10 @@ pub async fn serve_remux(
     let head = req.method.eq_ignore_ascii_case("HEAD");
     let resumable_download = req.method.eq_ignore_ascii_case("GET")
         && req.path.starts_with("/web/media/")
-        && req.header("X-RustyDLNA-Download") == Some("resumable")
+        && matches!(
+            req.header("X-RustyDLNA-Download"),
+            Some("resumable" | "progressive")
+        )
         && web_delivery(req).is_none();
     if resumable_download {
         // The system download queue reconnects after a preparation response,
@@ -2869,6 +2872,9 @@ pub async fn serve_remux(
     };
     let job = _client.job.clone();
     if resumable_download {
+        if req.header("X-RustyDLNA-Download") == Some("progressive") {
+            return serve_progressive_download(app, sock, req, &job, spec.mime).await;
+        }
         return serve_resumable_download(app, sock, req, &job, spec.mime).await;
     }
     let _path = match wait_ready(&job).await {
@@ -2940,6 +2946,120 @@ pub async fn serve_remux(
         return serve_finished(app, sock, req, &job, spec.mime, head).await;
     }
     serve_growing(app, sock, req, &job, spec.mime, head).await
+}
+
+/// A bounded range has a truthful wire length even while the output grows.
+/// Native clients durably append these ranges and use the final total as the
+/// completion boundary. Pinning prevents producer fallback from replacing bytes
+/// already exposed to a reader; the validator also rejects a replaced job.
+async fn serve_progressive_download(
+    app: &App,
+    sock: &mut tokio::net::TcpStream,
+    req: &HttpRequest,
+    job: &Arc<RemuxJob>,
+    mime: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (start, requested_end) = match req.header("Range").map(parse_open_range) {
+        Some(Ok(range)) => range,
+        None => (0, None),
+        Some(Err(_)) => {
+            write_remux_response(
+                app,
+                sock,
+                HttpResponse::html(400, "Bad Request", "invalid range"),
+                false,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if wait_ready(job).await.is_err() {
+        return serve_resumable_download(app, sock, req, job, mime).await;
+    }
+    let maximum_end = start.saturating_add(64 * 1024 * 1024 - 1);
+    let requested_end = requested_end.unwrap_or(maximum_end).min(maximum_end);
+    // Batch slow producers without waiting for the entire movie. A timeout can
+    // still expose a smaller available prefix; no received bytes are discarded.
+    let minimum = if start == 0 {
+        1024 * 1024
+    } else {
+        8 * 1024 * 1024
+    };
+    let need = start
+        .saturating_add(minimum)
+        .min(requested_end.saturating_add(1));
+    let _ = wait_offset(job, need).await;
+    let metadata_job = job.clone();
+    let (size, etag, complete) = tokio::task::spawn_blocking(move || {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::MetadataExt;
+        let complete = metadata_job.is_complete();
+        let output = metadata_job.open_output()?;
+        let metadata = output.metadata()?;
+        // File creation identity survives append, final rename, registry
+        // eviction and server restart. A process/job identity would incorrectly
+        // reject a paused download when the same cached file is reattached.
+        let etag = metadata.created().ok().map(|created| {
+            let identity = format!("{created:?}:{}:{}", metadata.dev(), metadata.ino());
+            let digest = Sha256::digest(identity.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("\"{digest}\"")
+        });
+        Ok::<_, std::io::Error>((metadata.len(), etag, complete))
+    })
+    .await??;
+    let Some(etag) = etag else {
+        // Filesystems without stable creation metadata retain finalized-only
+        // delivery instead of promising an unsafe validator for growing bytes.
+        return serve_resumable_download(app, sock, req, job, mime).await;
+    };
+    if req.header("If-Match").is_some_and(|value| value != etag) {
+        write_remux_response(
+            app,
+            sock,
+            HttpResponse::html(412, "Precondition Failed", "prepared output changed"),
+            false,
+        )
+        .await?;
+        return Ok(());
+    }
+    if !rusty_dlna_http::range::if_range_matches(req.header("If-Range"), Some(&etag)) {
+        // A native archive for an earlier output cannot be joined to this one.
+        // The ordinary finalized response ignores its stale Range, as required
+        // by If-Range; a growing replacement remains a preparation response.
+        return serve_resumable_download(app, sock, req, job, mime).await;
+    }
+    if start >= size {
+        if !complete {
+            return serve_resumable_download(app, sock, req, job, mime).await;
+        }
+        let mut response =
+            HttpResponse::html(416, "Requested Range Not Satisfiable", "range past EOF");
+        response.set("Content-Range", format!("bytes */{size}"));
+        response.set("ETag", etag);
+        response.set("X-RustyDLNA-Download", "progressive");
+        write_remux_response(app, sock, response, false).await?;
+        return Ok(());
+    }
+    let end = requested_end.min(size - 1);
+    let total = if complete {
+        size.to_string()
+    } else {
+        "*".to_owned()
+    };
+    let mut response = live_transcode_response(mime);
+    response.status = 206;
+    response.reason = "Partial Content".into();
+    response.set("Content-Range", format!("bytes {start}-{end}/{total}"));
+    response.set("Content-Length", end - start + 1);
+    response.set("ETag", etag);
+    response.set("X-RustyDLNA-Download", "progressive");
+    if write_remux_response(app, sock, response, false).await? {
+        stream_growing(app, sock, job, start, Some(end)).await?;
+    }
+    Ok(())
 }
 
 /// Native background downloads need a stable validator and a final length.
@@ -5526,6 +5646,108 @@ mod tests {
             "{method} {url} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nConnection: close\r\n{range}\r\n"
         );
         crate::tests::raw_connection(app.clone(), request.as_bytes(), false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn progressive_download_serves_growing_ranges_with_one_validator_and_final_total() {
+        let (app, job, url, mut payload) = compatible_connection_fixture();
+        let request = |headers: &str| {
+            format!(
+            "GET {url} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nConnection: close\r\nX-RustyDLNA-Download: progressive\r\n{headers}\r\n"
+        )
+        };
+        let first = crate::tests::raw_connection(
+            app.clone(),
+            request("Range: bytes=0-8191\r\n").as_bytes(),
+            false,
+        )
+        .await;
+        assert_eq!(wire_body(&first), &payload[..8192]);
+        let headers = String::from_utf8_lossy(&first[..first.len() - 8192]);
+        assert!(headers.contains("Content-Range: bytes 0-8191/*\r\n"));
+        assert_eq!(job.state(), RemuxState::Growing);
+        assert!(crate::lock_recover(&job.output).is_some());
+        assert!(crate::lock_recover(&job.disconnect_deadline).is_none());
+        let etag = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("ETag: "))
+            .unwrap()
+            .to_owned();
+        let extra = vec![29_u8; FIRST_BYTES as usize];
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&job.part)
+            .unwrap()
+            .write_all(&extra)
+            .unwrap();
+        payload.extend(extra);
+        let middle = crate::tests::raw_connection(
+            app.clone(),
+            request(&format!("Range: bytes=8192-20000\r\nIf-Match: {etag}\r\n")).as_bytes(),
+            false,
+        )
+        .await;
+        assert_eq!(wire_body(&middle), &payload[8192..20001]);
+        let headers = String::from_utf8_lossy(&middle[..middle.len() - 11809]);
+        assert!(headers.contains(&format!("ETag: {etag}\r\n")));
+        assert!(headers.contains("Content-Range: bytes 8192-20000/*\r\n"));
+        std::fs::rename(&job.part, &job.dest).unwrap();
+        write_cache_stamp_for_key(&job.dest, &job.web_spec.as_ref().unwrap().cache_key).unwrap();
+        job.transition(RemuxState::Complete);
+        let tail = crate::tests::raw_connection(
+            app.clone(),
+            request(&format!("Range: bytes=20001-\r\nIf-Match: {etag}\r\n")).as_bytes(),
+            false,
+        )
+        .await;
+        assert_eq!(wire_body(&tail), &payload[20001..]);
+        let headers = String::from_utf8_lossy(&tail[..tail.len() - (payload.len() - 20001)]);
+        assert!(headers.contains(&format!("ETag: {etag}\r\n")));
+        assert!(headers.contains(&format!(
+            "Content-Range: bytes 20001-{}/{}\r\n",
+            payload.len() - 1,
+            payload.len()
+        )));
+        // The cache registry may expire during a long pause. Reattaching the
+        // same finished inode must still accept the growing response's tag.
+        crate::lock_recover(&app.remuxes).clear();
+        let reattached = crate::tests::raw_connection(
+            app.clone(),
+            request(&format!("Range: bytes=8192-16383\r\nIf-Match: {etag}\r\n")).as_bytes(),
+            false,
+        )
+        .await;
+        assert_eq!(wire_body(&reattached), &payload[8192..16384]);
+        let stale = crate::tests::raw_connection(
+            app.clone(),
+            request("Range: bytes=8192-16383\r\nIf-Range: \"older-file\"\r\n").as_bytes(),
+            false,
+        )
+        .await;
+        assert!(stale.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert_eq!(wire_body(&stale), payload);
+        let complete = crate::tests::raw_connection(
+            app.clone(),
+            request(&format!(
+                "Range: bytes={}-\r\nIf-Match: {etag}\r\n",
+                payload.len()
+            ))
+            .as_bytes(),
+            false,
+        )
+        .await;
+        let headers = String::from_utf8_lossy(&complete);
+        assert!(headers.starts_with("HTTP/1.1 416 "));
+        assert!(headers.contains(&format!("Content-Range: bytes */{}\r\n", payload.len())));
+        assert!(headers.contains(&format!("ETag: {etag}\r\n")));
+        let replaced = crate::tests::raw_connection(
+            app.clone(),
+            request("Range: bytes=8192-16383\r\nIf-Match: \"replaced-output\"\r\n").as_bytes(),
+            false,
+        )
+        .await;
+        assert!(replaced.starts_with(b"HTTP/1.1 412 Precondition Failed\r\n"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
