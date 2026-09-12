@@ -172,6 +172,7 @@ export class PlaybackController {
   #session = 0;
   #playbackSession = 0;
   #source = null;
+  #effectiveRecipe = null;
   #mediaSourceObjectUrl = null;
   #trickplayController = null;
   #trickplayManifest = null;
@@ -1304,6 +1305,7 @@ export class PlaybackController {
       pendingSeek,
       onBuffered,
       copiedVideo: source.plan.streamNegotiation.video === "copy",
+      videoOutputs: this.#store.getState().server.capabilities.video_outputs,
       resourceMaxBytes: this.#store.getState().server.capabilities.mse_resource_max_bytes,
       onController: (controller) => { source.mediaBuffer = controller; },
     })
@@ -1477,6 +1479,14 @@ export class PlaybackController {
         if (signal.aborted || sessionId !== this.#store.getState().playback.sessionId) return;
         if (payload.state !== "idle" || registeredAtRequest) source.producerState = payload.state;
         source.lastProducerStatusAt = performance.now();
+        if (payload.effective_recipe
+          && payload.effective_recipe.identity !== source.effectiveRecipe?.identity) {
+          source.effectiveRecipe = payload.effective_recipe;
+          // Keep the completed stream's facts after its transport is released.
+          // A later source/session cannot inherit this recipe.
+          this.#effectiveRecipe = { sessionId, itemId: item.id, recipe: payload.effective_recipe };
+          this.#renderStreamInfo();
+        }
         if (source.mseProgress && Number.isFinite(payload.produced_seconds)
           && payload.produced_seconds > source.mseProgress.producedSeconds) {
           source.mseProgress.producedSeconds = payload.produced_seconds;
@@ -2113,11 +2123,13 @@ export class PlaybackController {
     const { playback, preferences, server } = this.#store.getState();
     const item = playback.item;
     if (!item) return;
+    const effective = this.#effectiveRecipe?.sessionId === playback.sessionId
+      && this.#effectiveRecipe?.itemId === item.id ? this.#effectiveRecipe.recipe : null;
     const inputs = [
       item, playback.audioTracks, playbackAudioTrackIndex(playback), playback.sourceMode,
       playback.outputQuality, playback.nativeHlsDelivery, playback.mediaSourceDelivery,
       playback.streamNegotiation, preferences.quality, server.capabilities,
-      playback.encodingPreset,
+      playback.encodingPreset, effective,
     ];
     // Clock ticks and buffering updates do not change stream facts. Keep the
     // existing nodes (and any text selection) until their inputs change.
@@ -2191,6 +2203,27 @@ export class PlaybackController {
           : playback.mediaSourceDelivery ? "Media Source · fragmented MP4" : "Native media loading"],
         ["Video", item.kind === "video" ? "Checking browser support…" : "None"],
         ["Audio", "Checking browser support…"],
+      ]);
+      return;
+    }
+    if (effective && effective.attempt !== "primary") {
+      const range = effective.dynamic_range === "hdr10" ? "HDR10"
+        : effective.dynamic_range === "copied" ? "source dynamic range copied" : "SDR";
+      const video = effective.video_encoder === "copy" ? `${sourceVideo} · copied unchanged`
+        : `${/hevc|265/.test(effective.video_encoder) ? "HEVC" : "H.264"} (${effective.video_encoder})`;
+      this.#dom.streamInfoSummary.textContent = effective.cache_reuse
+        ? "The server is reusing a validated fallback stream. These details describe the delivered output."
+        : "The server used a fallback encoder. These details describe the delivered output.";
+      replaceFacts(this.#dom.outputStreamFacts, [
+        ["Container", "Fragmented MP4"],
+        ["Delivery", playback.nativeHlsDelivery ? "Native HLS · fragmented MP4"
+          : playback.mediaSourceDelivery ? "Media Source · fragmented MP4" : "Native media loading"],
+        ["Quality", profileLabel],
+        ["Video", item.kind === "video"
+          ? [video, range, effective.pixel_format,
+            effective.max_video_bitrate ? `${effective.max_video_bitrate} maximum bitrate` : ""].filter(Boolean).join(" · ") : "None"],
+        ["Audio", effective.audio_encoder === "copy" ? `${sourceAudio} · copied unchanged` : (effective.audio_encoder || effective.audio_codecs?.join(", ") || "None").toUpperCase()],
+        ["Encoder preset", effective.preset],
       ]);
       return;
     }

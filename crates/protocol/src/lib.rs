@@ -78,6 +78,11 @@ pub use xml::{escape_xml, escape_xml_into, escape_xml_text, escape_xml_text_into
 /// Copied decoder dependencies remain intact; oversized resources fail explicitly.
 pub const MSE_RESOURCE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Actual encoded fallback recipe bound to the first Media Source playlist.
+/// These fixed values let an empty SourceBuffer match the output before init bytes.
+pub const MSE_VIDEO_OUTPUT_HEADER: &str = "X-Rusty-Video-Output";
+pub const MSE_AUDIO_CODEC_HEADER: &str = "X-Rusty-Audio-Codec";
+
 pub const SERVER_NAME: &str = "rustyDLNA";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 

@@ -7046,7 +7046,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
             dvp7.detail_id
         ),
         format!(
-            "/web/media/{}.m3u8?delivery=mse&mse_after=20001",
+            "/web/media/{}.m3u8?delivery=mse&mse_after=100001",
             dvp7.detail_id
         ),
         format!(

@@ -3143,6 +3143,73 @@ fn transcode_cache_key_with_tools(
     lowercase_hex(&hasher.finalize())
 }
 
+/// Identity of an actual successful fallback command. The request identity
+/// supplies the pinned source and toolchain; length-delimited byte-exact argv
+/// supplies every effective codec, filter, quality and timing choice. This is
+/// deliberately narrower than treating a fallback as an equivalent primary plan.
+/// Call from blocking preparation/producer work, never an async listener task.
+pub fn effective_fallback_cache_key(request_key: &str, args: &[OsString]) -> String {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let mut device = Vec::new();
+    // Fixed, bounded device/driver observations; no recursive sysfs discovery.
+    // A driver reload, device replacement, or executable/source change prevents
+    // a previous stable failure from silently selecting an old fallback.
+    for path in [
+        "/proc/sys/kernel/osrelease",
+        "/proc/driver/nvidia/version",
+        "/sys/module/nvidia/version",
+        "/sys/module/amdgpu/version",
+    ] {
+        device.extend_from_slice(path.as_bytes());
+        match std::fs::File::open(path) {
+            Ok(file) => {
+                let _ = file.take(4096).read_to_end(&mut device);
+            }
+            Err(error) => device.extend_from_slice(format!("{:?}", error.kind()).as_bytes()),
+        }
+        device.push(0);
+    }
+    for path in (0..16)
+        .map(|index| format!("/dev/dri/renderD{}", 128 + index))
+        .chain((0..16).map(|index| format!("/dev/nvidia{index}")))
+        .chain(["/dev/nvidiactl".to_owned()])
+    {
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            device.extend_from_slice(
+                format!(
+                    "{path}:{}:{}:{}:{}:{}:{}\n",
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.rdev(),
+                    metadata.len(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec()
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    effective_fallback_cache_key_with_device(request_key, args, &device)
+}
+
+fn effective_fallback_cache_key_with_device(
+    request_key: &str,
+    args: &[OsString],
+    device: &[u8],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"effective-fallback-v1\0");
+    for bytes in std::iter::once(request_key.as_bytes())
+        .chain(args.iter().map(|arg| arg.as_encoded_bytes()))
+        .chain(std::iter::once(device))
+    {
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    lowercase_hex(&digest.finalize())
+}
+
 fn validated_output_stamp(metadata: &std::fs::Metadata, cache_key: &str) -> String {
     use std::os::unix::fs::MetadataExt;
     format!(
@@ -7697,5 +7764,45 @@ encoder = "copy"
             .unwrap();
         assert!(!cache_is_fresh_for_key(&dest, "key"));
         std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn effective_fallback_identity_binds_recipe_source_tool_and_device() {
+        let args = vec![
+            OsString::from("ffmpeg"),
+            "-c:v".into(),
+            "libx264".into(),
+            "-crf".into(),
+            "22".into(),
+        ];
+        let key = effective_fallback_cache_key_with_device("source-tool-plan", &args, b"driver-a");
+        assert_eq!(
+            key,
+            effective_fallback_cache_key_with_device("source-tool-plan", &args, b"driver-a")
+        );
+        assert_ne!(
+            key,
+            effective_fallback_cache_key_with_device("new-source-tool-plan", &args, b"driver-a")
+        );
+        assert_ne!(
+            key,
+            effective_fallback_cache_key_with_device("source-tool-plan", &args, b"driver-b")
+        );
+        let mut changed = args.clone();
+        changed[4] = "28".into();
+        assert_ne!(
+            key,
+            effective_fallback_cache_key_with_device("source-tool-plan", &changed, b"driver-a")
+        );
+        changed = args.clone();
+        changed[2] = "hevc_nvenc".into();
+        assert_ne!(
+            key,
+            effective_fallback_cache_key_with_device("source-tool-plan", &changed, b"driver-a")
+        );
+        assert_ne!(
+            effective_fallback_cache_key_with_device("key", &["a".into(), "bc".into()], b"d"),
+            effective_fallback_cache_key_with_device("key", &["ab".into(), "c".into()], b"d")
+        );
     }
 }

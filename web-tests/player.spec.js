@@ -7138,3 +7138,225 @@ test("Android MSE timeout retries with real decodable fragments and cancels the 
   await expect(page.locator("#player-message[role=alert]")).toBeHidden();
   await page.locator("#video-player").evaluate((player) => player.pause());
 });
+
+test("stream details disclose the effective cached software fallback recipe", async ({ page, isMobile }) => {
+  // Portrait phones deliberately hide this control; inspect it in landscape.
+  if (isMobile) await page.setViewportSize({ width: 900, height: 600 });
+  await usePreference(page, "stream", "compat");
+  await serveFixtureMedia(page);
+  // Keep this short real fixture's source generation alive while inspecting
+  // status-driven facts, then explicitly resume it to exercise source cleanup.
+  await page.addInitScript(() => {
+    document.addEventListener("DOMContentLoaded", () => {
+      const video = document.querySelector("#video-player");
+      video.addEventListener("playing", () => {
+        queueMicrotask(() => video.pause());
+      }, { once: true });
+    });
+  });
+  let offerFallback = true;
+  const statusGenerations = new Set();
+  await page.route("**/api/web/transcode/*", (route) => {
+    const url = new URL(route.request().url());
+    if (route.request().method() === "GET") statusGenerations.add(url.searchParams.get("request"));
+    return route.fulfill({ json: {
+      schema_version: 2, item_id: url.pathname.split("/").at(-1),
+      request_id: Number(url.searchParams.get("request")), state: "producing",
+      retry_after_seconds: null,
+      effective_recipe: offerFallback ? {
+        identity: "effective-fallback-test", attempt: "portable", cache_reuse: true,
+        video_encoder: "libx264", audio_encoder: "aac", dynamic_range: "sdr",
+        pixel_format: "yuv420p", preset: "veryfast", max_video_bitrate: "3000k",
+      } : null,
+    } });
+  });
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  await expect.poll(() => page.locator("#video-player").evaluate((video) => ({
+    paused: video.paused, ended: video.ended, loaded: video.readyState >= 2,
+  }))).toEqual({ paused: true, ended: false, loaded: true });
+  await showPlayerControls(page);
+  await page.locator("#stream-info-button").click();
+  await expect(page.locator("#stream-info-summary")).toContainText("reusing a validated fallback stream");
+  await expect(page.locator("#output-stream-facts")).toContainText("H.264 (libx264) · SDR · yuv420p");
+  await expect(page.locator("#output-stream-facts")).toContainText("AAC");
+  await expect(page.locator("#output-stream-facts")).toContainText("veryfast");
+  await expect(page.locator("#output-stream-facts")).not.toContainText("copied unchanged");
+  await expect.poll(() => page.locator("#video-player").evaluate((video) => video.paused && !video.ended)).toBe(true);
+
+  // Natural completion disposes the transport, but the selected playback still
+  // describes the same actual output. Its facts must survive that cleanup.
+  await page.locator("#video-player").evaluate((video) => video.play());
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Replay");
+  await expect(page.locator("#stream-info-summary")).toContainText("reusing a validated fallback stream");
+  await expect(page.locator("#output-stream-facts")).toContainText("H.264 (libx264) · SDR · yuv420p");
+  await expect(page.locator("#output-stream-facts")).toContainText("AAC");
+  await expect(page.locator("#output-stream-facts")).not.toContainText("copied unchanged");
+
+  // Replaying creates another source generation. Until that source reports its
+  // own recipe, the previous generation's software fallback must not leak in.
+  await page.getByRole("button", { name: "Close stream information" }).click();
+  offerFallback = false;
+  await page.locator("#video-player").evaluate((video) => {
+    video.addEventListener("playing", () => queueMicrotask(() => video.pause()), { once: true });
+  });
+  await showPlayerControls(page);
+  const replay = page.getByRole("button", { name: "Replay", exact: true });
+  await replay.focus();
+  await expect(replay).toBeFocused();
+  await replay.press("Enter");
+  await expect.poll(() => statusGenerations.size).toBe(2);
+  await expect.poll(() => page.locator("#video-player").evaluate((video) => ({
+    paused: video.paused, ended: video.ended, loaded: video.readyState >= 2,
+  }))).toEqual({ paused: true, ended: false, loaded: true });
+  await showPlayerControls(page);
+  await page.locator("#stream-info-button").click();
+  await expect(page.locator("#stream-info-summary")).not.toContainText("fallback stream");
+  await expect(page.locator("#output-stream-facts")).toContainText("copied unchanged");
+  await expect(page.locator("#output-stream-facts")).not.toContainText("libx264");
+});
+
+for (const cacheReuse of [false, true]) {
+  test(`MSE replaces an empty HEVC buffer before decoding ${cacheReuse ? "cached" : "fresh"} H264 fallback output`, async ({ page, browserName }) => {
+    test.skip(browserName !== "chromium", "Real MSE decode coverage uses Chromium; HEVC capability alone is mocked");
+    const fixture = await fragmentedCompatibleFixture({ profile: "high", level: "5.1" });
+    const { initEnd } = fragmentedMp4Layout(fixture);
+    await usePreference(page, "stream", "compat");
+    await page.addInitScript(() => {
+      const nativeCanPlayType = HTMLMediaElement.prototype.canPlayType;
+      HTMLMediaElement.prototype.canPlayType = function fallbackCanPlayType(type) {
+        if (String(type).includes("hvc1.")) return "probably";
+        if (String(type).includes("ac-3")) return "";
+        return nativeCanPlayType.call(this, type);
+      };
+      Object.defineProperty(navigator, "mediaCapabilities", { configurable: true, value: {
+        decodingInfo: async (configuration) => ({
+          supported: !String(configuration.audio?.contentType).includes("ac-3"),
+          smooth: true, powerEfficient: true,
+        }),
+      } });
+      const nativeSupported = MediaSource.isTypeSupported.bind(MediaSource);
+      Object.defineProperty(MediaSource, "isTypeSupported", { configurable: true,
+        value: (type) => String(type).includes("hvc1.") || nativeSupported(type) });
+      const observed = window.__effectiveCodecMse = { events: [], decodedFrames: 0 };
+      const types = new WeakMap();
+      const nativeAdd = MediaSource.prototype.addSourceBuffer;
+      MediaSource.prototype.addSourceBuffer = function trackedAdd(type) {
+        // Allocate a genuine SourceBuffer on hosts without HEVC decoding. The
+        // requested type remains observable and any append to it fails below,
+        // so merely decoding H264 successfully cannot satisfy this regression.
+        const buffer = nativeAdd.call(this, String(type).includes("hvc1.")
+          ? 'video/mp4; codecs="avc1.640033,mp4a.40.2"' : type);
+        types.set(buffer, String(type));
+        observed.events.push({ event: "add", type: String(type) });
+        return buffer;
+      };
+      const nativeRemove = MediaSource.prototype.removeSourceBuffer;
+      MediaSource.prototype.removeSourceBuffer = function trackedRemove(buffer) {
+        nativeRemove.call(this, buffer);
+        observed.events.push({ event: "remove", type: types.get(buffer) });
+      };
+      const nativeAppend = SourceBuffer.prototype.appendBuffer;
+      SourceBuffer.prototype.appendBuffer = function trackedAppend(bytes) {
+        const type = types.get(this);
+        observed.events.push({ event: "append", type });
+        if (type?.includes("hvc1.")) throw new Error("Fallback initialization reached the original HEVC buffer");
+        return nativeAppend.call(this, bytes);
+      };
+      document.addEventListener("DOMContentLoaded", () => {
+        const video = document.querySelector("#video-player");
+        video.requestVideoFrameCallback(() => {
+          observed.decodedFrames += 1;
+          video.pause();
+        });
+      });
+    });
+    await page.route("**/api/web/library?**", async (route) => {
+      const response = await route.fetch();
+      const payload = await response.json();
+      for (const item of payload.entries || []) {
+        if (item.entry_type !== "media" || item.kind !== "video") continue;
+        Object.assign(item, {
+          video_codec: "hevc", codec_string: "hvc1.2.4.L150.90,ac-3",
+          video_content_type: 'video/mp4; codecs="hvc1.2.4.L150.90"',
+          video_profile: "Main 10", video_level: 150, bit_depth: 10,
+          pixel_format: "yuv420p10le", hdr: "hdr10", video_repair_required: false,
+          audio_codec: "ac3", stream_metadata_complete: true,
+          audio_tracks: [{ index: 0, codec: "ac3", channels: 6, default: true,
+            content_type: 'audio/mp4; codecs="ac-3"' }],
+        });
+      }
+      await route.fulfill({ response, json: payload });
+    });
+    const cancelled = [];
+    await page.route("**/api/web/transcode/*", (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      if (request.method() === "DELETE") cancelled.push(url.searchParams.get("request"));
+      return route.fulfill({ json: {
+        schema_version: 2, item_id: "9", request_id: Number(url.searchParams.get("request")),
+        state: cacheReuse ? "complete" : "producing", retry_after_seconds: null,
+        effective_recipe: {
+          identity: "effective-mse-fallback", attempt: "portable", cache_reuse: cacheReuse,
+          video_encoder: "libx264", audio_encoder: "aac", dynamic_range: "sdr",
+          pixel_format: "yuv420p", preset: "veryfast", max_video_bitrate: "3000k",
+        },
+      } });
+    });
+    const requests = [];
+    await page.route("**/web/media/*?**", async (route) => {
+      const url = new URL(route.request().url());
+      requests.push(url);
+      const delivery = url.searchParams.get("delivery");
+      if (delivery === "mse") {
+        const init = new URL(url);
+        init.pathname = init.pathname.replace(/\.m3u8$/, ".mp4");
+        init.searchParams.delete("mse_after");
+        init.searchParams.set("delivery", "mse_init");
+        init.searchParams.set("hls_offset", "0");
+        init.searchParams.set("hls_length", String(initEnd));
+        const fragment = new URL(init);
+        fragment.pathname = fragment.pathname.replace(/\.mp4$/, ".m4s");
+        fragment.searchParams.set("delivery", "mse_segment");
+        fragment.searchParams.set("hls_offset", String(initEnd));
+        fragment.searchParams.set("hls_length", String(fixture.byteLength - initEnd));
+        await route.fulfill({ status: 200, contentType: "application/vnd.apple.mpegurl",
+          headers: { "X-Rusty-Video-Output": "h264_sdr", "X-Rusty-Audio-Codec": "aac" },
+          body: `#EXTM3U\n#EXT-X-MAP:URI="${init}"\n#EXTINF:2.000000,\n${fragment}\n${cacheReuse ? "#EXT-X-ENDLIST\n" : ""}` });
+        return;
+      }
+      if (!["mse_init", "mse_segment"].includes(delivery)) {
+        await route.fulfill({ status: 400, body: "unexpected recovery delivery" });
+        return;
+      }
+      const offset = Number(url.searchParams.get("hls_offset"));
+      const length = Number(url.searchParams.get("hls_length"));
+      await route.fulfill({ status: 200, contentType: delivery === "mse_init" ? "video/mp4" : "video/iso.segment",
+        body: fixture.subarray(offset, offset + length) });
+    });
+    const errors = await openLibrary(page);
+    await selectTaggedVideo(page);
+    await expect.poll(() => page.evaluate(() => window.__effectiveCodecMse.decodedFrames)).toBe(1);
+    const events = await page.evaluate(() => window.__effectiveCodecMse.events);
+    expect(events.slice(0, 3)).toEqual([
+      { event: "add", type: 'video/mp4; codecs="hvc1.2.4.L150.90,mp4a.40.2"' },
+      { event: "remove", type: 'video/mp4; codecs="hvc1.2.4.L150.90,mp4a.40.2"' },
+      { event: "add", type: expect.stringContaining("avc1.") },
+    ]);
+    expect(events.filter(({ event }) => event === "add")).toHaveLength(2);
+    const appends = events.filter(({ event }) => event === "append");
+    expect(appends.length).toBeGreaterThanOrEqual(2);
+    expect(appends.every(({ type }) => type.includes("avc1."))).toBe(true);
+    expect(requests[0].searchParams.get("video_mode")).toBe("copy");
+    expect(requests[0].searchParams.get("audio_mode")).toBe("transcode");
+    expect(requests[0].searchParams.get("request")).toMatch(/^\d+$/);
+    expect(requests[0].searchParams.get("session")).toMatch(/^\d+$/);
+    expect(new Set(requests.map((url) => url.searchParams.get("request"))).size).toBe(1);
+    expect(new Set(requests.map((url) => url.searchParams.get("session"))).size).toBe(1);
+    expect(requests.filter((url) => url.searchParams.get("delivery") === "mse_init")).toHaveLength(1);
+    expect(requests.every((url) => url.searchParams.get("video_mode") === "copy")).toBe(true);
+    expect(cancelled).toEqual([]);
+    expect(errors).toEqual([]);
+    await expect(page.locator("#player-message[role=alert]")).toBeHidden();
+  });
+}

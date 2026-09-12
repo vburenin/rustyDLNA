@@ -1,8 +1,10 @@
 # Plan: project quality and streaming performance
 
-- Status: bundles A (R01–R05) and B (P01–P04/P11) implemented. Bundle B
-  measurement and verification limits are recorded below; other bundles remain
-  proposed work. Bundle A's earlier parallel-browser failures and unresolved
+- Status: bundles A (R01–R05), B (P01–P04/P11), and C structural fixes
+  (P05/P06/P10) implemented. P07 has measured opt-in resource and pacing
+  prototypes; production scheduling/threading/pacing defaults remain unchanged.
+  Measurement and verification limits are recorded below; other findings retain
+  their individual implementation status. Bundle A's earlier parallel-browser failures and unresolved
   FFmpeg 6 helper crashes remain part of the verification record.
 - Baseline: `def6a7e` (`Treat native playback quality as a ceiling`), initially clean worktree.
 - Scope: all eight Rust crates, embedded browser, operator tools, deployment,
@@ -34,6 +36,9 @@ promised without representative measurements.
   to use current stable Rust. The user subsequently authorized committing and
   pushing bundle A. Bundle B implementation, regression tests, benchmarks and
   documentation are authorized; committing, pushing and deployment are not.
+  Bundle C focused implementation, regressions, measurements and documentation
+  are also authorized. The subsequent handoff instruction authorizes committing
+  and pushing bundle C; deployment remains outside scope.
   No live configuration change or modification of an existing media library is
   authorized.
 - No blanket reduction of probe limits, encoder quality, HDR preservation, or
@@ -287,6 +292,229 @@ reported rather than counted as a successful warm-MSE trial. Privileged network
 namespace, Docker release smoke, ARM64, soak and fuzz campaigns were not run for
 this scoped change. Local `cargo-audit`, `cargo-deny` and `cargo-machete` remain
 unavailable; standalone JavaScript/Python lint/type checking remains unconfigured.
+
+## Bundle C implementation and measurements
+
+The current baseline is clean commit `cc7724c`, with Rust 1.98.1 and a saved
+unchanged debug executable (`/tmp/rustydlna-bundle-c-before`, SHA-256
+`4404eeb9e083fc5ef5d3b18ccb80491ae913e0dacd63c13f138da9cd320265d1`).
+Existing bundle A/B/E contracts remain in place. No production codec, encoder
+quality, HDR policy, thread count, pacing argument or title/helper ceiling changed.
+[ADR 0004](docs/adr/0004-streaming-output-and-index-identity.md) records descriptor,
+index and effective-output identity decisions.
+
+P05 uses five rotated samples per variant, four loopback readers transferring
+8 GiB while a separate index worker reads 512 MiB of fixed sparse metadata.
+The same generated 64 MiB fixture, warm ext4 page cache, Ryzen 9 5950X and
+Rust 1.98.1 release build apply to every variant. This isolates primitives;
+it excludes HTTP guards, real demux/decode, storage-cache misses and renderer work.
+
+| Read strategy | Median CPU seconds/GiB (sample SD) | Median GiB/s (sample SD) | Median voluntary switches/GiB |
+| --- | ---: | ---: | ---: |
+| Legacy 64 KiB | 1.258 (0.075) | 3.281 (0.180) | 80,347 |
+| Positioned 64 KiB | 0.820 (0.054) | 6.669 (0.445) | 29,115 |
+| Positioned 256 KiB | 0.543 (0.032) | 9.410 (0.606) | 12,897 |
+| Positioned 1 MiB | 0.517 (0.209) | 9.622 (2.591) | 7,817 |
+
+256 KiB is selected: 1 MiB adds only 2.3% median throughput with much higher
+variance and four times the per-socket buffer. Involuntary switches increase
+from 3.875 to 12.875/GiB. First-write medians are 422/368/370/396 microseconds
+(20 correlated socket observations per variant), not displayed-frame latency.
+Five quiet slow-client cancellation runs have median 5.876 ms, SD 0.082 ms,
+range 5.716–5.910 ms. Process peak RSS is cumulative across variants and cannot
+establish comparative memory use; the one-buffer/socket bound is structural.
+Reports: `/tmp/rustydlna-bundle-c-p05-summary.json`,
+`/tmp/rustydlna-bundle-c-p05-sustained.log`, and
+`/tmp/rustydlna-bundle-c-p05-cancel.log`.
+
+P06 compares optimized original/current parsers with 18 synthetic samples per
+revision/shape, in two alternating process runs. Values below are the range of
+the two nine-sample medians, not confidence intervals. URIs are 200 characters.
+
+| Shape | Warm index ms, before → after | Render ms, before → after | Manifest bytes | Bytes/minute at assumed 1 Hz |
+| --- | ---: | ---: | ---: | ---: |
+| 10 minutes / 600 | 1.907–2.017 → 0.003647–0.003687 | 0.206–0.208 → 0.148 | 150,293 | 9,017,580 |
+| 2 hours / 7,200 | 22.907–23.838 → 0.002555–0.002665 | 1.799–1.857 → 1.065–1.093 | 1,806,244 | 108,374,640 |
+| 8 hours / 28,800 | 91.578–95.815 → 0.003526–0.003557 | 7.481–7.809 → 4.370–4.421 | 7,244,145 | 434,648,700 |
+
+Manifest bytes are identical before/after. Native EVENT network cost is not
+reduced. Eight-hour retained metadata is 2,359,660 → 2,100,028 bytes. Ten-minute
+cold parse median regresses 6–13% (1.902–2.010 → 2.138–2.146 ms); eight-hour
+cold parsing improves 91.631–95.666 → 63.103–64.172 ms, including P05 positional
+reads. There is no blanket cold-index speedup claim. All samples/minima/maxima
+are in `/tmp/rustydlna-p06-comparison-final.log`; its reproduction harness is
+`/tmp/rustydlna-p06-comparison.py`.
+
+Separate decodable fixtures contain real 32×32/1-fps H.264 video only, for
+10 minutes, two hours and eight hours. Full decoding and completed-output
+validation passed. Nine after-only debug samples had warm medians
+0.005951/0.004719/0.007614 ms; render medians 0.418/2.960/11.611 ms. Four
+64 KiB positioned readers during formatting observed p95 read latency
+0.007134/0.006853/0.006523 ms (1,455/20,389/94,925 correlated reads). These are
+not a matched before/after segment-latency comparison or representative UHD
+media. Report: `/tmp/rustydlna-p06-media-benchmark.log`. Native Safari, mobile
+hardware and variable-GOP native recovery are not certified by these tests.
+
+P07's opt-in mixed experiment uses five rotating-order trials per arm, the same
+40-second 640×360/24-fps SDR H.264/AAC fixture and output profiles, eight allowed
+logical CPUs (affinity 0–7), a four-helper ceiling, and the RTX 3050 8 GiB with
+driver 555.42.06/FFmpeg 6.1.1. Only the explicit threading and admission arms
+differ; video-only, both-track encode and NVENC remain separate workloads.
+This environment does not expose usable cgroup controller files, so a real
+cgroup-quota tier was unavailable; affinity limits were exercised.
+Every produced file decoded successfully. This is unpaced raw-MP4 throughput,
+not browser start/seek performance or new pacing validation.
+
+| Observation, median ms (sample SD) | FIFO, automatic threads | FIFO, bounded pools | Resource admission, bounded pools |
+| --- | ---: | ---: | ---: |
+| CPU video helper | 749 (14.9) | 1,814 (26.5) | 1,934 (60.1) |
+| Both-track helper | 1,354 (28.0) | 2,541 (26.0) | 2,539 (69.5) |
+| NVENC helper | 1,634 (65.4) | 1,994 (48.1) | 2,017 (143.2) |
+| Copy queue | 81 (9.1) | 61 (0) | 2,058 (60.6) |
+| Audio queue | 61 (0) | 61 (0) | 1,935 (60.2) |
+| Artwork queue | 122 (8.4) | 101.5 (0) | 2,269 (60.2) |
+| Probe queue | 91.5 (8.5) | 71 (0) | 1,996.5 (60.4) |
+
+Probe/artwork values average two jobs within each independent trial. Sampled
+CPU-video thread peaks drop from median 35 to 4, and NVENC from 35 to 10;
+CPU-video sampled CPU ticks drop 205 → 182 with bounded FIFO pools, while
+helper duration more than doubles. Sampling at about 20 ms misses short-lived
+work and is a lower bound. Reports retain exact commands and per-helper CPU,
+thread, RSS and first-16-KiB observations; GPU engine utilization/VRAM, other
+GPUs and AI-upscale execution are not measured. Existing upscale admission is
+preserved; its resource model is tested separately.
+
+For promotion, interactive queue/first-output screening budgets are 500/1,000 ms,
+background queue 10 seconds, at least 2× unpaced encoded throughput, and the
+existing four-helper ceiling. The resource arm fails the interactive budgets;
+no class times out, and raw throughput alone is insufficient evidence. We do
+not promote either threading or admission changes. A two-hour synthetic demand
+model preserves a bounded lead at 2× and stops additional demand when all viewers
+pause, while keeping another active viewer/native consumer independent. It does
+not control real FFmpeg; fixed-1× lead exhaustion and continued paused production
+remain production limitations. SIGINT/SIGTERM tests reap active prototype helpers
+and remove temporary output in 214/215 ms; no live configuration is changed.
+Reports: `/tmp/rustydlna-bundle-c-p07.tsv`, `-p07.log`, `-p07-summary.json` and
+`-p07-signals-final.json` with the same prefix. The initial wrapper pilot failed
+because argv[0] was passed twice; it is retained as `-p07-pilot.*` and excluded.
+The final signal/cleanup refinements leave the measured helper recipes unchanged.
+
+P10's actual FFmpeg unsupported-encoder regression publishes validated software
+H.264/SDR output, then reuses it without another producer attempt. Tests cover
+expiry, changed candidate recipes/device identities, invalid output, concurrent
+owners, cancellation, status-before-output, pinning below 16 KiB and unpinned
+output above it. A retained completed fallback cannot bypass new-owner checks;
+existing generations retain their pinned output. This is evidence for the
+mechanism, not a claim that every physical GPU failure was reproduced.
+Review also corrected a Growing-to-fallback readiness/pin race within the
+original deadline and made MSE use the pinned fallback's codecs before init
+append. A warm HEVC-request/H.264-output HTTP regression and fresh/cached browser
+decode cases cover that boundary without changing the playback generation.
+An initial browser run also exposed loss of effective stream facts after the
+short fixture ended. Facts now remain bound to the completed item/session,
+while a replay or replacement cannot inherit them; active, ended and replay
+states are covered explicitly.
+
+The matched P01 integration run uses ten independent trials per recipe, two
+concurrent Chromium MSE viewers at verified 2×, 40-second 640×360/24-fps SDR
+H.264/AAC fixtures, FFmpeg 6.1.1, debug executables and warm ext4 page cache.
+Cold means empty derived output/fresh server; warm requires a validated stamp
+and no new producer. All 40 output recipe/probe/decoded-frame-hash comparisons
+pass with no configuration mismatch. Startup observations from the two viewers
+are correlated; seek/cancellation have ten observations per workload.
+
+| Recipe | Cold frame ms (SD), before → after | Warm frame ms (SD), before → after | Restart frame ms (SD), before → after | Cancellation ms (SD), before → after |
+| --- | ---: | ---: | ---: | ---: |
+| Copy | 166.95 (7.57) → 168.00 (19.71) | 41.85 (6.04) → 45.40 (6.30) | 487.80 (7.39) → 491.85 (28.15) | unavailable |
+| Audio encode | 207.60 (11.45) → 208.50 (38.62) | 44.45 (5.95) → 48.05 (10.85) | 535.80 (5.27) → 536.35 (6.80) | 348.12 (34.97) → 352.40 (101.22) |
+| Video encode | 215.50 (5.18) → 210.25 (13.37) | 39.40 (5.39) → 45.15 (5.20) | 586.75 (28.15) → 584.25 (24.32) | 326.99 (37.26) → 345.47 (23.22) |
+| Both encode | 266.90 (12.49) → 261.75 (9.21) | 42.95 (5.97) → 41.85 (6.41) | 590.40 (5.38) → 594.15 (7.73) | 316.09 (47.96) → 357.45 (40.65) |
+
+There is no general startup/seek improvement. Warm medians regress for three
+recipes, and cancellation medians regress for all encoded recipes. Copy
+producers finish before active attachment/cancellation can be measured; those
+20 unavailable cases are not passes. The audio cold observed p95 rises
+219.77 → 328.52 ms (one trial affects both viewers); cancellation observed p95
+rises 386.60 → 551.36 ms. Both trigger P01's repeat recommendation. These small
+samples do not establish reliable tail distributions.
+
+Separate three-second post-validation playback windows all progress near 2×
+(observed media/wall range 1.992–2.003). Producers have already completed in
+these windows; zero physical reads/writes and median sampled server CPU
+0.020–0.030 seconds cannot establish production pacing behavior or CPU/GiB.
+Median server RSS increases by 0.66–1.70 MB across recipes. Per-trial startup
+and sustained CPU/RSS/I/O remain separate in the report, with concurrent viewers
+counted once. The baseline was collected while agents also edited and sometimes
+compiled/tested; the final measurement window excluded other heavy checks.
+Therefore integration differences are observational, not isolated causal gains.
+The rotated P05/P06 primitive benchmarks provide the stronger structural evidence.
+
+Reports are `/tmp/rustydlna-bundle-c-playback-before.json`,
+`/tmp/rustydlna-bundle-c-playback-after.json` and
+`/tmp/rustydlna-bundle-c-playback-summary.json`. The measured after executable
+is `/tmp/rustydlna-bundle-c-after`, SHA-256
+`2b149d9d1d5d17f0583cb8eff6d79351282bb977a3cfa7862e824f72d788e516`.
+This pair precedes the final readiness/fallback-MSE handshake corrections;
+the successful primary H.264 benchmark recipes do not exercise fallback.
+
+A separate matched audio-only repeat uses ten new independent trials per
+revision with the same fixture/codec/quality/storage/concurrency/rate options,
+run sequentially after other heavy checks stopped. All ten output validations
+pass; P01 reports comparable configurations and no repeat flags. Cold-frame
+median is 214.35 → 213.10 ms (SD 7.89 → 10.35), observed p95
+225.31 → 223.38 ms. Cancellation median is 325.26 → 308.63 ms
+(SD 40.30 → 37.28), observed p95 342.58 → 339.67 ms. Warm median
+still rises 41.55 → 44.10 ms; paused-nearby seek rises 26.55 → 32.35 ms.
+The original slower observations remain above; the repeat does not establish
+reliable tail performance or a general speedup. Reports:
+`/tmp/rustydlna-bundle-c-audio-repeat-before.json` and
+`/tmp/rustydlna-bundle-c-audio-repeat-after.json`. This repeat uses the final
+production executable `/tmp/rustydlna-bundle-c-final`, SHA-256
+`f5b231490186bd9532fe662e9b70938b93602b151ed64cbc9ba6d671247908cd`.
+
+Final `./scripts/agent-verify.sh` passes on Rust 1.98.1: 121 Python tests,
+102 web unit tests, workspace tests (366 server tests), formatting, Clippy with
+warnings denied, Rust documentation checks, fixture checksums, CLI checks,
+eight enabled socket E2E tests and test-port isolation. The final gate also
+covers the last history-append refinement removing an unnecessary invariant
+panic; browser matrix behavior is unchanged. Seven P07 example policy tests and
+its SIGINT/SIGTERM cleanup checks pass separately. The gate intentionally ignores
+six server/four scanner benchmarks; the three bundle C index/delivery benchmarks
+were exercised separately, while unrelated cache/library benchmarks were not
+rerun. Standalone JS/Python lint/type checking remains unconfigured; local
+cargo-audit/deny/machete were not available. Gate log:
+`/tmp/rustydlna-bundle-c-agent-verify-handoff.log`.
+
+Bundle C verification: the full four-worker Playwright matrix passes 758 tests,
+with 150 explicit platform/API skips and zero failures across 908 cases (6.2
+minutes). This is Chromium/Firefox/WebKit/mobile Chromium, not native Safari or
+physical-device certification. The default 16-worker matrix was not run. No
+FFmpeg SIGSEGV was logged in this run; earlier A/B crashes remain unresolved.
+Focused fresh/cached cross-codec tests decode real H.264 frames, with HEVC
+capability mocked, on desktop/mobile Chromium. Effective-facts tests pass all
+four projects through paused playback, natural end and keyboard Replay.
+
+`scripts/helper-load.sh` passes 24 requests: sampled peaks 59,432 KiB RSS,
+64 threads and 57 FDs; cache 853,923 bytes; longest response 0.352 seconds.
+The sampler observed at most one process and can miss short-lived helpers;
+this is the existing bounded-load regression, not a new process-cost estimate.
+The fixed-tree 180-second soak passes 18 socket-suite cycles over 184 seconds,
+with sampled peaks 57,612 KiB RSS, nine threads/nine FDs, two processes,
+962,517 database bytes and 10,531 cache bytes, with no temporary-tree leaks.
+It is a restart/socket soak, not 24-hour persistent streaming evidence. The
+full browser matrix and the first soak cycles overlapped on separate ports;
+performance measurements did not overlap these checks. An initial soak was
+invalidated by a concurrent regression-test edit and is retained separately.
+
+Logs: `/tmp/rustydlna-bundle-c-playwright.log`,
+`/tmp/rustydlna-bundle-c-helper-load.log`,
+`/tmp/rustydlna-bundle-c-soak-final.log` and `-soak-final.tsv`.
+Native Safari, physical mobile tiers, ARM64, GPU engine/VRAM instrumentation,
+other GPU families, AI-upscale execution, cgroup quota enforcement, cold storage,
+24-hour soak, privileged namespace tests, Docker release smoke and fuzz campaigns
+remain unavailable or outside these exercised surfaces. No production defaults,
+fixtures, lockfiles or live configuration were changed. Commit and push are
+authorized for this bundle C handoff; deployment remains outside scope.
 
 ## Original review evidence and verification
 
@@ -725,6 +953,14 @@ separately from cold restart seeks. Depends on R03's reliable progress handling.
 
 ### P05 — Reduce cached-stream read scheduling and cursor contention
 
+**Implemented and measured.** Pinned `Arc<File>` positioned delivery removes
+shared seek-cursor and index-lock contention. One 256 KiB buffer per socket
+starts with a 64 KiB read; EOF alone triggers metadata checks. Cancellation
+interrupts slow writes. Same-byte concurrent ranges/segments, publication,
+replacement, truncation and producer failures are covered. Matched synthetic
+CPU/GiB fell 56.9%; this is not a whole-server throughput claim. See the bundle C
+measurements. Original delivery and zero-copy remain unchanged.
+
 **P2 · Code-backed, end-to-end gain unmeasured · M.** `RemuxJob.output` is a shared
 `Mutex<File>` (`crates/server/src/remux.rs:287`). `stream_growing` (`:3176–3268`)
 schedules a blocking task, locks, stats, seeks, and reads per 64 KiB chunk; HLS
@@ -746,6 +982,15 @@ retain unlimited resources, and CPU/GiB/context switches improve on P01 workload
 P02/P06 should remove unrelated lock contention before attributing gains here.
 
 ### P06 — Bound native-HLS history costs and reuse validated indexes
+
+**Implemented for CPU/index costs; native network limitation retained.**
+Cumulative timing, immutable 256-entry chunks and detached formatting avoid
+whole-history summation/copying under locks. A 16-entry/16 MiB process-local
+completed-index LRU binds output identity and parser version after validated
+completion; restart reparses. Parser/allocation limits and a 100k-fragment cursor
+cover eight-hour shapes. Native targets are stable per session/request; a later
+larger copied GOP requires a new generation, preserving old segments. EVENT
+network bytes are unchanged; seamless native Safari recovery is unvalidated.
 
 **P1 at long-title scale · Measured metadata cost · M/L.**
 `crates/server/src/remux/hls.rs:186–244`, `:275–296` renders the complete native-HLS
@@ -783,6 +1028,15 @@ Concurrent segment reads must not wait behind complete-history formatting.
 Coordinate parser reuse/versioning with R02 and cache lifecycle with P02.
 
 ### P07 — Budget helper resources and producer pacing by workload
+
+**Prototype measured; production defaults unchanged.** The opt-in server
+`resource_budget` example compares FIFO/automatic threads, FIFO/bounded threads,
+and resource admission/bounded threads under the same four-helper ceiling.
+The mixed CPU/NVENC workload found substantial encode and queue regressions,
+so it does not justify new defaults. Seven policy tests cover fair turns,
+resource ceilings, deadlines and shared-viewer synthetic demand at 2×/pause.
+Real FFmpeg pacing remains 30-second burst then 1×; sustained-rate and pause
+limitations are not presented as completed production fixes.
 
 **P2 · Code-backed policy; throughput gain requires experiments · L.**
 `remux.rs:1862–1888` assigns equal title/helper slots to copy, audio-only, CPU encode
@@ -862,6 +1116,15 @@ HDR10 fallback is a visible quality/feature choice, not an equivalent P8 optimiz
 Requires P01, R01/R02 and changed-pipeline cache identity.
 
 ### P10 — Reuse successful fallback output under its real recipe
+
+**Implemented.** Successful fallback output is validated and stamped under
+its exact effective recipe/source/tool/device identity, in the existing reserved
+request lookup slot. Only currently offered, stably unsupported fallbacks may
+be preferred for one hour; transient/input/unknown failures retry the primary.
+New owners recheck registered completed fallbacks; old owners retain pinned
+output. Any descriptor pin closes in-process fallback, including pre-body
+exposure. Status and Stream details disclose actual codecs/HDR/quality. There
+is no global hardware blacklist or cross-plan fallback deduplication.
 
 **P2 · Code-backed opportunity · M.** `crates/server/src/remux.rs:1073–1120` allows
 primary/alternative/portable fallback after an unsuccessful helper exit only when

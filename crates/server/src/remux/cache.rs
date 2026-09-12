@@ -914,6 +914,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            effective_recipe: Mutex::new(None),
         })
     }
 

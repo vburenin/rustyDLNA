@@ -189,6 +189,14 @@ the `.part` rename, so publication cannot invalidate an in-flight first open.
 Reads and index updates use explicit offsets on the pinned file; a later
 pathname replacement cannot redirect an existing generation to different
 bytes. Output I/O and admission waits run outside asynchronous socket tasks.
+Delivery uses positioned reads without taking the index lock or changing the
+shared Unix seek cursor. Each client owns one 256 KiB read buffer, starts with a
+64 KiB read, and has one outstanding blocking read, then drains that buffer under
+socket backpressure.
+There is no read-ahead queue or helper retained by a blocked socket write.
+Growing EOF triggers a fresh metadata/state check and bounded growth wait;
+truncation, failed producers, cancellation and incomplete promised ranges end
+delivery. Cancellation also interrupts a pending socket write.
 
 A producer that has received cancellation is unavailable for new attachments,
 even while its public state still says Starting or Growing. A same-output
@@ -212,6 +220,44 @@ fragment, and reconnect requests from one browser generation reuse its initial
 descriptor-backed job plan; completed output stays protected from cache
 eviction while the generation heartbeat remains active.
 
+Resource-aware admission and demand pacing remain experiments. The daemon keeps
+its existing fair global helper gate, title ceiling, independent AI-upscale
+ceiling and encoder threading defaults. A fixed 1× producer can lose its initial
+lead during sustained 2× playback, and a paused browser suspends its MSE downloads
+but does not stop a shared producer. A per-viewer pause must not stop another
+viewer or a native/download consumer.
+
+The opt-in `resource_budget` server example creates disposable 40-second,
+640×360/24-fps SDR H.264/AAC media and compares three explicitly separate arms:
+FIFO with automatic threading, FIFO with one-thread codec/filter pools, and
+resource admission with those same bounded pools. All retain four global helper
+slots. The admission prototype reserves interactive capacity, charges hardware
+work for CPU use, limits device/upscale concurrency and gives waiting background
+work a turn after two interactive admissions, or one when it has waited 500 ms.
+An occupied background slot cannot block the reserved interactive slot. These
+weights are experimental assumptions. Thread settings do not cap every internal FFmpeg or
+driver thread, and changing them may change encoded bytes.
+
+```sh
+cargo run --locked -p rusty-dlna --example resource_budget -- 5 8 > /tmp/resource-budget.tsv 2> /tmp/resource-budget.log
+# Optional separate H.264 NVENC workload, still using software H.264 decoding:
+cargo run --locked -p rusty-dlna --example resource_budget -- 5 8 gpu > /tmp/resource-budget-gpu.tsv 2> /tmp/resource-budget-gpu.log
+cargo test --locked -p rusty-dlna --example resource_budget
+```
+
+The requested CPU budget is capped by Rust's advisory
+[parallelism estimate](https://doc.rust-lang.org/std/thread/fn.available_parallelism.html);
+inaccessible cgroup controllers and VM limits remain
+measurement limitations. Each child uses the shared supervisor, bounded capture,
+a private process group and a 90-second deadline. Queue admission has a ten-second
+deadline. SIGINT/SIGTERM cancel active helpers, join their workers and remove the
+temporary fixture directory. Reports include each helper's queue time, first observed 16 KiB,
+duration, sampled CPU ticks, threads and RSS; every generated output is decoded
+after timing. First bytes are not first-frame measurements. The separate demand
+model tests two-hour 2× playback, deliberate pause, shared viewers and lease
+expiry using synthetic time; it does not pace real FFmpeg processes. Neither
+this model nor the small generated workload establishes production defaults.
+
 For a nonzero mixed seek that encodes video and copies audio, FFmpeg first
 seeks to a bounded five-second lead and then trims both output streams at the
 requested timestamp. This prevents copied audio packets from the demuxer's
@@ -226,6 +272,32 @@ fragments are never advertised alone. Every encoded Media Source append also
 begins at a random-access point for Android hardware-decoder compatibility.
 Both delivery modes retain roughly one-second movie fragments for bounded
 startup and transfer.
+
+The incremental index keeps cumulative timing and immutable 256-entry history
+chunks. Playlist formatting releases the live index lock and reads a consistent
+view, sharing sealed chunks instead of copying every fragment. Index parsing is
+bounded to 100,000 fragments, 200,000 top-level boxes, 32 million selected-track
+samples and 256 MiB aggregate initialization/fragment metadata, with at most
+4 MiB per metadata box. MSE cursors can reach 100,000 while each response still
+contains at most 256 fragments. Manifest allocation is limited to 4 MiB for MSE
+and 32 MiB for native HLS before formatting request-derived resource URLs.
+
+A process-local completed-index LRU retains at most 16 entries and 16 MiB of
+metadata, keyed by pinned output identity and parser revision. Reattachment still
+requires the validated completed-output stamp; the index does not substitute for
+validation. Replacement, timestamp/length changes and parser changes prevent
+reuse. Retained entries own neither media descriptors nor disk sidecars, so disk
+eviction and reservations keep their existing contract. Process restart reparses
+the index. Active pinned views survive publication or unlinking of their inode.
+
+Native HLS keeps the complete EVENT history and its network cost. Target duration
+is frozen for each session/request generation. If a later copied GOP exceeds the
+published rounded target, that generation reports restart required; a new
+generation chooses the known larger maximum without discarding old segments.
+One session's cancellation cannot reset another session's target. This fixes
+target mutation but does not establish seamless native Safari recovery for
+variable-GOP copies; native-device validation remains necessary before introducing
+playlist windows or delta delivery.
 
 | State | `DLNA.ORG_OP` | Seek |
 |---|---|---|
@@ -365,13 +437,45 @@ gate, and observes daemon cancellation; admission, cancellation, deadline, and
 query failures do not emit a server cache key. Each lookup rechecks the file
 identity, so replacing an executable in place invalidates its cached version
 without requiring a rustyDLNA restart. An output-producing fallback may finish
-the current request, but is not stamped under the failed primary plan's cache
-identity; the next request re-evaluates the preferred plan.
+the current request. Its validation stamp identifies the actual successful
+recipe, including byte-exact output arguments and bounded Linux device/driver
+observations. It never carries the failed primary plan's identity. Lookup may
+reuse only a fallback that current negotiation still offers. Stable unsupported
+failures may prefer that output for one hour from the immutable media mtime;
+recency touches do not extend the preference. Resource pressure, malformed input
+and unknown failures remain separate bounded categories and do not suppress a
+future primary attempt. There is no device-wide failure blacklist.
 
-Browser cache basenames contain a fixed-size digest of the complete cache
-identity. The full identity, including readable policy revisions, remains in
-the cache stamp and job key. Adding a policy revision therefore invalidates the
-output without risking the filesystem's per-component filename limit.
+The reserved request pathname remains the lookup slot for fallback output, so
+existing staging reservations, publication, quota accounting and eviction remain
+in force. Fallbacks from different requested plans are not deduplicated across
+those slots. Actual codecs, dynamic range, pixel format, quality/preset and bitrate
+settings are exposed in the owning generation's status and Stream details.
+Historical attempt timing is not persisted with a cache hit.
+
+Fallback requires an unpinned output generation. Pinning before response headers,
+indexing or status exposure conservatively ends in-process retry eligibility,
+even below 16 KiB. A pinned generation may already have an observer and cannot
+be overwritten. Readiness checks and pinning share the replacement lock; a
+request that races an unpinned retry waits within its original readiness budget.
+All permitted attempts retain the original deadline and
+cancellation owner; successful fallback output passes the completed-output
+validator before publication under its effective recipe.
+
+Media Source playlists disclose changed encoded streams through
+`X-Rusty-Video-Output` and `X-Rusty-Audio-Codec`, after pinning the output. The
+browser replaces its empty SourceBuffer before appending initialization bytes
+when the permitted fallback changed codecs. Copied streams keep their negotiated
+codec declarations, and the playback request/session remain unchanged. This
+applies to fresh attempts and validated cached fallbacks; Stream details show
+the actual recipe independently of the originally requested plan. Those facts
+remain available after playback ends and cannot carry into a newer source.
+
+Browser cache basenames contain a fixed-size digest of the requested cache
+identity. The full requested identity, including readable policy revisions, remains
+in the job key; the stamp records the actual primary or fallback identity. Adding
+a policy revision therefore invalidates the output without risking the
+filesystem's per-component filename limit.
 
 Within one browser playback session, seek generations with the same source,
 stream plan, delivery mode, and quality reuse the already opened source and

@@ -32,7 +32,7 @@ struct MediaTrack {
 }
 
 pub(in crate::remux) fn validate_finished(
-    file: &mut File,
+    file: &File,
     expected: &RemuxOutputExpectation,
     deadline: Instant,
     cancelled: &AtomicBool,

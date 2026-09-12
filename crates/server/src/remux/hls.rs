@@ -1,9 +1,16 @@
+mod completed;
+#[cfg(test)]
+mod efficiency_tests;
+mod history;
 mod validation;
 pub(super) use validation::validate_finished;
 
+use history::{History, View};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
+use std::os::unix::fs::FileExt;
 #[cfg(test)]
 use std::path::Path;
 
@@ -11,6 +18,13 @@ const MAX_INDEX_BOX_BYTES: u64 = 4 * 1024 * 1024;
 const MIN_HLS_TARGET_DURATION_SECONDS: u64 = 1;
 const HLS_STARTUP_BUFFER_SECONDS: f64 = 1.0;
 const MAX_MSE_PLAYLIST_FRAGMENTS: usize = 256;
+const MAX_INDEX_BOXES: usize = 200_000;
+pub(super) const MAX_INDEX_FRAGMENTS: usize = 100_000;
+const MAX_INDEX_METADATA_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_INDEX_SAMPLES: u64 = 32_000_000;
+const MAX_NATIVE_PLAYLIST_BYTES: usize = 32 * 1024 * 1024;
+const MAX_MSE_PLAYLIST_BYTES: usize = 4 * 1024 * 1024;
+type PlaylistGeneration = Option<(u64, u64)>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Segment {
@@ -19,7 +33,7 @@ pub(super) struct Segment {
     pub(super) duration: f64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct Index {
     scan_offset: u64,
     init_end: Option<u64>,
@@ -27,15 +41,24 @@ pub(super) struct Index {
     defaults: HashMap<u32, TrackDefaults>,
     pending_fragment: Option<Fragment>,
     pending_segment: Option<Segment>,
-    fragments: Vec<Segment>,
-    fragment_timing: Vec<Option<(f64, f64)>>,
+    fragments: History<Segment>,
+    fragment_timing: History<Option<(f64, f64)>>,
     timeline_end: Option<f64>,
     timing_reliable: bool,
     fragment_time: f64,
     decode_start: f64,
     dependent_fragments: usize,
-    segments: Vec<Segment>,
+    segments: History<Segment>,
+    segment_time: f64,
+    fragment_target: u64,
+    segment_target: u64,
+    native_targets: HashMap<(bool, PlaylistGeneration), u64>,
+    scanned_boxes: usize,
+    metadata_bytes: u64,
+    indexed_samples: u64,
     finalized: bool,
+    completed_identity: Option<completed::Identity>,
+    failed: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,17 +98,47 @@ struct SliceBox<'a> {
 impl Index {
     #[cfg(test)]
     pub(super) fn update(&mut self, path: &Path, complete: bool) -> Result<(), String> {
-        let mut file = File::open(path).map_err(|error| format!("open HLS media: {error}"))?;
-        self.update_file(&mut file, complete)
+        let file = File::open(path).map_err(|error| format!("open HLS media: {error}"))?;
+        self.update_file(&file, complete)
     }
 
-    pub(super) fn update_file(&mut self, file: &mut File, complete: bool) -> Result<(), String> {
-        let available = file
+    pub(super) fn update_file(&mut self, file: &File, complete: bool) -> Result<(), String> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
+        let result = self.update_file_inner(file, complete);
+        if let Err(error) = &result {
+            self.failed = Some(error.clone());
+        }
+        result
+    }
+
+    fn update_file_inner(&mut self, file: &File, complete: bool) -> Result<(), String> {
+        let metadata = file
             .metadata()
-            .map_err(|error| format!("stat HLS media: {error}"))?
-            .len();
+            .map_err(|error| format!("stat HLS media: {error}"))?;
+        let available = metadata.len();
+        let identity = completed::Identity::from_metadata(&metadata);
+        if let Some(previous) = self.completed_identity {
+            if !previous.same_content(identity) {
+                return Err("completed HLS output changed after indexing".into());
+            }
+            return Ok(());
+        }
         if available < self.scan_offset {
-            *self = Self::default();
+            return Err("growing HLS output was truncated".into());
+        }
+        // Complete is supplied only after completed-output validation (or a
+        // fresh validation-stamp attachment). An index never certifies media.
+        if complete && self.scan_offset == 0 {
+            if let Some(index) = completed::get(identity) {
+                let after = file.metadata().map_err(|error| error.to_string())?;
+                if completed::Identity::from_metadata(&after) != identity {
+                    return Err("completed HLS output changed during index reuse".into());
+                }
+                *self = index;
+                return Ok(());
+            }
         }
         while let Some(header) = read_box_header(file, self.scan_offset, available)
             .map_err(|error| format!("read fragmented MP4: {error}"))?
@@ -96,6 +149,16 @@ impl Index {
                 .ok_or_else(|| "fragmented MP4 box offset overflow".to_owned())?;
             if end > available {
                 break;
+            }
+            self.scanned_boxes = self.scanned_boxes.saturating_add(1);
+            if self.scanned_boxes > MAX_INDEX_BOXES {
+                return Err("fragmented MP4 exceeds index box budget".into());
+            }
+            if matches!(&header.kind, b"moov" | b"moof") {
+                self.metadata_bytes = self.metadata_bytes.saturating_add(header.size);
+                if self.metadata_bytes > MAX_INDEX_METADATA_BYTES {
+                    return Err("fragmented MP4 exceeds index metadata budget".into());
+                }
             }
             match &header.kind {
                 b"ftyp" if header.offset == 0 => {}
@@ -123,6 +186,10 @@ impl Index {
                     let bytes = read_box(file, header)
                         .map_err(|error| format!("read fragmented MP4 movie fragment: {error}"))?;
                     let timing = parse_moof(&bytes, track, self.defaults.get(&track.id).copied())?;
+                    self.indexed_samples = self.indexed_samples.saturating_add(timing.samples);
+                    if self.indexed_samples > MAX_INDEX_SAMPLES {
+                        return Err("fragmented MP4 exceeds index sample budget".into());
+                    }
                     let contiguous = timing.decode_time.is_some_and(|start| {
                         self.timeline_end
                             .is_none_or(|end| (start - end).abs() <= 0.002)
@@ -154,9 +221,15 @@ impl Index {
                 return Err("completed fragmented MP4 ends inside a box".into());
             }
             if let Some(segment) = self.pending_segment.take() {
-                self.segments.push(segment);
+                self.push_segment(segment);
             }
             self.finalized = true;
+            let after = file.metadata().map_err(|error| error.to_string())?;
+            if completed::Identity::from_metadata(&after) != identity {
+                return Err("completed HLS output changed during indexing".into());
+            }
+            self.completed_identity = Some(identity);
+            completed::insert(identity, self);
         }
         Ok(())
     }
@@ -166,26 +239,13 @@ impl Index {
     }
 
     pub(super) fn has_startup_buffer(&self, complete: bool) -> bool {
-        self.has_playable_segment()
-            && (complete
-                || self
-                    .segments
-                    .iter()
-                    .map(|segment| segment.duration)
-                    .sum::<f64>()
-                    >= HLS_STARTUP_BUFFER_SECONDS)
+        self.has_playable_segment() && (complete || self.segment_time >= HLS_STARTUP_BUFFER_SECONDS)
     }
 
     pub(super) fn has_mse_startup_buffer(&self, complete: bool) -> bool {
         self.init_end.is_some()
             && !self.fragments.is_empty()
-            && (complete
-                || self
-                    .fragments
-                    .iter()
-                    .map(|fragment| fragment.duration)
-                    .sum::<f64>()
-                    >= HLS_STARTUP_BUFFER_SECONDS)
+            && (complete || self.fragment_time >= HLS_STARTUP_BUFFER_SECONDS)
     }
 
     /// Encoded fragmented producers force every movie fragment to begin with an IDR.
@@ -196,13 +256,7 @@ impl Index {
         self.init_end.is_some()
             && !self.fragments.is_empty()
             && self.dependent_fragments == 0
-            && (complete
-                || self
-                    .fragments
-                    .iter()
-                    .map(|fragment| fragment.duration)
-                    .sum::<f64>()
-                    >= HLS_STARTUP_BUFFER_SECONDS)
+            && (complete || self.fragment_time >= HLS_STARTUP_BUFFER_SECONDS)
     }
 
     pub(super) fn has_mse_fragments_after(&self, after: usize, complete: bool) -> bool {
@@ -213,55 +267,68 @@ impl Index {
     }
 
     pub(super) fn produced_duration_seconds(&self) -> Option<f64> {
-        let seconds = self
-            .fragments
-            .iter()
-            .map(|fragment| fragment.duration)
-            .sum::<f64>();
-        (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+        (self.fragment_time.is_finite() && self.fragment_time > 0.0).then_some(self.fragment_time)
     }
 
-    pub(super) fn playlist(&self, init_uri: &str, segment_uri: &str) -> Result<String, String> {
-        if self.segments.is_empty() {
+    #[cfg(test)]
+    pub(super) fn playlist_view(
+        &mut self,
+        independent_fragments: bool,
+    ) -> Result<PlaylistView, String> {
+        self.playlist_view_for(independent_fragments, None)
+    }
+
+    pub(super) fn forget_generation(&mut self, session_id: u64, request_id: u64) {
+        self.native_targets
+            .retain(|(_, generation), _| *generation != Some((session_id, request_id)));
+    }
+
+    pub(super) fn playlist_view_for(
+        &mut self,
+        independent_fragments: bool,
+        generation: PlaylistGeneration,
+    ) -> Result<PlaylistView, String> {
+        let (segments, target) = if independent_fragments {
+            if self.dependent_fragments != 0 {
+                return Err("fragmented MP4 contains a dependent movie fragment".into());
+            }
+            (&self.fragments, self.fragment_target)
+        } else {
+            (&self.segments, self.segment_target)
+        };
+        if segments.is_empty() {
             return Err("fragmented MP4 has no complete media segments".into());
         }
-        self.render_playlist(
-            init_uri,
-            segment_uri,
-            &self.segments,
-            true,
-            0,
-            self.finalized,
-        )
+        let target = target.max(MIN_HLS_TARGET_DURATION_SECONDS);
+        let key = (independent_fragments, generation);
+        if !self.native_targets.contains_key(&key)
+            && self.native_targets.len() >= 2 * (super::MAX_WEB_PLAYBACK_SESSIONS + 1)
+        {
+            return Err("too many HLS playlist generations".into());
+        }
+        let target_duration = *self.native_targets.entry(key).or_insert(target);
+        // EVENT targets cannot change after publication. Copied GOPs have no
+        // builder-proven maximum: an unexpectedly longer later GOP needs a new
+        // browser generation instead of publishing an invalid changed target.
+        if target > target_duration {
+            return Err(
+                "HLS segment exceeds the generation's target duration; restart required".into(),
+            );
+        }
+        Ok(PlaylistView {
+            init_end: self
+                .init_end
+                .ok_or("fragmented MP4 initialization is not complete")?,
+            segments: segments.view(0, segments.len()),
+            timing: self.fragment_timing.view(0, 0),
+            independent: true,
+            media_sequence: 0,
+            target_duration,
+            ended: self.finalized,
+        })
     }
 
-    pub(super) fn independent_fragment_playlist(
-        &self,
-        init_uri: &str,
-        segment_uri: &str,
-    ) -> Result<String, String> {
-        if self.fragments.is_empty() {
-            return Err("fragmented MP4 has no complete independent fragments".into());
-        }
-        if self.dependent_fragments != 0 {
-            return Err("fragmented MP4 contains a dependent movie fragment".into());
-        }
-        self.render_playlist(
-            init_uri,
-            segment_uri,
-            &self.fragments,
-            true,
-            0,
-            self.finalized,
-        )
-    }
-
-    pub(super) fn mse_playlist_after(
-        &self,
-        init_uri: &str,
-        segment_uri: &str,
-        after: usize,
-    ) -> Result<String, String> {
+    pub(super) fn mse_playlist_view(&self, after: usize) -> Result<PlaylistView, String> {
         if after > self.fragments.len() {
             return Err("Media Source fragment cursor is past the available output".into());
         }
@@ -269,73 +336,84 @@ impl Index {
             .saturating_add(MAX_MSE_PLAYLIST_FRAGMENTS)
             .min(self.fragments.len());
         let ended = self.finalized && end == self.fragments.len();
-        let fragments = &self.fragments[after..end];
-        if fragments.is_empty() && !ended {
+        if end == after && !ended {
             return Err("fragmented MP4 has no new Media Source fragments".into());
         }
-        if self
+        let init_end = self
             .init_end
-            .is_some_and(|length| length > rusty_dlna_protocol::MSE_RESOURCE_MAX_BYTES)
+            .ok_or("fragmented MP4 initialization is not complete")?;
+        let fragments = self.fragments.view(after, end);
+        if init_end > rusty_dlna_protocol::MSE_RESOURCE_MAX_BYTES
             || fragments
                 .iter()
                 .any(|fragment| fragment.length > rusty_dlna_protocol::MSE_RESOURCE_MAX_BYTES)
         {
             return Err("resource_limit: Media Source resource exceeds the byte budget".into());
         }
-        self.render_playlist(init_uri, segment_uri, fragments, false, after, ended)
+        Ok(PlaylistView {
+            init_end,
+            segments: fragments,
+            timing: self.fragment_timing.view(
+                after.min(self.fragment_timing.len()),
+                end.min(self.fragment_timing.len()),
+            ),
+            independent: false,
+            media_sequence: after,
+            target_duration: self.fragment_target.max(MIN_HLS_TARGET_DURATION_SECONDS),
+            ended,
+        })
     }
 
-    fn render_playlist(
+    #[cfg(test)]
+    pub(super) fn playlist(&mut self, init_uri: &str, segment_uri: &str) -> Result<String, String> {
+        self.playlist_view(false)?.render(init_uri, segment_uri)
+    }
+
+    #[cfg(test)]
+    pub(super) fn independent_fragment_playlist(
+        &mut self,
+        init_uri: &str,
+        segment_uri: &str,
+    ) -> Result<String, String> {
+        self.playlist_view(true)?.render(init_uri, segment_uri)
+    }
+
+    #[cfg(test)]
+    pub(super) fn mse_playlist_after(
         &self,
         init_uri: &str,
         segment_uri: &str,
-        segments: &[Segment],
-        independent: bool,
-        media_sequence: usize,
-        ended: bool,
+        after: usize,
     ) -> Result<String, String> {
-        let init_end = self
-            .init_end
-            .ok_or_else(|| "fragmented MP4 initialization is not complete".to_owned())?;
-        let target_duration = segments
-            .iter()
-            // RFC 8216 constrains TARGETDURATION against EXTINF rounded to
-            // the nearest integer, not its ceiling.
-            .map(|segment| segment.duration.round().max(1.0) as u64)
-            .max()
-            .unwrap_or(MIN_HLS_TARGET_DURATION_SECONDS)
-            .max(MIN_HLS_TARGET_DURATION_SECONDS);
-        let mut output = format!(
-            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n#EXT-X-PLAYLIST-TYPE:EVENT\n"
-        );
-        if independent {
-            output.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
-        }
-        output.push_str(&format!(
-            "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n#EXT-X-MAP:URI=\"{init_uri}&hls_offset=0&hls_length={init_end}\"\n"
-        ));
-        for (index, segment) in segments.iter().enumerate() {
-            if !independent {
-                if let Some(Some((start, decode_start))) =
-                    self.fragment_timing.get(media_sequence + index)
-                {
-                    output.push_str(&format!(
-                        "#EXT-X-RUSTY-TIMING:{start:.6},{decode_start:.6}\n"
-                    ));
-                }
-            }
-            output.push_str(&format!(
-                "#EXTINF:{:.6},\n{}&hls_offset={}&hls_length={}\n",
-                segment.duration, segment_uri, segment.offset, segment.length
-            ));
-        }
-        if ended {
-            output.push_str("#EXT-X-ENDLIST\n");
-        }
-        Ok(output)
+        self.mse_playlist_view(after)?.render(init_uri, segment_uri)
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.fragments.retained_bytes()
+            + self.fragment_timing.retained_bytes()
+            + self.segments.retained_bytes()
+            + self.failed.as_ref().map_or(0, String::capacity)
+            + self.native_targets.capacity()
+                * (std::mem::size_of::<(bool, PlaylistGeneration)>()
+                    + std::mem::size_of::<u64>()
+                    + 16)
+            + self.defaults.capacity()
+                * (std::mem::size_of::<u32>() + std::mem::size_of::<TrackDefaults>() + 16)
+    }
+
+    fn push_segment(&mut self, segment: Segment) {
+        self.segment_time += segment.duration;
+        self.segment_target = self
+            .segment_target
+            .max(segment.duration.round().max(1.0) as u64);
+        self.segments.push(segment);
     }
 
     fn push_fragment(&mut self, fragment: Fragment, end: u64) -> Result<(), String> {
+        if self.fragments.len() >= MAX_INDEX_FRAGMENTS {
+            return Err("fragmented MP4 exceeds index fragment budget".into());
+        }
         if !fragment.duration.is_finite() || fragment.duration <= 0.0 {
             return Err("fragmented MP4 has an invalid fragment duration".into());
         }
@@ -350,6 +428,9 @@ impl Index {
                 .then_some((self.fragment_time, self.decode_start)),
         );
         self.fragment_time += fragment.duration;
+        self.fragment_target = self
+            .fragment_target
+            .max(fragment.duration.round().max(1.0) as u64);
         self.fragments.push(Segment {
             offset: fragment.offset,
             length: end.saturating_sub(fragment.offset),
@@ -364,7 +445,7 @@ impl Index {
                 length: end.saturating_sub(fragment.offset),
                 duration: fragment.duration,
             }) {
-                self.segments.push(segment);
+                self.push_segment(segment);
             }
         } else if let Some(segment) = self.pending_segment.as_mut() {
             segment.length = end.saturating_sub(segment.offset);
@@ -374,13 +455,73 @@ impl Index {
     }
 }
 
-fn read_box_header(file: &mut File, offset: u64, available: u64) -> io::Result<Option<BoxHeader>> {
+/// Generation-consistent metadata only. Construct under the index lock; format
+/// after releasing it so old-history rendering cannot delay growing indexing.
+#[derive(Debug)]
+pub(super) struct PlaylistView {
+    init_end: u64,
+    segments: View<Segment>,
+    timing: View<Option<(f64, f64)>>,
+    independent: bool,
+    media_sequence: usize,
+    target_duration: u64,
+    ended: bool,
+}
+
+impl PlaylistView {
+    pub(super) fn render(&self, init_uri: &str, segment_uri: &str) -> Result<String, String> {
+        let limit = if self.independent {
+            MAX_NATIVE_PLAYLIST_BYTES
+        } else {
+            MAX_MSE_PLAYLIST_BYTES
+        };
+        // Includes timing tags, decimal offsets/lengths and playlist headers.
+        let estimated = segment_uri
+            .len()
+            .checked_add(160)
+            .and_then(|entry| entry.checked_mul(self.segments.len()))
+            .and_then(|entries| entries.checked_add(init_uri.len()))
+            .and_then(|entries| entries.checked_add(512));
+        if estimated.is_none_or(|bytes| bytes > limit) {
+            return Err("resource_limit: fragment playlist exceeds the byte budget".into());
+        }
+        let mut output = format!(
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{}\n#EXT-X-MEDIA-SEQUENCE:{}\n#EXT-X-PLAYLIST-TYPE:EVENT\n",
+            self.target_duration, self.media_sequence
+        );
+        if self.independent {
+            output.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+        }
+        let _ = write!(output,
+            "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n#EXT-X-MAP:URI=\"{init_uri}&hls_offset=0&hls_length={}\"\n",
+            self.init_end
+        );
+        let mut timing = self.timing.iter();
+        for segment in self.segments.iter() {
+            if !self.independent {
+                if let Some(Some((start, decode_start))) = timing.next() {
+                    let _ = writeln!(output, "#EXT-X-RUSTY-TIMING:{start:.6},{decode_start:.6}");
+                }
+            }
+            let _ = write!(
+                output,
+                "#EXTINF:{:.6},\n{}&hls_offset={}&hls_length={}\n",
+                segment.duration, segment_uri, segment.offset, segment.length
+            );
+        }
+        if self.ended {
+            output.push_str("#EXT-X-ENDLIST\n");
+        }
+        Ok(output)
+    }
+}
+
+fn read_box_header(file: &File, offset: u64, available: u64) -> io::Result<Option<BoxHeader>> {
     if available.saturating_sub(offset) < 8 {
         return Ok(None);
     }
     let mut bytes = [0_u8; 16];
-    file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(&mut bytes[..8])?;
+    file.read_exact_at(&mut bytes[..8], offset)?;
     let size32 = u32::from_be_bytes(bytes[..4].try_into().expect("four bytes"));
     let kind = bytes[4..8].try_into().expect("four bytes");
     let (size, header_size) = match size32 {
@@ -389,7 +530,7 @@ fn read_box_header(file: &mut File, offset: u64, available: u64) -> io::Result<O
             if available.saturating_sub(offset) < 16 {
                 return Ok(None);
             }
-            file.read_exact(&mut bytes[8..16])?;
+            file.read_exact_at(&mut bytes[8..16], offset + 8)?;
             (
                 u64::from_be_bytes(bytes[8..16].try_into().expect("eight bytes")),
                 16,
@@ -411,12 +552,11 @@ fn read_box_header(file: &mut File, offset: u64, available: u64) -> io::Result<O
     }))
 }
 
-fn read_box(file: &mut File, header: BoxHeader) -> io::Result<Vec<u8>> {
+fn read_box(file: &File, header: BoxHeader) -> io::Result<Vec<u8>> {
     let payload_size = usize::try_from(header.size.saturating_sub(header.header_size))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "MP4 box is too large"))?;
     let mut bytes = vec![0_u8; payload_size];
-    file.seek(SeekFrom::Start(header.offset + header.header_size))?;
-    file.read_exact(&mut bytes)?;
+    file.read_exact_at(&mut bytes, header.offset + header.header_size)?;
     Ok(bytes)
 }
 
@@ -527,6 +667,7 @@ fn parse_trak(bytes: &[u8]) -> Result<Track, String> {
 #[derive(Clone, Copy, Debug)]
 struct FragmentTiming {
     duration: f64,
+    samples: u64,
     decode_time: Option<f64>,
     reuse_safe: bool,
     random_access: bool,
@@ -602,7 +743,8 @@ fn parse_traf(
     for trun in children.iter().filter(|child| &child.kind == b"trun") {
         let flags = full_box_flags(trun.payload)?;
         let sample_count = u64::from(be_u32(trun.payload, 4)?);
-        if sample_count > 1_000_000 {
+        if sample_count > 1_000_000 || samples_seen.saturating_add(sample_count) > MAX_INDEX_SAMPLES
+        {
             return Err("track fragment contains too many samples".into());
         }
         let mut offset = 8;
@@ -665,6 +807,7 @@ fn parse_traf(
     }
     Ok(Some(FragmentTiming {
         decode_time,
+        samples: samples_seen,
         reuse_safe: bounded_reordering && (!selected.video || first_flags.is_some()),
         duration: duration as f64 / f64::from(selected.timescale),
         random_access: first_flags.is_none_or(|flags| flags & 0x0001_0000 == 0),
@@ -703,10 +846,10 @@ pub(super) mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    struct TempDir(PathBuf);
+    pub(super) struct TempDir(PathBuf);
 
     impl TempDir {
-        fn new(label: &str) -> Self {
+        pub(super) fn new(label: &str) -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
                 "rusty-dlna-hls-{label}-{}-{}",
@@ -717,7 +860,7 @@ pub(super) mod tests {
             Self(path)
         }
 
-        fn path(&self) -> &Path {
+        pub(super) fn path(&self) -> &Path {
             &self.0
         }
     }

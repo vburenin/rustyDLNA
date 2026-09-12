@@ -202,6 +202,13 @@ benchmark creates disposable 100/1k/10k/100k-entry caches with 1/2/8 concurrent
 maintenance callers. It reports sample counts and variability; these filesystem
 measurements do not establish playback latency improvements.
 
+Completed HLS/MSE indexes have a separate process-local metadata LRU, bounded to
+16 entries and 16 MiB. It owns no media descriptors or disk companion files and
+does not count as generated disk output. Eviction can remove the media normally;
+a later attachment must still pass its completion stamp and exact output-identity
+checks. Restart reparses indexes. Streaming and index identity decisions are
+recorded in [ADR 0004](adr/0004-streaming-output-and-index-identity.md).
+
 The same object reports separate `startup_to_initial_bytes_ms`,
 `startup_to_playlist_ready_ms`, Media Source playlist/init/first-fragment
 fetch-and-append phase summaries, `startup_to_canplay_ms`, and

@@ -20,8 +20,10 @@ use rusty_dlna_transcode::{
 use crate::App;
 
 mod cache;
+pub(crate) mod fallback;
 mod hls;
 pub(crate) mod performance;
+mod positional;
 #[cfg(test)]
 mod validation_tests;
 
@@ -51,7 +53,7 @@ const WEB_SUPERSEDED_JOB_HANDOFF: Duration = Duration::from_secs(2);
 const MAX_WEB_TRANSCODE_PREPARATIONS: usize = 64;
 const WEB_REQUEST_CANCELLED: &str = "web playback request superseded";
 const REMUX_CANCELLED: &str = "remux cancelled";
-pub(crate) const MAX_MSE_FRAGMENT_CURSOR: usize = 20_000;
+pub(crate) const MAX_MSE_FRAGMENT_CURSOR: usize = hls::MAX_INDEX_FRAGMENTS;
 
 #[cfg(test)]
 type P8TestRunner = fn(
@@ -333,8 +335,8 @@ pub struct RemuxJob {
     /// All producer I/O, permit drops and registry cleanup have finished.
     producer_finished: AtomicBool,
     /// One descriptor survives staging publication and pathname replacement.
-    /// Reads use explicit offsets while holding its short synchronous lock.
-    output: Mutex<Option<Arc<Mutex<std::fs::File>>>>,
+    /// Only pin/replacement needs this lock; delivery and indexing use pread.
+    output: Mutex<Option<Arc<std::fs::File>>>,
     startup_observations: WebStartupObservations,
     pub dest: PathBuf,
     pub part: PathBuf,
@@ -348,6 +350,7 @@ pub struct RemuxJob {
     cacheable: bool,
     started: Instant,
     hls_index: Mutex<hls::Index>,
+    effective_recipe: Mutex<Option<fallback::EffectiveRecipe>>,
 }
 
 #[derive(Debug, Default)]
@@ -643,7 +646,7 @@ impl EphemeralCleanupScheduler {
 }
 
 impl RemuxJob {
-    fn open_output(&self) -> std::io::Result<Arc<Mutex<std::fs::File>>> {
+    fn open_output(&self) -> std::io::Result<Arc<std::fs::File>> {
         let mut output = crate::lock_recover(&self.output);
         if self.cancelled.load(Ordering::Acquire) || self.err().is_some() {
             return Err(std::io::Error::new(
@@ -658,9 +661,56 @@ impl RemuxJob {
         if !file.metadata()?.is_file() {
             return Err(std::io::Error::other("remux output is not a regular file"));
         }
-        let file = Arc::new(Mutex::new(file));
+        let file = Arc::new(file);
         *output = Some(file.clone());
         Ok(file)
+    }
+
+    /// Readiness and descriptor publication share the fallback/publication lock.
+    /// Opening an unready attempt must not pin it: fallback may still replace it.
+    fn pin_ready_output(&self) -> Result<Option<PathBuf>, String> {
+        let mut output = crate::lock_recover(&self.output);
+        let complete = match self.state() {
+            RemuxState::Complete => true,
+            RemuxState::Growing => false,
+            RemuxState::Starting | RemuxState::Preprocessing => return Ok(None),
+            RemuxState::Failed(error) => return Err(error),
+            RemuxState::Cancelled => return Err(REMUX_CANCELLED.into()),
+        };
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(REMUX_CANCELLED.into());
+        }
+        let path = if complete {
+            self.dest.clone()
+        } else {
+            self.part.clone()
+        };
+        let candidate = if let Some(file) = output.as_ref() {
+            file.clone()
+        } else {
+            match std::fs::File::open(&path) {
+                Ok(file) => Arc::new(file),
+                Err(error) if !complete && error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None)
+                }
+                Err(error) => return Err(format!("open ready remux: {error}")),
+            }
+        };
+        let metadata = candidate
+            .metadata()
+            .map_err(|error| format!("stat ready remux: {error}"))?;
+        if !metadata.is_file() {
+            return Err("remux output is not a regular file".into());
+        }
+        if metadata.len() < if complete { 1 } else { FIRST_BYTES } {
+            return if complete {
+                Err("completed remux is missing or empty".into())
+            } else {
+                Ok(None)
+            };
+        }
+        *output = Some(candidate);
+        Ok(Some(path))
     }
 
     fn add_web_request(
@@ -687,6 +737,9 @@ impl RemuxJob {
         }
         if let Some(replaced) = replaced.filter(|replaced| Some(*replaced) != request_id) {
             request_ids.remove(&replaced);
+            if let Some(session_id) = session_id {
+                crate::lock_recover(&self.hls_index).forget_generation(session_id, replaced);
+            }
         }
         if let Some(request_id) = request_id {
             request_ids.insert(request_id);
@@ -705,12 +758,16 @@ impl RemuxJob {
             sessions.retain(|_, attached_request_id| *attached_request_id != request_id);
         }
         drop(sessions);
+        if let Some(session_id) = session_id {
+            crate::lock_recover(&self.hls_index).forget_generation(session_id, request_id);
+        }
         crate::lock_recover(&self.web_request_ids).remove(&request_id)
     }
 
     fn remove_web_session(&self, session_id: u64) -> Option<u64> {
         let request_id = crate::lock_recover(&self.web_sessions).remove(&session_id)?;
         crate::lock_recover(&self.web_request_ids).remove(&request_id);
+        crate::lock_recover(&self.hls_index).forget_generation(session_id, request_id);
         Some(request_id)
     }
 
@@ -1035,6 +1092,8 @@ fn spawn_ffmpeg(
             let deadline = job.started + Duration::from_secs(app.cfg.transcode.max_runtime_secs);
             let verify_timeout = Duration::from_secs(app.cfg.transcode.verify_timeout_secs);
             let mut output_fell_back = false;
+            let mut previous_failure = None;
+            let mut attempt_started = Instant::now();
             if spec.remux_p8 {
                 let p8 = TranscodePlan {
                     action: RecodeAction::RemuxP8,
@@ -1105,14 +1164,37 @@ fn spawn_ffmpeg(
                         return;
                     }
                     Err(e) => {
+                        let output = crate::lock_recover(&job.output);
+                        if output.is_some() {
+                            job.transition(RemuxState::Failed(
+                                "Profile-8 output failed after its generation was pinned".into(),
+                            ));
+                            cleanup_intermediates(&part);
+                            return;
+                        }
                         tracing::warn!(id, dest = %dest.display(), "{e}; falling back to hdr10");
                         let _ = std::fs::remove_file(&part);
                         job.transition(RemuxState::Starting);
                         output_fell_back = true;
+                        previous_failure = Some(fallback::classify(&e.to_string()));
+                        let mut actual =
+                            fallback::recipe(&spec, &spec.args, fallback::Attempt::Hdr10);
+                        actual.previous_failure = previous_failure;
+                        actual.previous_attempt_ms =
+                            Some(rusty_dlna_helper::duration_millis_saturating(
+                                attempt_started.elapsed(),
+                            ));
+                        *crate::lock_recover(&job.effective_recipe) = Some(actual);
+                        attempt_started = Instant::now();
+                        drop(output);
                     }
                 }
             }
             let mut args = &spec.args;
+            if !output_fell_back {
+                *crate::lock_recover(&job.effective_recipe) =
+                    Some(fallback::recipe(&spec, args, fallback::Attempt::Primary));
+            }
             tracing::info!(id, dest = %dest.display(), "remux job start");
             let mut result = run_ffmpeg_growing(
                 args,
@@ -1123,19 +1205,45 @@ fn spawn_ffmpeg(
                 deadline,
                 &app,
             );
-            for (fallback, kind) in [
-                (spec.hardware_fallback_args.as_ref(), "alternate hardware"),
-                (spec.fallback_args.as_ref(), "portable encoders"),
+            for (fallback_args, attempt) in [
+                (
+                    spec.hardware_fallback_args.as_ref(),
+                    fallback::Attempt::AlternateHardware,
+                ),
+                (spec.fallback_args.as_ref(), fallback::Attempt::Portable),
             ] {
                 let failed = matches!(&result, Ok((status, _)) if !status.success());
-                if !failed
-                    || job.cancelled.load(Ordering::Acquire)
-                    || current_len(&job) >= FIRST_BYTES
-                {
+                if !failed || job.cancelled.load(Ordering::Acquire) {
                     break;
                 }
-                if let Some(fallback) = fallback {
-                    if kind == "alternate hardware" {
+                if let Some(fallback_args) = fallback_args {
+                    // A pinned descriptor is an irrevocable generation boundary,
+                    // including headers/index views before any media bytes. Hold
+                    // the same lock as open_output while removing failed bytes.
+                    let output = crate::lock_recover(&job.output);
+                    if output.is_some() {
+                        break;
+                    }
+                    let failure = result
+                        .as_ref()
+                        .ok()
+                        .map(|(_, stderr)| fallback::classify(stderr))
+                        .unwrap_or(fallback::FailureClass::Unknown);
+                    // Every failed earlier path must be stably unsupported before
+                    // a later successful attempt may bypass the primary next time.
+                    let failure = match previous_failure {
+                        Some(prior) if prior != fallback::FailureClass::Unsupported => prior,
+                        _ => failure,
+                    };
+                    previous_failure = Some(failure);
+                    let mut actual = fallback::recipe(&spec, fallback_args, attempt);
+                    actual.previous_failure = Some(failure);
+                    actual.previous_attempt_ms = Some(
+                        rusty_dlna_helper::duration_millis_saturating(attempt_started.elapsed()),
+                    );
+                    *crate::lock_recover(&job.effective_recipe) = Some(actual);
+                    let kind = attempt.label();
+                    if attempt == fallback::Attempt::AlternateHardware {
                         app.remux_metrics
                             .performance
                             .fallbacks_hardware
@@ -1155,8 +1263,10 @@ fn spawn_ffmpeg(
                     );
                     cleanup_intermediates(&part);
                     job.transition(RemuxState::Starting);
-                    args = fallback;
+                    args = fallback_args;
                     output_fell_back = true;
+                    drop(output);
+                    attempt_started = Instant::now();
                     result = run_ffmpeg_growing(
                         args,
                         spec.source_file.as_deref(),
@@ -1170,43 +1280,25 @@ fn spawn_ffmpeg(
             }
             match result {
                 Ok((status, _)) if status.success() => {
-                    let mut expectation = spec.output_expectation.clone();
-                    if let Some(expected) = expectation.as_mut() {
-                        // A portable fallback may change the negotiated video codec.
-                        for pair in args.windows(2) {
-                            let option = pair[0].to_string_lossy();
-                            let codec = pair[1].to_string_lossy();
-                            if codec != "copy" && (option == "-c:a" || option.starts_with("-c:a:"))
-                            {
-                                if option == "-c:a" {
-                                    expected.audio_codecs.fill(codec.into_owned());
-                                } else if let Some(index) = option
-                                    .strip_prefix("-c:a:")
-                                    .and_then(|index| index.parse::<usize>().ok())
-                                {
-                                    if let Some(track) = expected.audio_codecs.get_mut(index) {
-                                        *track = codec.into_owned();
-                                    }
-                                }
-                            }
-                            if pair[0] == "-c:v" && pair[1] != "copy" {
-                                expected.video_copy = false;
-                                expected.video_codec =
-                                    Some(if pair[1].to_string_lossy().contains("264") {
-                                        "h264".into()
-                                    } else {
-                                        "hevc".into()
-                                    });
-                            }
+                    let expectation = fallback::expectation(&spec, args);
+                    if let Some(actual) = crate::lock_recover(&job.effective_recipe).as_mut() {
+                        actual.attempt_ms = Some(rusty_dlna_helper::duration_millis_saturating(
+                            attempt_started.elapsed(),
+                        ));
+                    }
+                    let mut published_spec = spec.clone();
+                    if output_fell_back {
+                        if let Some(actual) = crate::lock_recover(&job.effective_recipe).as_ref() {
+                            published_spec.cache_key = actual.stamp_key();
                         }
                     }
                     finalize_remux(
                         &app,
                         &job,
-                        &spec,
+                        &published_spec,
                         verify_timeout,
                         &expectation,
-                        spec.cacheable && !output_fell_back,
+                        spec.cacheable && (!output_fell_back || expectation.is_some()),
                     );
                 }
                 Ok((status, stderr)) => {
@@ -1590,14 +1682,14 @@ fn publish_finished_output(
     let deadline = original_deadline.min(Instant::now() + verify_timeout);
     let output = job.open_output().map_err(|error| error.to_string())?;
     let snapshot = {
-        let mut file = crate::lock_recover(&output);
+        let file = output.as_ref();
         let snapshot = OutputSnapshot::read(&file.metadata().map_err(|error| error.to_string())?);
         if snapshot.bytes == 0 {
             return Err("ffmpeg produced empty remux".into());
         }
         if let Some(expected) = expectation {
             let started = Instant::now();
-            let stats = hls::validate_finished(&mut file, expected, deadline, &job.cancelled)?;
+            let stats = hls::validate_finished(file, expected, deadline, &job.cancelled)?;
             tracing::debug!(
                 id = job.detail_id,
                 metadata_bytes = stats.metadata_bytes,
@@ -1609,7 +1701,7 @@ fn publish_finished_output(
         } else if !cfg!(test) {
             return Err("missing negotiated output validation contract".into());
         }
-        snapshot.unchanged(&file, &job.part)?;
+        snapshot.unchanged(file, &job.part)?;
         snapshot
     };
     #[cfg(test)]
@@ -1627,14 +1719,14 @@ fn publish_finished_output(
     cache::check_publication_limits(app, job)
         .map_err(|error| format!("transcode cache limits: {error}"))?;
     let _publication = crate::lock_recover(&job.output);
-    let file = crate::lock_recover(&output);
+    let file = output.as_ref();
     if job.cancelled.load(Ordering::Acquire) {
         return Err("cancelled".into());
     }
     if expectation.is_some() && Instant::now() >= deadline {
         return Err("final verification deadline exceeded".into());
     }
-    snapshot.unchanged(&file, &job.part)?;
+    snapshot.unchanged(file, &job.part)?;
     std::fs::rename(&job.part, &job.dest).map_err(|error| format!("remux rename: {error}"))?;
     let publish_result = (|| {
         // Rename can change ctime. Recheck content identity and take the new stable
@@ -1652,7 +1744,7 @@ fn publish_finished_output(
                 return Err(error.to_string());
             }
         }
-        published.unchanged(&file, &job.dest).and_then(|()| {
+        published.unchanged(file, &job.dest).and_then(|()| {
             if job.cancelled.load(Ordering::Acquire) {
                 Err("cancelled".into())
             } else if expectation.is_some() && Instant::now() >= deadline {
@@ -1877,6 +1969,68 @@ fn attach_job_attempt(
             }
         }
     }
+    // Resource requests belonging to an established source generation retain
+    // its immutable recipe. A new owner of completed fallback bytes must pass
+    // current negotiation, device identity and expiry checks, even while an
+    // earlier owner's job remains registered. Keep filesystem work off the
+    // registry lock and preserve the destination reservation across this gap.
+    let completed_fallback = map.get(&spec.job_key).and_then(|job| {
+        let existing_owner = spec
+            .web_request_id
+            .is_some_and(|request| job.owns_web_request(spec.web_session_id, request));
+        if !job.is_complete() || existing_owner {
+            return None;
+        }
+        let actual = crate::lock_recover(&job.effective_recipe).clone()?;
+        (actual.attempt != fallback::Attempt::Primary).then(|| (job.clone(), actual.identity))
+    });
+    if let Some((completed, identity)) = completed_fallback {
+        drop(map);
+        let allowed = fallback::reusable(spec).is_some_and(|actual| actual.identity == identity);
+        // Cancellation or supersession may win while the registry is unlocked.
+        // Reestablish session -> registry ordering before registering an owner.
+        let sessions = crate::lock_recover(&app.web_playback_sessions);
+        if let Some((session, request)) = spec.web_session_id.zip(spec.web_request_id) {
+            if sessions
+                .get(&session)
+                .is_none_or(|state| state.cancelled || state.latest_request_id != request)
+            {
+                return Err(WEB_REQUEST_CANCELLED.into());
+            }
+        }
+        map = crate::lock_recover(&app.remuxes);
+        drop(sessions);
+        if !allowed
+            && map
+                .get(&spec.job_key)
+                .is_some_and(|job| Arc::ptr_eq(job, &completed))
+        {
+            let sessions = crate::lock_recover(&completed.web_sessions);
+            let same_session_request = spec
+                .web_session_id
+                .and_then(|session| sessions.get(&session).copied());
+            let other_owners = sessions
+                .keys()
+                .any(|session| Some(*session) != spec.web_session_id)
+                || crate::lock_recover(&completed.web_request_ids)
+                    .iter()
+                    .any(|request| Some(*request) != same_session_request);
+            drop(sessions);
+            if completed.clients.load(Ordering::Acquire) != 0 || other_owners {
+                return Err(
+                    "transcode busy (completed fallback is owned by another playback generation)"
+                        .into(),
+                );
+            }
+            if !completed.producer_finished.load(Ordering::Acquire) {
+                return Ok(RemuxAttachment::Retiring(completed));
+            }
+            // No response or other playback owner can observe replacement.
+            // Same-session older generations were superseded above; their next
+            // request is rejected by the global generation tombstone.
+            map.remove(&spec.job_key);
+        }
+    }
     if let Some(job) = map.get(&spec.job_key) {
         let mut disconnect_deadline = crate::lock_recover(&job.disconnect_deadline);
         if job.err().is_none() && !job.cancelled.load(Ordering::Acquire) {
@@ -1947,7 +2101,9 @@ fn attach_job_attempt(
     drop(map);
     // Keep the requested candidate protected even before it becomes a live job.
     // Discovery, validation, stale eviction and admission never hold the map.
-    let fresh = spec.cacheable && cache_is_fresh_for_key(&spec.dest, &spec.cache_key);
+    let primary_fresh = spec.cacheable && cache_is_fresh_for_key(&spec.dest, &spec.cache_key);
+    let reused_fallback = (!primary_fresh).then(|| fallback::reusable(spec)).flatten();
+    let fresh = primary_fresh || reused_fallback.is_some();
     if !fresh {
         if spec.dest.is_file() {
             let _maintenance = crate::lock_recover(&app.cache_maintenance);
@@ -2011,6 +2167,7 @@ fn attach_job_attempt(
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            effective_recipe: Mutex::new(reused_fallback),
         });
         job.open_output()
             .map_err(|error| format!("open completed remux: {error}"))?;
@@ -2092,6 +2249,7 @@ fn attach_job_attempt(
         cacheable: spec.cacheable,
         started: Instant::now(),
         hls_index: Mutex::new(hls::Index::default()),
+        effective_recipe: Mutex::new(None),
     });
     register_admitted_job(&app, spec, &job, register_client, true)?;
     spawn_ffmpeg(
@@ -2251,6 +2409,21 @@ pub(crate) fn active_web_job_spec(
     Some(spec)
 }
 
+pub(crate) fn web_job_effective_recipe(
+    app: &App,
+    detail_id: i64,
+    session_id: Option<u64>,
+    request_id: Option<u64>,
+) -> Option<fallback::EffectiveRecipe> {
+    let request_id = request_id?;
+    let jobs = crate::lock_recover(&app.remuxes);
+    let job = jobs.values().find(|job| {
+        job.web && job.detail_id == detail_id && job.owns_web_request(session_id, request_id)
+    })?;
+    let actual = crate::lock_recover(&job.effective_recipe).clone();
+    actual
+}
+
 pub(crate) fn web_job_state(
     app: &App,
     detail_id: i64,
@@ -2320,9 +2493,8 @@ pub(crate) fn web_job_produced_seconds(
     }
     let complete = state == RemuxState::Complete;
     let output = job.open_output().ok()?;
-    let mut file = crate::lock_recover(&output);
     let mut index = crate::lock_recover(&job.hls_index);
-    index.update_file(&mut file, complete).ok()?;
+    index.update_file(&output, complete).ok()?;
     index.produced_duration_seconds()
 }
 
@@ -2527,21 +2699,45 @@ pub(crate) fn cancel_web_request(
     }
 }
 
+#[cfg(test)]
+type ReadinessTestHook = fn(&RemuxJob);
+
+#[cfg(test)]
+fn readiness_test_hooks() -> &'static Mutex<HashMap<PathBuf, ReadinessTestHook>> {
+    static HOOKS: std::sync::OnceLock<Mutex<HashMap<PathBuf, ReadinessTestHook>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub async fn wait_ready(job: &Arc<RemuxJob>) -> Result<PathBuf, String> {
-    let mut deadline = Instant::now() + FIRST_WAIT;
+    wait_ready_until(job, Instant::now() + FIRST_WAIT).await
+}
+
+async fn wait_ready_until(job: &Arc<RemuxJob>, mut deadline: Instant) -> Result<PathBuf, String> {
     loop {
         let notified = job.changed.notified();
         match job.state() {
-            RemuxState::Complete => {
-                if current_len_async(job).await? > 0 {
-                    return Ok(job.dest.clone());
+            RemuxState::Complete | RemuxState::Growing => {
+                let pin_job = job.clone();
+                let pinned = tokio::task::spawn_blocking(move || {
+                    #[cfg(test)]
+                    {
+                        let hook =
+                            crate::lock_recover(readiness_test_hooks()).remove(&pin_job.part);
+                        if let Some(hook) = hook {
+                            hook(&pin_job);
+                        }
+                    }
+                    pin_job.pin_ready_output()
+                })
+                .await
+                .map_err(|error| format!("remux readiness task: {error}"))??;
+                if let Some(path) = pinned {
+                    return Ok(path);
                 }
-                return Err("completed remux is missing or empty".into());
-            }
-            RemuxState::Growing => {
-                if current_len_async(job).await? >= FIRST_BYTES {
-                    return Ok(job.part.clone());
-                }
+                // An unpinned attempt can fail after the Growing observation.
+                // Its fallback clears the pathname and returns to Starting
+                // under the same output lock. Retain this request's deadline.
             }
             RemuxState::Failed(error) => return Err(error),
             RemuxState::Cancelled => return Err(REMUX_CANCELLED.into()),
@@ -2678,6 +2874,7 @@ pub async fn serve_remux(
             return Ok(());
         }
     };
+    // wait_ready pins the ready attempt before exposing response headers.
     if job.web
         && job
             .startup_observations
@@ -2824,27 +3021,41 @@ async fn serve_fragment_playlist(
             let output = index_job
                 .open_output()
                 .map_err(|error| format!("open HLS media: {error}"))?;
-            let mut file = crate::lock_recover(&output);
             let mut index = crate::lock_recover(&index_job.hls_index);
-            index.update_file(&mut file, complete)?;
+            index.update_file(&output, complete)?;
             let observed = (observe_fragment && index.produced_duration_seconds().is_some())
                 .then(Instant::now);
             let playlist = if media_source {
                 index
                     .has_mse_fragments_after(mse_after, complete)
-                    .then(|| index.mse_playlist_after(&init_uri, &segment_uri, mse_after))
+                    .then(|| index.mse_playlist_view(mse_after))
                     .transpose()
             } else if all_fragments_independent {
                 index
                     .has_independent_startup_buffer(complete)
-                    .then(|| index.independent_fragment_playlist(&init_uri, &segment_uri))
+                    .then(|| {
+                        index.playlist_view_for(
+                            true,
+                            timing_key.map(|(_, session, request)| (session, request)),
+                        )
+                    })
                     .transpose()
             } else {
                 index
                     .has_startup_buffer(complete)
-                    .then(|| index.playlist(&init_uri, &segment_uri))
+                    .then(|| {
+                        index.playlist_view_for(
+                            false,
+                            timing_key.map(|(_, session, request)| (session, request)),
+                        )
+                    })
                     .transpose()
             };
+            drop(index);
+            let playlist = playlist.and_then(|view| {
+                view.map(|view| view.render(&init_uri, &segment_uri))
+                    .transpose()
+            });
             Ok::<_, String>((observed, playlist))
         })
         .await?;
@@ -2933,6 +3144,19 @@ async fn serve_fragment_playlist(
     }
     let mut response = HttpResponse::new(200, "OK");
     response.set("Content-Type", "application/vnd.apple.mpegurl");
+    if media_source {
+        // Indexing pinned this attempt before the playlist view was created.
+        // Disclose only fixed, supported fallback formats, before any init or
+        // movie-fragment bytes can enter the client's empty SourceBuffer.
+        if let Some(actual) = crate::lock_recover(&job.effective_recipe).as_ref() {
+            if let Some(video) = actual.mse_video_output() {
+                response.set(rusty_dlna_protocol::MSE_VIDEO_OUTPUT_HEADER, video.id());
+            }
+            if let Some(audio) = actual.mse_audio_codec() {
+                response.set(rusty_dlna_protocol::MSE_AUDIO_CODEC_HEADER, audio);
+            }
+        }
+    }
     response.set("Cache-Control", "no-store");
     response.set("Content-Length", playlist.len());
     if !head {
@@ -3218,8 +3442,7 @@ async fn serve_finished(
     let (size, etag) = tokio::task::spawn_blocking(move || {
         cache::touch_recency(&metadata_job.dest);
         let output = metadata_job.open_output()?;
-        let file = crate::lock_recover(&output);
-        let metadata = file.metadata()?;
+        let metadata = output.metadata()?;
         use std::os::unix::fs::OpenOptionsExt;
         let etag = std::fs::OpenOptions::new()
             .read(true)
@@ -3392,11 +3615,9 @@ async fn serve_open_growing(
 }
 
 fn current_len(job: &RemuxJob) -> u64 {
-    if let Some(output) = crate::lock_recover(&job.output).as_ref() {
-        return crate::lock_recover(output)
-            .metadata()
-            .map(|m| m.len())
-            .unwrap_or(0);
+    let output = crate::lock_recover(&job.output).clone();
+    if let Some(output) = output {
+        return output.metadata().map(|m| m.len()).unwrap_or(0);
     }
     if job.dest.is_file() {
         return job.dest.metadata().map(|m| m.len()).unwrap_or(0);
@@ -3455,14 +3676,18 @@ async fn stream_growing(
         Err(error) => return Err(error.into()),
     };
     let mut pos = start;
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; positional::READ_BYTES];
     let mut sent = 0u64;
     loop {
         let notified = job.changed.notified();
         if end.is_some_and(|end| pos > end) {
             break;
         }
-        if let Some(err) = job.err() {
+        if let Some(err) = job.err().or_else(|| {
+            job.cancelled
+                .load(Ordering::Acquire)
+                .then(|| REMUX_CANCELLED.into())
+        }) {
             if sent == 0 && !(job.web && err == REMUX_CANCELLED) {
                 return Err(err.into());
             }
@@ -3471,26 +3696,46 @@ async fn stream_growing(
         let complete = job.is_complete();
         let read_output = output.clone();
         let (returned, got, size) = tokio::task::spawn_blocking(move || {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file = crate::lock_recover(&read_output);
-            let size = file.metadata()?.len();
-            let available = size.saturating_sub(pos);
-            let want = end.map_or(available, |end| {
-                end.saturating_sub(pos).saturating_add(1).min(available)
-            });
-            let count = usize::try_from(want.min(buf.len() as u64)).unwrap_or(buf.len());
-            let got = if count == 0 {
-                0
+            // Keep the first read small for first-byte latency, then amortize
+            // blocking-pool scheduling with one bounded, backpressured batch.
+            let limit = if sent == 0 { 64 * 1024 } else { buf.len() };
+            let got = positional::read_chunk(&read_output, &mut buf[..limit], pos, end)?;
+            // A positioned read observes growth directly. Metadata is needed
+            // only at EOF to distinguish a truncated inode from producer lag.
+            let size = if got == 0 {
+                read_output.metadata()?.len()
             } else {
-                file.seek(SeekFrom::Start(pos))?;
-                file.read(&mut buf[..count])?
+                0
             };
             Ok::<_, std::io::Error>((buf, got, size))
         })
         .await??;
         buf = returned;
         if got > 0 {
-            if let Err(error) = crate::socket_write_all(app, sock, &buf[..got]).await {
+            let write = crate::socket_write_all(app, sock, &buf[..got]);
+            let stopped = async {
+                loop {
+                    let changed = job.changed.notified();
+                    if let Some(error) = job.err().or_else(|| {
+                        job.cancelled
+                            .load(Ordering::Acquire)
+                            .then(|| REMUX_CANCELLED.into())
+                    }) {
+                        return error;
+                    }
+                    changed.await;
+                }
+            };
+            let result = tokio::select! {
+                result = write => result,
+                error = stopped => {
+                    if sent == 0 && !(job.web && error == REMUX_CANCELLED) {
+                        return Err(error.into());
+                    }
+                    return Ok(());
+                }
+            };
+            if let Err(error) = result {
                 if sent == 0 {
                     return Err(error.into());
                 }
@@ -3500,7 +3745,12 @@ async fn stream_growing(
             sent = sent.saturating_add(got as u64);
             continue;
         }
-        if pos < size || complete && end.is_some_and(|end| pos <= end) {
+        if pos < size {
+            // Growth can race a zero-byte pread and the following metadata
+            // check. Retry against the same inode instead of calling that EOF.
+            continue;
+        }
+        if pos > size || complete && end.is_some_and(|end| pos <= end) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "remux output ended before its promised range",
@@ -3738,6 +3988,7 @@ mod tests {
             cacheable: false,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            effective_recipe: Mutex::new(None),
         });
         crate::lock_recover(&app.remuxes).insert(key.clone(), job.clone());
         (key, job)
@@ -3769,6 +4020,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            effective_recipe: Mutex::new(None),
         })
     }
 
@@ -3852,6 +4104,21 @@ mod tests {
             crate::lock_recover(&job.web_request_ids).len(),
             MAX_WEB_PLAYBACK_SESSIONS
         );
+    }
+
+    #[test]
+    fn mse_cursor_covers_eight_hour_history_and_rejects_beyond_index_budget() {
+        for (cursor, accepted) in [
+            (20_001, true),
+            (28_800, true),
+            (100_000, true),
+            (100_001, false),
+        ] {
+            let request = HttpRequest::parse_headers(&format!(
+                "GET /web/media/42.m3u8?delivery=mse&mse_after={cursor} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            )).unwrap();
+            assert_eq!(fragment_resource_uris(&request, "mse").is_ok(), accepted);
+        }
     }
 
     #[test]
@@ -4461,6 +4728,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            effective_recipe: Mutex::new(None),
         });
 
         finalize_remux(
@@ -4776,6 +5044,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            effective_recipe: Mutex::new(None),
         });
         crate::lock_recover(&app.remuxes).insert("protected".into(), job);
         let protected = cache::active_artifacts(crate::lock_recover(&app.remuxes).values());
@@ -4888,6 +5157,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            effective_recipe: Mutex::new(None),
         });
         crate::lock_recover(&app.remuxes).insert(key.clone(), job.clone());
 
@@ -4951,6 +5221,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            effective_recipe: Mutex::new(None),
         });
         crate::lock_recover(&app.remuxes).insert(key.clone(), job.clone());
         assert!(enforce_active_cache_limits(&app).is_err());
@@ -5108,6 +5379,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            effective_recipe: Mutex::new(None),
         });
         assert!(!dest.exists());
         let writer = {
@@ -6272,6 +6544,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            effective_recipe: Mutex::new(None),
         });
         idle.attach_client();
         idle.detach_client(
@@ -6771,14 +7044,15 @@ mod tests {
     }
 
     #[test]
-    fn output_cursor_contention_does_not_block_socket_runtime() {
+    fn output_metadata_does_not_wait_for_index_lock() {
         let dir = temp_dir("pinned-cursor-contention");
         let job = growing_test_job(&dir, 42, b"output");
-        let output = job.open_output().unwrap();
+        job.open_output().unwrap();
+        let index_job = job.clone();
         let (locked, acquired) = std::sync::mpsc::channel();
         let (release, resume) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
-            let _cursor = crate::lock_recover(&output);
+            let _index = crate::lock_recover(&index_job.hls_index);
             locked.send(()).unwrap();
             resume.recv_timeout(Duration::from_secs(3)).unwrap();
         });
@@ -6788,15 +7062,14 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let mut metadata = tokio::spawn(async move { current_len_async(&job).await });
-            let started = Instant::now();
-            tokio::select! {
-                _ = &mut metadata => panic!("metadata unexpectedly acquired the held cursor"),
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {},
-            }
-            assert!(started.elapsed() < Duration::from_millis(500));
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(500), current_len_async(&job))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                6
+            );
             release.send(()).unwrap();
-            assert_eq!(metadata.await.unwrap().unwrap(), 6);
         });
         holder.join().unwrap();
     }
@@ -6883,5 +7156,73 @@ mod tests {
             false,
         ));
         assert_eq!(wire_body(&received), b"source bytes");
+    }
+
+    #[test]
+    fn pinned_output_closes_fallback_even_before_first_bytes() {
+        let dir = temp_dir("pinned-before-fallback");
+        let app = test_app(&dir, 1);
+        let release = dir.join("release-primary");
+        let fallback_marker = dir.join("fallback-started");
+        let mut spec = job_spec(&dir, "pinned-before-fallback", Vec::new());
+        spec.args = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf failed > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done; exit 1".into(),
+            "primary".into(),
+            cache_part(&spec.dest).into_os_string(),
+            release.as_os_str().to_owned(),
+        ];
+        spec.fallback_args = Some(vec!["touch".into(), fallback_marker.as_os_str().to_owned()]);
+        let job = attach(app.clone(), spec).unwrap();
+        wait_until(Duration::from_secs(3), || {
+            job.part
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() == 6)
+        });
+        let pinned = job.open_output().unwrap();
+        assert_eq!(pinned.metadata().unwrap().len(), 6);
+        std::fs::write(&release, b"release").unwrap();
+        wait_for_terminal_cleanup(&app, &job);
+        assert!(matches!(job.state(), RemuxState::Failed(_)));
+        assert!(!fallback_marker.exists());
+        assert_eq!(
+            pinned.metadata().unwrap().len(),
+            6,
+            "old output is never replaced underneath its readers"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unpinned_output_above_first_bytes_may_retry_before_any_exposure() {
+        let dir = temp_dir("large-unpinned-fallback");
+        let app = test_app(&dir, 1);
+        let release = dir.join("release-primary");
+        let mut spec = job_spec(&dir, "large-unpinned-fallback", Vec::new());
+        spec.args = vec![
+            "sh".into(),
+            "-c".into(),
+            "head -c 32768 /dev/zero > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done; exit 1"
+                .into(),
+            "primary".into(),
+            cache_part(&spec.dest).into_os_string(),
+            release.as_os_str().to_owned(),
+        ];
+        spec.fallback_args = Some(vec![
+            "cp".into(),
+            spec.src.as_os_str().to_owned(),
+            cache_part(&spec.dest).into_os_string(),
+        ]);
+        let job = attach(app.clone(), spec).unwrap();
+        wait_until(Duration::from_secs(3), || {
+            job.state() == RemuxState::Growing
+        });
+        assert!(crate::lock_recover(&job.output).is_none());
+        std::fs::write(&release, b"release").unwrap();
+        wait_for_terminal_cleanup(&app, &job);
+        assert_eq!(job.state(), RemuxState::Complete);
+        assert_eq!(std::fs::read(&job.dest).unwrap(), b"source bytes");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

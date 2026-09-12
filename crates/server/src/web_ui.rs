@@ -223,9 +223,18 @@ struct WebVideoOutput {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BrowserVideoOutput {
+pub(crate) enum BrowserVideoOutput {
     H264Sdr,
     HevcHdr10,
+}
+
+impl BrowserVideoOutput {
+    pub(crate) const fn id(self) -> &'static str {
+        match self {
+            Self::H264Sdr => "h264_sdr",
+            Self::HevcHdr10 => "hevc_hdr10",
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -314,6 +323,7 @@ struct WebTranscodeStatus {
     state: &'static str,
     retry_after_seconds: Option<u64>,
     produced_seconds: Option<f64>,
+    effective_recipe: Option<crate::remux::fallback::EffectiveRecipe>,
 }
 
 #[derive(Serialize)]
@@ -472,7 +482,7 @@ fn web_capabilities(app: &App) -> WebCapabilities {
     let mut video_outputs = Vec::new();
     if app.cfg.transcode.enable {
         video_outputs.push(WebVideoOutput {
-            id: "h264_sdr",
+            id: BrowserVideoOutput::H264Sdr.id(),
             label: "H.264 SDR",
             codec: "avc1.640033",
             video_content_type: "video/mp4; codecs=\"avc1.640033\"",
@@ -485,7 +495,7 @@ fn web_capabilities(app: &App) -> WebCapabilities {
         });
         if app.cfg.web.encoder == "h264_nvenc" {
             video_outputs.push(WebVideoOutput {
-                id: "hevc_hdr10",
+                id: BrowserVideoOutput::HevcHdr10.id(),
                 label: "HEVC Main 10 · HDR10",
                 codec: "hvc1.2.4.L153.B0",
                 video_content_type: "video/mp4; codecs=\"hvc1.2.4.L153.B0\"",
@@ -2555,6 +2565,9 @@ pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
         state,
         retry_after_seconds,
         produced_seconds,
+        effective_recipe: (!cancelled)
+            .then(|| crate::remux::web_job_effective_recipe(app, id, session_id, request_id))
+            .flatten(),
     });
     if let Some(retry_after) = retry_after_seconds {
         response.set("Retry-After", retry_after);

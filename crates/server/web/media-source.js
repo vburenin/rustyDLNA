@@ -1,6 +1,6 @@
 // Abort-scoped Media Source transport and bounded buffering.
 // Source selection, playback intent, and recovery belong to the player.
-import { bufferedSeekTarget, bufferedRangeSecondsAhead, parseHlsMediaPlaylist, reusableMediaSourceSeek, retainedMediaSourceBytes } from "./core.js";
+import { bufferedSeekTarget, bufferedRangeSecondsAhead, fallbackMediaSourceType, parseHlsMediaPlaylist, reusableMediaSourceSeek, retainedMediaSourceBytes } from "./core.js";
 
 // Copied UHD fragments can exceed 10 MB per second. Keep the total window
 // below Chromium's practical SourceBuffer quota instead of treating every
@@ -41,7 +41,7 @@ function withAbort(promise, signal) {
   });
 }
 
-export async function fetchResource(url, signal, { playlist = false, resourceMaxBytes = MEDIA_SOURCE_RESOURCE_MAX_BYTES } = {}) {
+export async function fetchResource(url, signal, { playlist = false, resourceMaxBytes = MEDIA_SOURCE_RESOURCE_MAX_BYTES, onHeaders } = {}) {
   if (signal.aborted) throw abortedError();
   const controller = new AbortController();
   const abort = () => controller.abort(abortedError());
@@ -60,6 +60,7 @@ export async function fetchResource(url, signal, { playlist = false, resourceMax
     if (response.status === 413) throw new MediaSourceResourceError("Media Source resource is too large.");
     if (!response.ok) throw new Error(`Media Source resource returned HTTP ${response.status}.`);
     if (Number(response.headers.get("content-length")) > limit) throw new MediaSourceResourceError("Media Source resource is too large.");
+    onHeaders?.(response.headers);
     if (!response.body) throw new Error("Media Source resource has no body.");
     reader = response.body.getReader();
     const chunks = [];
@@ -238,6 +239,7 @@ export async function pumpMediaSource({
   onBuffered = () => {},
   onController = () => {},
   copiedVideo = false,
+  videoOutputs = [],
   resourceMaxBytes = MEDIA_SOURCE_RESOURCE_MAX_BYTES,
   bufferMaxBytes = MEDIA_SOURCE_BUFFER_MAX_BYTES,
 }) {
@@ -247,7 +249,7 @@ export async function pumpMediaSource({
   if (signal.aborted || mediaSource.readyState !== "open") throw abortedError();
   resourceMaxBytes = Math.min(MEDIA_SOURCE_RESOURCE_MAX_BYTES, resourceMaxBytes);
   bufferMaxBytes = Math.min(MEDIA_SOURCE_BUFFER_MAX_BYTES, bufferMaxBytes);
-  const sourceBuffer = mediaSource.addSourceBuffer(contentType);
+  let sourceBuffer = mediaSource.addSourceBuffer(contentType);
   sourceBuffer.mode = "segments";
   const appended = new Set();
   let segments = [];
@@ -319,7 +321,13 @@ export async function pumpMediaSource({
     }
     const requestUrl = new URL(playlistUrl);
     requestUrl.searchParams.set("mse_after", String(appended.size));
-    const bytes = await fetchResource(requestUrl, signal, { playlist: true });
+    let fallbackVideoOutput = null;
+    let fallbackAudioCodec = null;
+    const bytes = await fetchResource(requestUrl, signal, { playlist: true, onHeaders: (headers) => {
+      fallbackVideoOutput = headers.get("X-Rusty-Video-Output");
+      fallbackAudioCodec = headers.get("X-Rusty-Audio-Codec");
+    } });
+    if (signal.aborted || mediaSource.readyState !== "open") throw abortedError();
     const playlist = parseHlsMediaPlaylist(new TextDecoder().decode(bytes), requestUrl.href);
     if (!playlist) throw new Error("Media Source playlist is invalid.");
     if (!playlistReported) {
@@ -328,6 +336,17 @@ export async function pumpMediaSource({
     }
 
     if (!initAppended) {
+      // The playlist pins the producer's actual bytes. Replace the still-empty
+      // buffer before init append when a permitted fallback changed codecs.
+      // This also handles warm fallback reuse without a new playback session.
+      const actualType = fallbackMediaSourceType(contentType, fallbackVideoOutput, fallbackAudioCodec, videoOutputs);
+      if (!actualType) throw new Error("Media Source fallback recipe is unsupported.");
+      if (actualType !== contentType) {
+        mediaSource.removeSourceBuffer(sourceBuffer);
+        sourceBuffer = mediaSource.addSourceBuffer(actualType);
+        sourceBuffer.mode = "segments";
+      }
+      if (fallbackVideoOutput) copiedVideo = false;
       initializationBytes = await appendResource(
         sourceBuffer,
         playlist.initUrl,

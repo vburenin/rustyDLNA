@@ -405,6 +405,28 @@ export function isAndroidDevice({ userAgent = "" } = {}) {
   return /\bAndroid\b/i.test(String(userAgent));
 }
 
+// A pinned fallback may encode different streams from the requested recipe.
+// Preserve copied codec declarations and use the advertised encoded profile.
+export function fallbackMediaSourceType(contentType, videoOutput, audioCodec, videoOutputs = []) {
+  if (!videoOutput && !audioCodec) return contentType;
+  const match = /^(video|audio)\/mp4\s*;\s*codecs\s*=\s*"([^"]+)"$/i.exec(String(contentType));
+  if (!match || match[2].length > 256) return null;
+  const codecs = match[2].split(",").map((codec) => codec.trim());
+  if (codecs.length > 2 || codecs.some((codec) => !/^[a-z0-9.-]+$/i.test(codec))) return null;
+  if (videoOutput) {
+    if (match[1].toLowerCase() !== "video" || !["h264_sdr", "hevc_hdr10"].includes(videoOutput)) return null;
+    const codec = Array.isArray(videoOutputs) && videoOutputs.find((output) => output?.id === videoOutput)?.codec;
+    if (!/^(?:avc1|hvc1)\.[a-z0-9.]{1,80}$/i.test(codec || "")) return null;
+    codecs[0] = codec;
+  }
+  if (audioCodec) {
+    // Browser portable attempts encode audio as AAC; reject unknown recipes.
+    if (audioCodec !== "aac") return null;
+    codecs[match[1].toLowerCase() === "video" ? 1 : 0] = "mp4a.40.2";
+  }
+  return `${match[1].toLowerCase()}/mp4; codecs="${codecs.join(",")}"`;
+}
+
 export function parseHlsMediaPlaylist(value, baseHref) {
   if (typeof value !== "string" || value.length === 0 || value.length > 4 * 1024 * 1024) return null;
   let base;

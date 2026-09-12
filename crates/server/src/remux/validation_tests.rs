@@ -453,10 +453,10 @@ fn completed_validation_work_is_bounded_and_measured_without_reading_payloads() 
     let dir = temp_dir("validation-cost");
     let fixture = dir.join("cost.mp4");
     generate(&fixture, "60", "libx264", true);
-    let mut file = std::fs::File::open(&fixture).unwrap();
+    let file = std::fs::File::open(&fixture).unwrap();
     let started = Instant::now();
     let stats = hls::validate_finished(
-        &mut file,
+        &file,
         &expected(60.0),
         started + Duration::from_secs(2),
         &AtomicBool::new(false),
@@ -472,14 +472,14 @@ fn completed_validation_work_is_bounded_and_measured_without_reading_payloads() 
     );
     assert!(stats.metadata_bytes < file.metadata().unwrap().len() / 2);
     assert!(hls::validate_finished(
-        &mut file,
+        &file,
         &expected(60.0),
         Instant::now(),
         &AtomicBool::new(false)
     )
     .is_err());
     assert!(hls::validate_finished(
-        &mut file,
+        &file,
         &expected(60.0),
         Instant::now() + Duration::from_secs(2),
         &AtomicBool::new(true)
@@ -949,5 +949,376 @@ fn completed_publication_preserves_dlna_chapters_and_copy_video_codecs() {
                 None,
             );
         }
+    }
+}
+
+#[test]
+fn effective_fallback_publication_reuses_only_current_stably_unsupported_recipe() {
+    let dir = temp_dir("effective-fallback-publication");
+    let fixture = dir.join("fallback-fixture.mp4");
+    generate(&fixture, "2", "libx264", true);
+    let expected_bytes = std::fs::read(&fixture).unwrap();
+    for (label, diagnostic, should_reuse) in [
+        ("unsupported", "Unknown encoder h264_nvenc", true),
+        ("busy", "Resource temporarily unavailable", false),
+        ("input", "Invalid data found when processing input", false),
+        ("unknown", "Error initializing output stream", false),
+    ] {
+        let app = test_app(&dir, 1);
+        let count = dir.join(format!("{label}-attempts"));
+        let mut spec = job_spec(&dir, label, Vec::new());
+        spec.output_expectation = Some(expected(2.0));
+        spec.args = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf x >> \"$1\"; printf '%s' \"$2\" >&2; exit 1".into(),
+            "primary".into(),
+            count.as_os_str().to_owned(),
+            diagnostic.into(),
+        ];
+        spec.fallback_args = Some(vec![
+            "cp".into(),
+            fixture.as_os_str().to_owned(),
+            cache_part(&spec.dest).into_os_string(),
+        ]);
+        let job = attach(app.clone(), spec.clone()).unwrap();
+        wait_for_terminal_cleanup(&app, &job);
+        assert_eq!(job.state(), RemuxState::Complete);
+        assert_eq!(std::fs::read(&job.dest).unwrap(), expected_bytes);
+        let actual = crate::lock_recover(&job.effective_recipe).clone().unwrap();
+        assert!(cache_is_fresh_for_key(&job.dest, &actual.stamp_key()));
+        assert!(!cache_is_fresh_for_key(&job.dest, &spec.cache_key));
+        let reused = attach(app.clone(), spec.clone()).unwrap();
+        wait_for_terminal_cleanup(&app, &reused);
+        assert_eq!(reused.state(), RemuxState::Complete);
+        assert_eq!(reused.cache_hit, should_reuse, "{label}");
+        assert_eq!(
+            std::fs::read(&count).unwrap().len(),
+            if should_reuse { 1 } else { 2 }
+        );
+        if should_reuse {
+            // Recency touches cannot renew the one-hour stable-failure preference.
+            let old = std::time::SystemTime::now() - Duration::from_secs(3601);
+            std::fs::File::open(&reused.dest)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            write_cache_stamp_for_key(&reused.dest, &actual.stamp_key()).unwrap();
+            assert!(cache_is_fresh_for_key(&reused.dest, &actual.stamp_key()));
+            let expired = attach(app.clone(), spec.clone()).unwrap();
+            wait_for_terminal_cleanup(&app, &expired);
+            assert!(!expired.cache_hit);
+            assert_eq!(std::fs::read(&count).unwrap().len(), 2);
+            let mut changed_recipe = spec.clone();
+            changed_recipe.fallback_args.as_mut().unwrap()[0] = "/bin/cp".into();
+            let changed = attach(app.clone(), changed_recipe).unwrap();
+            wait_for_terminal_cleanup(&app, &changed);
+            assert!(!changed.cache_hit);
+            assert_eq!(std::fs::read(&count).unwrap().len(), 3);
+        }
+        // Removing the currently allowed fallback prevents old output reuse.
+        let mut changed = spec.clone();
+        changed.fallback_args = None;
+        let failed = attach(app.clone(), changed).unwrap();
+        wait_for_terminal_cleanup(&app, &failed);
+        assert!(matches!(failed.state(), RemuxState::Failed(_)));
+        assert!(!failed.dest.exists());
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn invalid_fallback_never_gets_an_effective_validation_stamp() {
+    let dir = temp_dir("invalid-effective-fallback");
+    let app = test_app(&dir, 1);
+    let mut spec = job_spec(
+        &dir,
+        "invalid-effective-fallback",
+        vec![
+            "sh".into(),
+            "-c".into(),
+            "echo 'Unknown encoder' >&2; exit 1".into(),
+        ],
+    );
+    spec.output_expectation = Some(expected(2.0));
+    spec.fallback_args = Some(vec![
+        "cp".into(),
+        spec.src.as_os_str().to_owned(),
+        cache_part(&spec.dest).into_os_string(),
+    ]);
+    let job = attach(app.clone(), spec).unwrap();
+    wait_for_terminal_cleanup(&app, &job);
+    assert!(matches!(job.state(), RemuxState::Failed(_)));
+    assert!(!job.dest.exists());
+    assert!(!rusty_dlna_transcode::cache_stamp_path(&job.dest).exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn actual_ffmpeg_fallback_is_validated_reused_and_disclosed_as_software_sdr() {
+    use rusty_dlna_transcode::{
+        AudioAction, BrowserEncodingPreset, BrowserQuality, HardwareDecode, HdrKind,
+        ToolQueryControl, VideoCodec,
+    };
+    let dir = temp_dir("actual-ffmpeg-fallback");
+    let fixture = dir.join("actual-input.mp4");
+    generate(&fixture, "2", "libx264", true);
+    let app = test_app(&dir, 1);
+    let source = Arc::new(std::fs::File::open(&fixture).unwrap());
+    let primary_plan = TranscodePlan {
+        action: RecodeAction::Browser,
+        // Deterministic FFmpeg unsupported-path failure; this exercises real
+        // argv/executable/descriptor supervision without depending on a GPU.
+        video_encoder: "hevc_rustydlna_unavailable_hardware_encoder".into(),
+        audio: AudioAction::ToAac,
+        browser_quality: Some(BrowserQuality::Auto),
+        hardware_decode: HardwareDecode::None,
+        ..TranscodePlan::default()
+    };
+    let options = BrowserOutputOptions {
+        encoding_preset: BrowserEncodingPreset::Balanced,
+        source_video: Some(VideoCodec::H264),
+        selected_audio: rusty_dlna_transcode::AudioCodec::Aac,
+        source_hdr: HdrKind::Sdr,
+        start_seconds: 0,
+        hls: false,
+    };
+    let identity = rusty_dlna_transcode::browser_transcode_cache_identity_file_controlled(
+        &source,
+        &fixture,
+        &primary_plan,
+        options,
+        ToolQueryControl::new(
+            &app.helpers,
+            &app.scan_cfg.cancellation,
+            Duration::from_secs(2),
+        ),
+    )
+    .unwrap()
+    .unwrap();
+    let mut spec = job_spec(&dir, "actual-ffmpeg-fallback", Vec::new());
+    spec.job_key = "web:42:actual-ffmpeg-fallback".into();
+    spec.web_session_id = Some(9);
+    spec.web_request_id = Some(77);
+    spec.cache_key = identity.cache_key().to_owned();
+    spec.output_expectation = Some(RemuxOutputExpectation {
+        video_codec: Some("hevc".into()),
+        ..expected(2.0)
+    });
+    spec.source_file = Some(source);
+    spec.src = fixture;
+    spec.verified_ffmpeg = Some(identity.ffmpeg().clone());
+    let part = cache_part(&spec.dest);
+    let args = |plan: &TranscodePlan| {
+        rusty_dlna_transcode::browser_ffmpeg_os_args_for_verified_ffmpeg(
+            Path::new("/proc/self/fd/3"),
+            &part,
+            plan,
+            options,
+            identity.ffmpeg(),
+        )
+    };
+    spec.args = args(&primary_plan);
+    let portable = TranscodePlan {
+        video_encoder: "libx264".into(),
+        ..primary_plan
+    };
+    spec.fallback_args = Some(args(&portable));
+    let first = attach(app.clone(), spec.clone()).unwrap();
+    wait_for_terminal_cleanup(&app, &first);
+    assert_eq!(first.state(), RemuxState::Complete);
+    let actual = crate::lock_recover(&first.effective_recipe)
+        .clone()
+        .unwrap();
+    assert_eq!(actual.video_encoder, "libx264");
+    assert_eq!(actual.audio_encoder, "aac");
+    assert_eq!(actual.dynamic_range, "sdr");
+    assert_eq!(
+        actual.previous_failure,
+        Some(fallback::FailureClass::Unsupported)
+    );
+    assert!(cache_is_fresh_for_key(&first.dest, &actual.stamp_key()));
+    assert!(!cache_is_fresh_for_key(&first.dest, &spec.cache_key));
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let readers = [(9, 77), (10, 88)]
+        .into_iter()
+        .map(|(session, request)| {
+            let app = app.clone();
+            let barrier = barrier.clone();
+            let mut spec = spec.clone();
+            spec.web_session_id = Some(session);
+            spec.web_request_id = Some(request);
+            std::thread::spawn(move || {
+                barrier.wait();
+                attach_for_client(app, spec).unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let readers = readers
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    assert!(Arc::ptr_eq(&readers[0], &readers[1]));
+    assert!(readers[0].cache_hit);
+    assert!(
+        crate::lock_recover(&readers[0].effective_recipe)
+            .as_ref()
+            .unwrap()
+            .cache_reuse
+    );
+    assert!(web_job_effective_recipe(&app, 42, Some(9), Some(77)).is_some());
+    assert!(web_job_effective_recipe(&app, 42, Some(10), Some(88)).is_some());
+    assert!(web_job_effective_recipe(&app, 42, Some(9), Some(88)).is_none());
+    assert!(web_job_effective_recipe(&app, 42, Some(11), Some(77)).is_none());
+    assert_eq!(
+        app.remux_metrics
+            .performance
+            .fallbacks_portable
+            .load(Ordering::Relaxed),
+        1
+    );
+    // A warm MSE attachment discloses the effective H.264/AAC recipe before
+    // the client fetches or appends initialization bytes for requested HEVC.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let response = runtime.block_on(async {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = rusty_dlna_http::HttpRequest::parse_headers(
+            "GET /web/media/42.m3u8?delivery=mse&session=9&request=77 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ).unwrap();
+        let server_app = app.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            serve_remux(&server_app, &mut socket, &request, spec).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response)).await.unwrap().unwrap();
+        server.await.unwrap();
+        String::from_utf8(response).unwrap()
+    });
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(
+        response.contains(&format!(
+            "{}: h264_sdr\r\n",
+            rusty_dlna_protocol::MSE_VIDEO_OUTPUT_HEADER
+        )),
+        "{response}"
+    );
+    assert!(
+        response.contains(&format!(
+            "{}: aac\r\n",
+            rusty_dlna_protocol::MSE_AUDIO_CODEC_HEADER
+        )),
+        "{response}"
+    );
+    assert!(response.contains("#EXTM3U"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn release_failed_attempt_before_readiness_pin(job: &RemuxJob) {
+    let directory = job.part.parent().unwrap();
+    std::fs::write(directory.join("release-primary"), b"release").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while (job.state() != RemuxState::Starting || job.part.exists()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(job.state(), RemuxState::Starting);
+    assert!(!job.part.exists());
+    assert!(crate::lock_recover(&job.output).is_none());
+    std::fs::write(directory.join("readiness-handoff"), b"observed").unwrap();
+}
+
+#[tokio::test]
+async fn readiness_pin_retries_a_replaced_attempt_without_resetting_its_deadline() {
+    for expires in [false, true] {
+        let dir = temp_dir("readiness-fallback-handoff");
+        let app = test_app(&dir, 1);
+        let mut spec = job_spec(&dir, "readiness-fallback-handoff", Vec::new());
+        spec.args = vec![
+            "sh".into(),
+            "-c".into(),
+            "head -c 32768 /dev/zero > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done; exit 1"
+                .into(),
+            "primary".into(),
+            cache_part(&spec.dest).into_os_string(),
+            dir.join("release-primary").into_os_string(),
+        ];
+        spec.fallback_args = Some(vec![
+            "sh".into(),
+            "-c".into(),
+            "while [ ! -f \"$1\" ]; do sleep 0.01; done; cp \"$2\" \"$3\"".into(),
+            "fallback".into(),
+            dir.join("release-fallback").into_os_string(),
+            spec.src.as_os_str().to_owned(),
+            cache_part(&spec.dest).into_os_string(),
+        ]);
+        let job = attach(app.clone(), spec).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while job.state() != RemuxState::Growing {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        crate::lock_recover(readiness_test_hooks()).insert(
+            job.part.clone(),
+            release_failed_attempt_before_readiness_pin,
+        );
+        let deadline = Instant::now()
+            + if expires {
+                Duration::from_millis(250)
+            } else {
+                FIRST_WAIT
+            };
+        let waiting_job = job.clone();
+        let mut ready = tokio::spawn(async move { wait_ready_until(&waiting_job, deadline).await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !dir.join("readiness-handoff").is_file() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if expires {
+            let error = tokio::time::timeout(Duration::from_secs(1), ready)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(error.contains("remux produced no data"), "{error}");
+            assert!(Instant::now() >= deadline);
+        } else {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut ready)
+                    .await
+                    .is_err(),
+                "replacement is pending, not a missing-output error"
+            );
+            std::fs::write(dir.join("release-fallback"), b"release").unwrap();
+            let path = tokio::time::timeout(Duration::from_secs(3), ready)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(path, job.dest);
+            assert!(
+                crate::lock_recover(&job.output).is_some(),
+                "readiness already pinned the replacement"
+            );
+        }
+        std::fs::write(dir.join("release-fallback"), b"release").unwrap();
+        let cleanup_app = app.clone();
+        let cleanup_job = job.clone();
+        tokio::task::spawn_blocking(move || wait_for_terminal_cleanup(&cleanup_app, &cleanup_job))
+            .await
+            .unwrap();
+        assert_eq!(job.state(), RemuxState::Complete);
+        assert_eq!(std::fs::read(&job.dest).unwrap(), b"source bytes");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

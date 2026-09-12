@@ -435,9 +435,18 @@ roughly one-second random-access movie fragments; this accommodates Android
 hardware decoders that reject a separately appended fragment unless it begins
 at an IDR. After startup, the browser sends its appended fragment cursor and receives at most 256 new entries per
 long-polled playlist; it does not repeatedly download and parse the complete
-movie history. Native HLS continues to advertise only independently decodable
-one-second keyframe-aligned segments. After Media Source has one
-playable fragment, pausing also suspends its playlist polling and media
+movie history. Its bounded cursor supports up to 100,000 fragments, including
+eight-hour titles with one-second fragments. When the pinned playlist reports a
+fallback with different codecs, Media Source replaces its empty decoder buffer
+before initialization is appended, preserving the playback request and session.
+Stream details show the successful recipe, including cached fallback reuse.
+Native HLS advertises independently
+decodable keyframe-aligned segments, grouping dependent copied fragments;
+encoded segments are approximately one second. It retains the complete EVENT
+history. A later copied GOP above an already published target duration requires
+a new playlist generation, which can use the larger known maximum. Native Safari
+recovery for that case is not established by WebKit automation. After Media
+Source has one playable fragment, pausing also suspends its playlist polling and media
 downloads until Play. An exact seek within a ten-second server bucket keeps
 its target pending until the corresponding fragment is buffered and the native
 media clock accepts that offset. A paused seek fetches only enough fragments

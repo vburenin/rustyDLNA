@@ -21,6 +21,7 @@ import {
   doubleTapSeekDelta,
   durationSeconds,
   fullscreenAction,
+  fallbackMediaSourceType,
   hdrDisplaySupport,
   hdrVideoOutputCandidate,
   mediaMatchesQuery,
@@ -675,6 +676,21 @@ test("Android detection is limited to Android user agents", () => {
   assert.equal(isAndroidDevice({
     userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1",
   }), false);
+});
+
+test("effective fallback MSE types replace encoded codecs and preserve copied streams", () => {
+  const original = 'video/mp4; codecs="hvc1.2.4.L153.B0,ec-3"';
+  const outputs = [{ id: "h264_sdr", codec: "avc1.640033" }, { id: "hevc_hdr10", codec: "hvc1.2.4.L153.B0" }];
+  assert.equal(fallbackMediaSourceType(original, null, null, outputs), original);
+  assert.equal(fallbackMediaSourceType(original, "h264_sdr", "aac", outputs), 'video/mp4; codecs="avc1.640033,mp4a.40.2"');
+  assert.equal(fallbackMediaSourceType(original, "h264_sdr", null, outputs), 'video/mp4; codecs="avc1.640033,ec-3"');
+  assert.equal(fallbackMediaSourceType(original, null, "aac", outputs), 'video/mp4; codecs="hvc1.2.4.L153.B0,mp4a.40.2"');
+  assert.equal(fallbackMediaSourceType('audio/mp4; codecs="ec-3"', null, "aac", outputs), 'audio/mp4; codecs="mp4a.40.2"');
+  assert.equal(fallbackMediaSourceType(original, "unknown", "aac", outputs), null);
+  assert.equal(fallbackMediaSourceType(original, "h264_sdr", "unknown", outputs), null);
+  assert.equal(fallbackMediaSourceType(original, "h264_sdr", "aac", []), null);
+  assert.equal(fallbackMediaSourceType("invalid", "h264_sdr", "aac", outputs), null);
+  assert.equal(fallbackMediaSourceType(original, "h264_sdr", "aac", [{ id: "h264_sdr", codec: 'avc1.640033\"unsafe' }]), null);
 });
 
 test("HLS media playlists expose only confined fixed fragmented-MP4 resources", () => {
