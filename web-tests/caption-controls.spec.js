@@ -108,6 +108,9 @@ async function openCaptions(page) {
   await expect(button).toBeEnabled();
   await page.locator("#player-stage").scrollIntoViewIfNeeded();
   await page.locator("#player-stage").hover();
+  // WebKit can finish hovering before the fade-in makes the button focusable.
+  // Programmatic focus does not wait for visibility.
+  await expect(button).toBeVisible();
   await button.focus();
   await expect(button).toBeFocused();
   await button.press("Enter");
@@ -264,6 +267,10 @@ test("caption failure and retry leave decoded playback healthy and expose access
   await video.evaluate((video) => video.play());
   await expect.poll(() => video.evaluate((video) => video.getVideoPlaybackQuality?.().totalVideoFrames || 0)).toBeGreaterThan(1);
   const source = await video.evaluate((video) => video.src);
+  // Exercise caption access after the controls have actually hidden.
+  await page.locator("#layout-watch").focus();
+  await page.locator("#layout-watch").hover();
+  await expect(page.locator("#playback-controls")).toBeHidden();
   await openCaptions(page);
   await page.getByRole("radio", { name: "English", exact: true }).check();
   await expect(page.locator("#caption-error-message")).toHaveText("Captions could not load. Try again or turn captions off.");
