@@ -730,6 +730,17 @@ The browser keeps the last decoded video frame visible while a direct seek or
 compatible replacement stream is pending. The held frame is bounded to about
 four megapixels and is released as soon as the target source has displayable
 video data; choosing a different title clears it immediately.
+For a native HLS replacement at a nonzero position, the initial play request
+retains Safari's user activation while audio stays temporarily muted. The
+requested seek must settle and its video frame must be presented before audio
+and the held picture are released. An exact native HLS seek waits for a finite
+seekable range containing the target; Safari's early, unbounded range is
+insufficient. Seeking into that finite range can fetch missing target data
+while preserving paused playback.
+Browsers without frame callbacks use their
+decode-ready estimate. The temporary mute does not change the saved mute or
+volume; pause, mute changes, and a newer seek remain authoritative. Startup
+recovery stays active while the target frame is missing.
 
 When a valid offline timeline-preview sidecar is present, scrubbing selects the
 nearest frame from its revisioned JPEG sprite sheets. Frame size and grid come
@@ -1188,6 +1199,56 @@ Profile-8 remap jobs additionally expose bounded per-stage file sizes and I/O
 in `transcode.web_player.performance.profile8`; this shared diagnostic location
 does not imply that the browser negotiated a Dolby Vision remap. See the
 [Profile-8 pipeline contract](TRANSCODE.md#serve-path-background-growing-fmp4-file-cache).
+
+Native EVENT history has a separate opt-in Linux measurement:
+
+```sh
+RUSTY_DLNA_NATIVE_EVIDENCE=/tmp/native-history-evidence cargo test --release --locked -p rusty-dlna --lib measure_native_variable_gop_history -- --ignored --nocapture
+```
+
+The output directory must be new. The test retains generated two/eight-hour,
+128×72, 2 fps video-only sources, copied fragmented output, exact helper commands,
+FFmpeg identity, FFprobe packet timing, decoded-frame hashes, playlists and ten
+raw index/formatting samples per title. Late GOPs grow from two to twelve seconds.
+It uses the production HLS copy builder; copy-only input already has no pacing.
+Full EVENT durations/counts are checked against FFprobe; the
+source and output must decode to identical frames. This measures metadata and
+formatting cost. Actual Safari/device polling, backward/forward seeks, reconnect,
+multiple viewers, growing-generation recovery and daemon/cache restart still
+require native-device execution. Linux WebKit and Chromium MSE do not certify
+those behaviors. No replacement history strategy is enabled by this experiment.
+
+For assisted Safari testing, `scripts/native-hls-device.py` serves a temporary
+capture page and proxies a loopback rustyDLNA backend. For example, with an
+isolated backend on port 18230:
+
+```sh
+python3 scripts/native-hls-device.py --listen 192.168.1.10 --port 18231 --backend-port 18230 --output /tmp/native-device-capture
+```
+
+Use the server's actual LAN address, then open
+`http://192.168.1.10:18231/__native/?item=123` on the Apple device with the
+catalog item's ID. Tap Play, seek forward and back, reconnect, and save results.
+The page selects Prepared streaming and Automatic quality in its separate
+proxy-origin preferences so the native HLS path is exercised.
+The page records media events, presented-frame callbacks where available,
+buffered/seekable ranges, mute/pause state and user observations. Each viewer has
+a separate capture ID; the proxy records HLS request counts, playlist lengths,
+hashes, segment counts, target durations, generation URLs, response lengths and
+truncation errors. Generated long-title sources can be served by the isolated
+daemon to test native history; a short MP4 policy test cannot replace this tier.
+
+The proxy snapshots workspace JavaScript/CSS and records their hashes at launch.
+`--assets-dir` selects a saved baseline asset directory. Only the proxy's root
+document permits same-origin framing for the capture page; daemon security
+headers remain unchanged.
+It does not rebuild or replace the daemon. Normal playback can create ordinary
+backend transcode cache entries. Captures belong outside Git; the tool limits
+uploads to 2 MiB, total evidence to 64 MiB, concurrent requests to 32 and its
+lifetime to two hours by default. It closes responses and disables caching, so
+compare both versions through the same proxy and report these measurement
+conditions. A capture without actual Safari/device playback remains incomplete
+native validation.
 
 `node scripts/playback-benchmark.mjs --help` describes the generated-fixture
 benchmark. Run it against each saved server binary under matching conditions;

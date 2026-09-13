@@ -1050,6 +1050,11 @@ export class PlaybackController {
         ? source.plan.androidTranscodeEligible ? "Preparing reliable Android stream…" : "Preparing stream…"
         : undefined,
     });
+    // Native playback must start during the tap to retain Safari activation.
+    // Keep seek preroll inaudible until this replacement presents its target.
+    source.nativeSeekAudioHeld = source.plan.nativeHlsDelivery && item.kind === "video" && start > 0;
+    source.nativeSeekFramePresented = false;
+    player.muted = this.#effectiveMuted(player, this.#store.getState().preferences.muted);
     this.#attachSource(source, this.#bindSourceEvents(source));
     this.#watchPresentedFrame(source, start - source.segmentOffset);
     if (source.plan.sourceMode === SOURCE_MODES.COMPATIBLE) {
@@ -1106,10 +1111,16 @@ export class PlaybackController {
       // Native fragmented MP4 metadata can precede its seekable timeline.
       // Retain the requested offset when the browser clamps or rejects a seek;
       // later source events retry it once the corresponding range exists.
+      // Safari can initially advertise [0, Infinity] as seekable before any
+      // HLS fragment exists. Seeking into it can leave seeking=true while
+      // preroll frames/audio advance and currentTime stays pinned to the target.
+      // A finite native range can request missing target data even while
+      // paused; requiring buffered data here would make that fetch circular.
       const available = mediaSourceDelivery ? player.buffered : player.seekable;
       const ranges = Array.from({ length: available.length }, (_, index) => ({
         start: available.start(index), end: available.end(index),
-      }));
+      })).filter((range) => !source.plan.nativeHlsDelivery
+        || (Number.isFinite(range.start) && Number.isFinite(range.end)));
       if (!bufferedSeekTarget(ranges, local)) return false;
       if (Math.abs(player.currentTime - local) > 0.05) {
         if (!mediaSourceDelivery) {
@@ -1158,11 +1169,18 @@ export class PlaybackController {
     listen("loadeddata", () => {
       if (!mediaSourceDelivery) nativeSeekAttempt = null;
       if (!applyPendingSeek()) return;
-      if (sourceMode === SOURCE_MODES.COMPATIBLE) this.#clearStartupTimer();
-      this.#releaseHeldVideoFrame();
+      if (!source.nativeSeekAudioHeld) {
+        if (sourceMode === SOURCE_MODES.COMPATIBLE) this.#clearStartupTimer();
+        this.#releaseHeldVideoFrame();
+      }
     });
     const readyToPlay = async () => {
       if (!applyPendingSeek()) return;
+      if (source.nativeSeekAudioHeld) {
+        if (!source.nativeSeekFramePresented) return;
+        source.nativeSeekAudioHeld = false;
+        player.muted = this.#store.getState().preferences.muted;
+      }
       if (sourceMode === SOURCE_MODES.COMPATIBLE) this.#clearStartupTimer();
       this.#releaseHeldVideoFrame();
       this.#startTrickplayPreload();
@@ -1179,6 +1197,7 @@ export class PlaybackController {
         status("playing", { autoplayBlocked: false, intent: "playing", message: null });
       }
     };
+    source.nativeSeekFrameReady = () => { if (valid()) void readyToPlay(); };
     listen("canplay", readyToPlay);
     if (sourceMode === SOURCE_MODES.COMPATIBLE && !mediaSourceDelivery) {
       for (const name of ["progress", "durationchange"]) listen(name, () => {
@@ -1189,6 +1208,10 @@ export class PlaybackController {
     }
     listen("playing", () => {
       if (!mediaSourceDelivery && !applyPendingSeek()) return;
+      if (source.nativeSeekAudioHeld) {
+        void readyToPlay();
+        return;
+      }
       this.#reportStartup(source, "playing");
       if (document.visibilityState === "visible"
         && this.#nativeHlsSuspendedSession === sessionId) {
@@ -1231,7 +1254,10 @@ export class PlaybackController {
     });
     listen("volumechange", () => {
       this.#setPreference("volume", Math.round(player.volume * 100));
-      this.#setPreference("muted", player.muted);
+      if (source.nativeSeekAudioHeld) {
+        // Native controls can change the element independently of our controls.
+        if (!player.muted) player.muted = true;
+      } else this.#setPreference("muted", player.muted);
     });
     listen("ended", () => {
       const playback = this.#store.getState().playback;
@@ -1455,7 +1481,11 @@ export class PlaybackController {
     };
     const presented = (estimated = false, mediaTime = player.currentTime, observedAt = performance.now()) => {
       if (cancelled || !source.active || this.#timing !== timing) return;
-      if (!matchesTarget(mediaTime)) {
+      const nativeSeekAdvanced = source.nativeSeekAudioHeld
+        && this.#store.getState().playback.pendingSeekTime === null
+        && Number.isFinite(mediaTime) && mediaTime + 0.1 >= localTarget
+        && Math.abs(mediaTime - player.currentTime) <= 0.5;
+      if (!matchesTarget(mediaTime) && !nativeSeekAdvanced) {
         if (!estimated) requestFrame();
         return;
       }
@@ -1466,7 +1496,15 @@ export class PlaybackController {
         if (!estimated) pendingFrame = { mediaTime, observedAt };
         return;
       }
+      if (source.nativeSeekAudioHeld && this.#store.getState().playback.pendingSeekTime !== null) {
+        // A frame cannot authorize sound while settling readiness could still
+        // issue another seek. The resulting target frame must be observed too.
+        if (!estimated) requestFrame();
+        return;
+      }
       source.hasPresentedFrame = true;
+      source.nativeSeekFramePresented = true;
+      if (source.nativeSeekAudioHeld) source.nativeSeekFrameReady?.();
       const newlyPresented = timing && !timing.finished;
       timing?.finish(source, estimated, observedAt);
       if (!estimated && source.plan.sourceMode === SOURCE_MODES.COMPATIBLE && newlyPresented) {
@@ -1605,7 +1643,7 @@ export class PlaybackController {
   #scheduleCompatibleStartupRecovery(source, sourceUrl) {
     const { sessionId, item, player, start, signal } = source;
     const { streamNegotiation, nativeHlsDelivery, mediaSourceDelivery } = source.plan;
-    const ready = () => player.readyState >= 2
+    const ready = () => !source.nativeSeekAudioHeld && player.readyState >= 2
       && (mediaSourceDelivery || this.#store.getState().playback.pendingSeekTime === null);
     if (source.hasTimer("startup") || !source.active || ready()) return;
     source.setTimer("startup", () => {
@@ -1654,7 +1692,16 @@ export class PlaybackController {
       // during a long pause without fetching the replacement fragments. Reopen
       // the same generation first; its accumulated bytes remain reusable. A
       // second stall advances to the bounded fresh-generation retry above.
+      if (source.nativeSeekAudioHeld) {
+        source.nativeSeekFramePresented = false;
+        this.#store.dispatch({
+          type: "PLAYBACK_AUX", sessionId,
+          values: { pendingSeekTime: start > source.segmentOffset ? start : null },
+        });
+        this.#watchPresentedFrame(source, start - source.segmentOffset);
+      }
       player.load();
+      if (source.nativeSeekAudioHeld && playback.intent === "playing") void this.#attemptPlay(source);
     }, nativeHlsDelivery ? NATIVE_HLS_STARTUP_STALL_MS : COMPATIBLE_STARTUP_STALL_MS);
   }
 
@@ -2442,8 +2489,8 @@ export class PlaybackController {
     this.#dom.muteButton.addEventListener("click", () => {
       const muted = !this.#store.getState().preferences.muted;
       this.#setPreference("muted", muted);
-      this.#dom.video.muted = muted;
-      this.#dom.audio.muted = muted;
+      this.#dom.video.muted = this.#effectiveMuted(this.#dom.video, muted);
+      this.#dom.audio.muted = this.#effectiveMuted(this.#dom.audio, muted);
     });
     this.#dom.volumeControl.addEventListener("input", () => {
       const volume = Number(this.#dom.volumeControl.value);
@@ -2451,7 +2498,7 @@ export class PlaybackController {
       this.#setPreference("muted", volume === 0);
       for (const player of [this.#dom.video, this.#dom.audio]) {
         player.volume = volume / 100;
-        player.muted = volume === 0;
+        player.muted = this.#effectiveMuted(player, volume === 0);
       }
     });
     this.#dom.speedControl.addEventListener("change", () => {
@@ -2774,6 +2821,11 @@ export class PlaybackController {
       || focused === this.#dom.closePlayerButton
       || this.#dom.playbackControls.contains(focused))
       && focused.matches(":focus-visible");
+  }
+
+  #effectiveMuted(player, preference) {
+    return preference || Boolean(this.#source?.active && this.#source.player === player
+      && this.#source.nativeSeekAudioHeld);
   }
 
   #applyInitialPreferences() {

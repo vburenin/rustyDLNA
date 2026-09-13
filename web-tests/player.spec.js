@@ -3618,9 +3618,16 @@ test("iPad sleep restarts native HLS at the saved position on Play", async ({ pa
       paused.set(this, true);
       this.dispatchEvent(new Event("pause"));
     };
+    // This engine stub checks sleep/source policy. Real decoded presentation
+    // and seek readiness are exercised by the native-preroll A/V tests below.
+    HTMLVideoElement.prototype.requestVideoFrameCallback = function (callback) {
+      return window.setTimeout(() => callback(performance.now(), { mediaTime: this.currentTime }), 16);
+    };
+    HTMLVideoElement.prototype.cancelVideoFrameCallback = (id) => window.clearTimeout(id);
     HTMLMediaElement.prototype.load = function loadNativeHls() {
       const source = this.getAttribute("src") || "";
       if (!source.includes("delivery=hls")) return;
+      positions.set(this, 0);
       paused.set(this, true);
       window.__nativeHlsSleep.loads.push(source);
       window.__nativeHlsSleep.events.push("load");
@@ -7435,5 +7442,280 @@ for (const cacheReuse of [false, true]) {
     expect(cancelled).toEqual([]);
     expect(errors).toEqual([]);
     await expect(page.locator("#player-message[role=alert]")).toBeHidden();
+  });
+}
+
+test("native device capture page loads the player and saves seek observations", async ({ page }) => {
+  await disableFragmentedDelivery(page);
+  const fixture = await fragmentedCompatibleFixture({ seconds: 12 });
+  const html = await readFile(new URL("../scripts/native-hls-device.html", import.meta.url), "utf8");
+  const records = [];
+  // The temporary proxy permits its same-origin diagnostic frame. Production
+  // daemon pages retain frame-ancestors 'none'; socket tests cover this rewrite.
+  await page.route("**/*", async (route) => {
+    if (new URL(route.request().url()).pathname !== "/") return route.fallback();
+    const response = await route.fetch();
+    const headers = response.headers();
+    headers["content-security-policy"] = headers["content-security-policy"].replace(/frame-ancestors\s+[^;]+/, "frame-ancestors 'self'");
+    headers["x-frame-options"] = "SAMEORIGIN";
+    await route.fulfill({ response, headers });
+  });
+  await page.route("**/__native/?**", (route) => route.fulfill({ contentType: "text/html", body: html }));
+  await page.route("**/__native/record", (route) => {
+    records.push(route.request().postDataJSON());
+    return route.fulfill({ body: "Saved" });
+  });
+  await page.route("**/web/media/*.mp4?**", (route) => fulfillFiniteVideo(route, fixture));
+  await page.route("**/api/web/transcode/*", (route) => route.fulfill({ json: { schema_version: 2, state: "producing" } }));
+  await page.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    for (const entry of payload.entries || []) {
+      if (entry.entry_type === "media") { entry.duration_seconds = 600; entry.duration = "0:10:00.000"; }
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto("/__native/?capture-test=1");
+  await expect(page.locator("#status")).toContainText("Tap Play");
+  const player = page.frameLocator("#player");
+  await player.getByRole("tab", { name: "Videos" }).click();
+  await player.getByRole("button", { name: /^Play tagged\b/ }).click();
+  await expect.poll(() => player.locator("#video-player").evaluate((video) => video.currentTime > 0.2 && video.videoWidth > 0)).toBe(true);
+  await page.getByRole("button", { name: "Jump forward", exact: true }).click();
+  await expect.poll(() => player.locator("#video-player").evaluate((video) => new URL(video.src, location.href).searchParams.get("start"))).toBe("480");
+  await page.getByRole("button", { name: "Mark audio without video" }).click();
+  await page.getByLabel("Notes").fill("Automated capture plumbing check; not native device evidence.");
+  await page.getByRole("button", { name: "Save results" }).click();
+  await expect(page.locator("#status")).toContainText("Results saved");
+  expect(records.some((capture) => capture.records.some((event) => event.event === "requested_seek" && event.target === 480))).toBe(true);
+  expect(records.some((capture) => capture.records.some((event) => event.event === "audio_without_video_reported"))).toBe(true);
+  expect(records.some((capture) => capture.records.some((event) => event.event === "frame"))).toBe(true);
+  expect(errors).toEqual([]);
+});
+
+for (const outcome of ["playing", "paused", "muted", "replaced", "recovered", "unbounded", "paused_unbuffered"]) {
+  test(`native HLS seek keeps preroll silent and restores ${outcome} intent`, async ({ page }) => {
+    await usePreference(page, "stream", "compat");
+    await usePreference(page, "muted", "false");
+    await page.addInitScript(({ unboundedTimeline, fetchOnSeek }) => {
+      Object.defineProperty(navigator, "userAgent", { configurable: true, value: "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1" });
+      Object.defineProperty(navigator, "platform", { configurable: true, value: "iPad" });
+      Object.defineProperty(navigator, "maxTouchPoints", { configurable: true, value: 5 });
+      const canPlay = HTMLMediaElement.prototype.canPlayType;
+      HTMLMediaElement.prototype.canPlayType = function (type) {
+        if (/mpegurl/i.test(type)) return "maybe";
+        return canPlay.call(this, type);
+      };
+      // Exercise native-source policy with real A/V decoding. Linux automation
+      // does not supply the iPad HLS engine; map its selected URL to finite MP4.
+      const src = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "src");
+      const sourceUrls = new WeakMap();
+      const getAttribute = Element.prototype.getAttribute;
+      const removeAttribute = Element.prototype.removeAttribute;
+      Object.defineProperty(HTMLMediaElement.prototype, "src", {
+        ...src,
+        set(value) {
+          sourceUrls.set(this, String(value));
+          src.set.call(this, String(value).replace(".m3u8?", ".mp4?"));
+        },
+      });
+      HTMLMediaElement.prototype.getAttribute = function (name) {
+        return name === "src" && sourceUrls.has(this) ? sourceUrls.get(this) : getAttribute.call(this, name);
+      };
+      HTMLMediaElement.prototype.removeAttribute = function (name) {
+        if (name === "src") sourceUrls.delete(this);
+        return removeAttribute.call(this, name);
+      };
+      const setTimer = window.setTimeout.bind(window);
+      const clearTimer = window.clearTimeout.bind(window);
+      window.__nativeSeekStartup = null;
+      window.setTimeout = (callback, delay, ...args) => {
+        const id = setTimer(callback, delay, ...args);
+        if (delay === 12_000) window.__nativeSeekStartup = { id, fire: () => callback(...args) };
+        return id;
+      };
+      window.clearTimeout = (id) => {
+        if (window.__nativeSeekStartup?.id === id) window.__nativeSeekStartup = null;
+        clearTimer(id);
+      };
+      window.__nativeSeekLoads = 0;
+      const load = HTMLMediaElement.prototype.load;
+      HTMLMediaElement.prototype.load = function () {
+        window.__nativeSeekLoads++;
+        return load.call(this);
+      };
+      window.__nativeFragmentsReady = !unboundedTimeline && !fetchOnSeek;
+      window.__nativeSeekAssignments = [];
+      const isSeekSource = (player) => new URL(player.src || location.href).searchParams.get("start") > 0;
+      const buffered = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "buffered");
+      Object.defineProperty(HTMLMediaElement.prototype, "buffered", {
+        ...buffered,
+        get() { return isSeekSource(this) && !window.__nativeFragmentsReady ? { length: 0 } : buffered.get.call(this); },
+      });
+      const seekable = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "seekable");
+      Object.defineProperty(HTMLMediaElement.prototype, "seekable", {
+        ...seekable,
+        get() {
+          return unboundedTimeline && isSeekSource(this) && !window.__nativeFragmentsReady
+            ? { length: 1, start: () => 0, end: () => Infinity } : seekable.get.call(this);
+        },
+      });
+      const currentTime = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "currentTime");
+      Object.defineProperty(HTMLMediaElement.prototype, "currentTime", {
+        ...currentTime,
+        set(value) {
+          if (isSeekSource(this)) {
+            window.__nativeSeekAssignments.push(value);
+            // A paused native source may fetch its target only after seeking.
+            // Keep real decoding underneath this availability boundary.
+            if (fetchOnSeek) window.__nativeFragmentsReady = true;
+          }
+          currentTime.set.call(this, value);
+        },
+      });
+      window.__nativeSeekPlay = [];
+      window.__nativeSeekFrames = [];
+      window.__holdNativeSeekFrames = true;
+      const requestFrame = HTMLVideoElement.prototype.requestVideoFrameCallback;
+      HTMLVideoElement.prototype.requestVideoFrameCallback = function (callback) {
+        return requestFrame.call(this, (now, metadata) => {
+          if (window.__holdNativeSeekFrames && new URL(this.src).searchParams.get("start") !== "0"
+            && metadata.mediaTime >= 6.9) {
+            // Hold an actual decoded target frame at the presentation boundary,
+            // after media data and seek completion, rather than inventing one.
+            window.__nativeSeekFrames.push({ callback, now, metadata, source: this.src });
+          } else callback(now, metadata);
+        });
+      };
+      const play = HTMLMediaElement.prototype.play;
+      HTMLMediaElement.prototype.play = function () {
+        window.__nativeSeekPlay.push({ source: this.src, muted: this.muted, at: performance.now() });
+        return play.call(this);
+      };
+    }, { unboundedTimeline: outcome === "unbounded", fetchOnSeek: outcome === "paused_unbuffered" });
+    const fixture = await fragmentedCompatibleFixture({ seconds: 12 });
+    let notifyRequested;
+    const requested = new Promise((resolve) => { notifyRequested = resolve; });
+    let release;
+    const responseReady = new Promise((resolve) => { release = resolve; });
+    await page.route("**/web/media/*.mp4?**", async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get("start") !== "0") {
+        notifyRequested();
+        await responseReady;
+      }
+      await fulfillFiniteVideo(route, fixture);
+    });
+    await page.route("**/api/web/transcode/*", (route) => route.fulfill({ json: { schema_version: 2, state: "producing" } }));
+    await page.route("**/api/web/library?**", async (route) => {
+      const response = await route.fetch();
+      const payload = await response.json();
+      for (const entry of payload.entries || []) {
+        if (entry.entry_type === "media") { entry.duration_seconds = 600; entry.duration = "0:10:00.000"; }
+      }
+      await route.fulfill({ response, json: payload });
+    });
+    await openLibrary(page);
+    await selectTaggedVideo(page);
+    const video = page.locator("#video-player");
+    await expect.poll(() => video.evaluate((player) => player.readyState >= 2 && player.videoWidth > 0 && player.currentTime > 0.2)).toBe(true);
+    if (outcome === "paused_unbuffered") {
+      await page.locator("#play-button").evaluate((button) => button.click());
+      await expect.poll(() => video.evaluate((player) => player.paused)).toBe(true);
+    }
+    await page.locator("#timeline").evaluate((timeline) => {
+      timeline.value = "27";
+      timeline.dispatchEvent(new Event("input", { bubbles: true }));
+      timeline.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await requested;
+    await expect(page.locator("#video-frame-hold")).toBeVisible();
+    await expect.poll(() => video.evaluate((player) => player.muted)).toBe(true);
+    expect(await page.evaluate(() => localStorage.getItem("rustydlna.muted"))).toBe("false");
+    const earlyPlay = await page.evaluate(() => window.__nativeSeekPlay.filter((event) => new URL(event.source).searchParams.get("start") === "20"));
+    if (outcome === "paused_unbuffered") expect(earlyPlay).toEqual([]);
+    else expect(earlyPlay.length).toBeGreaterThan(0);
+    expect(earlyPlay.every((event) => event.muted)).toBe(true);
+    // User preferences remain effective after the temporary source-owned hold.
+    await page.locator("#mute-button").evaluate((button) => { button.click(); button.click(); });
+    await page.locator("#volume-control").evaluate((control) => {
+      control.value = "63";
+      control.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(await video.evaluate((player) => player.muted)).toBe(true);
+    expect(await page.evaluate(() => localStorage.getItem("rustydlna.muted"))).toBe("false");
+    if (outcome === "paused") await page.locator("#play-button").evaluate((button) => button.click());
+    if (outcome === "muted") await page.locator("#mute-button").evaluate((button) => button.click());
+    release();
+    if (outcome === "unbounded") {
+      await expect.poll(() => video.evaluate((player) => player.readyState >= 2 && player.videoWidth > 0)).toBe(true);
+      expect(await page.evaluate(() => window.__nativeSeekAssignments)).toEqual([]);
+      expect(await video.evaluate((player) => player.muted)).toBe(true);
+      await expect(page.locator("#video-frame-hold")).toBeVisible();
+      await video.evaluate((player) => {
+        window.__nativeFragmentsReady = true;
+        player.dispatchEvent(new Event("progress"));
+      });
+    }
+    await expect.poll(() => video.evaluate((player) => player.readyState >= 2 && !player.seeking
+      && player.currentTime >= 6.9 && window.__nativeSeekFrames.length > 0)).toBe(true);
+    // Decode readiness and a completed seek alone must not expose audible
+    // playback behind the old canvas. Only presentation clears both holds.
+    expect(await video.evaluate((player) => player.muted)).toBe(true);
+    await expect(page.locator("#video-frame-hold")).toBeVisible();
+    if (outcome === "playing") {
+      await video.evaluate((player) => { player.muted = false; });
+      await expect.poll(() => video.evaluate((player) => player.muted)).toBe(true);
+    }
+    if (outcome === "recovered") {
+      await expect.poll(() => page.evaluate(() => window.__nativeSeekStartup !== null)).toBe(true);
+      const loads = await page.evaluate(() => {
+        const loads = window.__nativeSeekLoads;
+        const timer = window.__nativeSeekStartup;
+        window.clearTimeout(timer.id);
+        window.__nativeSeekFrames = [];
+        timer.fire();
+        return loads;
+      });
+      await expect.poll(() => page.evaluate(() => window.__nativeSeekLoads)).toBeGreaterThan(loads);
+      await expect.poll(() => video.evaluate((player) => player.readyState >= 2 && !player.seeking
+        && player.currentTime >= 6.9 && window.__nativeSeekFrames.length > 0)).toBe(true);
+      expect(await video.evaluate((player) => player.muted)).toBe(true);
+      await expect(page.locator("#video-frame-hold")).toBeVisible();
+    }
+    if (outcome === "replaced") {
+      await page.locator("#timeline").evaluate((timeline) => {
+        timeline.value = "47";
+        timeline.dispatchEvent(new Event("input", { bubbles: true }));
+        timeline.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await expect.poll(() => page.evaluate(() => window.__nativeSeekFrames.some(
+        (frame) => new URL(frame.source).searchParams.get("start") === "40"))).toBe(true);
+      await page.evaluate(() => {
+        const stale = window.__nativeSeekFrames.filter((frame) => new URL(frame.source).searchParams.get("start") === "20");
+        window.__nativeSeekFrames = window.__nativeSeekFrames.filter((frame) => !stale.includes(frame));
+        for (const frame of stale) frame.callback(frame.now, frame.metadata);
+      });
+      expect(await video.evaluate((player) => player.muted)).toBe(true);
+      await expect(page.locator("#video-frame-hold")).toBeVisible();
+    }
+    await page.evaluate(() => {
+      window.__holdNativeSeekFrames = false;
+      for (const frame of window.__nativeSeekFrames.splice(0)) frame.callback(frame.now, frame.metadata);
+    });
+    await expect(page.locator("#video-frame-hold")).toBeHidden();
+    await expect.poll(() => video.evaluate((player) => !player.seeking && player.currentTime >= 6.9)).toBe(true);
+    expect(await video.evaluate((player) => player.muted)).toBe(outcome === "muted");
+    expect(await page.evaluate(() => localStorage.getItem("rustydlna.muted"))).toBe(String(outcome === "muted"));
+    expect(await video.evaluate((player) => player.volume)).toBeCloseTo(0.63);
+    const paused = outcome === "paused" || outcome === "paused_unbuffered";
+    await expect.poll(() => video.evaluate((player) => player.paused)).toBe(paused);
+    if (!paused) {
+      const first = await video.evaluate((player) => player.currentTime);
+      await expect.poll(() => video.evaluate((player) => player.currentTime)).toBeGreaterThan(first + 0.5);
+      await expect(page.locator("#stage-progress")).toBeHidden();
+    }
   });
 }

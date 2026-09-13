@@ -2,6 +2,8 @@ mod completed;
 #[cfg(test)]
 mod efficiency_tests;
 mod history;
+#[cfg(test)]
+mod native_evidence;
 mod validation;
 pub(super) use validation::validate_finished;
 

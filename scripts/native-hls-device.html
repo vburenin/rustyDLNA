@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Safari playback check</title>
+<style>body{font:16px system-ui;margin:16px;background:#111820;color:#f3f5f7}button,input{font:inherit;min-height:44px;margin:4px;padding:8px}iframe{width:100%;height:70vh;border:1px solid #596675}p{max-width:75ch}#status{color:#a9e7ba}a{color:#8fceff}</style>
+<h1>Safari playback check</h1>
+<p id="test-address"></p>
+<p>Use Safari on your iPad. Play the video, jump forward, then jump back. After each jump, watch and listen for at least ten seconds. The page records playback timing and whether video frames advance.</p>
+<div><button id="forward">Jump forward</button><button id="back">Jump back to 30 seconds</button><button id="reconnect">Reconnect</button><button id="issue">Mark audio without video</button><button id="save">Save results</button></div>
+<p><label>Notes <input id="notes" placeholder="What you saw or heard" maxlength="1000"></label></p>
+<p id="status" role="status">Loading the player…</p>
+<iframe id="player" title="rustyDLNA test player" allow="autoplay; fullscreen; picture-in-picture"></iframe>
+<script>
+const frame = document.querySelector('#player');
+const status = document.querySelector('#status');
+const params = new URLSearchParams(location.search);
+document.querySelector('#test-address').textContent = 'Test server: ' + location.host;
+const item = /^\d+$/.test(params.get('item') || '') ? params.get('item') : null;
+const client = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2,10);
+let records = [], activeVideo = null, first = true, sequence = 0, frames = 0;
+const identity = {user_agent:navigator.userAgent,platform:navigator.platform,touch_points:navigator.maxTouchPoints,screen:[screen.width,screen.height],item};
+function record(event, data={}) { if(records.length < 3000) records.push({at:performance.now(),event,...data}); }
+function ranges(value) { return Array.from({length:value.length},(_,i)=>[value.start(i),value.end(i)]); }
+function snapshot(event='sample') {
+  const video = activeVideo;
+  if(!video) return;
+  const doc = frame.contentDocument;
+  record(event,{source:video.currentSrc || video.src,time:video.currentTime,duration:Number.isFinite(video.duration)?video.duration:null,paused:video.paused,seeking:video.seeking,muted:video.muted,volume:video.volume,ready:video.readyState,buffered:ranges(video.buffered),seekable:ranges(video.seekable),frames,held:!doc.querySelector('#video-frame-hold')?.hidden,message:doc.querySelector('#stage-progress-label')?.textContent,progress_visible:!doc.querySelector('#stage-progress')?.hidden,rate:video.playbackRate,error:video.error?.code ?? null});
+}
+async function save() {
+  snapshot('save');
+  const pending = records; records = [];
+  const body = JSON.stringify({client,sequence:sequence++,identity,notes:document.querySelector('#notes').value,records:pending});
+  try {
+    const response = await fetch('/__native/record',{method:'POST',headers:{'Content-Type':'application/json'},body});
+    if(!response.ok) throw new Error('HTTP '+response.status);
+    status.textContent='Results saved. You can continue testing or return to the chat.';
+  } catch(error) {
+    records = pending.concat(records).slice(0,3000);
+    status.textContent='Could not save: '+error.message+'. Keep this page open and try Save results again.';
+  }
+}
+function seek(target) {
+  const doc=frame.contentDocument, timeline=doc.querySelector('#timeline');
+  if(!timeline || !activeVideo) return;
+  record('requested_seek',{target});
+  timeline.value=String(target);
+  timeline.dispatchEvent(new frame.contentWindow.Event('input',{bubbles:true}));
+  timeline.dispatchEvent(new frame.contentWindow.Event('change',{bubbles:true}));
+}
+frame.addEventListener('load',()=>{
+  if(first) {
+    first=false;
+    // Preferences belong only to this isolated test-page origin.
+    frame.contentWindow.localStorage.setItem('rustydlna.stream','compat');
+    frame.contentWindow.localStorage.setItem('rustydlna.quality','auto');
+    frame.src=item?'/?item='+item:'/?view=video';
+    return;
+  }
+  const video=frame.contentDocument.querySelector('#video-player');
+  activeVideo=video;
+  if(!video) { status.textContent='The player is unavailable.'; return; }
+  for(const name of ['loadstart','loadedmetadata','loadeddata','canplay','playing','waiting','seeking','seeked','pause','volumechange','error','ended']) video.addEventListener(name,()=>snapshot(name));
+  if(video.requestVideoFrameCallback) {
+    const presented=(_,metadata)=>{
+      if(activeVideo!==video) return;
+      frames++;
+      record('frame',{media_time:metadata.mediaTime,presented_frames:metadata.presentedFrames});
+      video.requestVideoFrameCallback(presented);
+    };
+    video.requestVideoFrameCallback(presented);
+  }
+  record('attached',{native_hls:video.canPlayType('application/vnd.apple.mpegurl'),frame_callback:!!video.requestVideoFrameCallback});
+  status.textContent='Tap Play in the player below, then use the jump buttons. Tap Save results when finished.';
+});
+document.querySelector('#forward').onclick=()=>{const timeline=frame.contentDocument.querySelector('#timeline');const duration=Number(timeline?.max);if(duration>0)seek(Math.min(duration-30,Math.max(67,duration*0.8)));};
+document.querySelector('#back').onclick=()=>seek(30);
+document.querySelector('#reconnect').onclick=()=>{record('reconnect');frame.contentWindow.location.reload();};
+document.querySelector('#issue').onclick=()=>{snapshot('audio_without_video_reported');status.textContent='Issue marked. Tap Save results after playback recovers.';};
+document.querySelector('#save').onclick=save;
+setInterval(()=>snapshot(),1000);
+setInterval(()=>{if(records.length)void save();},15000);
+document.addEventListener('visibilitychange',()=>snapshot('visibility:'+document.visibilityState));
+frame.src='/';
+</script></html>
