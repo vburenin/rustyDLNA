@@ -567,6 +567,7 @@ impl AppPreflight {
         let notify_dispatcher = events::NotifyDispatcher::new(Arc::clone(&events))
             .map_err(|source| AppInitError::NotificationWorkers { source })?;
         Ok(App {
+            original_reads: Arc::new(tokio::sync::Semaphore::new(cfg.max_connections)),
             cfg,
             catalog: RwLock::new(catalog),
             catalog_publication: Mutex::new(()),
@@ -2417,9 +2418,13 @@ impl App {
             });
             return r;
         }
-        let body = match read_open_file_range(&mut opened.file, start, end) {
-            Ok(b) => b,
-            Err(error) => return media_read_error_response(&path, &item.title, &error),
+        let body = if size == 0 {
+            Vec::new()
+        } else {
+            match read_open_file_range(&mut opened.file, start, end) {
+                Ok(b) => b,
+                Err(error) => return media_read_error_response(&path, &item.title, &error),
+            }
         };
         let mut r = media_response(MediaResponseOptions {
             server: &self.server,

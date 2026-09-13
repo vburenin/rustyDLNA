@@ -1648,21 +1648,7 @@ pub(crate) async fn stream_open_file_range(
     start: u64,
     end: u64,
 ) -> std::io::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut f = tokio::fs::File::from_std(file);
-    f.seek(std::io::SeekFrom::Start(start)).await?;
-    let mut left = end.saturating_sub(start).saturating_add(1);
-    let mut buf = vec![0u8; 64 * 1024];
-    while left > 0 {
-        let n = std::cmp::min(left as usize, buf.len());
-        let got = f.read(&mut buf[..n]).await?;
-        if got == 0 {
-            break;
-        }
-        socket_write_all(app, sock, &buf[..got]).await?;
-        left -= got as u64;
-    }
-    Ok(())
+    crate::file_delivery::stream(app, sock, file, start, end).await
 }
 
 pub(super) fn read_open_file_range(

@@ -331,6 +331,22 @@ Keep-Alive for SOAP/desc/art/captions. **Never** for `/MediaItems/`
 (or a transcode pipe). Host must be literal IPv4 or 400. TimeSeek
 without Range → 406.
 
+Original GET/HEAD and byte ranges retain the descriptor opened through media-root
+confinement. Empty original files return `200` with `Content-Length: 0`; their
+byte ranges are unsatisfiable. Original responses above 8 MiB use independent
+positional reads on the pinned inode. Replacing the path cannot retarget a
+response already prepared from that descriptor. Premature EOF closes delivery
+with an error; it does not count as a complete promised range.
+
+Blocking reads run outside listener tasks, with one bounded buffer per transfer
+and no read-ahead queue. Read admission remains held by a worker until its kernel
+operation returns, even if its connection is cancelled. Admission plus each read
+has the configured `write_timeout_secs` deadline; socket writes keep their
+existing 64 KiB granularity and deadline. Shutdown cancels the asynchronous
+transfer without waiting for the socket's write deadline. An uninterruptible
+kernel read may outlive that observer and still delay runtime/process teardown;
+this is not a guarantee of daemon exit during a storage hang.
+
 A persistent TCP connection serves at most 100 requests. The final response
 advertises `Connection: close` before the server closes the socket; preceding
 responses retain their normal persistence policy. Idle connections also have

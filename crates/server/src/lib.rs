@@ -70,6 +70,7 @@ mod catalog_query;
 mod config;
 mod derived_image_cache;
 mod events;
+mod file_delivery;
 mod http_app;
 mod lifecycle;
 mod metrics;
@@ -171,6 +172,7 @@ pub struct App {
     pub jobs: JobGate,
     pub(crate) ai_upscale_jobs: JobGate,
     pub(crate) helpers: Arc<HelperGate>,
+    pub(crate) original_reads: Arc<tokio::sync::Semaphore>,
     pub(crate) remuxes: Mutex<HashMap<String, Arc<remux::RemuxJob>>>,
     pub(crate) ephemeral_cleanup: Arc<remux::EphemeralCleanupScheduler>,
     pub(crate) cache_maintenance: Mutex<()>,

@@ -265,6 +265,37 @@ the old tree remains active and rustyDLNA retries the rebuild and full
 reconciliation with bounded backoff; raising the host limit lets this retry
 recover without a restart.
 
+## Original-file delivery measurements
+
+`python3 scripts/direct-delivery-benchmark.py --help` drives the production HTTP
+request and socket-delivery functions in a separate release test process. Build
+with `cargo test --release --locked -p rusty-dlna --lib --no-run`, copy the emitted
+test executable before rebuilding another arm, then supply each as
+`--arm label=/absolute/path/to/saved-test-executable`. Use a new `--output`
+directory outside Git. The default workload has ten independent test-process
+trials per arm at 1/4/16 readers, ranges immediately below/above 8 MiB and a
+128 MiB range, warm/cold page cache and application-throttled readers.
+
+The driver retains its generated transport fixture, SHA-256 identities, exact
+command, runtime, raw measurements, server logs and descriptive summaries. This
+fixture tests byte transport and is not a decodable movie. Each response is
+verified against an independently hashed source slice. CPU uses the server's
+high-resolution process clock; client hashing is outside it. Throughput uses
+actual client start/completion timestamps, independently of resource-sampling
+cadence. Another real HTTP connection probes listener responsiveness. RSS and
+file-descriptor maxima are sampled lower bounds. The process shutdown measurement
+covers the test listener, not the complete daemon lifecycle.
+
+Cold trials evict only the owned file with `POSIX_FADV_DONTNEED`, verify zero
+resident pages with `mincore`, and record actual process disk-read bytes. They do
+not flush device/controller caches or globally drop host caches. Slow readers
+pace application consumption; loopback throughput does not predict a WAN gain.
+Run measurements without simultaneous builds, tests or other benchmarks. Treat
+insufficient trials, unavailable cold-cache controls, byte failures, timing
+regressions and cancellation failures as unresolved evidence. The proposed
+acceptance margin is at least 10% lower median CPU/GiB with no more than 5% lower
+median throughput, subject to the byte, resource and lifecycle regressions.
+
 ## Graceful shutdown budget
 
 `shutdown_timeout_secs` defines the whole-process SIGTERM/SIGINT budget and
