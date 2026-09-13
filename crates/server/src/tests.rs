@@ -4123,9 +4123,65 @@ async fn connection_body_caps_incomplete_bodies_and_slow_headers_are_bounded() {
     assert!(incomplete.starts_with(b"HTTP/1.1 400 Bad Request"));
 
     let started = std::time::Instant::now();
-    let timeout = raw_connection(app, b"G", false).await;
+    let timeout = raw_connection(app.clone(), b"G", false).await;
     assert!(timeout.starts_with(b"HTTP/1.1 408 Request Timeout"));
     assert!(started.elapsed() < Duration::from_secs(3));
+    let body_timeout = raw_connection(
+        app.clone(),
+        b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\n\r\n",
+        false,
+    )
+    .await;
+    assert!(body_timeout.starts_with(b"HTTP/1.1 408 Request Timeout"));
+    let metrics = app.runtime_metrics.json();
+    let deliveries = metrics["http"]["deliveries"].as_object().unwrap();
+    for (status, expected) in [("400", 1), ("408", 2), ("413", 1)] {
+        assert_eq!(
+            deliveries
+                .values()
+                .map(|route| route["statuses"][status].as_u64().unwrap_or(0))
+                .sum::<u64>(),
+            expected
+        );
+    }
+    assert_eq!(
+        metrics["http"]["deliveries"]["unparsed"]["statuses"]["408"],
+        1
+    );
+    let bodies = [&oversized, &incomplete, &timeout, &body_timeout]
+        .into_iter()
+        .map(|wire| {
+            let headers = wire
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            wire.len() - headers
+        })
+        .sum::<usize>();
+    assert_eq!(
+        deliveries
+            .values()
+            .map(|route| route["body_bytes_total"].as_u64().unwrap())
+            .sum::<u64>(),
+        bodies as u64
+    );
+    assert_eq!(
+        deliveries
+            .values()
+            .map(|route| route["outcomes"]["completed"].as_u64().unwrap())
+            .sum::<u64>(),
+        4
+    );
+    assert_eq!(
+        metrics["http"]["routes"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|route| route["requests_total"].as_u64().unwrap())
+            .sum::<u64>(),
+        0
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

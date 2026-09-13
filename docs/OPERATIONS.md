@@ -183,6 +183,31 @@ that a restart cannot repair.
 
 `/api/status.metrics` contains fixed-cardinality HTTP route/status and SOAP
 action/fault counters plus Browse/Search and shutdown-duration histograms.
+`metrics.http.routes` retains its preparation semantics: `responses` describes
+the handler's prepared response and `latency_ms` measures handler work. A
+deferred remux can subsequently return a different status during admission or
+readiness. Use the additive `metrics.http.deliveries` counters for socket results.
+Its bounded route set includes `unparsed` for requests rejected before parsing.
+Exact `statuses` increment once a complete response header has been accepted by
+the socket, including remux 409/500/503 and serializer fallback responses.
+`header_bytes_total` and `body_bytes_total` count accepted writes, including
+partial writes before a timeout or reset. HEAD sends zero body bytes, and ranges
+count only their delivered payload. These are kernel-write observations; they
+do not prove the remote application consumed queued bytes.
+
+Delivery outcomes are `completed`, `truncated`, `disconnected`, `timed_out`,
+`cancelled`, and `failed`. They describe transfer completion separately from
+HTTP status: a fully delivered 503 response is a completed transfer. An early
+EOF with promised bytes outstanding is truncated. A partial or absent header
+does not increment a status. Task abort/shutdown retains cancellation evidence.
+Original and compatible media continue to close their connections as before.
+`first_write_ms`, `headers_ms`, and `duration_ms` separately measure the first
+accepted write, completed header, and transfer termination from the first
+request bytes observed by its socket task. For already-buffered pipelined
+requests timing starts when their processing begins; a timeout with no request
+bytes starts its observation when the error response is serialized. These
+timings are distinct from preparation and browser presented-frame latency.
+
 Scanner backlog and dropped-event markers, GENA queue/failures, helper wait and
 saturation, database-pool activity, and transcode cache hit/miss/eviction data
 are exposed alongside their components. Browser transcode metrics distinguish

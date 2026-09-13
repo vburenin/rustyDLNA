@@ -3338,7 +3338,12 @@ async fn serve_fragment_playlist(
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 let _ = tokio::time::timeout(remaining.min(POLL), notified).await;
             }
-            Ok(None) => return Err("transcode produced no complete media segment".into()),
+            Ok(None) => {
+                if !complete {
+                    crate::http_delivery::failed(crate::http_delivery::Outcome::TimedOut);
+                }
+                return Err("transcode produced no complete media segment".into());
+            }
             Err(error) => {
                 if error.starts_with("resource_limit:") {
                     let response = crate::web_ui::transcode_stream_error(413, "resource_limit");
@@ -3534,6 +3539,7 @@ async fn serve_hls_resource(
                 ua = req.user_agent().unwrap_or("-"),
                 "superseded compatible media resource closed during cleanup"
             );
+            crate::http_delivery::failed(crate::http_delivery::Outcome::Cancelled);
             return Ok(());
         }
         return Err(error);
@@ -3912,7 +3918,10 @@ async fn stream_growing(
     let open_job = job.clone();
     let output = match tokio::task::spawn_blocking(move || open_job.open_output()).await? {
         Ok(file) => file,
-        Err(_) if job.web && job.cancelled.load(Ordering::Acquire) => return Ok(()),
+        Err(_) if job.web && job.cancelled.load(Ordering::Acquire) => {
+            crate::http_delivery::failed(crate::http_delivery::Outcome::Cancelled);
+            return Ok(());
+        }
         Err(error) => return Err(error.into()),
     };
     let mut pos = start;
@@ -3928,6 +3937,11 @@ async fn stream_growing(
                 .load(Ordering::Acquire)
                 .then(|| REMUX_CANCELLED.into())
         }) {
+            crate::http_delivery::failed(if err == REMUX_CANCELLED {
+                crate::http_delivery::Outcome::Cancelled
+            } else {
+                crate::http_delivery::Outcome::Failed
+            });
             if sent == 0 && !(job.web && err == REMUX_CANCELLED) {
                 return Err(err.into());
             }
@@ -3969,6 +3983,11 @@ async fn stream_growing(
             let result = tokio::select! {
                 result = write => result,
                 error = stopped => {
+                    crate::http_delivery::failed(if error == REMUX_CANCELLED {
+                        crate::http_delivery::Outcome::Cancelled
+                    } else {
+                        crate::http_delivery::Outcome::Failed
+                    });
                     if sent == 0 && !(job.web && error == REMUX_CANCELLED) {
                         return Err(error.into());
                     }
@@ -5707,6 +5726,162 @@ mod tests {
             "{method} {url} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nConnection: close\r\n{range}\r\n"
         );
         crate::tests::raw_connection(app.clone(), request.as_bytes(), false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wire_metrics_record_remux_admission_and_readiness_status_after_preparation() {
+        for method in ["GET", "HEAD"] {
+            for expected in [206, 409, 500, 503] {
+                let (app, job, url, payload) = compatible_connection_fixture();
+                let mut permits = Vec::new();
+                if expected == 503 {
+                    crate::lock_recover(&app.remuxes).clear();
+                    while let Some(permit) = app.jobs.try_acquire() {
+                        permits.push(permit);
+                    }
+                    assert!(!permits.is_empty());
+                } else if expected != 206 {
+                    // No initial bytes: after real admission, the controlled
+                    // producer boundary will fail or cancel before readiness.
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&job.part)
+                        .unwrap()
+                        .set_len(0)
+                        .unwrap();
+                }
+                let before = app.runtime_metrics.json();
+                let responding = {
+                    let app = app.clone();
+                    let url = url.clone();
+                    tokio::spawn(async move {
+                        compatible_connection_wire(&app, &url, method, Some("bytes=0-7")).await
+                    })
+                };
+                if matches!(expected, 409 | 500) {
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        while job.clients.load(Ordering::Acquire) == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("real request admitted before readiness fault");
+                    if expected == 409 {
+                        job.cancelled.store(true, Ordering::Release);
+                        job.transition(RemuxState::Cancelled);
+                    } else {
+                        job.transition(RemuxState::Failed("controlled producer failure".into()));
+                    }
+                }
+                let wire = responding.await.unwrap();
+                assert!(
+                    wire.starts_with(format!("HTTP/1.1 {expected} ").as_bytes()),
+                    "{}",
+                    String::from_utf8_lossy(&wire)
+                );
+                let body = wire_body(&wire);
+                if method == "HEAD" {
+                    assert!(body.is_empty());
+                } else if expected == 206 {
+                    assert_eq!(body, &payload[..8]);
+                } else {
+                    assert!(String::from_utf8_lossy(body).contains(match expected {
+                        409 => "transcode_cancelled",
+                        500 => "transcode_failed",
+                        _ => "transcode_busy",
+                    }));
+                }
+                let after = app.runtime_metrics.json();
+                // Existing preparation telemetry remains additive-compatible;
+                // it must not be used as the response actually put on the wire.
+                assert_eq!(
+                    after["http"]["routes"]["web_media"]["responses"]["2xx"]
+                        .as_u64()
+                        .unwrap(),
+                    before["http"]["routes"]["web_media"]["responses"]["2xx"]
+                        .as_u64()
+                        .unwrap()
+                        + 1
+                );
+                let delivered = &after["http"]["deliveries"]["web_media"];
+                assert_eq!(delivered["statuses"][expected.to_string()], 1);
+                assert!(delivered["statuses"]["200"].is_null());
+                assert_eq!(delivered["outcomes"]["completed"], 1);
+                assert_eq!(delivered["body_bytes_total"], body.len());
+                assert_eq!(delivered["header_bytes_total"], wire.len() - body.len());
+                assert_eq!(delivered["headers_ms"]["count"], 1);
+                assert_eq!(delivered["duration_ms"]["count"], 1);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wire_metrics_keep_growing_producer_failures_after_body_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for outcome in ["failed", "cancelled"] {
+            let (app, job, url, payload) = compatible_connection_fixture();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (socket, peer) = listener.accept().await.unwrap();
+            let serving = app.clone();
+            let task =
+                tokio::spawn(
+                    async move { crate::lifecycle::handle_conn(serving, socket, peer).await },
+                );
+            client
+                .write_all(
+                    format!("GET {url} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut wire = Vec::new();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let mut byte = [0];
+                    client.read_exact(&mut byte).await.unwrap();
+                    wire.push(byte[0]);
+                    if let Some(end) = wire.windows(4).position(|b| b == b"\r\n\r\n") {
+                        if wire.len() - end - 4 == payload.len() {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(wire.starts_with(b"HTTP/1.1 200 "));
+            assert_eq!(wire_body(&wire), payload);
+            if outcome == "cancelled" {
+                job.cancelled.store(true, Ordering::Release);
+                job.transition(RemuxState::Cancelled);
+            } else {
+                job.transition(RemuxState::Failed(
+                    "controlled failure after body bytes".into(),
+                ));
+            }
+            tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut wire))
+                .await
+                .unwrap()
+                .unwrap();
+            // The producer path deliberately returns success after closing the
+            // response, so the outcome must survive that outer completion.
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(wire_body(&wire), payload);
+            let counters = app.runtime_metrics.json()["http"]["deliveries"]["web_media"].clone();
+            assert_eq!(counters["statuses"]["200"], 1);
+            assert_eq!(counters["body_bytes_total"], payload.len());
+            assert_eq!(counters["header_bytes_total"], wire.len() - payload.len());
+            assert_eq!(counters["outcomes"][outcome], 1);
+            assert_eq!(counters["outcomes"]["completed"], 0);
+            assert_eq!(counters["duration_ms"]["count"], 1);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1453,6 +1453,24 @@ async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
 
 pub(super) async fn handle_conn(
     app: Arc<App>,
+    sock: tokio::net::TcpStream,
+    peer: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    crate::http_delivery::scope(app.clone(), async move {
+        let result = handle_conn_observed(app, sock, peer).await;
+        if let Err(error) = &result {
+            if let Some(error) = error.downcast_ref::<std::io::Error>() {
+                crate::http_delivery::io_failed(error);
+            }
+        }
+        crate::http_delivery::finish(result.is_ok());
+        result
+    })
+    .await
+}
+
+async fn handle_conn_observed(
+    app: Arc<App>,
     mut sock: tokio::net::TcpStream,
     peer: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1464,6 +1482,9 @@ pub(super) async fn handle_conn(
     let mut request_number = 0u32;
     let mut tmp = [0u8; 4096];
     loop {
+        if !pending.is_empty() {
+            crate::http_delivery::begin_request();
+        }
         let header_wait = if request_number > 0 && pending.is_empty() {
             app.cfg.keep_alive_timeout_secs
         } else {
@@ -1505,6 +1526,7 @@ pub(super) async fn handle_conn(
                 crate::socket_write_http_response(&app, &mut sock, &response).await?;
                 return Ok(());
             }
+            crate::http_delivery::begin_request();
             pending.extend_from_slice(&tmp[..n]);
         };
         let head = match std::str::from_utf8(&pending[..header_end]) {
@@ -1524,6 +1546,10 @@ pub(super) async fn handle_conn(
                 return Ok(());
             }
         };
+        crate::http_delivery::parsed_request(
+            route(&req.method, &req.path),
+            req.method.eq_ignore_ascii_case("HEAD"),
+        );
         let need = req.content_length().unwrap_or(0);
         if rusty_dlna_http::http_body_too_large(need) || need > app.cfg.max_request_body_bytes {
             let resp = HttpResponse::html(413, "Payload Too Large", "body too large");
@@ -1597,9 +1623,14 @@ pub(super) async fn handle_conn(
             resp.persist = false;
         }
         if let Some(spec) = resp.remux_job.clone() {
-            remux::serve_remux(&app, &mut sock, &req, spec)
-                .await
-                .map_err(|error| format!("{} {}: {error}", req.method, req.path))?;
+            let result = remux::serve_remux(&app, &mut sock, &req, spec).await;
+            if let Err(error) = &result {
+                if let Some(error) = error.downcast_ref::<std::io::Error>() {
+                    crate::http_delivery::io_failed(error);
+                }
+            }
+            crate::http_delivery::finish(result.is_ok());
+            result.map_err(|error| format!("{} {}: {error}", req.method, req.path))?;
             break;
         }
         let valid_wire = crate::socket_write_http_response(&app, &mut sock, &resp)
@@ -1619,6 +1650,7 @@ pub(super) async fn handle_conn(
             .await
             .map_err(|error| format!("{} {} media: {error}", req.method, req.path))?;
         }
+        crate::http_delivery::finish(true);
         if !resp.persist || persist_left == 0 {
             break;
         }
@@ -1633,12 +1665,35 @@ pub(crate) async fn socket_write_all(
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    tokio::time::timeout(
-        Duration::from_secs(app.cfg.write_timeout_secs),
-        sock.write_all(bytes),
-    )
+    let result = tokio::time::timeout(Duration::from_secs(app.cfg.write_timeout_secs), async {
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let written = match sock.write(remaining).await {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if written == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "socket stopped accepting response bytes",
+                ));
+            }
+            crate::http_delivery::written(written);
+            remaining = &remaining[written..];
+        }
+        Ok(())
+    })
     .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "socket write timeout"))?
+    .unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "socket write timeout",
+        ))
+    });
+    if let Err(error) = &result {
+        crate::http_delivery::io_failed(error);
+    }
+    result
 }
 
 pub(crate) async fn stream_open_file_range(
@@ -1648,7 +1703,11 @@ pub(crate) async fn stream_open_file_range(
     start: u64,
     end: u64,
 ) -> std::io::Result<()> {
-    crate::file_delivery::stream(app, sock, file, start, end).await
+    let result = crate::file_delivery::stream(app, sock, file, start, end).await;
+    if let Err(error) = &result {
+        crate::http_delivery::io_failed(error);
+    }
+    result
 }
 
 pub(super) fn read_open_file_range(

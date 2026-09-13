@@ -83,6 +83,7 @@ async fn original_socket_bytes_ranges_head_and_cutoff() {
         ),
     ] {
         for method in ["GET", "HEAD"] {
+            let before = app.runtime_metrics.json()["http"]["deliveries"]["media_item"].clone();
             let wire = raw_connection(
                 app.clone(),
                 request(method, range.as_deref()).as_bytes(),
@@ -117,6 +118,26 @@ async fn original_socket_bytes_ranges_head_and_cutoff() {
                     &bytes[start..start + length]
                 }
             );
+            let after = app.runtime_metrics.json()["http"]["deliveries"]["media_item"].clone();
+            let status = status.to_string();
+            assert_eq!(
+                after["statuses"][&status].as_u64().unwrap(),
+                before["statuses"][&status].as_u64().unwrap_or(0) + 1
+            );
+            for (field, added) in [
+                ("header_bytes_total", headers.len() as u64),
+                ("body_bytes_total", body.len() as u64),
+            ] {
+                assert_eq!(
+                    after[field].as_u64().unwrap(),
+                    before[field].as_u64().unwrap() + added
+                );
+            }
+            assert_eq!(
+                after["outcomes"]["completed"].as_u64().unwrap(),
+                before["outcomes"]["completed"].as_u64().unwrap() + 1
+            );
+            assert_eq!(after["headers_ms"]["count"], after["duration_ms"]["count"]);
         }
     }
     for (range, status) in [
@@ -153,6 +174,180 @@ async fn original_socket_bytes_ranges_head_and_cutoff() {
     while let Some(reader) = readers.join_next().await {
         reader.unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn original_wire_telemetry_distinguishes_truncation_timeout_and_disconnect() {
+    use tokio::io::AsyncWriteExt;
+
+    for fault in [
+        "truncated",
+        "timed_out",
+        "disconnected",
+        "cancelled",
+        "aborted",
+    ] {
+        let tree = TestTree::new(&format!("original-wire-{fault}"));
+        let path = tree.path().join("original.mkv");
+        let source = File::create(&path).unwrap();
+        const PROMISED: u64 = 32 * 1024 * 1024;
+        source.set_len(PROMISED).unwrap();
+        let mut app = configured(&path);
+        app.cfg.write_timeout_secs = 1;
+        let app = Arc::new(app);
+        let (mut client, server) = pair().await;
+        socket2::SockRef::from(&client)
+            .set_recv_buffer_size(16 * 1024)
+            .unwrap();
+        socket2::SockRef::from(&server)
+            .set_send_buffer_size(16 * 1024)
+            .unwrap();
+        let peer = server.peer_addr().unwrap();
+        let serving_app = app.clone();
+        let task =
+            tokio::spawn(
+                async move { crate::lifecycle::handle_conn(serving_app, server, peer).await },
+            );
+        client
+            .write_all(request("GET", None).as_bytes())
+            .await
+            .unwrap();
+        let mut wire = Vec::new();
+        // Header receipt synchronizes mutation/disconnect with actual delivery;
+        // neither the request nor the prepared response is the oracle.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !wire.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut byte = [0];
+                client.read_exact(&mut byte).await.unwrap();
+                wire.push(byte[0]);
+            }
+        })
+        .await
+        .unwrap();
+        assert!(split(&wire).0.starts_with("HTTP/1.1 200 "));
+        assert!(split(&wire)
+            .0
+            .contains(&format!("Content-Length: {PROMISED}\r\n")));
+        match fault {
+            "truncated" => {
+                source.set_len(0).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut wire))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            "aborted" => {
+                task.abort();
+                tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut wire))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            "cancelled" => {
+                app.scan_control.cancellation.cancel();
+                tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut wire))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            "disconnected" => {
+                // A reset establishes a disconnect; read-side FIN alone does not.
+                socket2::SockRef::from(&client)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+                drop(client);
+            }
+            _ => {
+                // Do not read while the bounded sender fills the kernel queue.
+                tokio::time::timeout(Duration::from_secs(4), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                client.read_to_end(&mut wire).await.unwrap();
+                let counters =
+                    app.runtime_metrics.json()["http"]["deliveries"]["media_item"].clone();
+                assert_eq!(
+                    counters["body_bytes_total"].as_u64().unwrap(),
+                    split(&wire).1.len() as u64
+                );
+                assert_eq!(counters["outcomes"][fault], 1);
+                assert_eq!(counters["outcomes"]["completed"], 0);
+                assert_eq!(counters["statuses"]["200"], 1);
+                continue;
+            }
+        }
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap();
+        if fault == "aborted" {
+            assert!(result.unwrap_err().is_cancelled());
+        } else {
+            result.unwrap().unwrap_err();
+        }
+        let fault = if fault == "aborted" {
+            "cancelled"
+        } else {
+            fault
+        };
+        let counters = app.runtime_metrics.json()["http"]["deliveries"]["media_item"].clone();
+        assert_eq!(counters["outcomes"][fault], 1, "{counters}");
+        assert_eq!(counters["duration_ms"]["count"], 1);
+        assert_eq!(counters["outcomes"]["completed"], 0);
+        assert_eq!(counters["statuses"]["200"], 1);
+        assert!(counters["body_bytes_total"].as_u64().unwrap() < PROMISED);
+        if matches!(fault, "truncated" | "cancelled") {
+            assert_eq!(
+                counters["body_bytes_total"].as_u64().unwrap(),
+                split(&wire).1.len() as u64
+            );
+            assert!(split(&wire).1.iter().all(|byte| *byte == 0));
+        }
+    }
+}
+
+#[tokio::test]
+async fn wire_telemetry_partial_header_abort_does_not_count_an_unsent_status() {
+    let tree = TestTree::new("wire-partial-header");
+    let path = tree.path().join("empty.mkv");
+    std::fs::write(&path, []).unwrap();
+    let app = Arc::new(configured(&path));
+    let (mut client, mut server) = pair().await;
+    let serving = app.clone();
+    let task = tokio::spawn(async move {
+        crate::http_delivery::scope(serving.clone(), async move {
+            crate::http_delivery::begin_request();
+            let (wire, valid) = crate::response_wire(
+                &serving,
+                &HttpResponse::html(503, "Service Unavailable", "busy"),
+            );
+            assert!(valid);
+            crate::http_delivery::response_header(&wire);
+            // Stop at the external write boundary before the header completes.
+            crate::socket_write_all(&serving, &mut server, &wire[..9])
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        })
+        .await;
+    });
+    let mut prefix = [0; 9];
+    tokio::time::timeout(Duration::from_secs(3), client.read_exact(&mut prefix))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&prefix, b"HTTP/1.1 ");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let counters = app.runtime_metrics.json()["http"]["deliveries"]["unparsed"].clone();
+    assert_eq!(counters["statuses"], serde_json::json!({}));
+    assert_eq!(counters["header_bytes_total"], 9);
+    assert_eq!(counters["body_bytes_total"], 0);
+    assert_eq!(counters["headers_ms"]["count"], 0);
+    assert_eq!(counters["first_write_ms"]["count"], 1);
+    assert_eq!(counters["duration_ms"]["count"], 1);
+    assert_eq!(counters["outcomes"]["cancelled"], 1);
+    assert_eq!(counters["outcomes"]["completed"], 0);
 }
 
 #[tokio::test]

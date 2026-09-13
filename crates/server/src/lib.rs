@@ -72,6 +72,7 @@ mod derived_image_cache;
 mod events;
 mod file_delivery;
 mod http_app;
+mod http_delivery;
 mod lifecycle;
 mod metrics;
 mod remux;
@@ -347,6 +348,7 @@ pub(crate) async fn socket_write_http_response(
     response: &HttpResponse,
 ) -> std::io::Result<bool> {
     let (wire, valid) = response_wire(app, response);
+    http_delivery::response_header(&wire);
     socket_write_all(app, socket, &wire).await?;
     Ok(valid)
 }

@@ -94,7 +94,7 @@ impl AtomicComponentState {
 }
 
 #[derive(Debug)]
-struct Histogram {
+pub(crate) struct Histogram {
     buckets: [AtomicU64; LATENCY_BOUNDS_MS.len() + 1],
     count: AtomicU64,
     sum_ms: AtomicU64,
@@ -113,7 +113,7 @@ impl Default for Histogram {
 }
 
 impl Histogram {
-    fn observe(&self, elapsed: Duration) {
+    pub(crate) fn observe(&self, elapsed: Duration) {
         let millis = rusty_dlna_helper::duration_millis_saturating(elapsed);
         let bucket = LATENCY_BOUNDS_MS
             .iter()
@@ -125,7 +125,7 @@ impl Histogram {
         self.max_ms.fetch_max(millis, Ordering::Relaxed);
     }
 
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         let mut cumulative = 0u64;
         let mut buckets = Vec::with_capacity(LATENCY_BOUNDS_MS.len() + 1);
         for (index, count) in self.buckets.iter().enumerate() {
@@ -194,6 +194,7 @@ pub(crate) struct RuntimeMetrics {
     active_connections: AtomicUsize,
     accept_errors: AtomicU64,
     routes: [RouteMetrics; ROUTE_COUNT],
+    deliveries: [crate::http_delivery::Counters; ROUTE_COUNT + 1],
     soap_actions: [AtomicU64; SOAP_ACTION_COUNT],
     soap_faults: [AtomicU64; SOAP_FAULT_COUNT],
     browse_latency: Histogram,
@@ -212,6 +213,7 @@ impl Default for RuntimeMetrics {
             active_connections: AtomicUsize::new(0),
             accept_errors: AtomicU64::new(0),
             routes: array::from_fn(|_| RouteMetrics::default()),
+            deliveries: array::from_fn(|_| crate::http_delivery::Counters::default()),
             soap_actions: array::from_fn(|_| AtomicU64::new(0)),
             soap_faults: array::from_fn(|_| AtomicU64::new(0)),
             browse_latency: Histogram::default(),
@@ -222,6 +224,10 @@ impl Default for RuntimeMetrics {
 }
 
 impl RuntimeMetrics {
+    pub(crate) fn delivery(&self, route: Option<HttpRoute>) -> &crate::http_delivery::Counters {
+        &self.deliveries[route.map_or(ROUTE_COUNT, HttpRoute::index)]
+    }
+
     pub(crate) fn set_http_listener(&self, state: ComponentState) {
         self.http_listener.store(state);
     }
@@ -292,12 +298,18 @@ impl RuntimeMetrics {
 
     pub(crate) fn json(&self) -> Value {
         let mut routes = Map::new();
+        let mut deliveries = Map::new();
         for route in HttpRoute::ALL {
             routes.insert(
                 route_name(route).to_string(),
                 self.routes[route.index()].json(),
             );
+            deliveries.insert(
+                route_name(route).to_string(),
+                self.delivery(Some(route)).json(),
+            );
         }
+        deliveries.insert("unparsed".into(), self.delivery(None).json());
         let mut actions = Map::new();
         for (index, name) in SOAP_ACTION_NAMES.iter().enumerate() {
             actions.insert(
@@ -320,6 +332,7 @@ impl RuntimeMetrics {
                 "active_connections": runtime.active_connections,
                 "accept_errors_total": runtime.accept_errors,
                 "routes": routes,
+                "deliveries": deliveries,
             },
             "runtime": {
                 "ssdp_state": runtime.ssdp.as_str(),
