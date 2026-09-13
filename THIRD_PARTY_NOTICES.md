@@ -39,9 +39,14 @@ dpkg-query -W ffmpeg
 FFmpeg source and upstream license information are also available from
 `https://ffmpeg.org/download.html` and `https://ffmpeg.org/legal.html`.
 
-## dovi_tool 2.3.3
+## dovi_tool 2.3.3 and dolby_vision 3.4.0
 
 Source: `https://github.com/quietvoid/dovi_tool/tree/2.3.3`
+
+The server links the `dolby_vision` Rust library from this release for bounded
+per-sample Profile-7-to-8.1 metadata conversion. Its version and transitive Rust
+dependencies are pinned in `Cargo.lock` and included in the release SBOM.
+The library and command-line tool share the following license notice.
 
 MIT License
 

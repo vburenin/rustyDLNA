@@ -12,9 +12,10 @@ use rusty_dlna_http::{
     HttpRequest, HttpResponse, RangeError, RemuxAudio, RemuxJobSpec,
 };
 use rusty_dlna_transcode::{
-    cache_is_fresh_for_key, cache_part, run_remux_p8_with_toolchain_stage_observed,
-    write_cache_stamp_for_key, BrowserOutputOptions, RecodeAction, RemuxP8Error, RemuxP8Input,
-    RemuxP8Stage, RemuxP8StageEvent, RemuxP8StageStatus, TranscodeCacheIdentity, TranscodePlan,
+    cache_is_fresh_for_key, cache_part, run_remux_p8_streaming_with_toolchain,
+    run_remux_p8_with_toolchain_stage_observed, write_cache_stamp_for_key, BrowserOutputOptions,
+    RecodeAction, RemuxP8Error, RemuxP8Input, RemuxP8Stage, RemuxP8StageEvent, RemuxP8StageStatus,
+    TranscodeCacheIdentity, TranscodePlan,
 };
 
 use crate::App;
@@ -81,6 +82,7 @@ fn run_profile8_pipeline(
     deadline: Instant,
     cancelled: &AtomicBool,
     observer: &mut dyn FnMut(RemuxP8StageEvent) -> Result<(), String>,
+    streaming: bool,
 ) -> Result<(), RemuxP8Error> {
     #[cfg(test)]
     let test_runner = crate::lock_recover(p8_test_runners()).remove(part);
@@ -91,28 +93,21 @@ fn run_profile8_pipeline(
     let toolchain = spec.profile8_toolchain.as_ref().ok_or_else(|| {
         RemuxP8Error::Pipeline("Profile-8 job is missing its toolchain snapshot".into())
     })?;
-    if let Some(source) = spec.source_file.as_deref() {
-        run_remux_p8_with_toolchain_stage_observed(
-            toolchain,
-            RemuxP8Input::OpenFile {
-                file: source,
-                identity_path: &spec.src,
-            },
-            part,
-            plan,
-            deadline,
-            cancelled,
-            observer,
+    let input = if let Some(source) = spec.source_file.as_deref() {
+        RemuxP8Input::OpenFile {
+            file: source,
+            identity_path: &spec.src,
+        }
+    } else {
+        RemuxP8Input::Path(&spec.src)
+    };
+    if streaming {
+        run_remux_p8_streaming_with_toolchain(
+            toolchain, input, part, plan, deadline, cancelled, observer,
         )
     } else {
         run_remux_p8_with_toolchain_stage_observed(
-            toolchain,
-            RemuxP8Input::Path(&spec.src),
-            part,
-            plan,
-            deadline,
-            cancelled,
-            observer,
+            toolchain, input, part, plan, deadline, cancelled, observer,
         )
     }
 }
@@ -1117,7 +1112,7 @@ fn spawn_ffmpeg(
                     container: "mp4",
                     ..TranscodePlan::default()
                 };
-                tracing::info!(id, dest = %dest.display(), "remux-p8 dovi_tool start");
+                tracing::info!(id, streaming = app.cfg.helper_max_jobs > 1, dest = %dest.display(), "remux-p8 start");
                 job.transition(RemuxState::Preprocessing);
                 let mut sequence = app.remux_metrics.performance.profile8.begin();
                 let mut cache_monitor = cache_monitor::Monitor::new();
@@ -1153,6 +1148,7 @@ fn spawn_ffmpeg(
                     deadline,
                     &job.cancelled,
                     &mut observe_progress,
+                    app.cfg.helper_max_jobs > 1,
                 );
                 match p8_result {
                     Ok(()) => {
@@ -2287,7 +2283,11 @@ fn attach_job_attempt(
     };
     let helper_permit = app
         .helpers
-        .try_acquire()
+        .try_acquire_many(if spec.remux_p8 && app.cfg.helper_max_jobs > 1 {
+            2
+        } else {
+            1
+        })
         .map_err(|error| format!("media helper busy: {error}"))?;
     let part = cache_part(&spec.dest);
     if part.exists() {
@@ -5044,6 +5044,10 @@ mod tests {
         assert!(!dest.exists());
         assert!(!part.exists());
         assert!(!rusty_dlna_transcode::cache_stamp_path(&dest).exists());
+        // Failure cleanup schedules cache accounting on the maintenance worker.
+        wait_until(Duration::from_secs(2), || {
+            app.remux_metrics.cache_bytes.load(Ordering::Relaxed) == 0
+        });
         assert_eq!(app.remux_metrics.cache_bytes.load(Ordering::Relaxed), 0);
     }
 
@@ -5515,6 +5519,7 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
             &cancelled,
             &mut observer,
+            true,
         )
         .unwrap_err();
         assert_eq!(
@@ -7028,7 +7033,11 @@ mod tests {
                     ))
                     .unwrap();
                 });
-                wait_until(Duration::from_secs(2), || leader.is_file());
+                // Shell redirection creates the marker before echo writes it.
+                wait_until(Duration::from_secs(2), || {
+                    std::fs::read_to_string(&leader)
+                        .is_ok_and(|pid| pid.trim().parse::<u32>().is_ok())
+                });
                 let pid = std::fs::read_to_string(&leader)
                     .unwrap()
                     .trim()
@@ -7704,6 +7713,10 @@ mod tests {
             failed_job.producer_finished.load(Ordering::Acquire)
         });
         assert!(matches!(failed_job.state(), RemuxState::Failed(_)));
+        // Failed producers reconcile accounting asynchronously after cleanup.
+        wait_until(Duration::from_secs(2), || {
+            runtime_status(&app).cache_bytes == expected
+        });
         assert_eq!(runtime_status(&app).cache_bytes, expected);
 
         let key = "e".repeat(64);

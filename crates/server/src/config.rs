@@ -725,8 +725,8 @@ pub(crate) fn validate_http_config(cfg: &Config) -> Result<(), ConfigValidationE
     // Startup always maintains completed transcodes, even when producing new
     // transcodes is disabled. Validate the maintenance policy before it can
     // inspect or remove cache entries.
-    if !(1..=1_048_576).contains(&cfg.transcode.cache_max_mb) {
-        return Err("transcode.cache_max_mb must be between 1 and 1048576".into());
+    if !(1..=2_097_152).contains(&cfg.transcode.cache_max_mb) {
+        return Err("transcode.cache_max_mb must be between 1 and 2097152".into());
     }
     if !(1..=36_500).contains(&cfg.transcode.cache_max_age_days) {
         return Err("transcode.cache_max_age_days must be between 1 and 36500".into());

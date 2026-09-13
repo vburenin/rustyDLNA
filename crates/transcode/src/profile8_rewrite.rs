@@ -54,14 +54,14 @@ fn write_controlled(
 }
 
 #[derive(Clone, Copy, Debug)]
-struct BoxRange {
-    start: usize,
-    end: usize,
-    content: usize,
-    kind: [u8; 4],
+pub(super) struct BoxRange {
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) content: usize,
+    pub(super) kind: [u8; 4],
 }
 
-fn be32(bytes: &[u8], offset: usize) -> Result<u32, RemuxP8Error> {
+pub(super) fn be32(bytes: &[u8], offset: usize) -> Result<u32, RemuxP8Error> {
     let bytes = bytes
         .get(
             offset
@@ -89,7 +89,11 @@ fn be64(bytes: &[u8], offset: usize) -> Result<u64, RemuxP8Error> {
     ))
 }
 
-fn children(bytes: &[u8], start: usize, end: usize) -> Result<Vec<BoxRange>, RemuxP8Error> {
+pub(super) fn children(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+) -> Result<Vec<BoxRange>, RemuxP8Error> {
     if end > bytes.len() || start > end {
         return Err(invalid("invalid container bounds"));
     }
@@ -125,7 +129,7 @@ fn children(bytes: &[u8], start: usize, end: usize) -> Result<Vec<BoxRange>, Rem
     Ok(boxes)
 }
 
-fn only(boxes: &[BoxRange], kind: &[u8; 4]) -> Result<BoxRange, RemuxP8Error> {
+pub(super) fn only(boxes: &[BoxRange], kind: &[u8; 4]) -> Result<BoxRange, RemuxP8Error> {
     let mut found = boxes.iter().filter(|item| &item.kind == kind);
     let item = *found
         .next()
@@ -324,7 +328,7 @@ fn tables(
     })
 }
 
-fn kind(nal: &[u8]) -> Result<u8, RemuxP8Error> {
+pub(super) fn kind(nal: &[u8]) -> Result<u8, RemuxP8Error> {
     if nal.len() < 2 || nal[0] & 0x80 != 0 || nal[1] & 7 == 0 {
         return Err(invalid("invalid or truncated HEVC NAL header"));
     }
@@ -417,7 +421,7 @@ impl<R: Read> AnnexReader<R> {
     }
 }
 
-fn split_sample(sample: &[u8], length_bytes: usize) -> Result<Vec<&[u8]>, RemuxP8Error> {
+pub(super) fn split_sample(sample: &[u8], length_bytes: usize) -> Result<Vec<&[u8]>, RemuxP8Error> {
     let mut offset = 0;
     let mut nals = Vec::new();
     while offset < sample.len() {

@@ -5,10 +5,13 @@
 //! kind) — not titles or paths. First matching row wins.
 
 pub use rusty_dlna_helper::{JobGate, JobPermit};
+mod profile8_live;
 #[cfg(test)]
 mod profile8_media_tests;
 mod profile8_progress;
 mod profile8_rewrite;
+mod profile8_stream;
+pub use profile8_live::run_remux_p8_streaming_with_toolchain;
 pub use profile8_progress::{
     RemuxP8IoBasis, RemuxP8Stage, RemuxP8StageEvent, RemuxP8StageIo, RemuxP8StageStatus,
 };
@@ -155,7 +158,7 @@ const BROWSER_AI_UPSCALE_CACHE_REVISION: &str = "browser-ai-upscale-libplacebo-v
 /// Completed outputs must satisfy the structural fragment and track validator.
 pub const OUTPUT_VALIDATION_REVISION: &str = "fragment-tracks-v1";
 const MEDIA_INPUT_CACHE_REVISION: &str = "confined-demux-v1";
-const PROFILE8_TOOLCHAIN_CACHE_REVISION: &str = "profile8-source-timeline-v3";
+const PROFILE8_TOOLCHAIN_CACHE_REVISION: &str = "profile8-streaming-rpu-v4-dolby-vision-3.4.0";
 const CACHE_DIGEST_HEX_BYTES: usize = 64;
 const MAX_BROWSER_CACHE_KEY_BYTES: usize = 512;
 const VERIFIED_EXECUTABLE_FD: std::os::fd::RawFd = 4;
@@ -3868,15 +3871,7 @@ fn signal_profile8_in_mp4_with_control(
         return Err("intermediate MP4 already has Dolby Vision signaling".into());
     }
 
-    // ISO/IEC 14496-15 Dolby Vision decoder configuration record: v1.0,
-    // Profile 8, source level, RPU+BL present, no EL, HDR10 compatibility 1.
-    let mut dvvc = [0u8; 32];
-    dvvc[..4].copy_from_slice(&32u32.to_be_bytes());
-    dvvc[4..8].copy_from_slice(b"dvvC");
-    dvvc[8] = 1;
-    let flags = (8u16 << 9) | (u16::from(level) << 3) | (1 << 2) | 1;
-    dvvc[10..12].copy_from_slice(&flags.to_be_bytes());
-    dvvc[12] = 1 << 4;
+    let dvvc = profile8_decoder_configuration(level);
 
     let mut grown_sizes = Vec::with_capacity(spans.len());
     for span in &spans {
@@ -3904,6 +3899,18 @@ fn signal_profile8_in_mp4_with_control(
             })?;
     }
     Ok(())
+}
+
+fn profile8_decoder_configuration(level: u8) -> [u8; 32] {
+    // Dolby Vision v1.0: Profile 8, source level, RPU+BL, no EL, HDR10 ID 1.
+    let mut dvvc = [0u8; 32];
+    dvvc[..4].copy_from_slice(&32u32.to_be_bytes());
+    dvvc[4..8].copy_from_slice(b"dvvC");
+    dvvc[8] = 1;
+    let flags = (8u16 << 9) | (u16::from(level) << 3) | (1 << 2) | 1;
+    dvvc[10..12].copy_from_slice(&flags.to_be_bytes());
+    dvvc[12] = 1 << 4;
+    dvvc
 }
 
 #[cfg(test)]

@@ -41,3 +41,4 @@ roxmltree = "0.21.1"
 quick-xml = { version = "0.42.0", features = ["encoding"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 sha2 = "0.11"
+dolby_vision = { version = "=3.4.0", default-features = false }

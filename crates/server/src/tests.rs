@@ -697,9 +697,15 @@ enable = true
 
 #[test]
 fn transcode_cache_maintenance_limits_are_validated_when_transcoding_is_disabled() {
+    for cache_max_mb in [1, 1_048_576, 2_097_152] {
+        let config: Config =
+            toml::from_str(&format!("[transcode]\ncache_max_mb = {cache_max_mb}\n")).unwrap();
+        assert!(!config.transcode.enable);
+        assert!(validate_http_config(&config).is_ok());
+    }
     for (cache_max_mb, cache_max_age_days, expected) in [
         (0, 30, "transcode.cache_max_mb"),
-        (1_048_577, 30, "transcode.cache_max_mb"),
+        (2_097_153, 30, "transcode.cache_max_mb"),
         (512, 0, "transcode.cache_max_age_days"),
         (512, 36_501, "transcode.cache_max_age_days"),
     ] {

@@ -11,3 +11,4 @@ rusty-dlna-protocol.workspace = true
 serde = { workspace = true }
 toml.workspace = true
 sha2.workspace = true
+dolby_vision.workspace = true

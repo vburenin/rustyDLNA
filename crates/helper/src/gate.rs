@@ -87,11 +87,13 @@ impl HelperGate {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn admit(self: &Arc<Self>, state: &mut HelperGateState) -> HelperPermit {
-        state.active += 1;
-        self.admitted_total.fetch_add(1, Ordering::Relaxed);
+    fn admit(self: &Arc<Self>, state: &mut HelperGateState, slots: usize) -> HelperPermit {
+        state.active += slots;
+        self.admitted_total
+            .fetch_add(slots as u64, Ordering::Relaxed);
         HelperPermit {
             gate: Arc::clone(self),
+            slots,
         }
     }
 
@@ -110,9 +112,21 @@ impl HelperGate {
 
     /// Immediate admission. A queued waiter is never bypassed.
     pub fn try_acquire(self: &Arc<Self>) -> Result<HelperPermit, HelperAdmissionError> {
+        self.try_acquire_many(1)
+    }
+
+    /// Admit a cooperating set atomically, without holding one slot while
+    /// waiting for another. Existing FIFO waiters are never bypassed.
+    pub fn try_acquire_many(
+        self: &Arc<Self>,
+        slots: usize,
+    ) -> Result<HelperPermit, HelperAdmissionError> {
         let mut state = self.lock_state();
-        if state.active < self.max_active && state.queue.is_empty() {
-            return Ok(self.admit(&mut state));
+        if slots > 0
+            && slots <= self.max_active.saturating_sub(state.active)
+            && state.queue.is_empty()
+        {
+            return Ok(self.admit(&mut state, slots));
         }
         self.saturated_total.fetch_add(1, Ordering::Relaxed);
         self.rejected_total.fetch_add(1, Ordering::Relaxed);
@@ -144,7 +158,7 @@ impl HelperGate {
             return Err(HelperAdmissionError::Cancelled);
         }
         if state.active < self.max_active && state.queue.is_empty() {
-            return Ok(self.admit(&mut state));
+            return Ok(self.admit(&mut state, 1));
         }
         self.saturated_total.fetch_add(1, Ordering::Relaxed);
         if state.queue.len() >= self.queue_capacity {
@@ -169,7 +183,7 @@ impl HelperGate {
             if state.active < self.max_active && state.queue.front() == Some(&ticket) {
                 state.queue.pop_front();
                 self.observe_wait(wait_started);
-                return Ok(self.admit(&mut state));
+                return Ok(self.admit(&mut state, 1));
             }
             let remaining =
                 deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
@@ -219,12 +233,13 @@ impl HelperGate {
 #[derive(Debug)]
 pub struct HelperPermit {
     gate: Arc<HelperGate>,
+    slots: usize,
 }
 
 impl Drop for HelperPermit {
     fn drop(&mut self) {
         let mut state = self.gate.lock_state();
-        state.active = state.active.saturating_sub(1);
+        state.active = state.active.saturating_sub(self.slots);
         self.gate.changed.notify_all();
     }
 }
@@ -362,6 +377,26 @@ impl Drop for JobPermit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cooperating_helpers_are_admitted_atomically_and_release_every_slot() {
+        let gate = Arc::new(HelperGate::new(3, 2));
+        let single = gate.try_acquire().unwrap();
+        assert!(matches!(
+            gate.try_acquire_many(3),
+            Err(HelperAdmissionError::Rejected)
+        ));
+        assert_eq!(gate.metrics().active, 1, "failed group must hold no slots");
+        let pair = gate.try_acquire_many(2).unwrap();
+        assert_eq!(gate.metrics().active, 3);
+        assert!(gate.try_acquire().is_err());
+        drop(pair);
+        assert_eq!(gate.metrics().active, 1);
+        assert!(gate.try_acquire_many(0).is_err());
+        assert!(gate.try_acquire_many(usize::MAX).is_err());
+        drop(single);
+        assert_eq!(gate.metrics().active, 0);
+    }
 
     #[test]
     fn helper_permits_release_and_metrics_are_bounded() {

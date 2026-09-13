@@ -75,6 +75,7 @@ ai_upscale_max_jobs = 1
 enable = false
 encoder = "libx264"
 max_jobs = 2
+# MiB, including active intermediates; maximum 2097152 (2 TiB).
 cache_max_mb = 51200
 cache_max_age_days = 30
 

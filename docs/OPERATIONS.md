@@ -48,6 +48,14 @@ serves requests. Their quota and retention settings are therefore validated
 even when `transcode.enable = false`; an invalid value stops startup before
 cache maintenance runs.
 
+`transcode.cache_max_mb` is measured in MiB and accepts 1 through 2,097,152
+(2 TiB); its default is 51,200 (50 GiB). This quota includes active Profile-8
+intermediates as well as completed output. Large UHD remuxes can exceed the
+default during video extraction alone. Raising the quota requires a server
+restart and enough underlying storage. Profile-8 delivery normally converts
+small fragments before streaming; `helper_max_jobs = 1` uses sequential
+whole-video staging and needs enough quota for those intermediates.
+
 Derived JPEG maintenance reuses an inventory built at startup. Successful cold
 requests update only active output paths and the eviction candidates they need;
 they do not enumerate the directory before and after each image. On-demand
