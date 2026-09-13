@@ -411,8 +411,10 @@ Chrome for Android uses finite Media Source initialization and movie fragments
 for compatible video when the browser supports the selected SourceBuffer type.
 Supported video and AAC remain copied; encoding follows the existing independent
 stream negotiation. Exact HEVC Main 10/HDR10 SourceBuffer support keeps an HDR
-output; otherwise the output is H.264 SDR. Auto uses the server-designated
-mobile fallback profile, while an explicit quality is preserved.
+output; otherwise the output is H.264 SDR. Copied video keeps Auto. When video
+requires portable H.264 encoding, Auto selects the server-designated 720p mobile
+fallback (`data_saver`), including for smaller sources, which are never enlarged.
+An explicit quality follows the source bounds described below.
 The fragment path bounds both buffered duration and estimated compressed bytes.
 Production startup fetches and appends initialization before requesting media.
 Media requests remain sequential. Source cancellation prevents old fetched bytes
@@ -1297,17 +1299,72 @@ For an ordinary CPU smoke run after building the server:
 node scripts/playback-benchmark.mjs --samples=2 --recipes=copy,audio,video,both --size=640x360 --output=/tmp/playback-smoke.json
 ```
 
+The complete generated CPU recipe run uses ten trials per recipe:
+
+```sh
+cargo build --release --locked -p rusty-dlna
+node scripts/playback-benchmark.mjs --binary=target/release/rusty-dlna --build-profile=release --output=/tmp/playback-cpu.json --samples=10 --recipes=copy,audio,video,both --concurrency=1 --size=1280x720 --fps=24 --duration=40 --rate=1 --sustain-seconds=2 --quality=auto --encoding-preset=balanced
+```
+
+A smoke proves harness execution; it does not establish a performance gain.
+Completed-cache checks read the output and validation stamp again after observing
+producer termination, so publication between observations cannot be mistaken for
+a failed run. Missing stamps and unfinished `.part` files still fail validation.
+The benchmark derives Android's expected recipe from the generated input codecs
+and documented quality envelopes, independently of the application selector.
+It rejects changed requests and verifies actual output codecs, dimensions,
+pixel format, frame rate, and portable profile. Copied video must retain sampled
+decoded frames. Auto copy/audio recipes remain Auto; Auto video/both recipes use
+`data_saver`. An explicit oversized preference is capped to the source envelope.
+
 Use at least ten independent trials for a before/after comparison, saving the
 baseline executable before editing its embedded assets. Pass `--binary` for each
 executable, its `--build-profile=debug|release`, and
-`--compare=/tmp/playback-before.json` to the after run. Comparisons
-reject mismatched workload/environment conditions. Default engineering guard
+`--compare=/tmp/playback-before.json` to the after run. Comparisons validate both
+reports' complete recipe/workload/sample/viewer matrix and output validations,
+recalculate summaries from raw records, and reject missing or failed evidence.
+Output evidence must include the effective quality request, video dimensions,
+pixel format and frame rate, audio channels and sample rate, and a valid decoded
+frame hash with a positive whole-frame count. Removing the same fields in both
+reports cannot make incomplete quality evidence comparable.
+Runtime comparison includes OS, architecture, kernel, Node/Rust/browser versions,
+FFmpeg/FFprobe hashes, linked libraries (without ASLR addresses), media packages,
+CPU/cgroup/memory/affinity, storage, and cache conditions. NVIDIA identity is
+required when the selected encoder uses NVIDIA. Default engineering guard
 bands flag median increases exceeding both 25% and 50 ms, and observed p95
 increases exceeding both 30% and 100 ms; these are configurable thresholds, not
 statistical confidence. Fewer than ten trials cannot gate a regression; p99
 gating is disabled below 1,000 independent trials and is still an engineering
 threshold rather than a confidence interval. Concurrent viewers from one
 trial are correlated. Repeat flagged workloads under matching idle conditions.
+
+Comparison is report-only by default. Add `--gate` to a run with `--compare` for
+a CI exit status: 0 means complete acceptable evidence, 1 means a measured
+regression, and 2 means invalid, failed, incomplete, unavailable, insufficient,
+or noncomparable evidence. Report-only comparison still records those distinct
+classifications. Compare retained reports without rerunning playback using:
+
+```sh
+node scripts/compare-playback-benchmarks.mjs --before=/tmp/playback-before.json --after=/tmp/playback-after.json --output=/tmp/comparison.json --gate
+```
+
+Attachment/cancellation trials where the producer finishes before observation
+must remain in the report with an unavailable reason. They block the gate unless
+`--exclusions=/tmp/exclusions.json` declares a reason for each affected key, for
+example `{"copy/active-attachment":"Producer completes before another viewer can attach"}`.
+Exclusions apply only to unavailable conditional measurements; they cannot hide
+missing trials, failed runs, or regressions with enough available trials.
+The output retains excluded classifications, counts, and reasons. Deleting
+unavailable rows makes a report incomplete. Within-recipe output quality must be
+consistent across trials; a changed mix of quality levels cannot pass by sharing
+the same set of output signatures.
+
+The canonical gate runs controlled CLI comparisons with ten exact observations
+per arm, including a deliberately slower 300-ms candidate against a 100-ms
+baseline. These verify gating, not a product speedup. To retain all controlled
+reports, arguments, exit statuses and diagnostics, set
+`RUSTY_DLNA_BENCHMARK_TEST_EVIDENCE=/tmp/comparison-cases` when running
+`node --test scripts/tests/playback-benchmark.test.mjs`.
 
 `--concurrency=1|2|4`, `--fps=24|30|60`, `--rate=1|2` and `--size` select generated
 tiers. `--quality` and `--encoding-preset=balanced|fast_start|maximum_speed`

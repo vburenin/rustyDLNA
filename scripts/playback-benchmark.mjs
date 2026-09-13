@@ -8,19 +8,22 @@ import { tmpdir, cpus, totalmem, freemem, loadavg, release } from "node:os";
 import { resolve, join, dirname, extname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "@playwright/test";
-import { summarizeRecords, compareReports } from "./playback-benchmark-summary.mjs";
-import { sourceBoundedQualityProfile } from "../crates/server/web/core.js";
+import { summarizeRecords, compareReports, comparisonExitCode } from "./playback-benchmark-summary.mjs";
+import { expectedAndroidOutput, expectedAudioTrack, assertExpectedRequest, assertExpectedVideo } from "./playback-benchmark-policy.mjs";
+import { completedArtifact as findCompletedArtifact, waitForCompletedArtifact as waitForPublishedArtifact } from "./playback-benchmark-artifact.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = Object.fromEntries(process.argv.slice(2).map((arg) => {
   const [key, ...value] = arg.replace(/^--/, "").split("=");
   return [key, value.join("=") || true];
 }));
-const acceptedArguments = new Set(["help", "binary", "output", "samples", "recipes", "concurrency", "size", "fps", "duration", "rate", "sustain-seconds", "compare", "median-percent", "median-ms", "p95-percent", "p95-ms", "fixture", "tier", "encoder", "port", "build-profile", "quality", "encoding-preset", "network-latency-ms", "network-kbps"]);
-if (Object.entries(args).some(([key, value]) => !acceptedArguments.has(key) || (key !== "help" && value === true))) {
+const acceptedArguments = new Set(["help", "binary", "output", "samples", "recipes", "concurrency", "size", "fps", "duration", "rate", "sustain-seconds", "compare", "gate", "exclusions", "median-percent", "median-ms", "p95-percent", "p95-ms", "fixture", "tier", "encoder", "port", "build-profile", "quality", "encoding-preset", "network-latency-ms", "network-kbps"]);
+if (Object.entries(args).some(([key, value]) => !acceptedArguments.has(key) || (!["help", "gate"].includes(key) && value === true))
+  || (args.gate && (args.gate !== true || !args.compare)) || (args.exclusions && !args.compare)) {
   throw new Error("Unknown benchmark option or missing --option=value; see --help");
 }
 if (args.help) {
+  console.log("Comparison is report-only by default. Add --gate with --compare to exit 1 on regression or 2 on incomplete/noncomparable evidence. --exclusions=/tmp/exclusions.json declares reasons for unavailable conditional attachment/cancellation measurements. Offline: node scripts/compare-playback-benchmarks.mjs --help.");
   console.log("Preset experiments: --encoding-preset=balanced|fast_start|maximum_speed --quality=auto|uhd_high|uhd_optimized|full_hd|data_saver|sd_480|low_360. Quality follows the browser's source bounds; each validation records the requested preference and effective quality separately. Compare graph changes within the same preset; different presets can change quality and are not accepted by --compare as equivalent workloads.");
   console.log("Network experiments: --network-latency-ms=0..2000 --network-kbps=0..1000000 (0 means unlimited). Chromium DevTools applies latency and an aggregate throughput limit to each viewer's real requests. This models a client link, not kernel packet loss or a shared bottleneck across viewers. CDP resource records include completed and cancelled response bytes.");
   console.log("node scripts/playback-benchmark.mjs --binary=target/debug/rusty-dlna --output=/tmp/playback.json --samples=10 --recipes=copy,audio,video,both --concurrency=1 --size=1280x720 --fps=24 --duration=40 --rate=1 --sustain-seconds=2 [--build-profile=debug|release|unknown] [--compare=/tmp/baseline.json] [--median-percent=25 --median-ms=50 --p95-percent=30 --p95-ms=100]\nOptional existing hardware/media tiers: --fixture=/path/to/35-600s-clip.mkv --tier=hdr10 --encoder=h264_nvenc (copies supplied media into the temporary library; maximum 8 GiB). Available encoders: libx264, h264_nvenc. CPU default generates SDR fixtures.");
@@ -593,31 +596,8 @@ async function producers(item) {
   return matched;
 }
 
-async function completedArtifact(item) {
-  const names = await readdir(join(run, "cache")).catch(() => []);
-  for (const name of names) {
-    if (!name.startsWith(`${item.id}-web-`) || !name.endsWith(".mp4")) continue;
-    const path = join(run, "cache", name);
-    const [media, stamp, part] = await Promise.all([
-      stat(path).catch(() => null), stat(`${path}.src`).catch(() => null), stat(`${path}.part`).catch(() => null),
-    ]);
-    if (media?.isFile() && media.size > 0 && stamp?.isFile() && stamp.size > 0 && !part) return path;
-  }
-  return null;
-}
-
-async function waitForCompletedArtifact(item) {
-  for (let attempt = 0; attempt < 1200; attempt++) {
-    const artifact = await completedArtifact(item);
-    if (artifact) return artifact;
-    const status = await serverStatus();
-    if (attempt > 5 && status.transcode?.active === 0 && !(await producers(item)).length) {
-      throw new Error("Producer finished without a completed output and validation stamp");
-    }
-    await sleep(100);
-  }
-  throw new Error("Completed and stamped cache deadline");
-}
+const completedArtifact = (item) => findCompletedArtifact(join(run, "cache"), item);
+const waitForCompletedArtifact = (item) => waitForPublishedArtifact(join(run, "cache"), item, serverStatus, producers);
 
 function decodedHashes(path) {
   const value = execFileSync("ffmpeg", ["-nostdin", "-v", "error", "-threads", "2", "-i", path,
@@ -627,27 +607,59 @@ function decodedHashes(path) {
 }
 
 const sourceFrameHashes = new Map();
-async function validateOutput(recipe, artifact, requested, sample, { item, capabilities }) {
+async function validateOutput(recipe, artifact, requested, sample, { item, capabilities, page }) {
   const fixture = report.fixtures.find((entry) => entry.recipe === recipe);
   const probe = JSON.parse(command("ffprobe", ["-v", "error", "-show_streams", "-show_format", "-of", "json", artifact]));
   const video = probe.streams.find((stream) => stream.codec_type === "video");
   const audio = probe.streams.find((stream) => stream.codec_type === "audio");
-  const sourceVideo = fixture.probe.streams.find((stream) => stream.codec_type === "video");
+  const sourceVideo = fixture.probe.streams.find((stream) => stream.codec_type === "video" && !stream.disposition?.attached_pic);
+  const { stream: sourceAudio, ordinal: expectedAudio } = expectedAudioTrack(fixture.probe.streams);
+  if (Number(requested.audio) !== expectedAudio) throw new Error(`Expected source audio ordinal ${expectedAudio}, received ${requested.audio}`);
   const videoCopy = requested.video_mode === "copy";
-  if (!Array.isArray(capabilities?.quality_profiles) || !capabilities.quality_profiles.length) {
-    throw new Error("Advertised quality profiles unavailable for output validation");
-  }
-  const effectiveQuality = sourceBoundedQualityProfile(
-    capabilities.quality_profiles, requestedQuality, item, capabilities.ai_upscale,
-  );
-  if ((requested.quality || "auto") !== effectiveQuality
-    || (!videoCopy && (requested.encoding_preset || "balanced") !== encodingPreset)) {
-    throw new Error(`Expected effective quality ${effectiveQuality} from preference ${requestedQuality}, with preset ${encodingPreset}: ${JSON.stringify(requested)}`);
-  }
-  const expectedVideoCopy = effectiveQuality === "auto" && ["copy", "audio"].includes(recipe);
-  if (recipe !== "external" && (videoCopy !== expectedVideoCopy || requested.audio_mode !== (["copy", "video"].includes(recipe) ? "copy" : "transcode"))) {
-    throw new Error(`Requested recipe differs from ${recipe}: ${JSON.stringify(requested)}`);
-  }
+  const outputEnvelope = expectedAndroidOutput({ recipe, preference: requestedQuality, sourceVideo, sourceAudio,
+    profiles: capabilities?.quality_profiles, copySupport: true, hdrSupport: true });
+  const externalSupport = recipe === "external" ? await page.evaluate(async ({ item, capabilities, sourceVideo, sourceAudio, outputEnvelope }) => {
+    const player = document.querySelector("video");
+    const supported = async (configuration) => {
+      const type = configuration.video?.contentType || configuration.audio?.contentType;
+      if (player.canPlayType(type)) return true;
+      if (!navigator.mediaCapabilities?.decodingInfo) return false;
+      let timer;
+      try {
+        return await Promise.race([
+          navigator.mediaCapabilities.decodingInfo(configuration).then((result) => result.supported),
+          new Promise((resolve) => { timer = setTimeout(() => resolve(false), 1500); }),
+        ]);
+      } catch { return false; } finally { clearTimeout(timer); }
+    };
+    const [numerator, denominator = 1] = sourceVideo.r_frame_rate.split("/").map(Number);
+    const frameRate = numerator / denominator;
+    const videoConfiguration = (type) => ({ type: "file", video: { contentType: type,
+      width: sourceVideo.width, height: sourceVideo.height, bitrate: Number(sourceVideo.bit_rate) || Number(item.bitrate) * 8 || 8000000,
+      framerate: frameRate } });
+    const codec = /^video\/mp4\s*;\s*codecs\s*=\s*"([^"]+)"$/i.exec(item.video_content_type || "")?.[1]?.split(",")[0];
+    const copySupport = !item.video_repair_required && /^(avc1|hvc1)\./.test(codec || "")
+      && MediaSource.isTypeSupported(`video/mp4; codecs="${codec},mp4a.40.2"`)
+      && await supported(videoConfiguration(item.video_content_type));
+    const output = capabilities.video_outputs?.find((value) => value.id === "hevc_hdr10");
+    const profile = capabilities.quality_profiles.find((profile) => profile.id === outputEnvelope.quality);
+    const scale = Math.min(1, outputEnvelope.max_width / sourceVideo.width, outputEnvelope.max_height / sourceVideo.height);
+    const hdrSupport = item.video_codec === "hevc" && Number(item.bit_depth) > 8 && ["hdr10", "dv-p7", "dv-p8"].includes(item.hdr)
+      && Boolean(output?.mse_content_type) && MediaSource.isTypeSupported(output.mse_content_type)
+      && await supported({ type: "file", video: { ...videoConfiguration(output.video_content_type).video,
+        width: Math.max(2, Math.floor(sourceVideo.width * scale / 2) * 2),
+        height: Math.max(2, Math.floor(sourceVideo.height * scale / 2) * 2),
+        bitrate: profile.max_video_kbps * 1000, framerate: Math.min(frameRate, 30),
+        hdrMetadataType: "smpteSt2086", colorGamut: "bt2020", transferFunction: "pq" } });
+    const audioSupport = await supported({ type: "file", audio: { contentType: 'audio/mp4; codecs="mp4a.40.2"',
+      channels: String(sourceAudio.channels || 2), bitrate: 320000, samplerate: Number(sourceAudio.sample_rate) || 48000 } });
+    return { copySupport, hdrSupport, audioSupport };
+  }, { item, capabilities, sourceVideo, sourceAudio, outputEnvelope }) : {};
+  const expected = expectedAndroidOutput({ recipe, preference: requestedQuality, sourceVideo,
+    sourceAudio,
+    profiles: capabilities?.quality_profiles, ...externalSupport });
+  assertExpectedRequest(expected, requested, encodingPreset);
+  assertExpectedVideo(expected, video, sourceVideo);
   if ((recipe !== "external" && (video?.codec_name !== "h264" || audio?.codec_name !== "aac"))
     || !video || Number(probe.format.duration) < Math.min(duration, Number(fixture.probe.format.duration)) - 1.5) {
     throw new Error(`Output validation failed: ${JSON.stringify(probe)}`);
@@ -669,7 +681,7 @@ async function validateOutput(recipe, artifact, requested, sample, { item, capab
     decoded_frames_sampled: outputFrames.length, encoded_output_decoded_hash_sha256: sha256(outputFrames.join("\n")),
     scope: "Requested profile video encode; bounded output decoded-frame hashes can verify identical before/after frames. Output codec, dimensions, pixel format, frame rate, bitrate, and color metadata are recorded. No perceptual quality score or full-movie equality inferred." };
   const validation = { id: report.validations.length, recipe, sample, requested, output_probe: probe, output_bytes: (await stat(artifact)).size,
-    quality_selection: { requested: requestedQuality, effective: effectiveQuality },
+    quality_selection: { requested: requestedQuality, effective: expected.quality, expected },
     stamp_bytes: (await stat(`${artifact}.src`)).size, quality, outside_latency_measurements: true };
   report.validations.push(validation);
   return validation.id;
@@ -862,7 +874,7 @@ try {
           }
           const artifact = await waitForCompletedArtifact(item);
           const requested = players[0].requests.find((request) => request.recipe.delivery === "mse").recipe;
-          const validationId = workload === "cold" ? await validateOutput(recipe, artifact, requested, sample, { item, capabilities: library.capabilities })
+          const validationId = workload === "cold" ? await validateOutput(recipe, artifact, requested, sample, { item, capabilities: library.capabilities, page: players[0].page })
             : report.validations.findLast((value) => value.recipe === recipe && value.sample === sample).id;
           records.forEach((record) => { record.validation_id = validationId; });
           if (workload === "warm") {
@@ -902,19 +914,36 @@ try {
   report.failure = error.stack;
   process.exitCode = 1;
 } finally {
-  await browser?.close();
-  await stopServer();
+  // Always attempt both cleanup owners and retain failure evidence even when
+  // one owner fails. A cleanup error is a failed run, never a comparable one.
+  report.cleanup = {};
+  for (const [owner, close] of [["browser", () => browser?.close()], ["server", stopServer]]) {
+    try { await close(); report.cleanup[owner] = "closed"; }
+    catch (error) {
+      report.cleanup[owner] = error.stack;
+      report.failure ||= `Cleanup failed (${owner}): ${error.stack}`;
+      process.exitCode = 1;
+    }
+  }
   report.summaries = summarizeRecords(report.records);
-  if (args.compare) report.comparison = compareReports(JSON.parse(await readFile(resolve(args.compare), "utf8")), report, {
-    median_percent: Number(args["median-percent"] || 25), median_ms: Number(args["median-ms"] || 50),
-    p95_percent: Number(args["p95-percent"] || 30), p95_ms: Number(args["p95-ms"] || 100),
-  });
   report.environment.host_load_average_end = loadavg();
   report.environment.free_memory_bytes_end = freemem();
   report.environment.cpu_reported_mhz_end = cpus().map((cpu) => cpu.speed);
   report.finished = new Date().toISOString();
   report.runtime_directory = run;
+  if (args.compare) {
+    try {
+      report.comparison = compareReports(JSON.parse(await readFile(resolve(args.compare), "utf8")), report, {
+        median_percent: Number(args["median-percent"] ?? 25), median_ms: Number(args["median-ms"] ?? 50),
+        p95_percent: Number(args["p95-percent"] ?? 30), p95_ms: Number(args["p95-ms"] ?? 100),
+      }, args.exclusions ? JSON.parse(await readFile(resolve(args.exclusions), "utf8")) : {});
+      if (args.gate) process.exitCode = comparisonExitCode(report.comparison);
+    } catch (error) {
+      report.comparison_failure = error.stack;
+      process.exitCode = 2;
+    }
+  }
   await writeFile(output, JSON.stringify(report, null, 2));
   await writeFile(join(run, "server.log"), serverLogs.join(""));
-  console.log(JSON.stringify({ output, failure: report.failure, summaries: report.summaries }, null, 2));
+  console.log(JSON.stringify({ output, failure: report.failure, comparison_failure: report.comparison_failure, comparison: report.comparison, summaries: report.summaries }, null, 2));
 }

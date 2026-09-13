@@ -18,6 +18,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  persistent:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PERSISTENT_EVIDENCE: ${{ runner.temp }}/persistent-evidence
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libavcodec-dev libavformat-dev libavutil-dev libswscale-dev ffmpeg
+      - run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - run: npm ci && npx playwright install --with-deps chromium
+      - run: cargo build --release --locked -p rusty-dlna
+      - run: mkdir -p "$PERSISTENT_EVIDENCE"
+      - name: Persistent playback, seek, reconnect, eviction and scan
+        run: node scripts/persistent-soak.mjs --binary=target/release/rusty-dlna --seconds=600 --warmup-seconds=60 --output="$PERSISTENT_EVIDENCE/persistent.json"
+      - name: Generated four-recipe CPU smoke
+        run: node scripts/playback-benchmark.mjs --binary=target/release/rusty-dlna --build-profile=release --samples=2 --recipes=copy,audio,video,both --size=640x360 --output="$PERSISTENT_EVIDENCE/playback-smoke.json"
+      - name: Exercise comparison rejection and regression exit codes
+        env:
+          RUSTY_DLNA_BENCHMARK_TEST_EVIDENCE: ${{ runner.temp }}/persistent-evidence/comparison-cases
+        run: node --test scripts/tests/playback-benchmark.test.mjs
+      - name: Retain persistent measurements, failures and cleanup
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: persistent-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/persistent-evidence
+          if-no-files-found: warn
+          retention-days: 90
+
   soak:
     runs-on: ubuntu-24.04
     # Hosted jobs stop after six hours. Leave time for setup and evidence upload.

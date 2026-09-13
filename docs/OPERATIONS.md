@@ -553,6 +553,23 @@ node scripts/persistent-soak.mjs --binary=target/debug/rusty-dlna \
   --seconds=3600 --warmup-seconds=150 --output=/tmp/persistent-soak.json
 ```
 
+The scheduled soak workflow also runs a separate bounded persistent job, using
+a release server for ten minutes with a one-minute warm-up. It retains raw
+samples, cycle observations, failures and cleanup results for 90 days. Reproduce
+its workload command locally with:
+
+```sh
+cargo build --release --locked -p rusty-dlna
+export PERSISTENT_EVIDENCE=/tmp/rustydlna-persistent-ci
+mkdir -p "$PERSISTENT_EVIDENCE"
+node scripts/persistent-soak.mjs --binary=target/release/rusty-dlna --seconds=600 --warmup-seconds=60 --output="$PERSISTENT_EVIDENCE/persistent.json"
+```
+
+The job then runs the generated four-recipe CPU smoke and controlled comparison
+CLI tests described in [Web player measurement](WEB_PLAYER.md). Those steps
+test execution and regression rejection; two-sample smoke timings do not support
+performance claims. The separate five-hour restart/shutdown soak remains intact.
+
 Each cycle publishes a generated temporary media file through the watcher,
 replaces the previous cycle's file, and overlaps bounded library/search/folder
 queries and artwork requests with actual Chromium playback. Chromium presents
