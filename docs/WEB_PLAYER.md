@@ -1509,6 +1509,14 @@ events or truncated assertion detail. Request-only tests do not create a page
 for diagnostics. Firefox/WebKit lack the Long Tasks API; their report says so.
 Failure traces/screenshots remain enabled; the existing 10k-card scale spec
 disables full DOM trace snapshots because copying that DOM dominates the workload.
+Focus diagnostics also record bounded focus/pointer/key events, the active element,
+focus visibility, control visibility and player-stage classes. Caption test helpers
+wait for visible controls after hover before calling programmatic focus: focus on
+a hidden control can silently do nothing, including in WebKit. The decoded caption
+failure/retry case also runs with a delayed visibility transition, then requires
+the same keyboard focus, accessible Off actions, and advancing media time and
+decoded frames after both failure and retry. This checks
+the setup ordering without retries or weaker focus assertions.
 CI/release retain runtime versions and diagnostic reports even on success. Store
 reports outside source control; report missing observations as unavailable.
 

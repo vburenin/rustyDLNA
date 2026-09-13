@@ -47,6 +47,22 @@ export const test = base.extend({
       };
       window.__browserEvidence = { events, droppedEvents: 0, truncated: false, longTasksSupported:
         PerformanceObserver.supportedEntryTypes.includes("longtask") };
+      const focusState = () => {
+        const active = document.activeElement;
+        const controls = document.getElementById("playback-controls");
+        const style = controls && getComputedStyle(controls);
+        return { active: text(active?.id || active?.tagName), focusVisible: active?.matches(":focus-visible"),
+          documentFocused: document.hasFocus(), stageClass: text(document.getElementById("player-stage")?.className),
+          controlsVisibility: style?.visibility, controlsOpacity: style?.opacity };
+      };
+      for (const name of ["focusin", "focusout", "pointerenter", "pointerleave", "keydown"]) {
+        document.addEventListener(name, (event) => {
+          if (!(event.target instanceof Element)
+            || !event.target.closest("#player-stage, #layout-watch, #layout-browse")) return;
+          record(name, { target: text(event.target.id || event.target.tagName),
+            related: text(event.relatedTarget?.id || event.relatedTarget?.tagName), key: text(event.key), ...focusState() });
+        }, true);
+      }
       if (window.__browserEvidence.longTasksSupported) new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) record("longtask", { start: entry.startTime, duration: entry.duration });
       }).observe({ type: "longtask", buffered: true });
@@ -64,7 +80,8 @@ export const test = base.extend({
           const element = document.getElementById(id);
           if (element) new MutationObserver(() => record("state", {
             id, state: text(element.dataset.state), busy: text(element.getAttribute("aria-busy")), hidden: element.hidden,
-          })).observe(element, { attributes: true, attributeFilter: ["data-state", "aria-busy", "hidden"] });
+            ...(id === "player-stage" ? focusState() : {}),
+          })).observe(element, { attributes: true, attributeFilter: ["data-state", "aria-busy", "hidden", ...(id === "player-stage" ? ["class"] : [])] });
         }
       }, { once: true });
       window.addEventListener("load", () => record("load"), { once: true });

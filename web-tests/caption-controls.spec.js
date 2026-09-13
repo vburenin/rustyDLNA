@@ -129,6 +129,18 @@ async function expectCue(page, expected) {
   })).toEqual(expected);
 }
 
+async function expectPlaybackProgress(video) {
+  const before = await video.evaluate((video) => ({
+    time: video.currentTime, frames: video.getVideoPlaybackQuality().totalVideoFrames,
+  }));
+  await expect.poll(() => video.evaluate((video, before) => ({
+    clockAdvanced: video.currentTime >= before.time + 0.15,
+    framesAdvanced: video.getVideoPlaybackQuality().totalVideoFrames >= before.frames + 2,
+    playing: !video.paused && !video.ended && video.error === null,
+  }), before), { message: "Caption failure/retry must preserve advancing decoded playback" })
+    .toEqual({ clockAdvanced: true, framesAdvanced: true, playing: true });
+}
+
 test("caption Space and Arrow selection retain radio nodes, keyboard focus and visible controls", async ({ page }) => {
   const { item } = await captionFixture(page);
   await page.route("**/caption-controls.vtt", (route) => route.fulfill({ contentType: "text/vtt", body: timelineVtt }));
@@ -252,7 +264,7 @@ test("a changed caption list preserves the focused choice or moves to the select
   await expect(page.getByRole("radio", { name: "Off", exact: true })).toBeChecked();
 });
 
-test("caption failure and retry leave decoded playback healthy and expose accessible Off actions", async ({ page }) => {
+for (const delayedVisibility of [false, true]) test(`caption failure and retry leave decoded playback healthy and expose accessible Off actions${delayedVisibility ? " with delayed visibility" : ""}`, async ({ page }, testInfo) => {
   const { item, requests } = await captionFixture(page, { mode: "compat", playing: true });
   let fail = true;
   let attempts = 0;
@@ -271,12 +283,39 @@ test("caption failure and retry leave decoded playback healthy and expose access
   await page.locator("#layout-watch").focus();
   await page.locator("#layout-watch").hover();
   await expect(page.locator("#playback-controls")).toBeHidden();
-  await openCaptions(page);
+  if (delayedVisibility) {
+    // Hold the visibility transition after hover with CSS, reproducing the
+    // rendering boundary that can precede programmatic focus in WebKit. The
+    // helper must wait for visibility; focus() itself has no actionability wait.
+    await page.route("**/caption-focus-delay.css", (route) => route.fulfill({ contentType: "text/css",
+      body: "#playback-controls { transition: opacity .2s ease, visibility 0s linear .4s, transform .2s ease; }" }));
+    await page.addStyleTag({ url: "/caption-focus-delay.css" });
+  }
+  await page.locator("#captions-button").evaluate((button) => {
+    window.__captionFocusEvents = [];
+    button.addEventListener("focus", () => {
+      if (window.__captionFocusEvents.length < 16) window.__captionFocusEvents.push({
+        at: performance.now(), visibility: getComputedStyle(button).visibility,
+        active: document.activeElement?.id, controlsClass: document.getElementById("player-stage").className,
+      });
+    });
+  });
+  try {
+    await openCaptions(page);
+  } finally {
+    await testInfo.attach("caption-focus-evidence", { contentType: "application/json",
+      body: Buffer.from(JSON.stringify(await page.evaluate(() => ({ events: window.__captionFocusEvents,
+        active: document.activeElement?.id, visibility: getComputedStyle(document.getElementById("captions-button")).visibility })))) });
+  }
+  const focusEvents = await page.evaluate(() => window.__captionFocusEvents);
+  expect(focusEvents.length).toBeGreaterThan(0);
+  expect(focusEvents.every((event) => event.visibility === "visible" && event.active === "captions-button")).toBe(true);
   await page.getByRole("radio", { name: "English", exact: true }).check();
   await expect(page.locator("#caption-error-message")).toHaveText("Captions could not load. Try again or turn captions off.");
   await expect(page.locator("#caption-error-message")).toHaveAttribute("role", "status");
   await expect(page.locator("#player-retry")).toBeHidden();
   await expect(page.locator("#player-message")).not.toContainText("Playback could not continue");
+  await expectPlaybackProgress(video);
   expect((await new AxeBuilder({ page }).include("#player-stage").analyze()).violations).toEqual([]);
   const targets = await page.locator(".caption-error-actions button").evaluateAll((buttons) => buttons.map((button) => {
     const rect = button.getBoundingClientRect();
@@ -293,6 +332,7 @@ test("caption failure and retry leave decoded playback healthy and expose access
   await expectCue(page, { id: "opening", start: 0, end: 0.35, text: "Opening scene" });
   await expect(page.locator("#caption-error")).toBeHidden();
   expect(attempts).toBe(2);
+  await expectPlaybackProgress(video);
   await page.evaluate(() => {
     window.__failedCaption.dispatchEvent(new Event("error"));
     window.__failedCaption.dispatchEvent(new Event("load"));
