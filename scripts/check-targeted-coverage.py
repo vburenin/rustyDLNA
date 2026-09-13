@@ -17,6 +17,14 @@ FLOORS = {
     "crates/server/src/config.rs": (72.0, 72.0),
     "crates/server/src/catalog_query.rs": (71.0, 85.0),
     "crates/server/src/remux.rs": (73.0, 79.0),
+    "crates/server/src/remux/hls.rs": (89.0, 73.0),
+    "crates/server/src/remux/hls/completed.rs": (94.0, 97.0),
+    "crates/server/src/remux/hls/history.rs": (97.0, 97.0),
+    "crates/server/src/remux/hls/validation.rs": (83.0, 84.0),
+    "crates/server/src/remux/positional.rs": (74.0, 97.0),
+    "crates/server/src/remux/cache.rs": (89.0, 87.0),
+    "crates/server/src/remux/cache_monitor.rs": (91.0, 85.0),
+    "crates/scan/src/session.rs": (84.0, 72.0),
 }
 
 

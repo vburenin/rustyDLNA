@@ -53,6 +53,8 @@ All commands below run from the **repository root**. The agent wrapper invokes
 | Assisted native Safari capture | `python3 scripts/native-hls-device.py --help` | `docs/WEB_PLAYER.md`; temporary LAN proxy, local backend and separate evidence directory |
 | Persistent daemon/cache validation | `node scripts/persistent-soak.mjs --help` | `docs/OPERATIONS.md`; generated temporary media and isolated ports |
 | Media/runtime evidence | `python3 scripts/runtime-evidence.py --help` | `docs/DISTRIBUTION.md`; exact tool/library/package identities |
+| Production parser fuzz campaigns | `cargo +nightly-2026-08-01 fuzz run mp4_index -- -max_total_time=60 -max_len=65536 -timeout=5` (also `profile8_rewrite`) | `fuzz/README.md`; CI replays fixed controls and bounded campaigns |
+| Workspace and module coverage | `cargo llvm-cov --workspace --json --summary-only --output-path target/coverage.json --fail-under-lines 80` then `scripts/check-targeted-coverage.py target/coverage.json` | `.github/workflows/ci.yml`; module floors supplement semantic regressions |
 | Fresh package availability | `python3 scripts/clean-build-probe.py --help` | `docs/DISTRIBUTION.md`; availability probe, not a full historical rebuild |
 
 Rust type checking is covered by Clippy; no separate typecheck task is declared.

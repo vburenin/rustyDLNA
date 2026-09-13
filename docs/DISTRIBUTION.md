@@ -74,6 +74,23 @@ Rust advisory, license/source, unused-dependency, and container vulnerability
 checks remain separate gates. A failed audit service or unavailable local audit
 tool is an unavailable check, not evidence of a vulnerability or license violation.
 
+CI's LLVM coverage gate enforces an 80% workspace line floor and separate
+line/function floors in `scripts/check-targeted-coverage.py`. The risk-module
+floors include the fragmented-MP4 index (89/73), completed-index cache (94/97),
+history (97/97), fragment validation (83/84), positional reads (74/97), transcode
+cache (89/87), cache monitor (91/85), and scanner publication session (84/72).
+These percentages guard against losing coverage; they do not certify behavior.
+The owning tests separately assert exact fragment ranges/timing, immutable index
+reuse, protected cache eviction, bounded reads, and transactional publication
+and recovery. Coverage without those assertions is insufficient.
+
+The production MP4 index and Profile-8 staging rewriter also have opt-in parser
+adapters in the separate fuzz workspace. [Parser fuzzing](../fuzz/README.md)
+describes deterministic controls, preservation properties, input/deadline bounds,
+and replay commands. Ordinary CI runs bounded campaigns; scheduled address/leak
+campaigns retain failures. Structural parser fixtures do not establish genuine
+Dolby Vision decoding or native-device compatibility.
+
 All Ubuntu image stages fetch packages over HTTPS. The digest-pinned Rust
 image supplies the initial CA bundle until Ubuntu's `ca-certificates` package
 is installed; TLS verification and APT signature/hash checks remain enabled.

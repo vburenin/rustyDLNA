@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "rusty-dlna"
 path = "src/main.rs"
 
+# Opt-in parser adapters for the separate cargo-fuzz workspace.
+[features]
+fuzzing = []
+
 [dependencies]
 rusty-dlna-helper.workspace = true
 rusty-dlna-protocol.workspace = true

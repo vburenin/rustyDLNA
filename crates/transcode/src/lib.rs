@@ -4543,6 +4543,21 @@ pub fn probe_to_source(
     }
 }
 
+/// Test-only entry point: rewrite private staging files through the production parser.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_profile8_rewrite(mp4: &Path, hevc: &Path) -> Result<(), RemuxP8Error> {
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let mut observer = || Ok(());
+    let mut control = RemuxP8Control {
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+        cancelled: &cancelled,
+        observer: &mut observer,
+        io: None,
+    };
+    profile8_rewrite::rewrite(mp4, hevc, &mut control)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

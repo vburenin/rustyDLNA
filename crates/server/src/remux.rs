@@ -4032,6 +4032,9 @@ async fn stream_growing(
 #[cfg(test)]
 mod control_tests;
 
+#[cfg(feature = "fuzzing")]
+pub use hls::fuzzing::FuzzIndex;
+
 #[cfg(test)]
 mod tests {
     use super::*;

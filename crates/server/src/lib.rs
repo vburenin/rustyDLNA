@@ -966,5 +966,10 @@ impl CatalogChildRef<'_> {
     }
 }
 
+/// Test-only adapter for the production fragmented MP4 index.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use remux::FuzzIndex;
+
 #[cfg(test)]
 mod tests;

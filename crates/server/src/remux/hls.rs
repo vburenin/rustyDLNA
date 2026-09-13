@@ -1,6 +1,8 @@
 mod completed;
 #[cfg(test)]
 mod efficiency_tests;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 mod history;
 #[cfg(test)]
 mod native_evidence;

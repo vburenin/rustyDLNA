@@ -8,7 +8,7 @@ SANITIZER=${3:-address}
 FUZZ_RUST_TOOLCHAIN=${FUZZ_RUST_TOOLCHAIN:-nightly-2026-08-01}
 
 case "$TARGET" in
-	http_request|http_range|ssdp|soap_xml|nfo|url_ids|sidecars) ;;
+	http_request|http_range|ssdp|soap_xml|nfo|url_ids|sidecars|mp4_index|profile8_rewrite) ;;
 	*) echo "usage: $0 <target> <artifact> [address|leak|memory|thread|none]" >&2; exit 2 ;;
 esac
 case "$SANITIZER" in

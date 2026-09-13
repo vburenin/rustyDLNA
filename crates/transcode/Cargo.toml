@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Per-client transcode decision and ffmpeg job builder"
 
+# Opt-in parser adapters for the separate cargo-fuzz workspace.
+[features]
+fuzzing = []
+
 [dependencies]
 rusty-dlna-helper.workspace = true
 rusty-dlna-protocol.workspace = true

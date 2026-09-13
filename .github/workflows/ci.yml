@@ -160,7 +160,7 @@ jobs:
       - run: cargo +nightly-2026-08-01 fuzz build
       - name: Bounded parser fuzz smoke
         run: |
-          for target in http_request http_range ssdp soap_xml nfo url_ids sidecars; do
+          for target in http_request http_range ssdp soap_xml nfo url_ids sidecars mp4_index profile8_rewrite; do
             mkdir -p "fuzz/corpus/$target"
             cp -an "fuzz/seeds/$target/." "fuzz/corpus/$target/"
             if [ -d "fuzz/regressions/$target" ]; then

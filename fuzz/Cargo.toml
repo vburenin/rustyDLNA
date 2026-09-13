@@ -10,6 +10,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
+rusty-dlna = { path = "../crates/server", version = "0.1.0", features = ["fuzzing"] }
+rusty-dlna-transcode = { path = "../crates/transcode", version = "0.1.0", features = ["fuzzing"] }
 rusty-dlna-http = { path = "../crates/http", version = "0.1.0" }
 rusty-dlna-protocol = { path = "../crates/protocol", version = "0.1.0" }
 rusty-dlna-scan = { path = "../crates/scan", version = "0.1.0" }
@@ -64,6 +66,20 @@ bench = false
 [[bin]]
 name = "sidecars"
 path = "fuzz_targets/sidecars.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mp4_index"
+path = "fuzz_targets/mp4_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "profile8_rewrite"
+path = "fuzz_targets/profile8_rewrite.rs"
 test = false
 doc = false
 bench = false

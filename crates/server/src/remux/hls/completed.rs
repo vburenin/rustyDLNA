@@ -102,6 +102,11 @@ pub(super) fn insert(identity: Identity, index: &Index) {
     crate::lock_recover(&COMPLETED).insert(identity, index);
 }
 
+#[cfg(feature = "fuzzing")]
+pub(super) fn reset_for_fuzz_input() {
+    *crate::lock_recover(&COMPLETED) = CompletedIndexes::default();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
