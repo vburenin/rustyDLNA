@@ -64,8 +64,8 @@ async function nativeFragments(page, beforeFragment = async () => {}, { audio = 
         const result = new URL(url);
         result.pathname = `/web/media/1.${suffix}`;
         result.searchParams.set("delivery", delivery);
-        result.searchParams.set("hls_offset", String(index));
-        result.searchParams.set("hls_length", "1");
+        result.searchParams.set("hls_offset", String(delivery === "mse_init" ? 0 : offsets[index]));
+        result.searchParams.set("hls_length", String(delivery === "mse_init" ? init.length : fragments[index].length));
         return result.href;
       };
       return route.fulfill({ body: `#EXTM3U\n#EXT-X-MAP:URI="${resource("mp4", "mse_init", 0)}"\n`
@@ -74,7 +74,7 @@ async function nativeFragments(page, beforeFragment = async () => {}, { audio = 
     }
     await beforeFragment(url);
     return route.fulfill({ contentType: "video/mp4", body: url.pathname.endsWith(".mp4")
-      ? init : fragments[Number(url.searchParams.get("hls_offset"))] });
+      ? init : fragments[offsets.indexOf(Number(url.searchParams.get("hls_offset")))] });
   });
   await page.addInitScript(() => {
     localStorage.setItem("rustydlna.stream", "compat");

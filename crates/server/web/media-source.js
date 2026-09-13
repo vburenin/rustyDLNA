@@ -1,6 +1,6 @@
 // Abort-scoped Media Source transport and bounded buffering.
 // Source selection, playback intent, and recovery belong to the player.
-import { bufferedSeekTarget, bufferedRangeSecondsAhead, fallbackMediaSourceType, parseHlsMediaPlaylist, reusableMediaSourceSeek, retainedMediaSourceBytes } from "./core.js";
+import { bufferedSeekTarget, bufferedRangeSecondsAhead, fallbackMediaSourceType, parseHlsMediaPlaylist, mediaSourceStartupBudget, reusableMediaSourceSeek, retainedMediaSourceBytes } from "./core.js";
 
 // Copied UHD fragments can exceed 10 MB per second. Keep the total window
 // below Chromium's practical SourceBuffer quota instead of treating every
@@ -41,12 +41,16 @@ function withAbort(promise, signal) {
   });
 }
 
-export async function fetchResource(url, signal, { playlist = false, resourceMaxBytes = MEDIA_SOURCE_RESOURCE_MAX_BYTES, onHeaders } = {}) {
+export async function fetchResource(url, signal, { playlist = false, resourceMaxBytes = MEDIA_SOURCE_RESOURCE_MAX_BYTES, expectedBytes, onHeaders } = {}) {
   if (signal.aborted) throw abortedError();
   const controller = new AbortController();
   const abort = () => controller.abort(abortedError());
   signal.addEventListener("abort", abort, { once: true });
   const limit = playlist ? 4 * 1024 * 1024 : Math.min(MEDIA_SOURCE_RESOURCE_MAX_BYTES, resourceMaxBytes);
+  if (expectedBytes !== undefined && (!Number.isSafeInteger(expectedBytes) || expectedBytes <= 0 || expectedBytes > limit)) {
+    signal.removeEventListener("abort", abort);
+    throw new MediaSourceResourceError("Media Source resource is too large.");
+  }
   // Playlist headers may wait for helper admission, preparation, and the first
   // complete fragment. Subsequent finite-resource requests need less grace.
   let progressTimer = window.setTimeout(() => controller.abort(timeoutError("headers")), playlist ? 120_000 : 30_000);
@@ -60,10 +64,18 @@ export async function fetchResource(url, signal, { playlist = false, resourceMax
     if (response.status === 413) throw new MediaSourceResourceError("Media Source resource is too large.");
     if (!response.ok) throw new Error(`Media Source resource returned HTTP ${response.status}.`);
     if (Number(response.headers.get("content-length")) > limit) throw new MediaSourceResourceError("Media Source resource is too large.");
+    const declared = response.headers.get("content-length");
+    if (expectedBytes !== undefined && (response.status !== 200 || response.headers.has("content-range")
+      || (declared !== null && (!/^\d+$/.test(declared) || Number(declared) !== expectedBytes)))) {
+      throw new Error("Media Source resource does not match its requested range.");
+    }
     onHeaders?.(response.headers);
     if (!response.body) throw new Error("Media Source resource has no body.");
     reader = response.body.getReader();
     const chunks = [];
+    // Finite playlist resources have exact lengths. Allocate their destination
+    // once so two startup requests share one budget without assembly copies.
+    const destination = expectedBytes === undefined ? null : new Uint8Array(expectedBytes);
     let length = 0;
     let reads = 0;
     const resetProgress = () => {
@@ -78,10 +90,14 @@ export async function fetchResource(url, signal, { playlist = false, resourceMax
       if (value.byteLength) resetProgress();
       length += value.byteLength;
       if (length > limit) throw new MediaSourceResourceError("Media Source resource is too large.");
-      if (value.byteLength) chunks.push(value);
+      if (destination) {
+        if (length > expectedBytes) throw new Error("Media Source resource exceeds its requested range.");
+        destination.set(value, length - value.byteLength);
+      } else if (value.byteLength) chunks.push(value);
     }
     if (length === 0) throw new Error("Media Source resource is empty.");
-    const bytes = new Uint8Array(length);
+    if (expectedBytes !== undefined && length !== expectedBytes) throw new Error("Media Source resource ended before its requested range.");
+    const bytes = destination || new Uint8Array(length);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
     completed = true;
@@ -97,6 +113,38 @@ export async function fetchResource(url, signal, { playlist = false, resourceMax
     // A cancelled stream may still have a pending read; cancellation settles it
     // without delaying the already bounded operation's failure.
     try { reader?.releaseLock(); } catch (_) { /* Pending abort completion. */ }
+  }
+}
+
+export async function fetchStartupResources(playlist, budget, signal, reportStartup = () => {}) {
+  if (![budget?.initBytes, budget?.mediaBytes, budget?.totalBytes].every((value) => Number.isSafeInteger(value) && value > 0)
+    || budget.totalBytes !== budget.initBytes + budget.mediaBytes
+    || budget.totalBytes > MEDIA_SOURCE_RESOURCE_MAX_BYTES) {
+    throw new MediaSourceResourceError("Media Source startup resources exceed their shared budget.");
+  }
+  const controller = new AbortController();
+  const abort = () => controller.abort(abortedError());
+  if (signal.aborted) throw abortedError();
+  signal.addEventListener("abort", abort, { once: true });
+  try {
+    const fetchOne = async (url, expectedBytes, stage) => {
+      const bytes = await fetchResource(url, controller.signal, {
+        expectedBytes, resourceMaxBytes: budget.totalBytes,
+      });
+      reportStartup(stage);
+      return bytes;
+    };
+    // Promise.all observes both failures immediately. The first failure aborts
+    // its sibling; no append starts until both complete ranges are owned.
+    return await Promise.all([
+      fetchOne(playlist.initUrl, budget.initBytes, "mse_init_fetched"),
+      fetchOne(playlist.segments[0].url, budget.mediaBytes, "mse_first_fragment_fetched"),
+    ]);
+  } catch (error) {
+    controller.abort(error);
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", abort);
   }
 }
 
@@ -242,6 +290,9 @@ export async function pumpMediaSource({
   videoOutputs = [],
   resourceMaxBytes = MEDIA_SOURCE_RESOURCE_MAX_BYTES,
   bufferMaxBytes = MEDIA_SOURCE_BUFFER_MAX_BYTES,
+  // Opt-in experiment only. Production stays serial until constrained-link
+  // measurements establish unchanged sustained playback as well as startup gains.
+  startupOverlap = false,
 }) {
   if (mediaSource.readyState !== "open") {
     await waitForMediaEvent(mediaSource, "sourceopen", signal, "sourceclose");
@@ -254,6 +305,7 @@ export async function pumpMediaSource({
   const appended = new Set();
   let segments = [];
   let initializationBytes = 0;
+  let startupResources = null;
   let duration = 0;
   let timelinePriming = 0;
   let ended = false;
@@ -347,6 +399,10 @@ export async function pumpMediaSource({
         sourceBuffer.mode = "segments";
       }
       if (fallbackVideoOutput) copiedVideo = false;
+      const budget = startupOverlap && mediaSourceStartupBudget(
+        playlist, resourceMaxBytes, bufferMaxBytes, globalThis.navigator?.connection,
+      );
+      if (budget) startupResources = await fetchStartupResources(playlist, budget, signal, reportStartup);
       initializationBytes = await appendResource(
         sourceBuffer,
         playlist.initUrl,
@@ -354,10 +410,12 @@ export async function pumpMediaSource({
         signal,
         {
           resourceMaxBytes, prune,
-          onFetched: () => reportStartup("mse_init_fetched"),
+          bytes: startupResources?.[0],
+          onFetched: startupResources ? undefined : () => reportStartup("mse_init_fetched"),
           onAppended: () => reportStartup("mse_init_appended"),
         },
       );
+      if (startupResources) startupResources[0] = null;
       initAppended = true;
     }
 
@@ -400,10 +458,12 @@ export async function pumpMediaSource({
         signal,
         {
           resourceMaxBytes, prune,
-          onFetched: firstFragment ? () => reportStartup("mse_first_fragment_fetched") : undefined,
+          bytes: firstFragment ? startupResources?.[1] : undefined,
+          onFetched: firstFragment && !startupResources ? () => reportStartup("mse_first_fragment_fetched") : undefined,
           onAppended: firstFragment ? () => reportStartup("mse_first_fragment_appended") : undefined,
         },
       );
+      startupResources = null;
       if (firstFragment && sourceBuffer.buffered.length > 0) {
         // MP4 decode timestamps begin at zero, but AAC priming/B-frame
         // composition can shift the first presentation timestamp slightly.
@@ -440,7 +500,10 @@ export async function pumpMediaSource({
 }
 
 async function appendMediaSourceResource(sourceBuffer, url, player, signal, observers = {}) {
-  const bytes = await fetchResource(url, signal, { resourceMaxBytes: observers.resourceMaxBytes });
+  const bytes = observers.bytes || await fetchResource(url, signal, {
+    resourceMaxBytes: observers.resourceMaxBytes,
+    expectedBytes: Number(new URL(url).searchParams.get("hls_length")),
+  });
   observers.onFetched?.();
   const deadline = performance.now() + MEDIA_SOURCE_EVENT_TIMEOUT_MS;
   while (true) {

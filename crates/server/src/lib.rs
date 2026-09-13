@@ -320,6 +320,7 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.transcode_cache.monitor.stop();
         remux::shutdown_ephemeral_cleanups(self);
     }
 }

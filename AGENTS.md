@@ -59,6 +59,8 @@ compatibility decisions as rustyDLNA's own contract.
 - `crates/server/web/core.js`: Pure capability, time, queue, and navigation
   helpers. Keep it browser-independent and cover it with `core.test.js`.
 - `crates/server/web/library.js`: Library loading, paging, search, and history.
+- `crates/server/web/artwork.js`: Abortable, bounded artwork response bodies;
+  viewport admission and request ownership remain in `library.js`.
 - `crates/server/web/player.js`: Playback session, source negotiation, controls,
   seeking, recovery, audio tracks, and Media Session integration.
 - `crates/server/web/source-selection.js`: Browser capability probes, their

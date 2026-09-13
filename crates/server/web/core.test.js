@@ -706,21 +706,21 @@ test("HLS media playlists expose only confined fixed fragmented-MP4 resources", 
     "#EXT-X-ENDLIST",
     "",
   ].join("\n");
-  assert.deepEqual(parseHlsMediaPlaylist(playlist, "https://movies.example/web/media/42.m3u8"), {
+  assert.deepEqual(parseHlsMediaPlaylist(playlist, "https://movies.example/web/media/42.m3u8?request=7"), {
     initUrl: "https://movies.example/web/media/42.mp4?request=7&delivery=hls_init&hls_offset=0&hls_length=1024",
     segmentUrls: ["https://movies.example/web/media/42.m4s?request=7&delivery=hls_segment&hls_offset=1024&hls_length=4096"],
     segments: [{ url: "https://movies.example/web/media/42.m4s?request=7&delivery=hls_segment&hls_offset=1024&hls_length=4096", duration: 2 }],
     ended: true,
   });
-  assert.equal(parseHlsMediaPlaylist(playlist.replace("/web/media/42.m4s", "https://evil.example/video.m4s"), "https://movies.example/playlist.m3u8"), null);
-  assert.equal(parseHlsMediaPlaylist(playlist.replace("hls_length=4096", "hls_length=0"), "https://movies.example/playlist.m3u8"), null);
-  assert.equal(parseHlsMediaPlaylist(playlist.replace("#EXTINF:2.000000,\n", ""), "https://movies.example/playlist.m3u8"), null);
+  assert.equal(parseHlsMediaPlaylist(playlist.replace("/web/media/42.m4s", "https://evil.example/video.m4s"), "https://movies.example/web/media/42.m3u8?request=7"), null);
+  assert.equal(parseHlsMediaPlaylist(playlist.replace("hls_length=4096", "hls_length=0"), "https://movies.example/web/media/42.m3u8?request=7"), null);
+  assert.equal(parseHlsMediaPlaylist(playlist.replace("#EXTINF:2.000000,\n", ""), "https://movies.example/web/media/42.m3u8?request=7"), null);
 
   const msePlaylist = playlist
     .replace("delivery=hls_init", "delivery=mse_init")
     .replace("delivery=hls_segment", "delivery=mse_segment");
   assert.deepEqual(
-    parseHlsMediaPlaylist(msePlaylist, "https://movies.example/web/media/42.m3u8?delivery=mse"),
+    parseHlsMediaPlaylist(msePlaylist, "https://movies.example/web/media/42.m3u8?request=7&delivery=mse"),
     {
       initUrl: "https://movies.example/web/media/42.mp4?request=7&delivery=mse_init&hls_offset=0&hls_length=1024",
       segmentUrls: ["https://movies.example/web/media/42.m4s?request=7&delivery=mse_segment&hls_offset=1024&hls_length=4096"],
@@ -729,7 +729,7 @@ test("HLS media playlists expose only confined fixed fragmented-MP4 resources", 
     },
   );
   assert.equal(
-    parseHlsMediaPlaylist(msePlaylist, "https://movies.example/web/media/42.m3u8?delivery=hls"),
+    parseHlsMediaPlaylist(msePlaylist, "https://movies.example/web/media/42.m3u8?request=7&delivery=hls"),
     null,
   );
 
@@ -743,7 +743,7 @@ test("HLS media playlists expose only confined fixed fragmented-MP4 resources", 
   assert.deepEqual(
     parseHlsMediaPlaylist(
       exhaustedMsePlaylist,
-      "https://movies.example/web/media/42.m3u8?delivery=mse&mse_after=3",
+      "https://movies.example/web/media/42.m3u8?request=7&delivery=mse&mse_after=3",
     ),
     {
       initUrl: "https://movies.example/web/media/42.mp4?request=7&delivery=mse_init&hls_offset=0&hls_length=1024",
@@ -753,7 +753,7 @@ test("HLS media playlists expose only confined fixed fragmented-MP4 resources", 
     },
   );
   assert.equal(
-    parseHlsMediaPlaylist(exhaustedMsePlaylist, "https://movies.example/web/media/42.m3u8?delivery=hls"),
+    parseHlsMediaPlaylist(exhaustedMsePlaylist, "https://movies.example/web/media/42.m3u8?request=7&delivery=hls"),
     null,
   );
 });

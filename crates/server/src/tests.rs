@@ -14,6 +14,9 @@ mod query_budget;
 #[path = "original_delivery_tests.rs"]
 mod original_delivery;
 
+#[path = "derived_image_cache_tests.rs"]
+mod derived_image_cache_tests;
+
 const TINY_JPEG: &[u8] = &[
     0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
     0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08,
@@ -5865,6 +5868,7 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         "/web/playback-source.js",
         "/web/source-selection.js",
         "/web/library.js",
+        "/web/artwork.js",
         "/web/player.js",
         "/web/preferences.js",
         "/web/store.js",

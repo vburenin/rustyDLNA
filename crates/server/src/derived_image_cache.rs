@@ -1,15 +1,53 @@
 //! Bounded, concurrency-safe ownership for on-demand JPEG cache files.
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
 use crate::{available_filesystem_bytes, lock_recover};
 
 const DERIVED_IMAGE_STRIPES: usize = 64;
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_INVENTORY_ENTRIES: usize = 65_536;
+
+#[derive(Clone, Copy)]
+struct ImageEntry {
+    bytes: u64,
+    used: SystemTime,
+}
+
+#[derive(Default)]
+struct Inventory {
+    directory: PathBuf,
+    swept: Option<Instant>,
+    entries: HashMap<PathBuf, ImageEntry>,
+    recency: BTreeSet<(SystemTime, PathBuf)>,
+    temporary: HashSet<PathBuf>,
+    bytes: u64,
+}
+
+impl Inventory {
+    fn replace(&mut self, path: PathBuf, entry: Option<ImageEntry>) -> std::io::Result<()> {
+        if let Some(old) = self.entries.remove(&path) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+            self.recency.remove(&(old.used, path.clone()));
+        }
+        if let Some(entry) = entry {
+            if self.entries.len() + self.temporary.len() >= MAX_INVENTORY_ENTRIES {
+                return Err(std::io::Error::other(
+                    "derived-image inventory capacity exceeded",
+                ));
+            }
+            self.bytes = self.bytes.saturating_add(entry.bytes);
+            self.recency.insert((entry.used, path.clone()));
+            self.entries.insert(path, entry);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DerivedCacheMaintenance {
@@ -21,6 +59,29 @@ pub(crate) struct DerivedCacheMaintenance {
 pub(crate) struct DerivedImageCache {
     stripes: Vec<Mutex<()>>,
     active: Mutex<HashMap<String, usize>>,
+    inventory: Mutex<Inventory>,
+    #[cfg(test)]
+    pub(crate) work: ImageCacheWork,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ImageCacheWork {
+    pub(crate) scans: std::sync::atomic::AtomicU64,
+    pub(crate) stats: std::sync::atomic::AtomicU64,
+    pub(crate) lock_wait_nanos: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl ImageCacheWork {
+    pub(crate) fn snapshot(&self) -> [u64; 3] {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            self.scans.load(Relaxed),
+            self.stats.load(Relaxed),
+            self.lock_wait_nanos.load(Relaxed),
+        ]
+    }
 }
 
 impl DerivedImageCache {
@@ -28,6 +89,9 @@ impl DerivedImageCache {
         Self {
             stripes: (0..DERIVED_IMAGE_STRIPES).map(|_| Mutex::new(())).collect(),
             active: Mutex::new(HashMap::new()),
+            inventory: Mutex::new(Inventory::default()),
+            #[cfg(test)]
+            work: ImageCacheWork::default(),
         }
     }
 
@@ -59,37 +123,75 @@ impl DerivedImageCache {
         max_age_days: u32,
         minimum_free_bytes: u64,
     ) -> std::io::Result<DerivedCacheMaintenance> {
+        #[cfg(test)]
+        let waited = std::time::Instant::now();
         let _maintenance = lock_recover(maintenance);
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.work.lock_wait_nanos.fetch_add(
+                waited.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                Relaxed,
+            );
+        }
         let protected = lock_recover(&self.active)
             .keys()
             .cloned()
             .collect::<HashSet<_>>();
+        let mut inventory = lock_recover(&self.inventory);
+        #[cfg(test)]
+        if inventory.directory != directory
+            || inventory
+                .swept
+                .is_none_or(|at| at.elapsed() >= RECONCILE_INTERVAL)
+        {
+            self.work
+                .scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         maintain_derived_image_cache_with(
+            &mut inventory,
             directory,
             quota_bytes,
             max_age_days,
             minimum_free_bytes,
             &protected,
-            available_filesystem_bytes,
-            |entry| entry.metadata(),
+            (available_filesystem_bytes, |path: &Path| {
+                #[cfg(test)]
+                self.work
+                    .stats
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::fs::symlink_metadata(path)
+            }),
         )
     }
 
     pub(crate) fn maintain_startup(
+        &self,
         directory: &Path,
         quota_bytes: u64,
         max_age_days: u32,
         minimum_free_bytes: u64,
     ) -> std::io::Result<DerivedCacheMaintenance> {
         maintain_derived_image_cache_with(
+            &mut lock_recover(&self.inventory),
             directory,
             quota_bytes,
             max_age_days,
             minimum_free_bytes,
             &HashSet::new(),
-            available_filesystem_bytes,
-            |entry| entry.metadata(),
+            (available_filesystem_bytes, |path: &Path| {
+                std::fs::symlink_metadata(path)
+            }),
         )
+    }
+
+    /// Keep deletion and accounting ordered with video/image maintenance,
+    /// including rejection after a post-publication filesystem error.
+    pub(crate) fn reject(&self, maintenance: &Mutex<()>, path: &Path) -> std::io::Result<()> {
+        let _maintenance = lock_recover(maintenance);
+        remove_image(path)?;
+        lock_recover(&self.inventory).replace(path.to_owned(), None)
     }
 }
 
@@ -165,86 +267,228 @@ fn is_atomic_temporary(name: &str) -> bool {
     name.starts_with('.') && name.contains(".jpg.") && name.ends_with(".tmp.jpg")
 }
 
+fn path_is_protected(path: &Path, protected: &HashSet<String>) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| artifact_is_protected(name, protected))
+}
+
+fn remove_image(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+// Bound index memory by reclaiming the oldest unprotected files at capacity.
+// This happens before insertion, including discovery, so a large stale cache
+// can be repaired at startup instead of preventing the daemon from starting.
+fn make_inventory_room<M>(
+    inventory: &mut Inventory,
+    protected: &HashSet<String>,
+    metadata: &mut M,
+) -> std::io::Result<()>
+where
+    M: FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+{
+    if inventory.entries.len() + inventory.temporary.len() < MAX_INVENTORY_ENTRIES {
+        return Ok(());
+    }
+    let mut deferred = Vec::new();
+    let result = (|| {
+        for _ in 0..inventory.entries.len().saturating_mul(2) {
+            let Some((used, path)) = inventory.recency.pop_first() else {
+                break;
+            };
+            // Restore the popped record on every failed metadata/unlink path.
+            deferred.push((used, path.clone()));
+            if path_is_protected(&path, protected) {
+                continue;
+            }
+            let current = match metadata(&path) {
+                Ok(value) if value.is_file() => Some(ImageEntry {
+                    bytes: value.len(),
+                    used: value.modified()?,
+                }),
+                Ok(_) => None,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            if let Some(current) = current {
+                if current.used > used {
+                    inventory.replace(path, Some(current))?;
+                    deferred.pop();
+                    continue;
+                }
+                if remove_image(&path).is_err() {
+                    continue;
+                }
+            }
+            inventory.replace(path, None)?;
+            deferred.pop();
+            return Ok(());
+        }
+        Err(std::io::Error::other(
+            "derived-image inventory has no reclaimable capacity",
+        ))
+    })();
+    inventory.recency.extend(deferred);
+    result
+}
+
 fn maintain_derived_image_cache_with<F, M>(
+    inventory: &mut Inventory,
     directory: &Path,
     quota_bytes: u64,
     max_age_days: u32,
     minimum_free_bytes: u64,
     protected: &HashSet<String>,
-    mut available_bytes: F,
-    mut entry_metadata: M,
+    io: (F, M),
 ) -> std::io::Result<DerivedCacheMaintenance>
 where
     F: FnMut(&Path) -> std::io::Result<u64>,
-    M: FnMut(&std::fs::DirEntry) -> std::io::Result<std::fs::Metadata>,
+    M: FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
 {
-    std::fs::create_dir_all(directory)?;
+    let (mut available_bytes, mut entry_metadata) = io;
+    let read_entry = |path: &Path, metadata: &mut M| -> std::io::Result<Option<ImageEntry>> {
+        match metadata(path) {
+            Ok(value) if value.is_file() => Ok(Some(ImageEntry {
+                bytes: value.len(),
+                used: value.modified()?,
+            })),
+            Ok(_) => Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    };
+    let is_protected = |path: &Path| path_is_protected(path, protected);
+    let remove = remove_image;
+    if inventory.directory != directory
+        || inventory
+            .swept
+            .is_none_or(|at| at.elapsed() >= RECONCILE_INTERVAL)
+    {
+        std::fs::create_dir_all(directory)?;
+        // Publish only a complete reconciliation. A metadata error cannot turn
+        // partial discovery into an optimistic undercount on the next request.
+        let mut discovered = Inventory {
+            directory: directory.to_owned(),
+            ..Inventory::default()
+        };
+        for entry in std::fs::read_dir(directory)? {
+            let path = entry?.path();
+            let Some(value) = read_entry(&path, &mut entry_metadata)? else {
+                continue;
+            };
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_atomic_temporary)
+            {
+                if is_protected(&path) {
+                    make_inventory_room(&mut discovered, protected, &mut entry_metadata)?;
+                    discovered.temporary.insert(path);
+                } else {
+                    remove(&path)?;
+                }
+            } else if path.extension().and_then(|value| value.to_str()) == Some("jpg") {
+                if discovered.entries.len() + discovered.temporary.len() >= MAX_INVENTORY_ENTRIES
+                    && !is_protected(&path)
+                    && discovered
+                        .recency
+                        .iter()
+                        .find(|(_, path)| !is_protected(path))
+                        .is_none_or(|(used, _)| value.used < *used)
+                {
+                    remove(&path)?;
+                    continue;
+                }
+                make_inventory_room(&mut discovered, protected, &mut entry_metadata)?;
+                discovered.replace(path, Some(value))?;
+            }
+        }
+        discovered.swept = Some(Instant::now());
+        *inventory = discovered;
+    }
+    // Only active final files can be published/removed by server writers
+    // between reconciliations. There are at most 64 stripe owners. Temporary
+    // files remain unexposed and protected until helper cleanup/guard release.
+    for key in protected {
+        let path = directory.join(format!("{key}.jpg"));
+        let entry = read_entry(&path, &mut entry_metadata)?;
+        if entry.is_some() && !inventory.entries.contains_key(&path) {
+            make_inventory_room(inventory, protected, &mut entry_metadata)?;
+        }
+        inventory.replace(path, entry)?;
+    }
+    let abandoned = inventory
+        .temporary
+        .iter()
+        .filter(|path| !is_protected(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in abandoned {
+        remove(&path)?;
+        inventory.temporary.remove(&path);
+    }
     let now = SystemTime::now();
     let max_age = Duration::from_secs(u64::from(max_age_days).saturating_mul(86_400));
-    let mut entries = Vec::new();
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = match entry_metadata(&entry) {
-            Ok(metadata) if metadata.is_file() => metadata,
-            Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        let name = path.file_name().and_then(|value| value.to_str());
-        let protected = name.is_some_and(|name| artifact_is_protected(name, protected));
-        if name.is_some_and(is_atomic_temporary) {
-            if !protected {
-                std::fs::remove_file(path)?;
-            }
-            continue;
-        }
-        if path.extension().and_then(|value| value.to_str()) != Some("jpg") {
-            continue;
-        }
-        let used = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        if !protected && now.duration_since(used).unwrap_or_default() > max_age {
-            std::fs::remove_file(path)?;
-            continue;
-        }
-        total = total.saturating_add(metadata.len());
-        if !protected {
-            entries.push((used, metadata.len(), path));
-        }
-    }
-    entries.sort_by_key(|entry| entry.0);
-    let mut quota_reclaim = total.saturating_sub(quota_bytes);
     let mut free_shortfall = if minimum_free_bytes == 0 {
         0
     } else {
         minimum_free_bytes.saturating_sub(available_bytes(directory)?)
     };
-    for (_, bytes, path) in entries {
-        if quota_reclaim == 0 && free_shortfall == 0 {
-            break;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                quota_reclaim = quota_reclaim.saturating_sub(bytes);
-                total = total.saturating_sub(bytes);
+    // On ordinary misses this checks the oldest timestamp in O(1) and never
+    // walks the inventory. Pressure/age reclamation alone enumerates candidates.
+    for pass in 0..2 {
+        let pressure = inventory.bytes > quota_bytes || free_shortfall > 0;
+        let candidates = inventory
+            .recency
+            .iter()
+            .take_while(|(used, _)| {
+                pressure || now.duration_since(*used).unwrap_or_default() > max_age
+            })
+            .filter(|(_, path)| !is_protected(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for (used, path) in candidates {
+            if inventory.bytes <= quota_bytes
+                && free_shortfall == 0
+                && now.duration_since(used).unwrap_or_default() <= max_age
+            {
+                break;
+            }
+            let current = read_entry(&path, &mut entry_metadata)?;
+            inventory.replace(path.clone(), current)?;
+            let Some(current) = current else {
+                if free_shortfall > 0 {
+                    free_shortfall = minimum_free_bytes.saturating_sub(available_bytes(directory)?);
+                }
+                continue;
+            };
+            // Warm readers touch the file while holding their stripe. Refresh
+            // recency before unlink; defer newly used files behind older ones.
+            if pass == 0 && current.used > used {
+                continue;
+            }
+            if inventory.bytes <= quota_bytes
+                && free_shortfall == 0
+                && now.duration_since(current.used).unwrap_or_default() <= max_age
+            {
+                continue;
+            }
+            if remove(&path).is_ok() {
+                inventory.replace(path, None)?;
                 if free_shortfall > 0 {
                     free_shortfall = minimum_free_bytes.saturating_sub(available_bytes(directory)?);
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                quota_reclaim = quota_reclaim.saturating_sub(bytes);
-                total = total.saturating_sub(bytes);
-                if free_shortfall > 0 {
-                    free_shortfall = minimum_free_bytes.saturating_sub(available_bytes(directory)?);
-                }
-            }
-            Err(_) => {}
         }
     }
-    let quota_satisfied = quota_reclaim == 0;
+    let quota_satisfied = inventory.bytes <= quota_bytes;
     Ok(DerivedCacheMaintenance {
-        bytes: total,
+        bytes: inventory.bytes,
         quota_satisfied,
         limits_satisfied: quota_satisfied && free_shortfall == 0,
     })
@@ -258,13 +502,15 @@ pub(crate) fn prune_derived_image_cache(
     minimum_free_bytes: u64,
 ) -> std::io::Result<()> {
     let report = maintain_derived_image_cache_with(
+        &mut Inventory::default(),
         directory,
         quota_bytes,
         max_age_days,
         minimum_free_bytes,
         &HashSet::new(),
-        available_filesystem_bytes,
-        |entry| entry.metadata(),
+        (available_filesystem_bytes, |path: &Path| {
+            std::fs::symlink_metadata(path)
+        }),
     )?;
     if report.limits_satisfied {
         Ok(())
@@ -292,6 +538,190 @@ mod tests {
         path
     }
 
+    fn disk_bytes(directory: &Path) -> u64 {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum()
+    }
+
+    #[test]
+    fn bounded_inventory_reclaims_capacity_at_startup_and_publication() {
+        let directory = test_directory("capacity");
+        for index in 0..=MAX_INVENTORY_ENTRIES {
+            std::fs::write(directory.join(format!("{index:064x}.jpg")), [1]).unwrap();
+        }
+        let cache = DerivedImageCache::new();
+        let maintenance = Mutex::new(());
+        let report = cache.maintain_startup(&directory, u64::MAX, 30, 0).unwrap();
+        assert!(report.limits_satisfied);
+        assert_eq!(report.bytes, MAX_INVENTORY_ENTRIES as u64);
+        assert_eq!(disk_bytes(&directory), MAX_INVENTORY_ENTRIES as u64);
+        let key = "f".repeat(64);
+        let _active = cache.activate(&key, &maintenance);
+        let path = directory.join(format!("{key}.jpg"));
+        std::fs::write(&path, [2]).unwrap();
+        let report = cache
+            .maintain(&maintenance, &directory, u64::MAX, 30, 0)
+            .unwrap();
+        assert!(report.limits_satisfied);
+        assert_eq!(std::fs::read(&path).unwrap(), [2]);
+        assert_eq!(disk_bytes(&directory), MAX_INVENTORY_ENTRIES as u64);
+        let inventory = lock_recover(&cache.inventory);
+        assert_eq!(inventory.entries.len(), MAX_INVENTORY_ENTRIES);
+        assert_eq!(inventory.recency.len(), MAX_INVENTORY_ENTRIES);
+        drop(inventory);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rejection_after_free_space_error_forgets_only_the_unlinked_output() {
+        let directory = test_directory("rejected-accounting");
+        let cache = DerivedImageCache::new();
+        let maintenance = Mutex::new(());
+        let old = directory.join("old.jpg");
+        std::fs::write(&old, [0; 100]).unwrap();
+        cache
+            .maintain(&maintenance, &directory, 100, 30, 0)
+            .unwrap();
+        let key = "f".repeat(64);
+        let active = cache.activate(&key, &maintenance);
+        let path = directory.join(format!("{key}.jpg"));
+        std::fs::write(&path, [0; 50]).unwrap();
+        let error = maintain_derived_image_cache_with(
+            &mut lock_recover(&cache.inventory),
+            &directory,
+            100,
+            30,
+            1,
+            &HashSet::from([key]),
+            (
+                |_: &Path| Err(std::io::Error::other("statvfs failed")),
+                |path: &Path| std::fs::symlink_metadata(path),
+            ),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("statvfs failed"));
+        cache.reject(&maintenance, &path).unwrap();
+        drop(active);
+        let report = cache
+            .maintain(&maintenance, &directory, 100, 30, 0)
+            .unwrap();
+        assert!(report.limits_satisfied);
+        assert_eq!(report.bytes, disk_bytes(&directory));
+        assert_eq!(report.bytes, 100);
+        assert!(
+            old.exists(),
+            "phantom output bytes must not evict valid older files"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn publication_accounting_and_eviction_match_files_without_repeated_scans() {
+        let directory = test_directory("incremental");
+        let cache = DerivedImageCache::new();
+        let maintenance = Mutex::new(());
+        for index in 0..100 {
+            std::fs::write(directory.join(format!("{index:064x}.jpg")), [0; 100]).unwrap();
+        }
+        cache
+            .maintain(&maintenance, &directory, 20_000, 30, 0)
+            .unwrap();
+        let before = cache.work.snapshot();
+        let key = "a".repeat(64);
+        let active = cache.activate(&key, &maintenance);
+        cache
+            .maintain(&maintenance, &directory, 20_000, 30, 0)
+            .unwrap();
+        let output = directory.join(format!("{key}.jpg"));
+        std::fs::write(&output, [0; 200]).unwrap();
+        let report = cache
+            .maintain(&maintenance, &directory, 10_000, 30, 0)
+            .unwrap();
+        assert!(report.limits_satisfied);
+        assert_eq!(report.bytes, 10_000);
+        assert_eq!(disk_bytes(&directory), 10_000);
+        assert!(output.is_file(), "the new active output is protected");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 99);
+        assert_eq!(
+            cache.work.snapshot()[0],
+            before[0],
+            "cold misses must not rescan the directory"
+        );
+        assert!(
+            cache.work.snapshot()[1] - before[1] <= 6,
+            "only active files and eviction candidates need metadata"
+        );
+        // Rejected oversized final files stay accounted while protected.
+        std::fs::write(&output, [0; 20_000]).unwrap();
+        let report = cache
+            .maintain(&maintenance, &directory, 10_000, 30, 0)
+            .unwrap();
+        assert!(!report.limits_satisfied);
+        assert_eq!(report.bytes, disk_bytes(&directory));
+        assert_eq!(report.bytes, 20_000);
+        std::fs::remove_file(&output).unwrap();
+        assert_eq!(
+            cache
+                .maintain(&maintenance, &directory, 10_000, 30, 0)
+                .unwrap()
+                .bytes,
+            0
+        );
+        drop(active);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn external_changes_reconcile_and_recently_read_files_are_not_old_victims() {
+        let directory = test_directory("external");
+        let cache = DerivedImageCache::new();
+        let maintenance = Mutex::new(());
+        let old = directory.join("old.jpg");
+        let next = directory.join("next.jpg");
+        for (path, seconds) in [(&old, 100), (&next, 200)] {
+            std::fs::write(path, [0; 100]).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+                .unwrap();
+        }
+        cache
+            .maintain(&maintenance, &directory, 200, 36_500, 0)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(SystemTime::now())
+            .unwrap();
+        let report = cache
+            .maintain(&maintenance, &directory, 100, 36_500, 0)
+            .unwrap();
+        assert_eq!(report.bytes, 100);
+        assert!(old.is_file());
+        assert!(
+            !next.exists(),
+            "a recently read candidate must move behind an older file"
+        );
+        std::fs::remove_file(&old).unwrap();
+        std::fs::write(&next, [0; 50]).unwrap();
+        let leftover = directory.join(".abandoned.jpg.1.tmp.jpg");
+        std::fs::write(&leftover, [0; 20]).unwrap();
+        lock_recover(&cache.inventory).swept = Some(Instant::now() - RECONCILE_INTERVAL);
+        let report = cache
+            .maintain(&maintenance, &directory, 100, 30, 0)
+            .unwrap();
+        assert_eq!(report.bytes, disk_bytes(&directory));
+        assert_eq!(report.bytes, 50);
+        assert!(!leftover.exists());
+        assert_eq!(cache.work.snapshot()[0], 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn active_final_and_atomic_temporary_are_protected_until_guard_drop() {
         let directory = test_directory("active");
@@ -307,9 +737,15 @@ mod tests {
         let report = cache
             .maintain(&maintenance, &directory, 0, 36_500, 0)
             .unwrap();
+        assert!(
+            final_path.exists(),
+            "active final output must survive quota pressure"
+        );
+        assert!(
+            temporary.exists(),
+            "active temporary output must survive quota pressure"
+        );
         assert!(!report.limits_satisfied);
-        assert!(final_path.exists());
-        assert!(temporary.exists());
 
         drop(active);
         let report = cache
@@ -331,17 +767,20 @@ mod tests {
         let mut readings = VecDeque::from([0u64, 0, 100]);
 
         let report = maintain_derived_image_cache_with(
+            &mut Inventory::default(),
             &directory,
             u64::MAX,
             36_500,
             100,
             &HashSet::new(),
-            |_| {
-                readings
-                    .pop_front()
-                    .ok_or_else(|| std::io::Error::other("unexpected free-space read"))
-            },
-            |entry| entry.metadata(),
+            (
+                |_: &Path| {
+                    readings
+                        .pop_front()
+                        .ok_or_else(|| std::io::Error::other("unexpected free-space read"))
+                },
+                |path: &Path| std::fs::symlink_metadata(path),
+            ),
         )
         .unwrap();
 
@@ -358,13 +797,16 @@ mod tests {
         let image = directory.join(format!("{}.jpg", "c".repeat(64)));
         std::fs::write(&image, vec![0u8; 100]).unwrap();
         let error = maintain_derived_image_cache_with(
+            &mut Inventory::default(),
             &directory,
             u64::MAX,
             36_500,
             100,
             &HashSet::new(),
-            |_| Err(std::io::Error::other("statvfs failed")),
-            |entry| entry.metadata(),
+            (
+                |_: &Path| Err(std::io::Error::other("statvfs failed")),
+                |path: &Path| std::fs::symlink_metadata(path),
+            ),
         )
         .unwrap_err();
         assert!(error.to_string().contains("statvfs failed"));
@@ -378,13 +820,16 @@ mod tests {
         let image = directory.join(format!("{}.jpg", "d".repeat(64)));
         std::fs::write(&image, vec![0u8; 100]).unwrap();
         let error = maintain_derived_image_cache_with(
+            &mut Inventory::default(),
             &directory,
             u64::MAX,
             36_500,
             0,
             &HashSet::new(),
-            |_| Ok(u64::MAX),
-            |_| Err(std::io::Error::other("metadata failed")),
+            (
+                |_: &Path| Ok(u64::MAX),
+                |_: &Path| Err(std::io::Error::other("metadata failed")),
+            ),
         )
         .unwrap_err();
         assert!(error.to_string().contains("metadata failed"));
@@ -401,13 +846,16 @@ mod tests {
         let image = directory.join(std::ffi::OsString::from_vec(b"cache-\xff.jpg".to_vec()));
         std::fs::write(&image, vec![0u8; 100]).unwrap();
         let report = maintain_derived_image_cache_with(
+            &mut Inventory::default(),
             &directory,
             0,
             36_500,
             0,
             &HashSet::new(),
-            |_| Ok(u64::MAX),
-            |entry| entry.metadata(),
+            (
+                |_: &Path| Ok(u64::MAX),
+                |path: &Path| std::fs::symlink_metadata(path),
+            ),
         )
         .unwrap();
         assert!(report.limits_satisfied);

@@ -71,7 +71,7 @@ for (const phase of ["sourceopen", "playlist headers", "init headers", "fragment
           }, cancel() { state.cancelled += 1; } }));
         }
         return new Response(resource === "playlist"
-          ? '#EXTM3U\n#EXT-X-MAP:URI="/web/media/1.mp4?delivery=mse_init&hls_offset=0&hls_length=1"\n#EXTINF:1,\n/web/media/1.m4s?delivery=mse_segment&hls_offset=1&hls_length=1\n#EXT-X-ENDLIST\n'
+          ? `#EXTM3U\n#EXT-X-MAP:URI="/web/media/1.mp4?delivery=mse_init&hls_offset=0&hls_length=1"\n#EXTINF:1,\n/web/media/1.m4s?delivery=mse_segment&hls_offset=1&hls_length=${phase === "absolute body" ? 64 : 1}\n#EXT-X-ENDLIST\n`
           : new Uint8Array([1]));
       };
       if (phase === "sourceopen") state.reached = true;

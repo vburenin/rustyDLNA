@@ -38,7 +38,7 @@ export function summarizeRecords(records) {
 export function compareReports(before, after, thresholds = {}) {
   thresholds = { median_percent: 25, median_ms: 50, p95_percent: 30, p95_ms: 100, ...thresholds };
   if (!Object.values(thresholds).every((value) => Number.isFinite(value) && value >= 0)) throw new Error("Invalid comparison thresholds");
-  const comparedKeys = ["concurrency", "duration", "fps", "rate", "size", "recipes", "encoder", "build_profile", "tier", "external_fixture", "sustain_seconds", "quality", "encoding_preset", "delivery"];
+  const comparedKeys = ["concurrency", "duration", "fps", "rate", "size", "recipes", "encoder", "build_profile", "tier", "external_fixture", "sustain_seconds", "quality", "encoding_preset", "delivery", "network"];
   const mismatches = comparedKeys.filter((key) => JSON.stringify(before.configuration?.[key]) !== JSON.stringify(after.configuration?.[key]));
   for (const key of ["cpu", "logical_cpus", "cpu_max", "memory_max", "cgroup_ancestor_limits", "process_affinity_cpus", "browser", "ffmpeg", "filesystem", "cache_conditions"]) {
     if (JSON.stringify(before.environment?.[key]) !== JSON.stringify(after.environment?.[key])) mismatches.push(`environment.${key}`);

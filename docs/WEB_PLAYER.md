@@ -114,8 +114,14 @@ descriptive and technical fields stay off the card. Missing artwork has an
 intentional fallback and never creates an empty image request.
 Folder cards use the same 2:3 portrait artwork dimensions as movie posters,
 with a centered folder icon and item count.
-Artwork uses four concurrent loading slots; leaving a view releases its pending
-images so a slow response cannot block artwork in the new view.
+Artwork uses four concurrent loading slots. Each request has a 60-second
+ownership deadline and is cancelled after five continuous seconds outside the
+nearby viewport. Returning within that grace period preserves a healthy slow
+load. Leaving a view cancels its requests; expired or failed images show the
+fallback until the view is reloaded. There is no automatic retry loop.
+Responses stream into a bounded 16 MiB image blob, whose temporary URL is released
+after decoding or cancellation. Slots remain occupied until their transport
+settles, and late callbacks cannot release a newer image's slot or move focus.
 
 The browser loads all metadata for the current folder or search before displaying
 its cards. It assembles one catalog generation using batches of up to 200 entries
@@ -408,6 +414,14 @@ stream negotiation. Exact HEVC Main 10/HDR10 SourceBuffer support keeps an HDR
 output; otherwise the output is H.264 SDR. Auto uses the server-designated
 mobile fallback profile, while an explicit quality is preserved.
 The fragment path bounds both buffered duration and estimated compressed bytes.
+Production startup fetches and appends initialization before requesting media.
+Media requests remain sequential. Source cancellation prevents old fetched bytes
+from appending to a replacement source.
+Playlist resources must retain the selected title, source generation and recipe,
+with no additional recipe parameters. Each finite response must match its exact
+advertised length; unexpected partial-response status, `Content-Range`, or
+conflicting `Content-Length` causes source recovery.
+
 A nearby MSE seek reuses the source only when its selected tracks, quality,
 capabilities, and active generation still match and the required decoder data is
 buffered. The server's per-fragment `#EXT-X-RUSTY-TIMING` metadata identifies the
@@ -1298,6 +1312,38 @@ Media-clock progression and dropped-frame observations remain separate checks;
 a selected 2× rate alone does not establish sustained 2× playback. Cumulative
 process-sampling time is observer overhead, separate from measured window duration
 and browser latency.
+
+`--network-latency-ms=0..2000` and `--network-kbps=0..1000000` apply Chromium
+network emulation to each viewer's real requests; zero throughput means
+unlimited. This models one client's aggregate link, without packet loss or a
+shared bottleneck across viewers. Comparisons require matching network settings.
+The recorded connection hint is sampled at page initialization; network emulation
+may leave it unchanged. Actual fetch counts establish whether startup overlaps.
+Reports include actual request timestamps, response bytes, aborted transfers,
+append order, and peak concurrent finite-resource fetches. Response-buffer
+identity follows bytes through assembly to append, including across seeks.
+Sustained windows sample forward buffer and media readiness every 250 ms,
+record waiting events, and retain media-clock and presented/dropped-frame counts.
+Samples below one second of forward buffer identify low-buffer exposure; they
+do not by themselves imply playback stalled.
+The advertised-byte accounting retains reservations through append completion
+or discard and charges appended bytes until their source closes. It deliberately
+keeps removed ranges charged, while excluding transient incoming/assembly copies
+and decoder allocations; it is a logical payload measure, not a heap bound.
+Use the separate sampled browser/server RSS alongside these counts. A producer
+that finishes before cancellation is observed remains an unavailable cancellation
+trial; its transfer records do not establish active-helper cancellation latency.
+
+The transport retains an internal, opt-in `startupOverlap` experiment, disabled
+by default. It fetches only initialization (at most 64 KiB) and the first media
+range together, sharing a 32 MiB advertised-byte limit and the playback buffer
+budget. Both must finish before ordered appends; failure aborts the sibling.
+Slow/save-data connection hints retain serial scheduling even when opted in.
+`web-tests/mse-startup.spec.js` explicitly enables the option through an isolated
+module wrapper, while separately checking the production serial default.
+Startup gains alone do not justify enabling this experiment: constrained-link
+stalls, retained bytes, cancellation waste and memory must also meet the workload's
+acceptance criteria.
 
 The separate linked-navigation benchmark injects 600-ms page latency into
 400-card and 10,000-card libraries while serving generated media from memory:

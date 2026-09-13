@@ -10,10 +10,13 @@ import {
   validDetailId,
 } from "./core.js";
 import { clearProgress, progressDetails, progressSnapshot, savePreference } from "./preferences.js";
+import { fetchArtwork } from "./artwork.js";
 
 const CONTINUE_BATCH_SIZE = 100;
 const MAX_CONTINUE_ITEMS = 500;
 const MAX_ACTIVE_ARTWORK = 4;
+const ARTWORK_DEADLINE_MS = 60_000;
+const ARTWORK_OFFSCREEN_GRACE_MS = 5_000;
 
 export class LibraryController {
   #store;
@@ -290,7 +293,7 @@ export class LibraryController {
     this.#artworkQueue.clear();
     // Detached images may never emit load/error. Release their admission
     // slots explicitly so a slow old view cannot starve the current one.
-    for (const cancel of this.#artworkRequests.values()) cancel();
+    for (const request of this.#artworkRequests.values()) request.cancel();
     if (!cards) {
       const batches = this.#cardBatches(library.entries, navigation);
       let batch;
@@ -632,6 +635,7 @@ export class LibraryController {
     };
     // Skip distant batches without reading geometry inside skipped subtrees.
     visit(this.#dom.grid);
+    for (const request of this.#artworkRequests.values()) request.checkVisibility();
     this.#drainArtworkQueue();
   }
 
@@ -660,33 +664,77 @@ export class LibraryController {
     if (!source) return;
     delete image.dataset.src;
     let settled = false;
-    const settle = () => {
+    let offscreenTimer = null;
+    let objectUrl = null;
+    let transportDone = false;
+    const controller = new AbortController();
+    const release = () => {
+      this.#artworkRequests.delete(image);
+      // Let aborted network operations settle before starting the next batch.
+      // Recompute visibility too: scrolling may have superseded the old queue.
+      this.#scheduleArtwork();
+    };
+    const deadline = window.setTimeout(() => expire(), ARTWORK_DEADLINE_MS);
+    const settle = (discard = false) => {
       if (settled) return;
       settled = true;
+      window.clearTimeout(deadline);
+      window.clearTimeout(offscreenTimer);
+      controller.abort();
       image.removeEventListener("load", settle);
       image.removeEventListener("error", failed);
-      this.#artworkRequests.delete(image);
-      this.#drainArtworkQueue();
+      // Close the old network load before admitting its replacement. Each DOM
+      // image gets one attempt per view, so expiry cannot cause a retry loop.
+      if (discard === true) image.removeAttribute("src");
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      if (transportDone) release();
     };
     const failed = () => {
+      if (settled) return;
       image.classList.add("failed");
       settle();
     };
-    this.#artworkRequests.set(image, () => {
-      settle();
-      image.removeAttribute("src");
+    const expire = () => {
+      if (settled) return;
+      image.classList.add("failed");
+      settle(true);
+    };
+    this.#artworkRequests.set(image, {
+      cancel: () => settle(true),
+      checkVisibility: () => {
+        if (settled) return;
+        if (!image.isConnected) { settle(true); return; }
+        const bounds = image.closest(".media-card").getBoundingClientRect();
+        const nearby = bounds.width > 0 && bounds.height > 0
+          && bounds.bottom >= -400 && bounds.top <= window.innerHeight + 400;
+        if (nearby) {
+          window.clearTimeout(offscreenTimer);
+          offscreenTimer = null;
+        } else if (offscreenTimer === null) {
+          // Ordinary scrolling back to a healthy slow image retains its load;
+          // repeated scroll events must not extend an abandoned request forever.
+          offscreenTimer = window.setTimeout(expire, ARTWORK_OFFSCREEN_GRACE_MS);
+        }
+      },
     });
     image.addEventListener("load", settle, { once: true });
     image.addEventListener("error", failed, { once: true });
     // Visibility and concurrency are already controlled by this queue.
     image.loading = "eager";
-    image.src = source;
-    window.queueMicrotask(() => {
-      // A cached failure can already be complete before its error event.
-      if (!settled && image.complete) {
-        if (image.naturalWidth === 0) failed();
-        else settle();
-      }
+    void fetchArtwork(source, controller.signal).then((blob) => {
+      if (settled) return;
+      objectUrl = URL.createObjectURL(blob);
+      image.src = objectUrl;
+      window.queueMicrotask(() => {
+        // A cached failure can already be complete before its error event.
+        if (!settled && image.complete) {
+          if (image.naturalWidth === 0) failed();
+          else settle();
+        }
+      });
+    }).catch(failed).finally(() => {
+      transportDone = true;
+      if (settled) release();
     });
   }
 

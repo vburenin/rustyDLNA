@@ -145,6 +145,7 @@ pub fn route(method: &str, path: &str) -> HttpRoute {
         | "/web/playback-source.js"
         | "/web/source-selection.js"
         | "/web/library.js"
+        | "/web/artwork.js"
         | "/web/player.js"
         | "/web/preferences.js"
         | "/web/store.js" => HttpRoute::WebAsset,

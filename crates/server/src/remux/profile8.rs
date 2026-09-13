@@ -140,21 +140,35 @@ impl Metrics {
 /// A complete independently playable copied-video segment is required, using
 /// the same bounded parser and dependency look-ahead as ordinary fragment delivery.
 pub(super) fn observe_final_mux(
-    app: &App,
-    job: &RemuxJob,
-    index: &mut hls::Index,
+    app: &Arc<App>,
+    job: &Arc<RemuxJob>,
+    monitor: &mut cache_monitor::Monitor,
+    kind: cache_monitor::Kind,
 ) -> Result<bool, String> {
     if job.cancelled.load(Ordering::Acquire) {
         return Ok(false);
     }
     if matches!(job.state(), RemuxState::Growing) {
         job.notify_growth();
+    }
+    let Some(observation) = monitor
+        .poll(app, job, kind)
+        .map_err(|error| format!("transcode cache limits: {error}"))?
+    else {
+        return Ok(false);
+    };
+    if job.cancelled.load(Ordering::Acquire)
+        || !observation.playable
+        || !matches!(job.state(), RemuxState::Preprocessing)
+    {
         return Ok(false);
     }
-    if !matches!(job.state(), RemuxState::Preprocessing) {
-        return Ok(false);
-    }
-    let file = match std::fs::File::open(&job.part) {
+    job.transition(RemuxState::Growing);
+    Ok(true)
+}
+
+pub(super) fn inspect_final_mux(path: &Path, index: &mut hls::Index) -> Result<bool, String> {
+    let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(format!("open Profile-8 final mux: {error}")),
@@ -167,17 +181,7 @@ pub(super) fn observe_final_mux(
         return Err("Profile-8 final mux is not a regular file".into());
     }
     index.update_file(&file, false)?;
-    if !index.has_playable_segment() {
-        return Ok(false);
-    }
-    // The periodic pressure pass may precede the bytes just indexed. Recheck
-    // immediately before exposing them, including helpers that finish quickly.
-    enforce_active_cache_limits(app).map_err(|error| format!("transcode cache limits: {error}"))?;
-    if job.cancelled.load(Ordering::Acquire) {
-        return Ok(false);
-    }
-    job.transition(RemuxState::Growing);
-    Ok(true)
+    Ok(index.has_playable_segment())
 }
 
 #[cfg(test)]
@@ -300,19 +304,27 @@ mod tests {
             offset += size;
         }
         assert!(media_ends.len() >= 3);
-        let job = job(&dir);
-        let mut index = hls::Index::default();
+        let job = Arc::new(job(&dir));
+        let observe = || {
+            let mut monitor = cache_monitor::Monitor::new();
+            assert!(
+                !observe_final_mux(&app, &job, &mut monitor, cache_monitor::Kind::Profile8)
+                    .unwrap()
+            );
+            super::super::tests::wait_until(Duration::from_secs(2), || monitor.result_ready());
+            observe_final_mux(&app, &job, &mut monitor, cache_monitor::Kind::Profile8).unwrap()
+        };
         // Size alone and incomplete media do not make private bytes ready.
         std::fs::write(&job.part, &bytes[..media_ends[0] - 1]).unwrap();
-        assert!(!observe_final_mux(&app, &job, &mut index).unwrap());
+        assert!(!observe());
         assert_eq!(job.state(), RemuxState::Preprocessing);
         assert!(job.pin_ready_output().unwrap().is_none());
         assert!(crate::lock_recover(&job.output).is_none());
         // Copied fragments retain the established independent-segment look-ahead.
         std::fs::write(&job.part, &bytes[..media_ends[0]]).unwrap();
-        assert!(!observe_final_mux(&app, &job, &mut index).unwrap());
+        assert!(!observe());
         std::fs::write(&job.part, &bytes[..media_ends[2]]).unwrap();
-        assert!(observe_final_mux(&app, &job, &mut index).unwrap());
+        assert!(observe());
         assert_eq!(job.state(), RemuxState::Growing);
         assert!(!job.dest.exists());
         assert!(!rusty_dlna_transcode::cache_stamp_path(&job.dest).exists());
@@ -322,11 +334,17 @@ mod tests {
         );
         let pinned = job.open_output().unwrap();
         std::fs::write(&job.part, &bytes).unwrap();
-        assert!(!observe_final_mux(&app, &job, &mut index).unwrap());
+        assert!(!observe());
         assert_eq!(pinned.metadata().unwrap().len(), bytes.len() as u64);
         job.cancel();
         assert!(job.pin_ready_output().is_err());
-        assert!(!observe_final_mux(&app, &job, &mut index).unwrap());
+        assert!(!observe_final_mux(
+            &app,
+            &job,
+            &mut cache_monitor::Monitor::new(),
+            cache_monitor::Kind::Profile8
+        )
+        .unwrap());
     }
 
     fn staged_runner(
@@ -362,6 +380,8 @@ mod tests {
             if Instant::now() >= deadline {
                 return Err(RemuxP8Error::Deadline("test".into()));
             }
+            observer(event(RemuxP8Stage::FinalMux, RemuxP8StageStatus::Progress))
+                .map_err(RemuxP8Error::Observer)?;
             if let Ok(mode) = std::fs::read_to_string(part.with_extension("finish")) {
                 return match mode.as_str() {
                     "failure" => Err(RemuxP8Error::Pipeline("test downstream failure".into())),
@@ -414,11 +434,21 @@ mod tests {
             std::fs::copy(&fixture, part.with_extension("fixture")).unwrap();
             crate::lock_recover(p8_test_runners()).insert(part.clone(), staged_runner);
             let job = attach(app.clone(), spec).unwrap();
+            struct CancelOnDrop(Arc<RemuxJob>);
+            impl Drop for CancelOnDrop {
+                fn drop(&mut self) {
+                    self.0.cancel();
+                }
+            }
+            let _cancel = CancelOnDrop(job.clone());
             wait_marker(&part.with_extension("private"));
             assert_eq!(job.state(), RemuxState::Preprocessing);
             assert!(job.pin_ready_output().unwrap().is_none());
             std::fs::write(part.with_extension("mux"), b"continue").unwrap();
             wait_marker(&part.with_extension("growing"));
+            super::super::tests::wait_until(Duration::from_secs(2), || {
+                job.state() == RemuxState::Growing
+            });
             assert_eq!(job.state(), RemuxState::Growing);
             assert!(!job.dest.exists());
             assert!(!rusty_dlna_transcode::cache_stamp_path(&job.dest).exists());

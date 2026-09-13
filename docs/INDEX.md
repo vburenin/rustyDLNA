@@ -42,6 +42,7 @@ All commands below run from the **repository root**. The agent wrapper invokes
 | Rust documentation | `RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked` | `scripts/check.sh` |
 | Build (optional, separate) | `cargo build --locked -p rusty-dlna` | `.github/workflows/ci.yml`, privileged SSDP job |
 | Generated playback benchmark (optional CPU/device tiers) | `node scripts/playback-benchmark.mjs --help` | `docs/WEB_PLAYER.md` |
+| Derived-image cache scale with concurrent posters/video | `cargo test --release --locked -p rusty-dlna --lib derived_image_cache_scale_benchmark -- --ignored --nocapture` | `docs/OPERATIONS.md`; disposable JPEGs and real FFmpeg output |
 | Experimental helper resource policy (optional CPU/NVENC tiers) | `cargo run --locked -p rusty-dlna --example resource_budget -- --help` | `docs/TRANSCODE.md` |
 | Selective GPU graph experiments (optional NVIDIA tier) | `cargo run --locked -p rusty-dlna --example gpu_graph -- --help` | `docs/TRANSCODE.md` |
 | Profile-8 stage measurements (optional genuine media/tool tier) | `cargo run --locked -p rusty-dlna --example profile8_stages -- --help` | `docs/TRANSCODE.md` |

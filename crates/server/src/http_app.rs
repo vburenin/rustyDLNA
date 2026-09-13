@@ -510,16 +510,18 @@ impl AppPreflight {
             }
         };
         let derived_dir = cache_dir.join("derived-images");
-        let derived_startup = derived_image_cache::DerivedImageCache::maintain_startup(
-            &derived_dir,
-            cfg.derived_image_cache_mb.saturating_mul(1024 * 1024),
-            cfg.derived_image_cache_age_days,
-            cfg.cache_min_free_mb.saturating_mul(1024 * 1024),
-        )
-        .map_err(|source| AppInitError::DerivedImageCache {
-            path: derived_dir.clone(),
-            source,
-        })?;
+        let derived_images = derived_image_cache::DerivedImageCache::new();
+        let derived_startup = derived_images
+            .maintain_startup(
+                &derived_dir,
+                cfg.derived_image_cache_mb.saturating_mul(1024 * 1024),
+                cfg.derived_image_cache_age_days,
+                cfg.cache_min_free_mb.saturating_mul(1024 * 1024),
+            )
+            .map_err(|source| AppInitError::DerivedImageCache {
+                path: derived_dir.clone(),
+                source,
+            })?;
         if !derived_startup.quota_satisfied {
             return Err(AppInitError::DerivedImageCache {
                 path: derived_dir,
@@ -597,7 +599,7 @@ impl AppPreflight {
             remux_metrics: remux::RemuxMetrics::new(initial_cache_bytes),
             events,
             notify_dispatcher,
-            derived_images: derived_image_cache::DerivedImageCache::new(),
+            derived_images,
             client_cache: Mutex::new(ClientCache::new()),
             scan_control: Arc::new(ScanControl {
                 cancellation,
@@ -2663,19 +2665,12 @@ impl App {
                         cache_bytes = report.bytes,
                         "derived-image cache remains above a configured limit"
                     );
-                    remove_rejected_derived_image(&dest);
-                    let _ = self.derived_images.maintain(
-                        &self.cache_maintenance,
-                        &derived_dir,
-                        cache_quota,
-                        self.cfg.derived_image_cache_age_days,
-                        minimum_free,
-                    );
+                    remove_rejected_derived_image(self, &dest);
                     return HttpResponse::html(507, "Insufficient Storage", "image cache limits");
                 }
                 Err(error) => {
                     tracing::warn!(%error, "cannot recheck derived-image cache limits");
-                    remove_rejected_derived_image(&dest);
+                    remove_rejected_derived_image(self, &dest);
                     return HttpResponse::html(507, "Insufficient Storage", "image cache limits");
                 }
             }
@@ -3155,8 +3150,8 @@ pub(crate) fn media_read_error_response(
     )
 }
 
-fn remove_rejected_derived_image(path: &Path) {
-    if let Err(error) = std::fs::remove_file(path) {
+fn remove_rejected_derived_image(app: &App, path: &Path) {
+    if let Err(error) = app.derived_images.reject(&app.cache_maintenance, path) {
         if error.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(%error, path = %path.display(), "cannot remove rejected derived image");
         }

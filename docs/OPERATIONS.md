@@ -48,6 +48,17 @@ serves requests. Their quota and retention settings are therefore validated
 even when `transcode.enable = false`; an invalid value stops startup before
 cache maintenance runs.
 
+Derived JPEG maintenance reuses an inventory built at startup. Successful cold
+requests update only active output paths and the eviction candidates they need;
+they do not enumerate the directory before and after each image. On-demand
+reconciliation runs at most once per minute and discovers external additions,
+deletions, and abandoned temporary files. The inventory holds at most 65,536
+entries, reclaiming eligible older images when that bound is reached. Age,
+byte quota, and shared minimum free space can require earlier eviction. Active
+temporary and final outputs remain protected, same-key requests share one helper,
+and a successful helper's output must pass the final maintenance check before it
+can be served. Rejected output is removed from both disk and accounting.
+
 The browser-only gateway compresses proxied JSON, JavaScript, and CSS when the
 client advertises gzip support. Media and JPEG responses remain uncompressed;
 browser cards request scanner-prepared source artwork through a four-request
@@ -177,7 +188,10 @@ cache-maintenance pass while their producer remains active.
 `transcode.cache_bytes` reports generated output and staging bytes from an
 incremental inventory. Maintenance refreshes active artifacts and the requested
 cache candidate; publication transfers staging accounting to the completed path,
-and failure/ephemeral cleanup removes deleted bytes. A full reconciliation runs
+and failure/ephemeral cleanup removes deleted bytes. Failed-job retirement is
+queued for the maintenance worker; any intervening admission consumes those
+retirements before considering eviction. The status gauge may briefly retain
+deleted staging bytes until that maintenance occurs. A full reconciliation runs
 on demand at most once every 30 seconds, independently of producer count, and
 reconciles externally added or deleted completed files. Active producers can grow
 between observations. Admission checks actual active sizes and filesystem free
@@ -187,11 +201,20 @@ Discovery and unlink I/O run outside the job registry. An eviction must reserve
 its exact destination and recheck current registered ownership before unlinking;
 a pending attachment reserves its candidate before admission. Active readers,
 producers and pending admissions therefore remain protected even when a directory
-snapshot is stale. The shared maintenance gate still coordinates image/video
-space checks. A slow filesystem can delay the request or producer doing a sweep
-and queued maintenance, while active attachments, status and cancellation can
-access the registry. Failed maintenance is reported as failure rather than a
-successful cached quota check.
+snapshot is stale. The shared maintenance gate coordinates image/video space
+checks. One worker per server performs periodic producer checks; child observers
+poll its results and continue checking cancellation and deadlines. An ordinary
+producer still starting may wait up to 5 ms for a readiness result, capped by its
+remaining deadline, then recheck cancellation. The first
+playable output waits for a successful quota check made after those bytes were
+observed. Growth notifications retain their 50 ms cadence. Final publication
+waits cancellably for the shared gate and rechecks limits before renaming output.
+The worker queues at most 64 attempt checks and 320 retired artifact paths;
+retirement overflow coalesces into one full reconciliation. A failed discovery
+must be retried before admission can succeed. Filesystem calls can still block
+the maintenance worker or request doing the I/O; child supervision never performs
+those calls or waits for the shared gate. Failed maintenance remains a reported
+failure.
 
 Existing maintenance counters remain available; `cache_scans` and
 `cache_scan_entries` distinguish full discovery from incremental checks.
@@ -201,6 +224,19 @@ Existing maintenance counters remain available; `cache_scans` and
 benchmark creates disposable 100/1k/10k/100k-entry caches with 1/2/8 concurrent
 maintenance callers. It reports sample counts and variability; these filesystem
 measurements do not establish playback latency improvements.
+The separate image-cache workload generates real JPEG cache entries at
+100/1k/10k scale, runs concurrent cold posters and a video producer, and checks
+file sums and output decoding independently:
+
+```sh
+cargo test --release --locked -p rusty-dlna --lib derived_image_cache_scale_benchmark -- --ignored --nocapture
+```
+
+It reports ten trials per size, discovery/stat counts, shared-gate wait, and
+process RSS before/after inventory seeding and after the work. RSS includes the
+test process and retained allocator pages; it does not isolate live inventory
+allocations or include helper RSS. Video readiness precedes browser frame
+presentation.
 
 Completed HLS/MSE indexes have a separate process-local metadata LRU, bounded to
 16 entries and 16 MiB. It owns no media descriptors or disk companion files and

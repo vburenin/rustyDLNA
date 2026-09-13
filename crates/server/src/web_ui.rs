@@ -32,6 +32,7 @@ const SOURCE_SELECTION_JS: &str = include_str!("../web/source-selection.js");
 const CAPTIONS_JS: &str = include_str!("../web/captions.js");
 const CORE_JS: &str = include_str!("../web/core.js");
 const LIBRARY_JS: &str = include_str!("../web/library.js");
+const ARTWORK_JS: &str = include_str!("../web/artwork.js");
 const PLAYER_JS: &str = include_str!("../web/player.js");
 const PREFERENCES_JS: &str = include_str!("../web/preferences.js");
 const STORE_JS: &str = include_str!("../web/store.js");
@@ -659,7 +660,7 @@ pub(crate) fn presentation(app: &App) -> HttpResponse {
     let mut response = html_response(INDEX_HTML.to_owned());
     response.set(
         "Content-Security-Policy",
-        "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
     );
     response.set("Referrer-Policy", "no-referrer");
     response
@@ -684,6 +685,7 @@ pub(crate) fn asset(app: &App, path: &str) -> HttpResponse {
         "/web/captions.js" => ("text/javascript; charset=utf-8", CAPTIONS_JS),
         "/web/core.js" => ("text/javascript; charset=utf-8", CORE_JS),
         "/web/library.js" => ("text/javascript; charset=utf-8", LIBRARY_JS),
+        "/web/artwork.js" => ("text/javascript; charset=utf-8", ARTWORK_JS),
         "/web/player.js" => ("text/javascript; charset=utf-8", PLAYER_JS),
         "/web/preferences.js" => ("text/javascript; charset=utf-8", PREFERENCES_JS),
         "/web/store.js" => ("text/javascript; charset=utf-8", STORE_JS),

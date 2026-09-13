@@ -5746,23 +5746,31 @@ test("already-complete broken artwork shows the fallback and releases its loadin
   await page.setViewportSize({ width: 1280, height: 1000 });
   await page.addInitScript(() => {
     // Model a cached failure whose complete flag precedes its queued error event.
+    const broken = new Set();
+    const create = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = (blob) => {
+      const url = create(blob);
+      if (blob.size === 12) broken.add(url); // The invalid JPEG response below.
+      return url;
+    };
     const complete = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "complete").get;
     Object.defineProperty(HTMLImageElement.prototype, "complete", {
       configurable: true,
-      get() { return this.getAttribute("src")?.startsWith("/Thumbnails/") ? true : complete.call(this); },
+      get() { return broken.has(this.getAttribute("src")) ? true : complete.call(this); },
     });
   });
   let releaseArtwork;
   const held = new Promise((resolve) => { releaseArtwork = resolve; });
-  await page.route("**/Thumbnails/**", async (route) => {
+  await page.route(/\/(?:Thumbnails|AlbumArt)\//, async (route) => {
     await held;
-    await route.fulfill({ status: 404 }).catch(() => {});
+    await route.fulfill({ contentType: "image/jpeg", body: "invalid JPEG" }).catch(() => {});
   });
   try {
     await openLibrary(page);
     await openVideoView(page);
-    const failedImages = page.locator('#media-grid img[src^="/Thumbnails/"].failed');
-    await expect.poll(() => failedImages.count()).toBeGreaterThan(3);
+    releaseArtwork();
+    const failedImages = page.locator('#media-grid img[src^="blob:"].failed');
+    await expect.poll(() => failedImages.count()).toBeGreaterThan(4);
     await expect(failedImages.first()).toBeHidden();
     expect(await failedImages.evaluateAll((images) => images.every((image) => image.naturalWidth === 0))).toBe(true);
   } finally {

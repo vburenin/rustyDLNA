@@ -283,6 +283,7 @@ impl Inventory {
 /// with the live job registry before eviction. No snapshot grants unlink rights.
 #[derive(Default)]
 pub(crate) struct CacheCoordinator {
+    pub(crate) monitor: Arc<super::cache_monitor::Worker>,
     inventory: Mutex<Inventory>,
     reserved: Mutex<HashSet<PathBuf>>,
     released: Condvar,
@@ -403,12 +404,34 @@ fn maintain_inventory(
     // No caller may hold the job registry while acquiring it.
     let _maintenance = crate::lock_recover(&app.cache_maintenance);
     app.remux_metrics.cache_lock_wait.record(waited.elapsed());
+    maintain_inventory_locked(app, requested, startup)
+}
+
+fn maintain_inventory_locked(
+    app: &App,
+    requested: &HashSet<PathBuf>,
+    startup: bool,
+) -> std::io::Result<u64> {
+    let (retired, reconcile) = app.transcode_cache.monitor.take_retired();
     let mut inventory = crate::lock_recover(&app.transcode_cache.inventory);
+    for path in retired {
+        match read_entry(&path) {
+            Ok(entry) => inventory.replace(path, entry),
+            Err(error) => {
+                inventory.swept = None;
+                return Err(error);
+            }
+        }
+    }
     let sweep = startup
+        || reconcile
         || inventory
             .swept
             .is_none_or(|at| at.elapsed() >= SWEEP_INTERVAL);
     if sweep {
+        // A forced retirement reconciliation may arrive before the ordinary
+        // interval expires. Failed discovery must remain mandatory on retry.
+        inventory.swept = None;
         *inventory = discover(app)?;
     }
     let waited = Instant::now();
@@ -540,8 +563,55 @@ pub(super) fn maintain_app_cache(
     result
 }
 
+#[cfg(test)]
 pub(super) fn enforce_active_cache_limits(app: &App) -> std::io::Result<u64> {
     maintain_app_cache(app, &HashSet::new(), false)
+}
+
+pub(super) fn maintain_background(app: &App, cancelled: impl Fn() -> bool) -> std::io::Result<()> {
+    let _maintenance = lock_maintenance(app, cancelled)?;
+    maintain_locked_measured(app, false).map(|_| ())
+}
+
+pub(super) fn lock_maintenance(
+    app: &App,
+    cancelled: impl Fn() -> bool,
+) -> std::io::Result<std::sync::MutexGuard<'_, ()>> {
+    let waited = Instant::now();
+    let _maintenance = loop {
+        if cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cache observation cancelled",
+            ));
+        }
+        match app.cache_maintenance.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+        }
+    };
+    app.remux_metrics.cache_lock_wait.record(waited.elapsed());
+    Ok(_maintenance)
+}
+
+pub(super) fn maintain_locked_measured(app: &App, reconcile: bool) -> std::io::Result<u64> {
+    let started = Instant::now();
+    app.remux_metrics
+        .cache_maintenance
+        .fetch_add(1, Ordering::Relaxed);
+    let result = maintain_inventory_locked(app, &HashSet::new(), reconcile);
+    app.remux_metrics
+        .cache_maintenance_duration
+        .record(started.elapsed());
+    if result.is_err() {
+        app.remux_metrics
+            .cache_maintenance_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    result
 }
 
 /// Caller holds shared maintenance gate; publication and deletion do not scan.

@@ -16,12 +16,13 @@ const args = Object.fromEntries(process.argv.slice(2).map((arg) => {
   const [key, ...value] = arg.replace(/^--/, "").split("=");
   return [key, value.join("=") || true];
 }));
-const acceptedArguments = new Set(["help", "binary", "output", "samples", "recipes", "concurrency", "size", "fps", "duration", "rate", "sustain-seconds", "compare", "median-percent", "median-ms", "p95-percent", "p95-ms", "fixture", "tier", "encoder", "port", "build-profile", "quality", "encoding-preset"]);
+const acceptedArguments = new Set(["help", "binary", "output", "samples", "recipes", "concurrency", "size", "fps", "duration", "rate", "sustain-seconds", "compare", "median-percent", "median-ms", "p95-percent", "p95-ms", "fixture", "tier", "encoder", "port", "build-profile", "quality", "encoding-preset", "network-latency-ms", "network-kbps"]);
 if (Object.entries(args).some(([key, value]) => !acceptedArguments.has(key) || (key !== "help" && value === true))) {
   throw new Error("Unknown benchmark option or missing --option=value; see --help");
 }
 if (args.help) {
   console.log("Preset experiments: --encoding-preset=balanced|fast_start|maximum_speed --quality=auto|uhd_high|uhd_optimized|full_hd|data_saver|sd_480|low_360. Quality follows the browser's source bounds; each validation records the requested preference and effective quality separately. Compare graph changes within the same preset; different presets can change quality and are not accepted by --compare as equivalent workloads.");
+  console.log("Network experiments: --network-latency-ms=0..2000 --network-kbps=0..1000000 (0 means unlimited). Chromium DevTools applies latency and an aggregate throughput limit to each viewer's real requests. This models a client link, not kernel packet loss or a shared bottleneck across viewers. CDP resource records include completed and cancelled response bytes.");
   console.log("node scripts/playback-benchmark.mjs --binary=target/debug/rusty-dlna --output=/tmp/playback.json --samples=10 --recipes=copy,audio,video,both --concurrency=1 --size=1280x720 --fps=24 --duration=40 --rate=1 --sustain-seconds=2 [--build-profile=debug|release|unknown] [--compare=/tmp/baseline.json] [--median-percent=25 --median-ms=50 --p95-percent=30 --p95-ms=100]\nOptional existing hardware/media tiers: --fixture=/path/to/35-600s-clip.mkv --tier=hdr10 --encoder=h264_nvenc (copies supplied media into the temporary library; maximum 8 GiB). Available encoders: libx264, h264_nvenc. CPU default generates SDR fixtures.");
   process.exit(0);
 }
@@ -37,11 +38,15 @@ const requestedQuality = String(args.quality || "auto");
 const encodingPreset = String(args["encoding-preset"] || "balanced");
 const buildProfile = String(args["build-profile"] || "unknown");
 const sustainSeconds = Number(args["sustain-seconds"] || 2);
+const networkLatencyMs = Number(args["network-latency-ms"] || 0);
+const networkKbps = Number(args["network-kbps"] || 0);
 if (!Number.isInteger(samples) || samples < 1 || samples > 1000
   || ![1, 2, 4].includes(concurrency) || ![24, 30, 60].includes(fps)
   || ![1, 2].includes(rate) || !/^\d{2,4}x\d{2,4}$/.test(size)
   || !Number.isFinite(duration) || duration < 35 || duration > 600
   || !Number.isFinite(sustainSeconds) || sustainSeconds < 0.5 || sustainSeconds > 30
+  || !Number.isFinite(networkLatencyMs) || networkLatencyMs < 0 || networkLatencyMs > 2000
+  || !Number.isFinite(networkKbps) || networkKbps < 0 || networkKbps > 1_000_000
   || !["libx264", "h264_nvenc"].includes(encoder) || !["debug", "release", "unknown"].includes(buildProfile)
   || !["auto", "uhd_high", "uhd_optimized", "full_hd", "data_saver", "sd_480", "low_360"].includes(requestedQuality)
   || !["balanced", "fast_start", "maximum_speed"].includes(encodingPreset)
@@ -126,6 +131,7 @@ const report = {
   },
   fixtures: [], records: [], validations: [], summaries: {},
 };
+report.configuration.network = { latency_ms: networkLatencyMs, kbps: networkKbps, scope: "per-viewer CDP aggregate" };
 if (report.environment.gpu_inventory.startsWith("unavailable:")) {
   report.environment.unavailable_tiers.push("NVIDIA inventory query unavailable; see gpu_inventory diagnostic. This does not prove all GPU hardware is absent.");
 }
@@ -264,6 +270,36 @@ async function measured(callback) {
 async function openPlayback(item, mode = "compat", { awaitFrame = true, beforeMediaRequest = null } = {}) {
   const context = await browser.newContext({ userAgent: "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Mobile Safari/537.36" });
   const page = await context.newPage();
+  const cdp = await context.newCDPSession(page);
+  await cdp.send("Network.enable");
+  await cdp.send("Network.emulateNetworkConditions", { offline: false, latency: networkLatencyMs,
+    downloadThroughput: networkKbps ? networkKbps * 1000 / 8 : -1, uploadThroughput: -1 });
+  const transfers = [];
+  const pendingTransfers = new Map();
+  cdp.on("Network.requestWillBeSent", ({ requestId, request, timestamp }) => {
+    if (!new URL(request.url).pathname.startsWith("/web/media/")) return;
+    if (transfers.length >= 2048) {
+      if (!errors.includes("Benchmark transfer record bound exceeded")) errors.push("Benchmark transfer record bound exceeded");
+      return;
+    }
+    const entry = { url: request.url, started: timestamp, bytes: 0, status: "pending" };
+    transfers.push(entry); pendingTransfers.set(requestId, entry);
+  });
+  cdp.on("Network.responseReceived", ({ requestId, timestamp, response }) => {
+    const entry = pendingTransfers.get(requestId);
+    if (entry) Object.assign(entry, { headers_at: timestamp, http_status: response.status, headers: response.headers });
+  });
+  cdp.on("Network.dataReceived", ({ requestId, dataLength }) => {
+    const entry = pendingTransfers.get(requestId);
+    if (entry) entry.bytes += dataLength;
+  });
+  for (const event of ["loadingFinished", "loadingFailed"]) cdp.on(`Network.${event}`, (value) => {
+    const entry = pendingTransfers.get(value.requestId);
+    if (!entry) return;
+    Object.assign(entry, { ended: value.timestamp, status: event, encoded_bytes: value.encodedDataLength,
+      cancelled: value.canceled, error: value.errorText });
+    pendingTransfers.delete(value.requestId);
+  });
   const requests = [];
   const errors = [];
   page.on("pageerror", (error) => { if (errors.length < 16) errors.push(error.message); });
@@ -294,11 +330,118 @@ async function openPlayback(item, mode = "compat", { awaitFrame = true, beforeMe
     localStorage.setItem("rustydlna.quality", quality);
     localStorage.setItem("rustydlna.encodingPreset", encodingPreset);
     const state = window.__playbackBench = { start: null, first: null, frames: 0, stages: [], records: [], sourceOffset: 0 };
+    state.connection = { downlink: navigator.connection?.downlink ?? null,
+      effective_type: navigator.connection?.effectiveType ?? null, save_data: navigator.connection?.saveData ?? null };
+    const transport = state.transport = { resources: [], appends: [], reserved: 0, appended: 0,
+      maximum_reserved_bytes: 0, maximum_reserved_plus_appended_bytes: 0, maximum_fetches: 0, active: 0,
+      byte_basis: "Advertised finite-resource reservations through updateend/discard plus bytes submitted to live SourceBuffers, charged until source removal. Counts logical payload, not JS/native allocation or decoder heap. Incoming chunks and assembly can add up to one resource copy; RSS is sampled separately." };
+    const update = () => {
+      transport.maximum_reserved_bytes = Math.max(transport.maximum_reserved_bytes, transport.reserved);
+      transport.maximum_reserved_plus_appended_bytes = Math.max(transport.maximum_reserved_plus_appended_bytes, transport.reserved + transport.appended);
+      transport.maximum_fetches = Math.max(transport.maximum_fetches, transport.active);
+    };
+    const payloadOwners = new WeakMap();
+    const copyBytes = Uint8Array.prototype.set;
+    Uint8Array.prototype.set = function(bytes, offset) {
+      const result = copyBytes.call(this, bytes, offset);
+      const record = payloadOwners.get(bytes.buffer);
+      if (record) {
+        const previous = payloadOwners.get(this.buffer);
+        if (previous && previous !== record) transport.failure = "Resource assembly mixed response ownership";
+        payloadOwners.set(this.buffer, record);
+      }
+      return result;
+    };
+    const release = (record) => { if (record.reserved) { transport.reserved -= record.expected; record.reserved = false; } };
+    let currentBufferInfo = null;
     const fetchMedia = window.fetch;
-    window.fetch = function(input, options) {
+    window.fetch = async function(input, options) {
       const url = new URL(input instanceof Request ? input.url : String(input), location.href);
-      if (url.pathname.startsWith("/web/media/") && url.searchParams.get("delivery") === "mse") state.sourceOffset = Number(url.searchParams.get("start") || 0);
-      return fetchMedia.call(this, input, options);
+      if (url.pathname.startsWith("/web/media/") && url.searchParams.get("delivery") === "mse") {
+        state.sourceOffset = Number(url.searchParams.get("start") || 0);
+        state.generation = url.searchParams.get("request");
+        if (currentBufferInfo) currentBufferInfo.generation = state.generation;
+        for (const record of transport.resources) if (record.generation !== state.generation && record.reserved) {
+          record.discarded = performance.now(); release(record);
+        }
+      }
+      const delivery = url.searchParams.get("delivery");
+      if (!["mse_init", "mse_segment"].includes(delivery)) return fetchMedia.call(this, input, options);
+      if (transport.resources.length >= 2048) {
+        transport.failure = "Benchmark browser resource record bound exceeded";
+        return fetchMedia.call(this, input, options);
+      }
+      const record = { url: url.href, request: url.searchParams.get("request"), delivery,
+        expected: Number(url.searchParams.get("hls_length")), received: 0, reserved: true,
+        started: performance.now(), completed: null, appended: null, failed: null };
+      record.generation = state.generation;
+      transport.resources.push(record); transport.reserved += record.expected; transport.active++; update();
+      let finished = false;
+      const finish = (error) => {
+        if (error) { record.failed = String(error); release(record); }
+        if (finished) return;
+        finished = true; transport.active--;
+        if (!error) record.completed = performance.now();
+      };
+      const aborted = () => finish("aborted");
+      options?.signal?.addEventListener("abort", aborted, { once: true });
+      try {
+        const response = await fetchMedia.call(this, input, options);
+        const getReader = response.body.getReader.bind(response.body);
+        response.body.getReader = (...args) => {
+          const reader = getReader(...args);
+          const read = reader.read.bind(reader);
+          const cancel = reader.cancel.bind(reader);
+          reader.read = async (...args) => {
+            try {
+              const result = await read(...args);
+              if (result.done) finish();
+              else { record.received += result.value.byteLength; payloadOwners.set(result.value.buffer, record); }
+              return result;
+            } catch (error) { finish(error); throw error; }
+          };
+          reader.cancel = (...args) => { finish("cancelled body"); return cancel(...args); };
+          return reader;
+        };
+        return response;
+      } catch (error) { finish(error); throw error; }
+    };
+    const buffers = new WeakMap();
+    const addBuffer = MediaSource.prototype.addSourceBuffer;
+    MediaSource.prototype.addSourceBuffer = function(...args) {
+      const buffer = addBuffer.apply(this, args);
+      const info = { bytes: 0, generation: null };
+      currentBufferInfo = info;
+      buffers.set(buffer, info);
+      this.addEventListener("sourceclose", () => {
+        transport.appended -= info.bytes; info.bytes = 0;
+        for (const record of transport.resources) if (record.generation === info.generation && record.reserved) {
+          record.discarded = performance.now(); release(record);
+        }
+      }, { once: true });
+      return buffer;
+    };
+    const append = SourceBuffer.prototype.appendBuffer;
+    SourceBuffer.prototype.appendBuffer = function(bytes) {
+      const result = append.call(this, bytes);
+      const record = payloadOwners.get(bytes.buffer || bytes);
+      if (!record || record.completed === null || record.received !== bytes.byteLength || record.discarded) {
+        transport.failure = "Benchmark could not associate an append with an exact fetched resource";
+        return result;
+      }
+      record.appended = performance.now();
+      this.addEventListener("updateend", () => release(record), { once: true });
+      const info = buffers.get(this);
+      info.bytes += bytes.byteLength; transport.appended += bytes.byteLength; update();
+      transport.appends.push({ request: record.request, delivery: record.delivery, bytes: bytes.byteLength, at: record.appended });
+      return result;
+    };
+    const removeBuffer = MediaSource.prototype.removeSourceBuffer;
+    MediaSource.prototype.removeSourceBuffer = function(buffer) {
+      const result = removeBuffer.call(this, buffer);
+      const info = buffers.get(buffer);
+      transport.appended -= info.bytes; info.bytes = 0;
+      return result;
     };
     addEventListener("rustydlna-playback-timing", (e) => { if (state.records.length < 64) state.records.push(e.detail); });
     addEventListener("DOMContentLoaded", () => {
@@ -334,7 +477,7 @@ async function openPlayback(item, mode = "compat", { awaitFrame = true, beforeMe
     if (button) button.click();
     else [...document.querySelectorAll("button")].find((button) => button.getAttribute("aria-label")?.startsWith(`Play ${id}`))?.click();
   }, item.id);
-  const playback = { page, context, requests, errors, first: null };
+  const playback = { page, context, requests, transfers, errors, first: null };
   if (awaitFrame) {
     try { await page.waitForFunction(() => window.__playbackBench.first !== null, null, { timeout: 45_000 }); }
     catch (error) { error.stack += ` diagnostics=${JSON.stringify(await diagnostics(playback))}`; throw error; }
@@ -402,6 +545,7 @@ function verifyDelivery(playback, mode) {
     throw new Error("Original workload did not request the original source");
   }
   if (playback.errors.length) throw new Error(`Browser errors: ${playback.errors.join("; ")}`);
+  if (playback.first?.transport?.failure) throw new Error(playback.first.transport.failure);
 }
 
 async function serverStatus() {
@@ -532,6 +676,31 @@ async function validateOutput(recipe, artifact, requested, sample, { item, capab
 }
 
 async function sustainedPlayback(player) {
+  await player.page.evaluate(() => {
+    const video = document.querySelector("video");
+    const observation = window.__playbackBench.bufferObservation = { samples: [], waiting_events: 0, interval_ms: 250 };
+    const started = performance.now();
+    const sample = () => {
+      const position = video.currentTime;
+      let ahead = 0;
+      for (let index = 0; index < video.buffered.length; index++) {
+        if (video.buffered.start(index) <= position && position <= video.buffered.end(index)) {
+          ahead = video.buffered.end(index) - position; break;
+        }
+      }
+      if (observation.samples.length < 128) observation.samples.push({ elapsed_ms: performance.now() - started,
+        ahead_seconds: ahead, ready_state: video.readyState, media_time: position, paused: video.paused, ended: video.ended });
+    };
+    const waiting = () => { observation.waiting_events++; };
+    video.addEventListener("waiting", waiting);
+    const timer = setInterval(sample, observation.interval_ms);
+    observation.finish = () => {
+      clearInterval(timer); video.removeEventListener("waiting", waiting); sample();
+      delete observation.finish;
+      return observation;
+    };
+    sample();
+  });
   const start = await player.page.evaluate(() => ({ wall: performance.now(), media: document.querySelector("video").currentTime,
     frames: window.__playbackBench.frames, ended: document.querySelector("video").ended,
     actual_rate: { playback_rate: document.querySelector("video").playbackRate,
@@ -549,7 +718,11 @@ async function sustainedPlayback(player) {
       control_rate: Number(document.querySelector("#speed-control")?.value) },
     dropped: document.querySelector("video").getVideoPlaybackQuality?.().droppedVideoFrames ?? null }));
   verifyRate(end.actual_rate, "sustained window end");
+  const bufferObservation = await player.page.evaluate(() => window.__playbackBench.bufferObservation.finish());
   return { actual_rate_start: start.actual_rate, actual_rate_end: end.actual_rate,
+    buffer_observation: bufferObservation,
+    minimum_buffer_ahead_seconds: Math.min(...bufferObservation.samples.map((sample) => sample.ahead_seconds)),
+    low_buffer_samples: bufferObservation.samples.filter((sample) => sample.ahead_seconds < 1).length,
     wall_seconds: (end.wall - start.wall) / 1000, media_seconds: end.media - start.media,
     media_seconds_per_wall_second: (end.media - start.media) * 1000 / (end.wall - start.wall),
     presented_frames: end.frames - start.frames, requested_rate: rate, ended_at_start: start.ended, ended_at_end: end.ended,
@@ -569,7 +742,19 @@ async function bufferedRange(player, target) {
   }, target);
 }
 
-async function closePlayers(players) { await Promise.all(players.map((player) => player.context.close())); }
+async function closePlayers(players) {
+  for (const player of players) {
+    await player.page.evaluate(async () => {
+      document.querySelector("#close-player-button").click();
+      await new Promise(requestAnimationFrame);
+    });
+    const transport = await player.page.evaluate(() => structuredClone(window.__playbackBench.transport));
+    if (transport.failure) throw new Error(transport.failure);
+    player.finalTransport = transport;
+  }
+  await Promise.all(players.map((player) => player.context.close()));
+  for (const player of players) if (player.errors.length) throw new Error(player.errors.join("; "));
+}
 
 async function measureCancellation(item, recipe, sample) {
   // Start a genuinely cold producer; never classify completed-source close as
@@ -587,10 +772,10 @@ async function measureCancellation(item, recipe, sample) {
     await sleep(20);
   }
   if (!active.length) {
-    await player.context.close();
+    await closePlayers([player]);
     report.records.push({ recipe, workload: "cancellation", sample, available: false,
       reason: "No active FFmpeg producer was observable within five seconds; completed-cache cleanup is not cancellation.",
-      output_requests: player.requests });
+      output_requests: player.requests, transfers: player.transfers, transport: player.finalTransport });
     return;
   }
   const started = performance.now();
@@ -609,13 +794,15 @@ async function measureCancellation(item, recipe, sample) {
     const status = await serverStatus();
     if (!stillOwned && status.transcode?.active === 0) {
       const cancellationMs = performance.now() - started;
-      await player.context.close();
+      await closePlayers([player]);
       if (status.transcode.cancelled_total <= before.transcode.cancelled_total) {
         report.records.push({ recipe, workload: "cancellation", sample, available: false,
-          reason: "The observed producer completed before the Close player cancellation took ownership" });
+          reason: "The observed producer completed before the Close player cancellation took ownership",
+          transfers: player.transfers, transport: player.finalTransport });
         return;
       }
       report.records.push({ recipe, workload: "cancellation", sample, available: true,
+        transfers: player.transfers, transport: player.finalTransport,
         cancellation_ms: cancellationMs, active_helpers_observed: active.length,
         actual_helper_recipes_observed: active.map((helper) => helper.recipe),
         helpers_reaped: true, auxiliary_helpers_active_when_reaped: status.helpers?.active ?? null,
@@ -649,7 +836,7 @@ try {
         const afterStatus = await serverStatus();
         const cacheReuses = (afterStatus.transcode?.web_player?.cache_reuses_total || 0) - (beforeStatus.transcode?.web_player?.cache_reuses_total || 0);
         const records = players.map((p, viewer) => ({ recipe, workload, sample, viewer, selection_to_frame_ms: p.first.first,
-          browser: p.first, output_requests: structuredClone(p.requests), wall_ms: result.wall_ms,
+          browser: p.first, output_requests: structuredClone(p.requests), transfers: p.transfers, wall_ms: result.wall_ms,
           resource: result.resource, resource_scope: "Shared concurrent trial; do not sum across viewers",
           cache_bytes: null, warm_stamp_verified: Boolean(warmArtifact), warm_cache_reuse_counter_delta: workload === "warm" ? cacheReuses : null,
           server_before: beforeStatus.transcode, server_after_first_frame: afterStatus.transcode }));
@@ -690,18 +877,20 @@ try {
               }
               console.log(`${recipe} sample ${sample + 1}/${samples}: ${seekKind}`);
               const beforeRequests = players[0].requests.length;
+              const beforeTransfers = players[0].transfers.length;
               const seekResult = await measured(() => seek(players[0], target, paused));
               const newRequests = players[0].requests.slice(beforeRequests);
               report.records.push({ recipe, workload: seekKind, sample, seek_to_frame_ms: seekResult.value.first,
                 requested_paused: paused, buffer_before: buffer,
                 actual_seek: newRequests.some((request) => request.recipe.delivery === "mse_init") ? "restarted" : "buffered",
-                browser: seekResult.value, output_requests: newRequests, requests: newRequests.length, resource: seekResult.resource });
+                browser: seekResult.value, output_requests: newRequests, transfers: players[0].transfers.slice(beforeTransfers), requests: newRequests.length, resource: seekResult.resource });
             }
           }
         }
         const sustained = await measured(() => Promise.all(players.map((player) => sustainedPlayback(player))));
         records.forEach((record, index) => { record.sustained = sustained.value[index]; record.sustained_resource = sustained.resource; });
         await closePlayers(players);
+        records.forEach((record, index) => { record.transport_after_playback = players[index].finalTransport; });
       }
       console.log(`${recipe} sample ${sample + 1}/${samples}: cancellation`);
       await measureCancellation(item, recipe, sample);

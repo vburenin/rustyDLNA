@@ -451,11 +451,28 @@ export function parseHlsMediaPlaylist(value, baseHref) {
     const offsets = url.searchParams.getAll("hls_offset");
     const lengths = url.searchParams.getAll("hls_length");
     if (url.origin !== base.origin
+      || url.username || url.password || url.hash
       || !new RegExp(`^/web/media/[1-9]\\d*\\.${extension}$`).test(url.pathname)
       || url.searchParams.getAll("delivery").length !== 1
       || url.searchParams.get("delivery") !== delivery
       || offsets.length !== 1 || !/^\d+$/.test(offsets[0])
       || lengths.length !== 1 || !/^[1-9]\d*$/.test(lengths[0])) return null;
+    const identity = base.pathname.match(/^\/web\/media\/([1-9]\d*)\.m3u8$/)?.[1];
+    if (identity && url.pathname !== `/web/media/${identity}.${extension}`) return null;
+    for (const key of base.searchParams.keys()) {
+      if (["delivery", "mse_after"].includes(key)) continue;
+      const values = base.searchParams.getAll(key);
+      const resourceValues = url.searchParams.getAll(key);
+      if (values.length !== 1 || resourceValues.length !== 1 || values[0] !== resourceValues[0]) return null;
+    }
+    for (const key of url.searchParams.keys()) {
+      if (!["delivery", "hls_offset", "hls_length", "mse_after"].includes(key)
+        && !base.searchParams.has(key)) return null;
+    }
+    const offset = Number(offsets[0]);
+    const length = Number(lengths[0]);
+    if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length)
+      || !Number.isSafeInteger(offset + length)) return null;
     return url.href;
   };
 
@@ -505,6 +522,21 @@ export function parseHlsMediaPlaylist(value, baseHref) {
     segments,
     ended,
   };
+}
+
+// The initialization is small enough that it cannot reserve most of a narrow
+// link. Connection hints can only disable overlap; ordinary serial delivery
+// remains available when the hint or aggregate byte budget is unsuitable.
+export function mediaSourceStartupBudget(playlist, resourceMaxBytes, bufferMaxBytes, connection) {
+  if (!playlist?.segments?.length || connection?.saveData
+    || (connection?.effectiveType && connection.effectiveType !== "4g")
+    || (Number.isFinite(connection?.downlink) && connection.downlink <= 2)) return null;
+  const initBytes = Number(new URL(playlist.initUrl).searchParams.get("hls_length"));
+  const mediaBytes = Number(new URL(playlist.segments[0].url).searchParams.get("hls_length"));
+  const totalBytes = initBytes + mediaBytes;
+  if (![initBytes, mediaBytes, totalBytes].every((value) => Number.isSafeInteger(value) && value > 0)
+    || initBytes > 64 * 1024 || totalBytes > resourceMaxBytes || totalBytes > bufferMaxBytes) return null;
+  return { initBytes, mediaBytes, totalBytes };
 }
 
 function positiveNumber(value, fallback) {

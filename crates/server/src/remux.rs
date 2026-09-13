@@ -20,6 +20,7 @@ use rusty_dlna_transcode::{
 use crate::App;
 
 mod cache;
+mod cache_monitor;
 pub(crate) mod fallback;
 mod hls;
 pub(crate) mod performance;
@@ -28,7 +29,9 @@ mod profile8;
 #[cfg(test)]
 mod validation_tests;
 
-use cache::{enforce_active_cache_limits, maintain_app_cache};
+#[cfg(test)]
+use cache::enforce_active_cache_limits;
+use cache::maintain_app_cache;
 pub(crate) use cache::{maintain_transcode_cache, CacheCoordinator};
 
 const FIRST_BYTES: u64 = 16 * 1024;
@@ -80,7 +83,9 @@ fn run_profile8_pipeline(
     observer: &mut dyn FnMut(RemuxP8StageEvent) -> Result<(), String>,
 ) -> Result<(), RemuxP8Error> {
     #[cfg(test)]
-    if let Some(runner) = crate::lock_recover(p8_test_runners()).remove(part) {
+    let test_runner = crate::lock_recover(p8_test_runners()).remove(part);
+    #[cfg(test)]
+    if let Some(runner) = test_runner {
         return runner(part, deadline, cancelled, observer);
     }
     let toolchain = spec.profile8_toolchain.as_ref().ok_or_else(|| {
@@ -1053,8 +1058,12 @@ impl Drop for RemuxCompletionGuard {
             RemuxState::Failed(_) | RemuxState::Cancelled
         ) {
             // Failure paths may have removed staging bytes after their last
-            // observer scan. Refresh before publishing cleanup completion.
-            let _ = enforce_active_cache_limits(&self.app);
+            // observer scan. Refresh asynchronously so cleanup cannot wait
+            // behind an unrelated image request's maintenance gate.
+            self.app
+                .transcode_cache
+                .monitor
+                .reconcile(&self.app, &self.job);
         }
         finish_job(&self.app, &self.job_key, &self.job);
         self.job.producer_finished.store(true, Ordering::Release);
@@ -1111,8 +1120,7 @@ fn spawn_ffmpeg(
                 tracing::info!(id, dest = %dest.display(), "remux-p8 dovi_tool start");
                 job.transition(RemuxState::Preprocessing);
                 let mut sequence = app.remux_metrics.performance.profile8.begin();
-                let mut final_mux_index = hls::Index::default();
-                let mut next_cache_check = Instant::now();
+                let mut cache_monitor = cache_monitor::Monitor::new();
                 let mut observe_progress = |event: RemuxP8StageEvent| {
                     app.remux_metrics
                         .performance
@@ -1121,25 +1129,21 @@ fn spawn_ffmpeg(
                     if job.reconnect_grace_expired() {
                         job.cancel();
                     }
-                    let now = Instant::now();
-                    if now >= next_cache_check {
-                        enforce_active_cache_limits(&app)
-                            .map(|_| ())
-                            .map_err(|error| format!("transcode cache limits: {error}"))?;
-                        next_cache_check = now + Duration::from_secs(1);
-                    }
                     // The packet rewrite has verified source sample association
                     // and retained its timeline before this immutable final mux.
-                    if event.stage == RemuxP8Stage::FinalMux
+                    let final_mux = event.stage == RemuxP8Stage::FinalMux
                         && matches!(
                             event.status,
                             RemuxP8StageStatus::Started
                                 | RemuxP8StageStatus::Progress
                                 | RemuxP8StageStatus::Succeeded
-                        )
-                    {
-                        profile8::observe_final_mux(&app, &job, &mut final_mux_index)?;
-                    }
+                        );
+                    let kind = if final_mux {
+                        cache_monitor::Kind::Profile8
+                    } else {
+                        cache_monitor::Kind::CacheOnly
+                    };
+                    profile8::observe_final_mux(&app, &job, &mut cache_monitor, kind)?;
                     Ok(())
                 };
                 let p8_result = run_profile8_pipeline(
@@ -1166,7 +1170,7 @@ fn spawn_ffmpeg(
                         cleanup_intermediates(&part);
                         // Refresh after cleanup so the gauge reflects disk,
                         // whether pressure or final-mux inspection stopped it.
-                        let _ = enforce_active_cache_limits(&app);
+                        app.transcode_cache.monitor.reconcile(&app, &job);
                         job.transition(RemuxState::Failed(error));
                         return;
                     }
@@ -1349,7 +1353,7 @@ fn spawn_ffmpeg(
                     if cache_pressure {
                         // The failed pass included the now-removed staging
                         // file, so refresh accounting after cleanup.
-                        let _ = enforce_active_cache_limits(&app);
+                        app.transcode_cache.monitor.reconcile(&app, &job);
                     }
                 }
             }
@@ -1368,9 +1372,9 @@ fn run_ffmpeg_growing(
     source_file: Option<&std::fs::File>,
     ai_upscale_shader_file: Option<&std::fs::File>,
     verified_ffmpeg: Option<&rusty_dlna_transcode::VerifiedExecutable>,
-    job: &RemuxJob,
+    job: &Arc<RemuxJob>,
     deadline: Instant,
-    app: &App,
+    app: &Arc<App>,
 ) -> Result<(std::process::ExitStatus, String), String> {
     use rusty_dlna_helper::{
         CaptureConfig, CaptureRetention, SupervisedCommand, SupervisedOutcome, SupervisionError,
@@ -1437,60 +1441,104 @@ fn run_ffmpeg_growing(
         Cache(String),
     }
     let mut last_len = 0;
-    let mut next_cache_check = Instant::now();
-    let outcome = runner.run_until(deadline, POLL, || {
+    let mut cache_monitor = cache_monitor::Monitor::new();
+    let stop_reason = || {
         if job.cancelled.load(Ordering::Acquire) {
-            return ControlFlow::Break(Stop::Cancelled);
+            return Some(Stop::Cancelled);
         }
         if job.reconnect_grace_expired() {
             job.cancel();
-            return ControlFlow::Break(Stop::Cancelled);
+            return Some(Stop::Cancelled);
         }
-        let now = Instant::now();
-        if now >= deadline {
-            return ControlFlow::Break(Stop::Deadline);
+        (Instant::now() >= deadline).then_some(Stop::Deadline)
+    };
+    let outcome = runner.run_until(deadline, POLL, || {
+        if let Some(reason) = stop_reason() {
+            return ControlFlow::Break(reason);
         }
-        let mut cache_checked = false;
-        if now >= next_cache_check {
-            if let Err(error) = enforce_active_cache_limits(app) {
-                return ControlFlow::Break(Stop::Cache(error.to_string()));
+        // Wake readers at the established 50 ms cadence without doing file IO
+        // in the child observer or waiting for the periodic quota result.
+        if matches!(job.state(), RemuxState::Growing) {
+            job.notify_growth();
+        }
+        let mut observation = cache_monitor.poll(app, job, cache_monitor::Kind::Ordinary);
+        if matches!(job.state(), RemuxState::Starting)
+            && observation
+                .as_ref()
+                .is_ok_and(|value| value.as_ref().is_none_or(|value| !value.playable))
+        {
+            // Give a cheap worker result a bounded opportunity to arrive in
+            // this observer tick. Request at most 5 ms of waiting; filesystem
+            // and cache-gate work remain outside the child observer.
+            cache_monitor.wait_pending(
+                Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
+            );
+            if let Some(reason) = stop_reason() {
+                return ControlFlow::Break(reason);
             }
-            next_cache_check = now + Duration::from_secs(1);
-            cache_checked = true;
+            observation = cache_monitor.poll(app, job, cache_monitor::Kind::Ordinary);
         }
-        let len = job
-            .part
-            .metadata()
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        if len != last_len {
-            last_len = len;
-            let becoming_playable =
-                len >= FIRST_BYTES && matches!(job.state(), RemuxState::Starting);
-            // Do not expose the first playable fragment based on a cache pass
-            // that happened before the child produced it. Fast helpers can
-            // otherwise finish an oversized output inside the one-second
-            // maintenance interval and let a waiter open bytes that final
-            // admission will reject.
-            if becoming_playable && !cache_checked {
-                if let Err(error) = enforce_active_cache_limits(app) {
-                    return ControlFlow::Break(Stop::Cache(error.to_string()));
+        match observation {
+            Err(error) => return ControlFlow::Break(Stop::Cache(error)),
+            Ok(Some(observation)) if !job.cancelled.load(Ordering::Acquire) => {
+                if observation.playable && matches!(job.state(), RemuxState::Starting) {
+                    // The worker sampled these bytes before its successful
+                    // pressure pass. No pending/older result grants exposure.
+                    job.transition(RemuxState::Growing);
+                } else if observation.length != last_len {
+                    job.notify_growth();
                 }
-                next_cache_check = now + Duration::from_secs(1);
+                last_len = observation.length;
             }
-            if becoming_playable {
-                job.transition(RemuxState::Growing);
-            } else {
-                job.notify_growth();
-            }
+            _ => {}
         }
         ControlFlow::Continue(())
     });
     match outcome {
-        Ok(SupervisedOutcome::Exited(output)) => Ok((
-            output.status,
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        )),
+        Ok(SupervisedOutcome::Exited(output)) => {
+            if output.status.success() && matches!(job.state(), RemuxState::Starting) {
+                // A fast child can exit before the observer consumes its ready
+                // result. Reap first, then inspect its final bytes once. Keeping
+                // this observation owned restores early playback without
+                // waiting for final verification or blocking child supervision.
+                cache_monitor = cache_monitor::Monitor::new();
+                cache_monitor
+                    .poll(app, job, cache_monitor::Kind::Ordinary)
+                    .map_err(|error| format!("transcode cache limits: {error}"))?;
+                loop {
+                    if job.reconnect_grace_expired() {
+                        job.cancel();
+                    }
+                    if job.cancelled.load(Ordering::Acquire) {
+                        return Err("cancelled".into());
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("transcode runtime exceeded configured deadline".into());
+                    }
+                    if let Some(observation) = cache_monitor
+                        .take_ready()
+                        .transpose()
+                        .map_err(|error| format!("transcode cache limits: {error}"))?
+                    {
+                        if job.cancelled.load(Ordering::Acquire) {
+                            return Err("cancelled".into());
+                        }
+                        if Instant::now() >= deadline {
+                            return Err("transcode runtime exceeded configured deadline".into());
+                        }
+                        if observation.playable {
+                            job.transition(RemuxState::Growing);
+                        }
+                        break;
+                    }
+                    cache_monitor.wait_pending(POLL);
+                }
+            }
+            Ok((
+                output.status,
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ))
+        }
         Ok(
             SupervisedOutcome::NotStarted {
                 reason: Stop::Cancelled,
@@ -1672,9 +1720,13 @@ fn finalize_remux(
             job.transition(RemuxState::Cancelled);
         } else {
             tracing::error!(id = job.detail_id, %error, "remux output verification/publication failed");
-            job.transition(RemuxState::Failed(format!(
-                "remux output verification failed: {error}"
-            )));
+            job.transition(RemuxState::Failed(
+                if error.starts_with("transcode cache limits:") {
+                    error
+                } else {
+                    format!("remux output verification failed: {error}")
+                },
+            ));
         }
     }
 }
@@ -1728,11 +1780,15 @@ fn publish_finished_output(
         hook(job);
     }
     // The completed bytes remain protected staging artifacts during the quota check.
-    enforce_active_cache_limits(app).map_err(|error| format!("transcode cache limits: {error}"))?;
     // Acquire the shared gate before the completion lock: maintenance may
     // briefly inspect the registry, whose cancellation paths take completion.
     // Publication never reacquires the registry while holding either lock.
-    let _maintenance = crate::lock_recover(&app.cache_maintenance);
+    let _maintenance = cache::lock_maintenance(app, || {
+        job.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
+    })
+    .map_err(|error| format!("transcode cache limits: {error}"))?;
+    cache::maintain_locked_measured(app, false)
+        .map_err(|error| format!("transcode cache limits: {error}"))?;
     // Cancellation and publication retain one ordering through Complete.
     let _completion = crate::lock_recover(&job.disconnect_deadline);
     cache::check_publication_limits(app, job)
@@ -4137,7 +4193,7 @@ mod tests {
         assert_eq!(app.ai_upscale_jobs.in_use(), 1);
     }
 
-    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
+    pub(super) fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + timeout;
         while !condition() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
@@ -4919,7 +4975,7 @@ mod tests {
             &app,
             &job,
             &job_spec(&dir, "quota", Vec::new()),
-            Duration::ZERO,
+            Duration::from_secs(1),
             &None,
             false,
         );
@@ -6779,6 +6835,284 @@ mod tests {
         );
         assert!(!part.exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cache_gate_cannot_delay_running_child_cancellation_or_deadline() {
+        for profile8 in [false, true] {
+            for deadline in [false, true] {
+                let dir = temp_dir("blocked-cache-child");
+                let mut config = crate::Config {
+                    cache_dir: Some(dir.display().to_string()),
+                    rescan_secs: 0,
+                    ..crate::Config::default()
+                };
+                config.transcode.enable = true;
+                config.transcode.max_jobs = 1;
+                config.transcode.max_runtime_secs = 5;
+                let app = Arc::new(App::from_config(config, 18200, 11900, &dir));
+                let mut spec = job_spec(&dir, "blocked-cache", Vec::new());
+                spec.dest = rusty_dlna_transcode::cache_dest_for_key(
+                    &dir,
+                    42,
+                    RecodeAction::Hdr10,
+                    &"b".repeat(64),
+                );
+                let part = cache_part(&spec.dest);
+                let leader = part.with_extension("p8-stage.pid");
+                let descendant = part.with_extension("p8-stage-child.pid");
+                if profile8 {
+                    spec.remux_p8 = true;
+                    crate::lock_recover(p8_test_runners())
+                        .insert(part.clone(), cache_pressure_p8_stage);
+                } else {
+                    spec.args = vec![
+                        "sh".into(), "-c".into(),
+                        "echo $$ > \"$1\"; dd if=/dev/zero of=\"$2\" bs=1048576 count=2 2>/dev/null; trap '' TERM; sleep 30 & echo $! > \"$3\"; wait".into(),
+                        "cache-gate-child".into(), leader.clone().into_os_string(),
+                        part.clone().into_os_string(), descendant.clone().into_os_string(),
+                    ];
+                }
+                let job = attach(app.clone(), spec).unwrap();
+                struct CancelOnDrop(Arc<RemuxJob>);
+                impl Drop for CancelOnDrop {
+                    fn drop(&mut self) {
+                        self.0.cancel();
+                        let until = Instant::now() + Duration::from_secs(3);
+                        while !self.0.producer_finished.load(Ordering::Acquire)
+                            && Instant::now() < until
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }
+                let _cancel = CancelOnDrop(job.clone());
+                wait_until(Duration::from_secs(2), || descendant.is_file());
+                let pids: Vec<_> = [&leader, &descendant]
+                    .into_iter()
+                    .map(|path| {
+                        let pid = std::fs::read_to_string(path)
+                            .unwrap()
+                            .trim()
+                            .parse::<u32>()
+                            .unwrap();
+                        PathBuf::from(format!("/proc/{pid}"))
+                    })
+                    .collect();
+                assert!(pids.iter().all(|path| path.exists()));
+                let gate = crate::lock_recover(&app.cache_maintenance);
+                wait_until(Duration::from_secs(2), || {
+                    app.transcode_cache.monitor.waiting()
+                });
+                if !deadline {
+                    cancel_all(&app);
+                }
+                wait_until(Duration::from_secs(6), || {
+                    job.producer_finished.load(Ordering::Acquire)
+                        && app.jobs.in_use() == 0
+                        && app.helpers.metrics().active == 0
+                });
+                if deadline {
+                    assert!(
+                        matches!(job.state(), RemuxState::Failed(error) if error.contains("deadline"))
+                    );
+                } else {
+                    assert_eq!(job.state(), RemuxState::Cancelled);
+                }
+                wait_until(Duration::from_secs(2), || {
+                    pids.iter().all(|path| !path.exists())
+                });
+                assert!(!part.exists());
+                assert!(!part.with_extension("p8.hevc").exists());
+                assert!(!job.dest.exists());
+                assert!(crate::lock_recover(&app.remuxes).is_empty());
+                // Every assertion above is made while the actual shared image/
+                // video maintenance gate is still held by this thread.
+                drop(gate);
+                app.scan_cfg.cancellation.cancel();
+                let weak = Arc::downgrade(&app);
+                drop(app);
+                wait_until(Duration::from_secs(2), || weak.upgrade().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn successful_child_exit_keeps_readiness_owned_before_publication() {
+        let fixture_dir = temp_dir("post-exit-media");
+        let fixture = fixture_dir.join("source.mp4");
+        let generated = rusty_dlna_helper::SupervisedCommand::new(
+            std::process::Command::new("ffmpeg")
+                .args([
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=160x90:rate=24",
+                    "-t",
+                    "2",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-threads",
+                    "2",
+                    "-g",
+                    "24",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-an",
+                    "-movflags",
+                    "+frag_keyframe+empty_moov",
+                ])
+                .arg(&fixture),
+        )
+        .run_until(Instant::now() + Duration::from_secs(10), POLL, || {
+            std::ops::ControlFlow::<()>::Continue(())
+        })
+        .unwrap();
+        assert!(
+            matches!(generated, rusty_dlna_helper::SupervisedOutcome::Exited(output) if output.status.success())
+        );
+        let media = std::fs::read(fixture).unwrap();
+        assert!(media.len() >= FIRST_BYTES as usize);
+        for mode in ["ready", "short", "cancel", "disconnect", "deadline"] {
+            let dir = temp_dir("post-exit-readiness");
+            let app = test_app(&dir, 1);
+            let job = growing_test_job(&dir, 42, b"");
+            job.transition(RemuxState::Starting);
+            crate::lock_recover(&app.remuxes).insert("post-exit".into(), job.clone());
+            let source = dir.join("source.mp4");
+            let bytes = if mode == "short" {
+                &b"too short"[..]
+            } else {
+                &media
+            };
+            std::fs::write(&source, bytes).unwrap();
+            let leader = dir.join("leader.pid");
+            let args = vec![
+                "sh".into(),
+                "-c".into(),
+                "echo $$ > \"$1\"; cp \"$2\" \"$3\"".into(),
+                "post-exit-child".into(),
+                leader.clone().into_os_string(),
+                source.into_os_string(),
+                job.part.clone().into_os_string(),
+            ];
+            let (sent, received) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let gate = crate::lock_recover(&app.cache_maintenance);
+                struct CancelOnDrop<'a>(&'a RemuxJob);
+                impl Drop for CancelOnDrop<'_> {
+                    fn drop(&mut self) {
+                        self.0.cancel();
+                    }
+                }
+                let _cancel = CancelOnDrop(&job);
+                scope.spawn(|| {
+                    let budget = if mode == "deadline" {
+                        Duration::from_millis(500)
+                    } else {
+                        Duration::from_secs(5)
+                    };
+                    sent.send(run_ffmpeg_growing(
+                        &args,
+                        None,
+                        None,
+                        None,
+                        &job,
+                        Instant::now() + budget,
+                        &app,
+                    ))
+                    .unwrap();
+                });
+                wait_until(Duration::from_secs(2), || leader.is_file());
+                let pid = std::fs::read_to_string(&leader)
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap();
+                wait_until(Duration::from_secs(2), || {
+                    !Path::new(&format!("/proc/{pid}")).exists()
+                });
+                assert_eq!(job.state(), RemuxState::Starting);
+                assert!(job.pin_ready_output().unwrap().is_none());
+                match mode {
+                    "ready" | "short" => drop(gate),
+                    "cancel" => job.cancel(),
+                    "disconnect" => {
+                        *crate::lock_recover(&job.disconnect_deadline) = Some(Instant::now())
+                    }
+                    _ => {}
+                }
+                let result = received.recv_timeout(Duration::from_secs(2)).unwrap();
+                if mode == "ready" {
+                    assert!(result.unwrap().0.success());
+                    assert_eq!(job.state(), RemuxState::Growing);
+                    let ready = job.pin_ready_output().unwrap().unwrap();
+                    assert_eq!(std::fs::read(ready).unwrap(), media);
+                    assert!(
+                        !job.dest.exists(),
+                        "readiness precedes completed publication"
+                    );
+                } else if mode == "short" {
+                    assert!(result.unwrap().0.success());
+                    assert_eq!(job.state(), RemuxState::Starting);
+                    assert!(job.pin_ready_output().unwrap().is_none());
+                } else {
+                    let expected = if mode == "deadline" {
+                        "deadline"
+                    } else {
+                        "cancelled"
+                    };
+                    assert!(result.unwrap_err().contains(expected));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn cache_gate_cannot_delay_cancellation_after_child_exit() {
+        let dir = temp_dir("blocked-cache-publication");
+        let app = test_app(&dir, 1);
+        let mut spec = job_spec(&dir, "blocked-cache-publication", Vec::new());
+        let release = dir.join("release");
+        let leader = dir.join("leader.pid");
+        spec.args = vec![
+            "sh".into(),
+            "-c".into(),
+            "echo $$ > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done; cp \"$3\" \"$4\"".into(),
+            "publication-child".into(),
+            leader.clone().into_os_string(),
+            release.clone().into_os_string(),
+            spec.src.as_os_str().to_owned(),
+            cache_part(&spec.dest).into_os_string(),
+        ];
+        let job = attach(app.clone(), spec).unwrap();
+        wait_until(Duration::from_secs(2), || leader.is_file());
+        let pid = std::fs::read_to_string(&leader)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        let gate = crate::lock_recover(&app.cache_maintenance);
+        std::fs::write(&release, b"finish").unwrap();
+        wait_until(Duration::from_secs(2), || {
+            !Path::new(&format!("/proc/{pid}")).exists()
+        });
+        assert!(!job.producer_finished.load(Ordering::Acquire));
+        job.cancel();
+        wait_until(Duration::from_secs(2), || {
+            job.producer_finished.load(Ordering::Acquire)
+                && app.jobs.in_use() == 0
+                && app.helpers.metrics().active == 0
+        });
+        assert_eq!(job.state(), RemuxState::Cancelled);
+        assert!(!job.part.exists());
+        assert!(!job.dest.exists());
+        drop(gate);
     }
 
     #[test]
