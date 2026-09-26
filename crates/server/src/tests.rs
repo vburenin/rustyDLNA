@@ -2,6 +2,183 @@ use super::*;
 use rusty_dlna_scan::scan;
 use rusty_dlna_soap::xml_tag_text;
 
+#[test]
+fn embedded_text_captions_are_discovered_extracted_and_confined() {
+    let tree = TestTree::new("embedded-captions");
+    let root = tree.path().join("media");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = root.join("The Glass Observatory.mkv");
+    let english = tree.path().join("english.srt");
+    let french = tree.path().join("french.srt");
+    std::fs::write(
+        &english,
+        "1\n00:00:00,500 --> 00:00:02,500\nThe brass moon rises.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &french,
+        "1\n00:00:00,500 --> 00:00:02,500\nLa lune de cuivre.\n",
+    )
+    .unwrap();
+    let mut command = std::process::Command::new("ffmpeg");
+    command
+        .args([
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=s=96x64:r=10:d=3",
+        ])
+        .arg("-i")
+        .arg(&english)
+        .arg("-i")
+        .arg(&french)
+        .args([
+            "-map",
+            "0:v",
+            "-map",
+            "1:s",
+            "-map",
+            "2:s",
+            "-c:v",
+            "libx264",
+            "-threads",
+            "1",
+            "-c:s",
+            "srt",
+            "-metadata:s:s:0",
+            "language=eng",
+            "-metadata:s:s:0",
+            "title=Moon dialogue",
+            "-metadata:s:s:1",
+            "language=fra",
+            "-disposition:s:0",
+            "default",
+            "-disposition:s:1",
+            "forced",
+        ])
+        .arg(&source);
+    let generated = rusty_dlna_helper::SupervisedCommand::new(&mut command)
+        .run_until(
+            Instant::now() + Duration::from_secs(30),
+            Duration::from_millis(20),
+            || std::ops::ControlFlow::<()>::Continue(()),
+        )
+        .unwrap();
+    assert!(
+        matches!(generated, rusty_dlna_helper::SupervisedOutcome::Exited(output) if output.status.success())
+    );
+    std::fs::copy(&english, root.join("The Glass Observatory.en.srt")).unwrap();
+    let app = App::from_config(
+        Config {
+            friendly_name: "subtitle-test".into(),
+            media_dir: vec![root.display().to_string()],
+            cache_dir: Some(tree.path().join("cache").display().to_string()),
+            db_dir: Some(tree.path().join("database").display().to_string()),
+            thumbnails: false,
+            rescan_secs: 0,
+            ..Config::default()
+        },
+        18200,
+        11900,
+        tree.path(),
+    );
+    *write_recover(&app.catalog) = scan(&app.scan_cfg).unwrap();
+    let id = read_recover(&app.catalog)
+        .items
+        .values()
+        .find(|item| item.path == source)
+        .unwrap()
+        .detail_id;
+    let response = app.handle(&req(&get(&format!("/api/web/item/{id}"), "Browser/1.0")));
+    assert_eq!(response.status, 200);
+    let json: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(json["item"]["embedded_captions_complete"], true);
+    let captions = json["item"]["captions"].as_array().unwrap();
+    assert_eq!(captions.len(), 3);
+    let embedded: Vec<_> = captions
+        .iter()
+        .filter(|track| track["embedded"] == true)
+        .collect();
+    assert_eq!(embedded.len(), 2);
+    assert_eq!(embedded[0]["language"], "eng");
+    assert_eq!(embedded[0]["default"], true);
+    assert_eq!(embedded[1]["forced"], true);
+    for (track, text) in embedded
+        .iter()
+        .zip(["The brass moon rises.", "La lune de cuivre."])
+    {
+        assert!(track["index"].as_u64().unwrap() > u64::from(u32::MAX));
+        let path = track["url"].as_str().unwrap();
+        let caption = app.handle(&req(&get(path, "Browser/1.0")));
+        assert_eq!(
+            caption.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&caption.body)
+        );
+        let body = std::str::from_utf8(&caption.body).unwrap();
+        assert!(body.starts_with("WEBVTT"));
+        assert!(body.contains(text));
+        assert!(body.contains("00:00.500 --> 00:02.500"), "{body}");
+        // Like converted sidecars, this bounded resource ignores Range and
+        // returns the complete document so resumed clients can restart safely.
+        let mut ranged = req(&get(path, "Browser/1.0"));
+        ranged.headers.push(("Range".into(), "bytes=12-".into()));
+        let restarted = app.handle(&ranged);
+        assert_eq!(restarted.status, 200);
+        assert_eq!(restarted.body, caption.body);
+    }
+    assert_eq!(
+        app.handle(&req(&get(
+            &format!("/Captions/{id}/embedded/0.vtt"),
+            "Browser/1.0"
+        )))
+        .status,
+        404
+    );
+    assert_eq!(
+        app.handle(&req(&get(
+            &format!("/Captions/{id}/embedded/01.vtt"),
+            "Browser/1.0"
+        )))
+        .status,
+        404
+    );
+    // Old catalogs can enrich on demand without a rescan or schema migration.
+    {
+        let mut catalog = write_recover(&app.catalog);
+        let key = catalog.by_detail[&id].clone();
+        catalog
+            .items
+            .get_mut(&key)
+            .unwrap()
+            .probe
+            .audio_streams
+            .clear();
+    }
+    let refreshed = app.handle(&req(&get(
+        &format!("/api/web/item/{id}?enrich=1"),
+        "Browser/1.0",
+    )));
+    let refreshed: serde_json::Value = serde_json::from_slice(&refreshed.body).unwrap();
+    assert_eq!(refreshed["item"]["captions"], json["item"]["captions"]);
+    let outside = tree.path().join("outside.mkv");
+    std::fs::rename(&source, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &source).unwrap();
+    assert_eq!(
+        app.handle(&req(&get(
+            embedded[0]["url"].as_str().unwrap(),
+            "Browser/1.0"
+        )))
+        .status,
+        404
+    );
+}
+
 #[path = "large_library_tests.rs"]
 mod large_library;
 
@@ -959,7 +1136,7 @@ fn web_item_samples_item_and_generation_under_one_catalog_snapshot() {
     assert_eq!(json["generation"], old_generation);
     assert_eq!(
         resp_header(&response, "ETag"),
-        Some(format!("W/\"web-v2-r9-{old_generation}-item-{detail_id}\"").as_str())
+        Some(format!("W/\"web-v2-r10-{old_generation}-item-{detail_id}\"").as_str())
     );
     done_rx.recv().unwrap().unwrap();
     publisher.join().unwrap();
@@ -5935,8 +6112,11 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     )));
     assert_eq!(folders.status, 200);
     let folders_etag = resp_header(&folders, "ETag").unwrap().to_owned();
-    assert!(folders_etag.starts_with("W/\"web-v2-r9-"), "{folders_etag}");
-    let stale_capability_etag = folders_etag.replacen("-r9-", "-r8-", 1);
+    assert!(
+        folders_etag.starts_with("W/\"web-v2-r10-"),
+        "{folders_etag}"
+    );
+    let stale_capability_etag = folders_etag.replacen("-r10-", "-r9-", 1);
     let stale_conditional = req(&format!(
         "GET /api/web/library?view=folders&folder=64&offset=0&limit=200 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\nIf-None-Match: {stale_capability_etag}\r\n\r\n"
     ));

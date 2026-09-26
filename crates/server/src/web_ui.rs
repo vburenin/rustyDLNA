@@ -119,7 +119,7 @@ const WEB_SCHEMA_VERSION: u8 = 2;
 // Change when a browser API representation can differ without a catalog
 // generation change. This keeps conditional requests from reusing capability
 // or media metadata cached from an older rustyDLNA build.
-const WEB_API_CACHE_REVISION: u8 = 9;
+const WEB_API_CACHE_REVISION: u8 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WebItemId(i64);
@@ -399,6 +399,7 @@ struct WebMediaItem {
     audio_tracks: Vec<WebAudioTrack>,
     default_audio_index: usize,
     captions: Vec<WebCaption>,
+    embedded_captions_complete: bool,
     chapters: Vec<WebChapter>,
     stream_metadata_complete: bool,
     art_url: Option<String>,
@@ -425,10 +426,12 @@ struct WebAudioTrack {
 
 #[derive(Serialize)]
 struct WebCaption {
-    index: u32,
+    index: u64,
     label: String,
     language: Option<String>,
     default: bool,
+    forced: bool,
+    embedded: bool,
     source_format: String,
     browser_supported: bool,
     url: Option<String>,
@@ -1518,6 +1521,7 @@ fn stream_metadata_complete(
         && matches!(container, "mp4" | "mov")
         && matches!(video_codec, "h264" | "hevc");
     metadata.has_video_capabilities_marker()
+        && metadata.has_subtitle_marker()
         && (!needs_timestamp_check || metadata.has_timestamp_marker())
 }
 
@@ -1646,25 +1650,60 @@ fn caption_label(index: u32, language: Option<&str>) -> String {
 }
 
 fn caption_dtos(item: &MediaItem) -> Vec<WebCaption> {
-    item.captions
+    let mut captions: Vec<_> = item
+        .captions
         .iter()
         .map(|caption| {
             let language = caption_language(&item.path, &caption.path);
             let url = browser_caption_url(item.detail_id, caption.index, &caption.ext);
             WebCaption {
-                index: caption.index,
+                index: u64::from(caption.index),
                 label: caption_label(caption.index, language.as_deref()),
                 language,
                 // Sidecar filenames do not carry a standards-defined default
                 // disposition. Keep captions opt-in unless that fact is
                 // persisted explicitly in a future schema.
                 default: false,
+                forced: false,
+                embedded: false,
                 source_format: caption.ext.clone(),
                 browser_supported: url.is_some(),
                 url,
             }
         })
-        .collect()
+        .collect();
+    if let Ok(metadata) = CompactStreamMetadata::parse(&item.probe.audio_streams) {
+        captions.extend(metadata.subtitle_records().map(|track| {
+            let supported = rusty_dlna_transcode::captions::embedded_caption_supported(track.codec);
+            let language = track.language.map(|value| value.into_owned());
+            let language_label = caption_label(0, language.as_deref());
+            let label = match track.title.filter(|title| !title.is_empty()) {
+                Some(title) if language.is_some() => format!("{title} · {language_label}"),
+                Some(title) => title.into_owned(),
+                None if language.is_some() => language_label,
+                None => format!("Subtitle {}", track.global_index + 1),
+            };
+            WebCaption {
+                // Sidecar indexes occupy u32; embedded indexes are disjoint
+                // and still exactly representable by JavaScript numbers.
+                index: (1_u64 << 32) + track.global_index as u64,
+                label,
+                language,
+                default: track.default,
+                forced: track.forced,
+                embedded: true,
+                source_format: track.codec.to_owned(),
+                browser_supported: supported,
+                url: supported.then(|| {
+                    format!(
+                        "/Captions/{}/embedded/{}.vtt",
+                        item.detail_id, track.global_index
+                    )
+                }),
+            }
+        }));
+    }
+    captions
 }
 
 fn media_dto(app: &App, item: &MediaItem) -> WebMediaItem {
@@ -1778,7 +1817,13 @@ fn media_dto(app: &App, item: &MediaItem) -> WebMediaItem {
         hdr: item.probe.hdr.clone(),
         audio_tracks,
         default_audio_index,
-        captions: caption_dtos(item),
+        captions: if app.scan_cfg.subtitles {
+            caption_dtos(item)
+        } else {
+            vec![]
+        },
+        embedded_captions_complete: !app.scan_cfg.subtitles
+            || stream_metadata.is_some_and(CompactStreamMetadata::has_subtitle_marker),
         chapters: stored_chapters(stream_metadata),
         stream_metadata_complete: stream_metadata_complete(
             stream_metadata,
@@ -2575,6 +2620,106 @@ pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
         response.set("Retry-After", retry_after);
     }
     response
+}
+
+pub(crate) fn embedded_caption(app: &App, req: &HttpRequest) -> HttpResponse {
+    if !app.cfg.web.enable || !app.scan_cfg.subtitles {
+        return not_found();
+    }
+    let parsed = req.path.strip_prefix("/Captions/").and_then(|rest| {
+        let (id, stream) = rest.split_once("/embedded/")?;
+        let stream = stream.strip_suffix(".vtt")?;
+        let id_value = id.parse::<i64>().ok().filter(|id| *id > 0)?;
+        let stream_value = stream.parse::<usize>().ok()?;
+        (id_value.to_string() == id && stream_value.to_string() == stream)
+            .then_some((id_value, stream_value))
+    });
+    let Some((id, stream)) = parsed else {
+        return not_found();
+    };
+    if !req.query.is_empty() {
+        return api_error(
+            400,
+            "invalid_caption_request",
+            "Subtitle requests do not accept parameters.",
+            false,
+            None,
+        );
+    }
+    let Some(item) = read_recover(&app.catalog).get_item_by_detail(id).cloned() else {
+        return not_found();
+    };
+    let path = rusty_dlna_scan::rebase_media_path_for_config(&item.path, &app.scan_cfg);
+    let Ok(opened) = rusty_dlna_scan::open_allowed_file(&path, &app.scan_cfg) else {
+        return not_found();
+    };
+    let Ok(_permit) = app.helpers.acquire_timeout_cancelled(
+        Duration::from_secs(app.cfg.helper_queue_timeout_secs),
+        &app.scan_cfg.cancellation,
+    ) else {
+        let mut response = api_error(
+            503,
+            "caption_busy",
+            "The server is preparing other media. Try again shortly.",
+            true,
+            None,
+        );
+        response.set("Retry-After", "1");
+        return response;
+    };
+    // Re-probe the opened inode: a replaced movie must never map an old subtitle
+    // index to video/audio or reopen a pathname after authorization.
+    let Some(probe) = rusty_dlna_scan::probe_media_with_cancellation(
+        &opened.proc_path(),
+        Duration::from_secs(app.cfg.scan_command_timeout_secs.min(10)),
+        &app.scan_cfg.cancellation,
+    ) else {
+        return api_error(
+            422,
+            "caption_probe_failed",
+            "Subtitle tracks could not be read.",
+            false,
+            None,
+        );
+    };
+    let Some(track) = probe
+        .subtitle_tracks
+        .iter()
+        .find(|track| track.global_index == stream)
+    else {
+        return not_found();
+    };
+    if !rusty_dlna_transcode::captions::embedded_caption_supported(&track.codec) {
+        return api_error(
+            415,
+            "caption_unsupported",
+            "This image-based or unsupported subtitle cannot be converted to text.",
+            false,
+            None,
+        );
+    }
+    match rusty_dlna_transcode::captions::extract_embedded_webvtt(
+        &opened.file,
+        stream,
+        Duration::from_secs(120),
+        &app.scan_cfg.cancellation,
+    ) {
+        Ok(body) => browser_caption_response(app, "vtt", &body),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => api_error(
+            504,
+            "caption_timeout",
+            "Subtitle preparation timed out. Try again.",
+            true,
+            None,
+        ),
+        Err(_) => api_error(
+            422,
+            "caption_conversion_failed",
+            "This subtitle could not be prepared for offline playback.",
+            false,
+            None,
+        ),
+    }
 }
 
 pub(crate) fn browser_caption_response(app: &App, ext: &str, body: &[u8]) -> HttpResponse {
@@ -4243,7 +4388,7 @@ mod tests {
     #[test]
     fn compact_chapters_keep_source_gaps_and_malformed_marker_presence() {
         let metadata = CompactStreamMetadata::parse(concat!(
-            "@v:bad%XX,@t:,",
+            "@v:bad%XX,@t:,@s,",
             "@c:bad|300:200:backwards|100:200:Good%20One|200:300:bad%XX|300:400:"
         ))
         .ok();

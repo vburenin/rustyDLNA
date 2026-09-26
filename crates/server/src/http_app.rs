@@ -2698,6 +2698,9 @@ impl App {
     }
 
     fn caption(&self, req: &HttpRequest) -> HttpResponse {
+        if req.path.contains("/embedded/") {
+            return web_ui::embedded_caption(self, req);
+        }
         let Some((id, idx)) = caption_from_path(&req.path) else {
             return HttpResponse::html(404, "Not Found", "bad caption");
         };

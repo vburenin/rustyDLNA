@@ -27,8 +27,9 @@ use std::time::{Duration, Instant};
 use ffmpeg_sys_next as sys;
 use rusty_dlna_protocol::{
     encode_compact_stream_metadata, CompactAudioRecordInput, CompactChapterInput,
-    CompactStreamMetadataInput, CompactStreamMetadataWriteError, CompactVideoCapabilitiesInput,
-    MAX_COMPACT_AUDIO_RECORDS, MAX_COMPACT_CHAPTERS,
+    CompactStreamMetadataInput, CompactStreamMetadataWriteError, CompactSubtitleRecord,
+    CompactVideoCapabilitiesInput, MAX_COMPACT_AUDIO_RECORDS, MAX_COMPACT_CHAPTERS,
+    MAX_COMPACT_SUBTITLE_RECORDS,
 };
 
 use crate::{duration_str, AvMeta, CancellationToken, EmbeddedTags, SourceProbe};
@@ -52,6 +53,7 @@ pub struct MediaProbe {
     /// Ordered audio streams with request-facing labels. The compact catalog
     /// stream descriptor persists these labels for ordinary playback.
     pub audio_tracks: Vec<AudioTrackProbe>,
+    pub subtitle_tracks: Vec<SubtitleTrackProbe>,
     pub chapters: Vec<ChapterProbe>,
 }
 
@@ -72,6 +74,17 @@ pub struct AudioTrackProbe {
     pub language: Option<String>,
     pub title: Option<String>,
     pub default: bool,
+}
+
+/// One embedded subtitle stream, including unsupported image-based codecs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubtitleTrackProbe {
+    pub global_index: usize,
+    pub codec: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub default: bool,
+    pub forced: bool,
 }
 
 static INIT: Once = Once::new();
@@ -589,6 +602,7 @@ unsafe fn probe_avformat(
         av: AvMeta::default(),
         tags: EmbeddedTags::default(),
         audio_tracks: Vec::new(),
+        subtitle_tracks: Vec::new(),
         chapters: Vec::new(),
     };
     let fmt = (*ctx).iformat;
@@ -735,6 +749,16 @@ unsafe fn probe_avformat(
             }
             sys::AVMediaType::AVMEDIA_TYPE_SUBTITLE => {
                 push_unique(&mut subs, map_subtitle((*par).codec_id));
+                if out.subtitle_tracks.len() < MAX_COMPACT_SUBTITLE_RECORDS {
+                    out.subtitle_tracks.push(SubtitleTrackProbe {
+                        global_index: i as usize,
+                        codec: map_subtitle((*par).codec_id),
+                        language: dictionary_value((*st).metadata, &["language"]),
+                        title: dictionary_value((*st).metadata, &["title"]),
+                        default: (*st).disposition & sys::AV_DISPOSITION_DEFAULT != 0,
+                        forced: (*st).disposition & sys::AV_DISPOSITION_FORCED != 0,
+                    });
+                }
             }
             _ => {}
         }
@@ -773,6 +797,7 @@ unsafe fn probe_avformat(
         &out.audio_tracks,
         &audio_stream_indices,
         &out.chapters,
+        &out.subtitle_tracks,
     );
 
     if owner.expired() {
@@ -836,10 +861,16 @@ fn persisted_stream_metadata(
     audio_tracks: &[AudioTrackProbe],
     audio_stream_indices: &[usize],
     chapters: &[ChapterProbe],
+    subtitles: &[SubtitleTrackProbe],
 ) -> String {
-    if let Ok(encoded) =
-        encode_probe_stream_metadata(probe, audio_tracks, audio_stream_indices, chapters, true)
-    {
+    if let Ok(encoded) = encode_probe_stream_metadata(
+        probe,
+        audio_tracks,
+        audio_stream_indices,
+        chapters,
+        subtitles,
+        true,
+    ) {
         return encoded;
     }
 
@@ -856,6 +887,7 @@ fn persisted_stream_metadata(
         &audio_tracks[..audio_limit],
         &audio_stream_indices[..audio_limit],
         &[],
+        subtitles,
         false,
     ) {
         return encoded;
@@ -864,7 +896,7 @@ fn persisted_stream_metadata(
     // Generated capability values are short libav names and the timestamp
     // mode is one of two scanner literals, so the essential-only form is
     // expected to fit even if every audio descriptor had to be discarded.
-    if let Ok(encoded) = encode_probe_stream_metadata(probe, &[], &[], &[], false) {
+    if let Ok(encoded) = encode_probe_stream_metadata(probe, &[], &[], &[], subtitles, false) {
         return encoded;
     }
 
@@ -884,6 +916,7 @@ fn encode_probe_stream_metadata(
     audio_tracks: &[AudioTrackProbe],
     audio_stream_indices: &[usize],
     chapters: &[ChapterProbe],
+    subtitles: &[SubtitleTrackProbe],
     include_optional_audio_fields: bool,
 ) -> Result<String, CompactStreamMetadataWriteError> {
     let audio_record_count = audio_tracks.len().min(audio_stream_indices.len());
@@ -923,8 +956,20 @@ fn encode_probe_stream_metadata(
             title: chapter.title.as_deref(),
         })
         .collect::<Vec<_>>();
+    let subtitles = subtitles
+        .iter()
+        .map(|track| CompactSubtitleRecord {
+            global_index: track.global_index,
+            codec: &track.codec,
+            language: track.language.as_deref().map(Into::into),
+            title: track.title.as_deref().map(Into::into),
+            default: track.default,
+            forced: track.forced,
+        })
+        .collect::<Vec<_>>();
     encode_compact_stream_metadata(CompactStreamMetadataInput {
         audio_records: &audio_records,
+        subtitle_records: Some(&subtitles),
         video: CompactVideoCapabilitiesInput {
             profile: &probe.video_profile,
             level: probe.video_level,
@@ -1921,14 +1966,14 @@ mod tests {
             title: Some("Intro: Кино".into()),
         }];
         assert_eq!(
-            persisted_stream_metadata(&probe, &tracks, &[1, 2], &chapters),
+            persisted_stream_metadata(&probe, &tracks, &[1, 2], &chapters, &[]),
             concat!(
                 "1:0:truehd:6,",
                 "2:1:aac:2:en%2CUS:Dub%3A %D0%9A%D0%B8%D0%BD%D0%BE%7C100%25:1,",
                 "@v:Main 10:153:yuv420p10le:10:24000%2F1001:",
                 "hvc1.2.4.L153.B0%2Cmp4a.40.2:5.1,",
                 "@t:broken-reordered,",
-                "@c:1250:4000:Intro%3A %D0%9A%D0%B8%D0%BD%D0%BE"
+                "@c:1250:4000:Intro%3A %D0%9A%D0%B8%D0%BD%D0%BE,@s"
             )
         );
     }
@@ -1959,13 +2004,13 @@ mod tests {
             end_seconds: 2.0,
             title: Some("discarded chapter".into()),
         };
-        let encoded = persisted_stream_metadata(&probe, &[track], &[1], &[chapter]);
+        let encoded = persisted_stream_metadata(&probe, &[track], &[1], &[chapter], &[]);
         assert_eq!(
             encoded,
             concat!(
                 "1:0:ac3:6:::1,",
                 "@v:High:41:yuv420p:8:24%2F1:avc1.640029%2Cac-3:5.1,",
-                "@t:broken-reordered"
+                "@t:broken-reordered,@s"
             )
         );
         let metadata = CompactStreamMetadata::parse(&encoded).unwrap();
@@ -1993,7 +2038,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let indices = (0..=MAX_COMPACT_AUDIO_RECORDS).collect::<Vec<_>>();
-        let encoded = persisted_stream_metadata(&probe, &tracks, &indices, &[]);
+        let encoded = persisted_stream_metadata(&probe, &tracks, &indices, &[], &[]);
         let raw_audio = encoded
             .split(',')
             .take_while(|record| !record.starts_with('@'))

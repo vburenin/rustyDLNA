@@ -4577,6 +4577,7 @@ fn apply_probe_writes_dlna_pn_and_multi_audio() {
         },
         tags: EmbeddedTags::default(),
         audio_tracks: Vec::new(),
+        subtitle_tracks: Vec::new(),
         chapters: Vec::new(),
     };
     apply_probe_to_detail(&db, id, &got).unwrap();

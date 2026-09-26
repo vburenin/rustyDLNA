@@ -197,6 +197,13 @@ work in an issue.
 
 ### Transcode and media jobs
 
+- Native offline subtitles share the browser caption list. Persist embedded
+  track identity/dispositions in additive compact `@s` metadata; preserve old
+  sidecar indexes. Text extraction consumes only a rooted descriptor through
+  the bounded helper supervisor. Image codecs stay visible but unavailable;
+  never substitute OCR or burn-in silently. Existing catalogs expose incomplete
+  discovery until item enrichment probes the file.
+
 - The default is the original stream. Remap rules match media traits and
   renderer software; never special-case a title or filesystem path.
 - Negotiate video and audio independently. Copy every compatible stream and

@@ -194,6 +194,12 @@ chapter entries. Marker presence remains distinct from field validity so older
 partial `@v:` and `@t:` records retain their conservative fallback behavior.
 The scanner writes audio records followed by `@v:`, `@t:`, and optional `@c:`
 records through the protocol crate's canonical encoder.
+An additive `@s` marker records completed embedded subtitle discovery (including
+zero tracks). Up to 128 `@s:index:codec:language:title:default:forced` records
+retain absolute stream indexes and dispositions; language and title use the
+same percent encoding and are capped at 256 characters. Older descriptors
+remain readable and can be enriched on demand. These tags do not change audio
+ordinals or existing sidecar caption indexes.
 
 Persisted media detail IDs are positive SQLite integers below `i64::MAX`, so a
 next ID always exists without wrapping. File sizes must fit a nonnegative

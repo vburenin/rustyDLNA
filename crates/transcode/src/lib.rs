@@ -5,6 +5,7 @@
 //! kind) — not titles or paths. First matching row wins.
 
 pub use rusty_dlna_helper::{JobGate, JobPermit};
+pub mod captions;
 mod profile8_live;
 #[cfg(test)]
 mod profile8_media_tests;

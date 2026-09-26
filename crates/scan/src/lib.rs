@@ -2278,6 +2278,7 @@ fn persist_prepared_probe(
             av: AvMeta::default(),
             tags: EmbeddedTags::default(),
             audio_tracks: Vec::new(),
+            subtitle_tracks: Vec::new(),
             chapters: Vec::new(),
         },
     )?;

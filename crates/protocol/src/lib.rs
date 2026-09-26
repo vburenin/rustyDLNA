@@ -56,9 +56,10 @@ pub use stream_metadata::{
     decode_compact_stream_field, encode_compact_stream_field, encode_compact_stream_metadata,
     CompactAudioRecord, CompactAudioRecordInput, CompactChapter, CompactChapterInput,
     CompactFieldDecodeError, CompactStreamMetadata, CompactStreamMetadataInput,
-    CompactStreamMetadataParseError, CompactStreamMetadataWriteError, CompactVideoCapabilities,
-    CompactVideoCapabilitiesInput, MAX_COMPACT_AUDIO_RECORDS, MAX_COMPACT_CHAPTERS,
-    MAX_COMPACT_CHAPTER_TITLE_CHARS, MAX_COMPACT_STREAM_METADATA_BYTES,
+    CompactStreamMetadataParseError, CompactStreamMetadataWriteError, CompactSubtitleRecord,
+    CompactVideoCapabilities, CompactVideoCapabilitiesInput, MAX_COMPACT_AUDIO_RECORDS,
+    MAX_COMPACT_CHAPTERS, MAX_COMPACT_CHAPTER_TITLE_CHARS, MAX_COMPACT_STREAM_METADATA_BYTES,
+    MAX_COMPACT_SUBTITLE_RECORDS,
 };
 pub use trickplay::{
     is_trickplay_directory_name, trickplay_directory_for_media, trickplay_frame_count,

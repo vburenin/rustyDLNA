@@ -809,6 +809,22 @@ encoder, and the `libx264` retry encoder on the deployed host.
 
 ## Captions, audio tracks, chapters, and resume
 
+Embedded SubRip, ASS/SSA, WebVTT, mov_text and plain-text streams also appear in
+the caption list, with language, track title, default and forced dispositions.
+The additive `embedded` and `forced` fields describe each choice. Their numeric
+indexes are `2^32 + absolute_stream_index`, disjoint from unchanged sidecar
+indexes and exactly representable in JavaScript. Clients must consume the
+advertised URL: `/Captions/{id}/embedded/{stream}.vtt` serves validated WebVTT
+from a rooted, descriptor-backed source. A bounded helper extracts only the
+chosen text track, with a 120-second deadline and 5 MiB output limit. Source
+media stays read-only. Image-based and unknown codecs remain visible with
+`browser_supported: false` and no URL; no OCR or burn-in is performed.
+
+Item DTOs include `embedded_captions_complete`. When false, fetch the same item
+with `enrich=1` to discover tracks from an older catalog without a rescan. New
+scans persist subtitle descriptors. Clients can store all advertised supported
+tracks alongside an offline video, independently of the current selection.
+
 Indexed sidecar `.vtt`, `.srt`, `.ass`, `.ssa`, `.smi`, and `.sub` captions are
 exposed with stable indexes, labels, an inferred language subtag from the
 dot-owned filename variant, and source format. Browser-selectable entries also
@@ -1160,8 +1176,9 @@ upscaled browser output cannot satisfy these native requests.
 Other requests without `download_audio` retain the web player's existing audio
 and upscale negotiation. Native audio choices can exceed the profile's stereo
 bandwidth estimate: `max_video_kbps` describes the video budget; copied or
-additional audio contributes separately. MP4 delivery still omits embedded
-subtitles; clients can store advertised caption sidecars alongside it.
+additional audio contributes separately. MP4 delivery omits embedded subtitle
+streams, but their supported text tracks are downloadable separately through
+the same advertised caption list as sidecars.
 
 Each video DTO also advertises source-specific `prepared_video_outputs`.
 `hevc_hdr10` is included only when the configured encoder and the probed source

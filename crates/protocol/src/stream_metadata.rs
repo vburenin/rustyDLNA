@@ -16,6 +16,9 @@ pub const MAX_COMPACT_STREAM_METADATA_BYTES: usize = 1024 * 1024;
 /// Maximum number of parsed audio records exposed to a consumer.
 pub const MAX_COMPACT_AUDIO_RECORDS: usize = 1024;
 
+/// Maximum embedded subtitle tracks advertised for one file.
+pub const MAX_COMPACT_SUBTITLE_RECORDS: usize = 128;
+
 /// Maximum number of chapter entries persisted or inspected.
 pub const MAX_COMPACT_CHAPTERS: usize = 512;
 
@@ -187,6 +190,38 @@ impl<'a> CompactStreamMetadata<'a> {
             .take(MAX_COMPACT_AUDIO_RECORDS)
     }
 
+    /// Whether subtitle discovery has run, including files with no subtitles.
+    pub fn has_subtitle_marker(self) -> bool {
+        self.records().any(|record| record == "@s")
+    }
+
+    /// Embedded subtitle streams. Unknown tagged records remain ignorable by
+    /// older readers of the same catalog representation.
+    pub fn subtitle_records(self) -> impl Iterator<Item = CompactSubtitleRecord<'a>> {
+        self.records()
+            .filter_map(|record| {
+                let mut fields = record.strip_prefix("@s:")?.split(':');
+                let global_index = fields.next()?.parse::<u32>().ok()? as usize;
+                let codec = fields.next()?;
+                let language = decode_optional_field(fields.next()).ok()?;
+                let title = decode_optional_field(fields.next()).ok()?;
+                let default = fields.next()? == "1";
+                let forced = fields.next()? == "1";
+                if fields.next().is_some() {
+                    return None;
+                }
+                Some(CompactSubtitleRecord {
+                    global_index,
+                    codec,
+                    language,
+                    title,
+                    default,
+                    forced,
+                })
+            })
+            .take(MAX_COMPACT_SUBTITLE_RECORDS)
+    }
+
     /// Decode the first `@v:` record using the legacy lenient defaults.
     ///
     /// Missing, malformed, or non-UTF-8 text fields become empty. Missing or
@@ -322,6 +357,23 @@ pub struct CompactAudioRecordInput<'a> {
     pub default: bool,
 }
 
+/// One embedded subtitle stream and its selectable dispositions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactSubtitleRecord<'a> {
+    /// Absolute container stream index, never an audio ordinal.
+    pub global_index: usize,
+    /// Libav codec name.
+    pub codec: &'a str,
+    /// Decoded language tag.
+    pub language: Option<Cow<'a, str>>,
+    /// Decoded track title.
+    pub title: Option<Cow<'a, str>>,
+    /// Default disposition.
+    pub default: bool,
+    /// Forced disposition.
+    pub forced: bool,
+}
+
 /// Video capability fields supplied to the compact writer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompactVideoCapabilitiesInput<'a> {
@@ -357,6 +409,8 @@ pub struct CompactChapterInput<'a> {
 pub struct CompactStreamMetadataInput<'a> {
     /// Ordered audio descriptors.
     pub audio_records: &'a [CompactAudioRecordInput<'a>],
+    /// `None` is legacy/unknown discovery; `Some(&[])` means no subtitles.
+    pub subtitle_records: Option<&'a [CompactSubtitleRecord<'a>]>,
     /// Video capability marker, which is always persisted.
     pub video: CompactVideoCapabilitiesInput<'a>,
     /// Timestamp classification, written literally after `@t:`.
@@ -368,7 +422,7 @@ pub struct CompactStreamMetadataInput<'a> {
 /// Serialize compact stream metadata in its canonical legacy order.
 ///
 /// Audio descriptors come first, followed by exactly one `@v:` and one `@t:`
-/// record, then an optional `@c:` record. The operation fails atomically when
+/// record, then optional `@c:` and subtitle records. The operation fails atomically when
 /// the output would exceed [`MAX_COMPACT_STREAM_METADATA_BYTES`].
 pub fn encode_compact_stream_metadata(
     input: CompactStreamMetadataInput<'_>,
@@ -441,6 +495,26 @@ pub fn encode_compact_stream_metadata(
         }
     }
 
+    if let Some(subtitles) = input.subtitle_records {
+        writer.start_record()?;
+        writer.push_str("@s")?;
+        for subtitle in subtitles.iter().take(MAX_COMPACT_SUBTITLE_RECORDS) {
+            writer.start_record()?;
+            writer.push_str("@s:")?;
+            writer.push_usize(subtitle.global_index)?;
+            writer.push_char(':')?;
+            writer.push_str(subtitle.codec)?;
+            for field in [subtitle.language.as_deref(), subtitle.title.as_deref()] {
+                writer.push_char(':')?;
+                let bounded = field.unwrap_or("").chars().take(256).collect::<String>();
+                writer.push_encoded(&bounded)?;
+            }
+            writer.push_char(':')?;
+            writer.push_char(if subtitle.default { '1' } else { '0' })?;
+            writer.push_char(':')?;
+            writer.push_char(if subtitle.forced { '1' } else { '0' })?;
+        }
+    }
     Ok(writer.output)
 }
 
@@ -592,6 +666,7 @@ mod tests {
     ) -> CompactStreamMetadataInput<'a> {
         CompactStreamMetadataInput {
             audio_records,
+            subtitle_records: None,
             video: CompactVideoCapabilitiesInput::default(),
             timestamp_mode: "",
             chapters,
@@ -627,6 +702,37 @@ mod tests {
     }
 
     #[test]
+    fn subtitles_preserve_identity_dispositions_and_bounded_labels() {
+        let tracks = [CompactSubtitleRecord {
+            global_index: 12,
+            codec: "subrip",
+            language: Some("en-US".into()),
+            title: Some("Moon: dialogue, 100% | subtitle".into()),
+            default: true,
+            forced: true,
+        }];
+        let raw = encode_compact_stream_metadata(CompactStreamMetadataInput {
+            subtitle_records: Some(&tracks),
+            ..empty_input(&[], &[])
+        })
+        .unwrap();
+        let parsed = CompactStreamMetadata::parse(&raw).unwrap();
+        assert!(parsed.has_subtitle_marker());
+        assert_eq!(parsed.subtitle_records().collect::<Vec<_>>(), tracks);
+        assert_eq!(parsed.audio_records().count(), 0);
+        assert!(!CompactStreamMetadata::parse("@v::0::0:::")
+            .unwrap()
+            .has_subtitle_marker());
+        assert_eq!(
+            CompactStreamMetadata::parse("@s,@s:no:subrip:en:a:1:0,@s:2:subrip:fr:a:0:1:extra")
+                .unwrap()
+                .subtitle_records()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn writer_matches_the_complete_legacy_layout() {
         let audio = [
             CompactAudioRecordInput {
@@ -655,6 +761,7 @@ mod tests {
         }];
         let encoded = encode_compact_stream_metadata(CompactStreamMetadataInput {
             audio_records: &audio,
+            subtitle_records: None,
             video: CompactVideoCapabilitiesInput {
                 profile: "Main 10",
                 level: 153,
