@@ -89,7 +89,10 @@ function copiedAndroidMediaSourceType(item) {
   }
 }
 
-function copiedHevcMediaSourceType(item, streamNegotiation) {
+// Desktop Chromium's native loader can stop at the current tail of a growing
+// fragmented MP4, leaving copied video undecoded while converted audio plays.
+// Copied H.264 and HEVC use bounded Media Source fragments when accepted.
+function copiedVideoMediaSourceType(item, streamNegotiation) {
   if (isAndroidDevice(navigator)
     || isAppleMobileDevice(navigator)
     || streamNegotiation?.video !== "copy"
@@ -98,7 +101,7 @@ function copiedHevcMediaSourceType(item, streamNegotiation) {
     || typeof globalThis.MediaSource.isTypeSupported !== "function") return null;
   const match = /^video\/mp4\s*;\s*codecs\s*=\s*"([^"]+)"$/i.exec(String(item?.video_content_type || ""));
   const videoCodec = match?.[1]?.split(",", 1)[0]?.trim();
-  if (!/^hvc1\./i.test(videoCodec || "")) return null;
+  if (!/^(?:avc1|hvc1)\./i.test(videoCodec || "")) return null;
   const contentType = `video/mp4; codecs="${videoCodec},mp4a.40.2"`;
   try {
     return globalThis.MediaSource.isTypeSupported(contentType) ? contentType : null;
@@ -250,9 +253,9 @@ export class SourceSelector {
         mediaSourceDelivery = true;
       }
     }
-    const copiedHevcMediaSourceSupport = !nativeHlsDelivery && copiedHevcMediaSourceType(item, streamNegotiation);
-    if (copiedHevcMediaSourceSupport) {
-      mediaSourceType = copiedHevcMediaSourceSupport;
+    const copiedVideoMediaSourceSupport = !nativeHlsDelivery && copiedVideoMediaSourceType(item, streamNegotiation);
+    if (copiedVideoMediaSourceSupport) {
+      mediaSourceType = copiedVideoMediaSourceSupport;
       mediaSourceDelivery = true;
     }
     const encodedMediaSourceSupport = !nativeHlsDelivery

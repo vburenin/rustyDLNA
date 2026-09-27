@@ -1049,7 +1049,7 @@ export function compatibleDecodeRecovery({
   });
   if (mediaSourceDelivery && !mediaSourceRetry && ["producing", "ready"].includes(producerState)
     && (negotiation?.video === "copy" || negotiation?.videoOutput === "hevc_hdr10")) {
-    return fallback(negotiation, "Reconnecting to the HEVC stream…", {
+    return fallback(negotiation, "Reconnecting to the stream…", {
       mediaSourceRetry: true, preservePreviousTranscode: true, messageKind: "retry",
     });
   }

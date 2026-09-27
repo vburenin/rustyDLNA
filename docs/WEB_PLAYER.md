@@ -538,8 +538,10 @@ is accepted, and for copied H.264 or HEVC on Android when the exact type is
 accepted. This keeps Chrome from treating the currently available tail of a
 growing fragmented MP4 as EOF, including during AI-upscaled playback and after
 a seek. Unsupported video or audio is converted to portable H.264/AAC before
-fragmented delivery. Desktop copied HEVC with converted AAC also uses Media
-Source when its exact type is accepted.
+fragmented delivery. Desktop copied H.264 or HEVC with converted AAC also uses
+Media Source when its exact type is accepted; through the native loader,
+Chrome can keep playing the converted audio while the copied video never
+decodes.
 When Auto chooses an advertised-supported Original video but it remains loading
 or buffering for twelve seconds without playing, the player preserves the
 position and switches to the safest lower-bandwidth Compatible profile. This
@@ -985,7 +987,7 @@ Apple mobile HLS does not use this growing-MP4 recovery loop.
 A desktop browser that supports the exact encoded H.264 SDR or HEVC HDR10
 output type through Media Source receives bounded fragmented-MP4 resources
 rather than a native growing-file response. The same path is used for supported
-copied HEVC with converted AAC. AI-upscaled H.264 therefore does not depend on
+copied H.264 or HEVC with converted AAC. AI-upscaled H.264 therefore does not depend on
 the native media loader following a growing file indefinitely.
 An early `ended` event on any Compatible stream, including fully transcoded
 H.264/AAC, enters the same recovery path as a decoder or media-resource failure.

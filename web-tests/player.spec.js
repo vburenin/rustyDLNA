@@ -2548,6 +2548,66 @@ test("desktop Chrome tries encoded HDR before SDR when copied-HEVC Media Source 
   await expect(page.locator("#player-message[role=alert]")).toBeHidden();
 });
 
+test("desktop Chrome sends copied H.264 with converted audio through Media Source", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "chromium", "Media Source delivery selection belongs to desktop Chromium");
+  await usePreference(page, "stream", "compat");
+  await page.addInitScript(() => {
+    const original = HTMLMediaElement.prototype.canPlayType;
+    HTMLMediaElement.prototype.canPlayType = function negotiatedCanPlayType(contentType) {
+      if (String(contentType).includes("ac-3")) return "";
+      if (String(contentType).includes("avc1.640029")) return "probably";
+      return original.call(this, contentType);
+    };
+    Object.defineProperty(navigator, "mediaCapabilities", {
+      configurable: true,
+      value: {
+        decodingInfo: async (configuration) => ({
+          supported: Boolean(configuration.video),
+          smooth: true,
+          powerEfficient: true,
+        }),
+      },
+    });
+    Object.defineProperty(MediaSource, "isTypeSupported", {
+      configurable: true,
+      value: (contentType) => String(contentType) === 'video/mp4; codecs="avc1.640029,mp4a.40.2"',
+    });
+  });
+  await page.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    for (const entry of payload.entries || []) {
+      if (entry.entry_type !== "media" || entry.kind !== "video") continue;
+      entry.video_codec = "h264";
+      entry.codec_string = "avc1.640029,ac-3";
+      entry.video_content_type = 'video/mp4; codecs="avc1.640029"';
+      entry.video_profile = "High";
+      entry.video_level = 41;
+      entry.pixel_format = "yuv420p";
+      entry.bit_depth = 8;
+      entry.hdr = "sdr";
+      entry.audio_codec = "ac3";
+      entry.audio_tracks = [{ index: 0, codec: "ac3", content_type: 'audio/mp4; codecs="ac-3"', channels: 6, default: true }];
+      entry.stream_metadata_complete = true;
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  const mediaRequests = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith("/web/media/")) mediaRequests.push(url);
+  });
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  // Chromium's native loader can play converted audio while copied video
+  // stalls at the growing file's current tail; copied H.264 must use MSE.
+  await expect.poll(() => mediaRequests.find((url) => url.pathname.endsWith(".m3u8"))?.searchParams.get("video_mode"))
+    .toBe("copy");
+  const playlist = mediaRequests.find((url) => url.pathname.endsWith(".m3u8"));
+  expect(playlist.searchParams.get("audio_mode")).toBe("transcode");
+  expect(mediaRequests.filter((url) => url.pathname.endsWith(".mp4") && !url.searchParams.get("delivery"))).toEqual([]);
+});
+
 test("desktop Chrome sends an encoded 4K HDR rendition through Media Source", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium", "Media Source delivery selection belongs to desktop Chromium");
   await usePreference(page, "stream", "compat");
