@@ -12,7 +12,11 @@ fn embedded_text_captions_are_discovered_extracted_and_confined() {
     let french = tree.path().join("french.srt");
     std::fs::write(
         &english,
-        "1\n00:00:00,500 --> 00:00:02,500\nThe brass moon rises.\n",
+        "1\n00:00:00,500 --> 00:00:02,500\nThe brass moon rises.\n\n\
+         2\n00:00:05,000 --> 00:00:05,000\nAn invisible event.\n\n\
+         3\n00:01:58,000 --> 00:02:03,000\nAcross the boundary.\n\n\
+         4\n00:02:01,000 --> 00:02:04,000\nThe next window.\n\n\
+         5\n00:06:01,000 --> 00:06:04,000\nAfter a seek.\n",
     )
     .unwrap();
     std::fs::write(
@@ -30,7 +34,7 @@ fn embedded_text_captions_are_discovered_extracted_and_confined() {
             "-f",
             "lavfi",
             "-i",
-            "color=s=96x64:r=10:d=3",
+            "color=s=96x64:r=1:d=420",
         ])
         .arg("-i")
         .arg(&english)
@@ -47,6 +51,8 @@ fn embedded_text_captions_are_discovered_extracted_and_confined() {
             "libx264",
             "-threads",
             "1",
+            "-g",
+            "10",
             "-c:s",
             "srt",
             "-metadata:s:s:0",
@@ -124,6 +130,7 @@ fn embedded_text_captions_are_discovered_extracted_and_confined() {
         assert!(body.starts_with("WEBVTT"));
         assert!(body.contains(text));
         assert!(body.contains("00:00.500 --> 00:02.500"), "{body}");
+        assert!(!body.contains("An invisible event."));
         // Like converted sidecars, this bounded resource ignores Range and
         // returns the complete document so resumed clients can restart safely.
         let mut ranged = req(&get(path, "Browser/1.0"));
@@ -131,6 +138,38 @@ fn embedded_text_captions_are_discovered_extracted_and_confined() {
         let restarted = app.handle(&ranged);
         assert_eq!(restarted.status, 200);
         assert_eq!(restarted.body, caption.body);
+    }
+    let streaming = embedded[0]["streaming_url"].as_str().unwrap();
+    let first = app.handle(&req(&get(streaming, "Native/1.0")));
+    assert_eq!(first.status, 200);
+    let first = std::str::from_utf8(&first.body).unwrap();
+    assert!(first.contains("The brass moon rises."));
+    assert!(first.contains("Across the boundary."));
+    assert!(!first.contains("The next window."));
+    assert!(!first.contains("After a seek."));
+    for (start, expected) in [
+        (120, "01:58.000 --> 02:03.000\nAcross the boundary."),
+        (360, "06:01.000 --> 06:04.000\nAfter a seek."),
+        (600, "WEBVTT\n"),
+    ] {
+        let path = streaming.replace("start=0", &format!("start={start}"));
+        let response = app.handle(&req(&get(&path, "Native/1.0")));
+        assert_eq!(response.status, 200);
+        let body = std::str::from_utf8(&response.body).unwrap();
+        assert!(body.contains(expected), "{body}");
+        if start == 600 {
+            assert!(!body.contains("-->"));
+        }
+    }
+    for query in [
+        "start=-1",
+        "start=NaN",
+        "start=2592001",
+        "start=0&start=120",
+        "other=0",
+    ] {
+        let path = format!("{}?{query}", embedded[0]["url"].as_str().unwrap());
+        assert_eq!(app.handle(&req(&get(&path, "Native/1.0"))).status, 400);
     }
     assert_eq!(
         app.handle(&req(&get(

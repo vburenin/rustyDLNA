@@ -435,6 +435,8 @@ struct WebCaption {
     source_format: String,
     browser_supported: bool,
     url: Option<String>,
+    /// Optional native streaming route. `url` remains the complete offline file.
+    streaming_url: Option<String>,
 }
 
 fn web_capabilities(app: &App) -> WebCapabilities {
@@ -1669,6 +1671,7 @@ fn caption_dtos(item: &MediaItem) -> Vec<WebCaption> {
                 source_format: caption.ext.clone(),
                 browser_supported: url.is_some(),
                 url,
+                streaming_url: None,
             }
         })
         .collect();
@@ -1697,6 +1700,12 @@ fn caption_dtos(item: &MediaItem) -> Vec<WebCaption> {
                 url: supported.then(|| {
                     format!(
                         "/Captions/{}/embedded/{}.vtt",
+                        item.detail_id, track.global_index
+                    )
+                }),
+                streaming_url: supported.then(|| {
+                    format!(
+                        "/Captions/{}/embedded/{}.vtt?start=0",
                         item.detail_id, track.global_index
                     )
                 }),
@@ -2637,11 +2646,18 @@ pub(crate) fn embedded_caption(app: &App, req: &HttpRequest) -> HttpResponse {
     let Some((id, stream)) = parsed else {
         return not_found();
     };
-    if !req.query.is_empty() {
+    let params = QueryParams::parse(&req.query);
+    let window_start = params.optional_u32("start");
+    if params.has_unknown(&["start"])
+        || window_start.is_err()
+        || window_start
+            .as_ref()
+            .is_ok_and(|value| value.is_some_and(|start| start > 2_592_000))
+    {
         return api_error(
             400,
             "invalid_caption_request",
-            "Subtitle requests do not accept parameters.",
+            "The subtitle start time is invalid.",
             false,
             None,
         );
@@ -2701,10 +2717,20 @@ pub(crate) fn embedded_caption(app: &App, req: &HttpRequest) -> HttpResponse {
     match rusty_dlna_transcode::captions::extract_embedded_webvtt(
         &opened.file,
         stream,
+        window_start.unwrap_or(None),
         Duration::from_secs(120),
         &app.scan_cfg.cancellation,
     ) {
-        Ok(body) => browser_caption_response(app, "vtt", &body),
+        Ok(body) => match crate::web_caption::normalize_extracted_webvtt(&body) {
+            Ok(body) => bytes_response("text/vtt; charset=utf-8", &body, "no-store"),
+            Err(_) => api_error(
+                422,
+                "caption_malformed",
+                "This subtitle could not be prepared.",
+                false,
+                None,
+            ),
+        },
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => api_error(
             504,
             "caption_timeout",

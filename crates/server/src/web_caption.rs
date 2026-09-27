@@ -9,6 +9,44 @@ use rusty_dlna_protocol::CaptionWebVttConversion;
 const MAX_INPUT_BYTES: usize = rusty_dlna_scan::MAX_SIDECAR_BYTES as usize;
 const MAX_OUTPUT_BYTES: usize = 6 * MAX_INPUT_BYTES;
 
+/// FFmpeg can emit zero-duration events from otherwise usable embedded tracks.
+/// Such events have no display interval; omit them instead of rejecting every
+/// other cue. This tolerance is confined to generated output, not sidecar input.
+pub(super) fn normalize_extracted_webvtt(body: &[u8]) -> Result<Vec<u8>, BrowserCaptionError> {
+    if body.len() > MAX_INPUT_BYTES {
+        return Err(BrowserCaptionError::Malformed);
+    }
+    let text = std::str::from_utf8(body).map_err(|_| BrowserCaptionError::Encoding)?;
+    let mut blocks = text.split("\n\n");
+    if blocks.next().map(str::trim) != Some("WEBVTT") {
+        return Err(BrowserCaptionError::Malformed);
+    }
+    let mut output = String::from("WEBVTT\n\n");
+    for block in blocks.filter(|block| !block.trim().is_empty()) {
+        let mut lines = block.lines();
+        let first = lines.next().ok_or(BrowserCaptionError::Malformed)?;
+        let timing = if first.contains("-->") {
+            first
+        } else {
+            lines.next().ok_or(BrowserCaptionError::Malformed)?
+        };
+        let (start, end, _) = caption_timing(timing, false)?;
+        if end <= start {
+            continue;
+        }
+        output.push_str(timing);
+        output.push('\n');
+        output.push_str(
+            &lines
+                .collect::<Vec<_>>()
+                .join("\n")
+                .replace("-->", "--&gt;"),
+        );
+        output.push_str("\n\n");
+    }
+    validate_webvtt(&output).map(String::into_bytes)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BrowserCaptionError {
     Encoding,
@@ -591,6 +629,23 @@ fn parse_caption_time(value: &str, subrip: bool) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_captions_omit_nonpositive_events_without_losing_valid_cues() {
+        let input = b"WEBVTT\n\n00:01.000 --> 00:02.000\nFirst\n\n00:03.000 --> 00:03.000\nInvisible\n\n00:05.000 --> 00:04.000\nReversed\n\n00:06.000 --> 00:07.000\nA --> B\n";
+        let normalized = normalize_extracted_webvtt(input).unwrap();
+        let text = std::str::from_utf8(&normalized).unwrap();
+        assert!(text.contains("First"));
+        assert!(text.contains("A --&gt; B"));
+        assert!(!text.contains("Invisible"));
+        assert!(!text.contains("Reversed"));
+        assert!(caption_to_webvtt(CaptionWebVttConversion::ValidateWebVtt, input).is_err());
+        assert!(normalize_extracted_webvtt(b"WEBVTT\n\ninvalid --> timing\ntext\n").is_err());
+        assert_eq!(
+            normalize_extracted_webvtt(b"WEBVTT\n\n").unwrap(),
+            b"WEBVTT\n"
+        );
+    }
 
     fn minimal_valid_input(conversion: CaptionWebVttConversion) -> &'static [u8] {
         match conversion {

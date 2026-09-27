@@ -822,6 +822,18 @@ chosen text track, with a 120-second deadline and 5 MiB output limit. Source
 media stays read-only. Image-based and unknown codecs remain visible with
 `browser_supported: false` and no URL; no OCR or burn-in is performed.
 
+Text tracks also advertise an optional `streaming_url` with `start=0`. Native
+clients can replace `start` with a whole number of seconds (0 through 2,592,000)
+to request a 120-second movie-time window. The extractor seeks with up to 120
+seconds of look-behind and keeps absolute movie timestamps; returned cues may
+overlap an earlier window and should be merged without duplication. An empty
+WebVTT document is a successful window with no dialogue. Preload the next window
+before playback reaches the boundary and retain recent windows for seeking.
+The original `url` still returns the complete track for browsers and offline
+packages. Unknown or duplicate parameters are rejected. Generated events with
+nonpositive duration are omitted instead of invalidating the whole track;
+sidecar validation remains strict.
+
 Item DTOs include `embedded_captions_complete`. When false, fetch the same item
 with `enrich=1` to discover tracks from an older catalog without a rescan. New
 scans persist subtitle descriptors. Clients can store all advertised supported

@@ -25,6 +25,7 @@ pub fn embedded_caption_supported(codec: &str) -> bool {
 pub fn extract_embedded_webvtt(
     source: &File,
     stream: usize,
+    window_start: Option<u32>,
     timeout: Duration,
     cancellation: &CancellationToken,
 ) -> io::Result<Vec<u8>> {
@@ -42,21 +43,27 @@ pub fn extract_embedded_webvtt(
             "-copyts",
             "-start_at_zero",
         ])
-        .args(rusty_dlna_protocol::media_input::inherited_media_input_options(3))
-        .args([
-            "-i",
-            "fd:",
-            "-map",
-            &format!("0:{stream}"),
-            "-vn",
-            "-an",
-            "-dn",
-            "-c:s",
-            "webvtt",
-            "-f",
-            "webvtt",
-            "pipe:1",
-        ]);
+        .args(rusty_dlna_protocol::media_input::inherited_media_input_options(3));
+    if let Some(start) = window_start {
+        // Seek with overlap so cues already in progress at the window boundary
+        // survive ordinary dialogue and continuous playback. Keep source time:
+        // clients merge overlapping windows without rebasing their cues.
+        command.args(["-ss", &start.saturating_sub(120).to_string()]);
+    }
+    command.args([
+        "-i",
+        "fd:",
+        "-map",
+        &format!("0:{stream}"),
+        "-vn",
+        "-an",
+        "-dn",
+    ]);
+    if let Some(start) = window_start {
+        // With copyts/start_at_zero this is an absolute movie-time endpoint.
+        command.args(["-to", &u64::from(start).saturating_add(120).to_string()]);
+    }
+    command.args(["-c:s", "webvtt", "-f", "webvtt", "pipe:1"]);
     let outcome = SupervisedCommand::new(&mut command)
         .inherit_file_at(source, 3)?
         .capture_stdout(
