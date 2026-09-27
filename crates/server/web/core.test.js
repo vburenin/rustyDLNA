@@ -16,6 +16,7 @@ import {
   bufferedRangeSecondsAhead,
   bufferedSeekTarget,
   captionCueWindow,
+  captionWindowStarts,
   chooseSource,
   compatibleSegmentStart,
   compatibleDecodeRecovery,
@@ -51,6 +52,7 @@ import {
   selectedAudioRequiresCompatible,
   isAndroidDevice,
   parseHlsMediaPlaylist,
+  parseWebVttCues,
   isAppleMobileDevice,
   isApplePhoneDevice,
   isSafariBrowser,
@@ -128,6 +130,30 @@ test("caption cue windows follow the source timeline and clip crossing cues", ()
   for (const args of [[NaN, 2, 0], [0, Infinity, 0], [0, 2, NaN], [0, 2, -1], [-1, 2, 0], [3, 2, 0], [2, 2, 0]]) {
     assert.equal(captionCueWindow(...args), null);
   }
+});
+
+test("streaming caption windows share boundaries and preload before the edge", () => {
+  assert.deepEqual(captionWindowStarts(0), [0]);
+  assert.deepEqual(captionWindowStarts(74.9), [0]);
+  assert.deepEqual(captionWindowStarts(75), [0, 120]);
+  assert.deepEqual(captionWindowStarts(2700), [2640]);
+  assert.deepEqual(captionWindowStarts(2750), [2640, 2760]);
+  assert.deepEqual(captionWindowStarts(100, 120), [0]);
+  assert.deepEqual(captionWindowStarts(100, 121), [0, 120]);
+  for (const value of [NaN, -1, Infinity]) assert.deepEqual(captionWindowStarts(value), []);
+});
+
+test("WebVTT cue parsing keeps identifiers, settings, and multiline text", () => {
+  const text = "\uFEFFWEBVTT - extracted\r\n\r\nNOTE skipped\r\n\r\n00:49.194 --> 00:51.437\r\nI’m here.\r\n\r\n"
+    + "line-two\n01:02:03.500 --> 01:02:05.000 align:start position:20%\nFirst\n<i>Second</i>\n\n"
+    + "00:00:05.000 --> 00:00:04.000\nBackwards\n\nbad --> 00:00:01.000\nBad\n";
+  assert.deepEqual(parseWebVttCues(text), [
+    { id: "", start: 49.194, end: 51.437, settings: "", text: "I’m here." },
+    { id: "line-two", start: 3723.5, end: 3725, settings: "align:start position:20%", text: "First\n<i>Second</i>" },
+  ]);
+  assert.deepEqual(parseWebVttCues("WEBVTT\n"), []);
+  assert.deepEqual(parseWebVttCues("WEBVTT\n\n00:01.000 --> 00:02.000\nLast\n"),
+    [{ id: "", start: 1, end: 2, settings: "", text: "Last" }]);
 });
 
 test("processing labels describe actual streams rather than the selected playback policy", () => {

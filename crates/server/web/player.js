@@ -1022,7 +1022,9 @@ export class PlaybackController {
       this.#failSource(source, playbackError(plan.blocked));
       return;
     }
-    this.#captions.attach(item.captions || [], { segmentOffset: source.segmentOffset, signal: source.signal });
+    this.#captions.attach(item.captions || [], {
+      segmentOffset: source.segmentOffset, signal: source.signal, globalTime: () => this.globalTime(),
+    });
     // Native load() restores playbackRate from defaultPlaybackRate, including
     // when attaching an MSE object URL or replacing a compatible seek source.
     player.defaultPlaybackRate = state.preferences.rate;

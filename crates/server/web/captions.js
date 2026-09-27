@@ -1,4 +1,49 @@
-import { captionCueWindow } from "./core.js";
+import { captionCueWindow, captionWindowStarts, parseWebVttCues } from "./core.js";
+
+const CAPTION_WINDOW_RETRIES = 3;
+let emptyCaptionsUrl = "";
+
+// Streaming tracks start empty and receive cues window by window, so the
+// selected caption shows without extracting the complete track first.
+function emptyCaptions() {
+  emptyCaptionsUrl ||= URL.createObjectURL(new Blob(["WEBVTT\n\n"], { type: "text/vtt" }));
+  return emptyCaptionsUrl;
+}
+
+function applyCueSettings(cue, settings) {
+  for (const setting of settings.split(" ")) {
+    const [name, value = ""] = setting.split(":");
+    const [amount, alignment] = value.split(",");
+    const percent = amount.endsWith("%") ? Number.parseFloat(amount) : null;
+    try {
+      if (name === "vertical") cue.vertical = value;
+      else if (name === "align") cue.align = value;
+      else if (name === "size" && percent !== null) cue.size = percent;
+      else if (name === "position" && percent !== null) {
+        cue.position = percent;
+        if (alignment) cue.positionAlign = alignment;
+      } else if (name === "line" && amount) {
+        cue.snapToLines = percent === null;
+        cue.line = percent ?? Number.parseInt(amount, 10);
+        if (alignment) cue.lineAlign = alignment;
+      }
+    } catch {
+      // An unsupported setting keeps the browser default for that cue.
+    }
+  }
+}
+
+function abortableDelay(milliseconds, signal) {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, milliseconds);
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
 
 // Own the caption DOM and its source lifetime. The player supplies the local
 // timeline origin; this component never negotiates or restarts media sources.
@@ -35,10 +80,10 @@ export class CaptionController {
     if (restoreFocus) this.#dom.captionsButton.focus();
   }
 
-  attach(captions, { segmentOffset, signal }) {
+  attach(captions, { segmentOffset, signal, globalTime = null }) {
     this.clear();
     if (signal.aborted) return;
-    const source = { signal, segmentOffset, tracks: [], cleanup: null };
+    const source = { signal, segmentOffset, globalTime, tracks: [], cleanup: null };
     source.cleanup = () => {
       signal.removeEventListener("abort", source.cleanup);
       for (const entry of source.tracks) this.#removeTrack(entry);
@@ -52,7 +97,7 @@ export class CaptionController {
 
     for (const caption of captions) {
       if (!caption.browser_supported || !caption.url) continue;
-      const entry = { caption, node: null, ready: false, loading: false, failed: false, cleanup: null };
+      const entry = { caption, node: null, ready: false, loading: false, failed: false, cleanup: null, windows: null };
       source.tracks.push(entry);
       this.#createTrack(source, entry);
     }
@@ -77,7 +122,7 @@ export class CaptionController {
     node.kind = "subtitles";
     node.label = caption.label;
     node.srclang = caption.language || "und";
-    node.src = caption.url;
+    node.src = caption.streaming_url ? emptyCaptions() : caption.url;
     node.dataset.captionIndex = String(caption.index);
     entry.node = node;
     const current = () => this.#source === source && !source.signal.aborted && entry.node === node;
@@ -96,18 +141,15 @@ export class CaptionController {
       entry.ready = true;
       entry.loading = false;
       this.#applySelection();
+      if (caption.streaming_url) this.#startWindows(source, entry);
     };
     const failed = () => {
       if (!current() || !this.#isSelected(entry) || entry.ready || entry.failed) return;
-      entry.failed = true;
-      entry.loading = false;
-      node.track.mode = "disabled";
-      this.#dom.captionMenu.hidden = false;
-      this.#dom.captionsButton.setAttribute("aria-expanded", "true");
-      this.#dom.playerStage.classList.add("controls-visible");
-      this.#renderError();
+      this.#fail(entry);
     };
     entry.cleanup = () => {
+      entry.windows?.controller.abort();
+      entry.windows = null;
       node.removeEventListener("load", loaded);
       node.removeEventListener("error", failed);
       node.track.mode = "disabled";
@@ -118,6 +160,88 @@ export class CaptionController {
     node.addEventListener("load", loaded);
     node.addEventListener("error", failed);
     this.#dom.video.append(node);
+  }
+
+  #fail(entry) {
+    entry.failed = true;
+    entry.loading = false;
+    entry.windows?.controller.abort();
+    entry.windows = null;
+    entry.node.track.mode = "disabled";
+    this.#dom.captionMenu.hidden = false;
+    this.#dom.captionsButton.setAttribute("aria-expanded", "true");
+    this.#dom.playerStage.classList.add("controls-visible");
+    this.#renderError();
+  }
+
+  #globalTime(source) {
+    const time = source.globalTime?.();
+    return Number.isFinite(time) ? time : source.segmentOffset + (this.#dom.video.currentTime || 0);
+  }
+
+  #startWindows(source, entry) {
+    const controller = new AbortController();
+    const windows = { controller, loaded: new Set(), pending: false, seen: new Set() };
+    entry.windows = windows;
+    const update = () => this.#loadNextWindow(source, entry, windows);
+    for (const type of ["timeupdate", "seeking", "loadedmetadata"]) {
+      this.#dom.video.addEventListener(type, update, { signal: controller.signal });
+    }
+    update();
+  }
+
+  #loadNextWindow(source, entry, windows) {
+    if (windows.pending || windows.controller.signal.aborted || entry.windows !== windows) return;
+    const duration = Number(this.#store.getState().playback.item?.duration_seconds) || Infinity;
+    const start = captionWindowStarts(this.#globalTime(source), duration).find((start) => !windows.loaded.has(start));
+    if (start === undefined) return;
+    windows.pending = true;
+    this.#fetchWindow(source, entry, windows, start).catch(() => {
+      if (entry.windows === windows && this.#isSelected(entry)) this.#fail(entry);
+    }).finally(() => {
+      windows.pending = false;
+      this.#loadNextWindow(source, entry, windows);
+    });
+  }
+
+  async #fetchWindow(source, entry, windows, start) {
+    const { signal } = windows.controller;
+    const url = new URL(entry.caption.streaming_url, document.baseURI);
+    url.searchParams.set("start", String(start));
+    let text = null;
+    for (let attempt = 0; text === null; attempt += 1) {
+      let status = 0;
+      try {
+        const response = await fetch(url, { signal, headers: { Accept: "text/vtt" } });
+        status = response.status;
+        if (response.ok) text = await response.text();
+      } catch {
+        // Network failures are retried below; aborts end this window.
+      }
+      if (signal.aborted || entry.windows !== windows) return;
+      if (text !== null) break;
+      // Busy helpers and timeouts are transient; other statuses are final.
+      if (![0, 503, 504].includes(status) || attempt >= CAPTION_WINDOW_RETRIES) {
+        if (this.#isSelected(entry)) this.#fail(entry);
+        return;
+      }
+      await abortableDelay(1000 * (attempt + 1), signal);
+      if (signal.aborted) return;
+    }
+    const { track } = entry.node;
+    // Windows overlap; cues keep absolute times, so the key is stable.
+    for (const cue of parseWebVttCues(text)) {
+      const key = `${cue.start}|${cue.end}|${cue.text}`;
+      if (windows.seen.has(key)) continue;
+      windows.seen.add(key);
+      const window = captionCueWindow(cue.start, cue.end, source.segmentOffset);
+      if (!window) continue;
+      const added = new VTTCue(window.start, window.end, cue.text);
+      added.id = cue.id;
+      applyCueSettings(added, cue.settings);
+      track.addCue(added);
+    }
+    windows.loaded.add(start);
   }
 
   #isSelected(entry) {
@@ -147,7 +271,7 @@ export class CaptionController {
     for (const track of this.#dom.video.textTracks || []) track.mode = "disabled";
     for (const entry of this.#source.tracks) {
       const selected = this.#isSelected(entry);
-      if (!selected && (entry.loading || entry.failed)) {
+      if (!selected && (entry.loading || entry.failed || entry.windows)) {
         this.#removeTrack(entry);
         entry.failed = false;
       }

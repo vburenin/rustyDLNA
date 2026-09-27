@@ -5229,7 +5229,9 @@ test("captions survive source restarts but reset for a different title", async (
 });
 
 // Real text tracks and media seeks exercise cue timing, not just menu state.
-async function captionTimelineFixture(page) {
+const timelineCaptions = [{ index: 0, browser_supported: true, label: "Timeline", language: "en", url: "/review-captions.vtt" }];
+
+async function captionTimelineFixture(page, captions = timelineCaptions) {
   await usePreference(page, "stream", "compat");
   await page.addInitScript(() => {
     // Keep the short media fixture paused while we inspect its real cue clock.
@@ -5261,7 +5263,7 @@ async function captionTimelineFixture(page) {
     if (String(payload.item?.id) === String(item.id)) {
       Object.assign(payload.item, {
         duration_seconds: 600, duration: "0:10:00.000", stream_metadata_complete: true,
-        captions: [{ index: 0, browser_supported: true, label: "Timeline", language: "en", url: "/review-captions.vtt" }],
+        captions,
       });
     }
     await route.fulfill({ response, json: payload });
@@ -5345,6 +5347,51 @@ for (const start of ["deep link", "saved resume"]) {
     await expectCaptionAt(page, 0.05, "Opening scene");
   });
 }
+
+test("streaming captions show from bounded windows without extracting the complete track", async ({ page }) => {
+  const item = await captionTimelineFixture(page, [{
+    index: 0, browser_supported: true, label: "Timeline", language: "en", embedded: true,
+    url: "/review-captions-full.vtt", streaming_url: "/review-captions-stream.vtt?start=0",
+  }]);
+  const cues = [...captionTimelineVtt.matchAll(/(\S+)\n(\S+) --> (\S+)([^\n]*)\n([^\n]+)/g)]
+    .map(([, id, start, end, settings, text]) => ({ block: `${id}\n${start} --> ${end}${settings}\n${text}\n`, start }));
+  const seconds = (value) => value.split(":").reduce((total, part) => total * 60 + Number(part), 0);
+  let fullRequests = 0;
+  let busyResponses = 0;
+  const windows = [];
+  await page.route("**/review-captions-full.vtt", (route) => {
+    fullRequests += 1;
+    return route.fulfill({ contentType: "text/vtt", body: captionTimelineVtt });
+  });
+  await page.route("**/review-captions-stream.vtt?**", (route) => {
+    const start = Number(new URL(route.request().url()).searchParams.get("start"));
+    if (busyResponses === 0) {
+      busyResponses += 1;
+      return route.fulfill({ status: 503, contentType: "application/json", body: "{}" });
+    }
+    windows.push(start);
+    const body = cues.filter((cue) => Math.abs(seconds(cue.start) - start) <= 120).map((cue) => cue.block).join("\n");
+    return route.fulfill({ contentType: "text/vtt", body: `WEBVTT\n\n${body}` });
+  });
+  await page.goto(`/?view=video&item=${item.id}&t=90`);
+  await showPlayerControls(page);
+  await page.locator("#captions-button").click();
+  await page.locator('input[name="caption-choice"][value="0"]').check();
+  await expectCaptionAt(page, 0.05, "Crossing the source start");
+  await expectCaptionAt(page, 0.25, "Scene at ninety seconds");
+  await expect.poll(() => windows).toEqual([0, 120]);
+  // Both windows contain the early cues; each cue is added once.
+  expect(await page.locator("#video-player").evaluate((video) => [...video.textTracks[0].cues].map((cue) => cue.id)))
+    .toEqual(["crossing", "ninety", "two-minutes"]);
+  expect(await page.locator("#video-player").evaluate((video) => {
+    const cue = video.textTracks[0].cues[0];
+    return { start: cue.startTime, align: cue.align, position: cue.position };
+  })).toEqual({ start: 0, align: "start", position: 20 });
+  await seekCaptionTimeline(page, 120);
+  await expectCaptionAt(page, 0.05, "Scene at two minutes");
+  expect(busyResponses).toBe(1);
+  expect(fullRequests).toBe(0);
+});
 
 test("a caption load superseded by a seek cannot apply its old offset", async ({ page }) => {
   const item = await captionTimelineFixture(page);

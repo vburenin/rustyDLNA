@@ -829,8 +829,13 @@ seconds of look-behind and keeps absolute movie timestamps; returned cues may
 overlap an earlier window and should be merged without duplication. An empty
 WebVTT document is a successful window with no dialogue. Preload the next window
 before playback reaches the boundary and retain recent windows for seeking.
-The original `url` still returns the complete track for browsers and offline
-packages. Unknown or duplicate parameters are rejected. Generated events with
+The original `url` still returns the complete track for offline packages.
+Complete extraction reads the whole movie and can take a minute on large files,
+so the browser player uses `streaming_url` when present: the selected track
+shows immediately, fetches the 120-second-aligned window around the playhead,
+preloads the next window within 45 seconds of its edge, and adds each cue once.
+Busy (503), timed-out (504), and network failures retry up to three times before
+the caption error is shown. Sidecar tracks keep loading their complete `url`. Unknown or duplicate parameters are rejected. Generated events with
 nonpositive duration are omitted instead of invalidating the whole track;
 sidecar validation remains strict.
 

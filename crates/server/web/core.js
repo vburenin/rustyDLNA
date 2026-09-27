@@ -167,6 +167,50 @@ export function captionCueWindow(start, end, segmentOffset = 0) {
   return { start: Math.max(0, start - segmentOffset), end: end - segmentOffset };
 }
 
+export const CAPTION_WINDOW_SECONDS = 120;
+const CAPTION_WINDOW_PRELOAD_SECONDS = 45;
+
+// Streaming caption windows are requested at fixed boundaries so repeated
+// requests for nearby times share one window. The window starting at S holds
+// cues from S - 120 through S + 120; the next one is preloaded near its edge.
+export function captionWindowStarts(time, duration = Infinity) {
+  if (!Number.isFinite(time) || time < 0) return [];
+  const start = Math.floor(time / CAPTION_WINDOW_SECONDS) * CAPTION_WINDOW_SECONDS;
+  const next = start + CAPTION_WINDOW_SECONDS;
+  return next - time <= CAPTION_WINDOW_PRELOAD_SECONDS && !(next >= duration) ? [start, next] : [start];
+}
+
+function webVttSeconds(value) {
+  const match = /^(?:(\d+):)?([0-5]\d):([0-5]\d)\.(\d{3})$/.exec(value);
+  if (!match) return null;
+  return Number(match[1] || 0) * 3600 + Number(match[2]) * 60 + Number(match[3]) + Number(match[4]) / 1000;
+}
+
+// Parse the server's validated WebVTT into plain cue records. Header, NOTE,
+// STYLE, and REGION blocks are skipped; malformed cue blocks are ignored.
+export function parseWebVttCues(text) {
+  const blocks = String(text).replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n").replace(/\n+$/, "").split(/\n{2,}/);
+  const cues = [];
+  for (const block of blocks.slice(1)) {
+    const lines = block.split("\n");
+    const timingIndex = lines.findIndex((line) => line.includes("-->"));
+    if (timingIndex < 0 || timingIndex > 1) continue;
+    const [startText, rest = ""] = lines[timingIndex].split("-->");
+    const [endText = "", ...settings] = rest.trim().split(/[ \t]+/);
+    const start = webVttSeconds(startText.trim());
+    const end = webVttSeconds(endText);
+    if (start === null || end === null || end <= start) continue;
+    cues.push({
+      id: timingIndex === 1 ? lines[0] : "",
+      start,
+      end,
+      settings: settings.join(" "),
+      text: lines.slice(timingIndex + 1).join("\n"),
+    });
+  }
+  return cues;
+}
+
 export function compatibleSegmentStart(value, bucketSeconds = 10) {
   const target = Math.max(0, Math.floor(Number(value) || 0));
   const bucket = Math.max(1, Math.floor(Number(bucketSeconds) || 1));
