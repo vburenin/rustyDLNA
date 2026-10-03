@@ -782,6 +782,7 @@ fn refresh_caption_event(db: &LibraryDb, cfg: &ScanConfig, sidecar: &Path) -> Sc
         return Ok(false);
     }
     let mut touched = false;
+    let mut captions = CaptionInventoryCache::default();
     for entry in std::fs::read_dir(dir).map_err(|error| scan_io(dir, error))? {
         let entry = entry.map_err(|error| scan_io(dir, error))?;
         let path = entry.path();
@@ -793,7 +794,7 @@ fn refresh_caption_event(db: &LibraryDb, cfg: &ScanConfig, sidecar: &Path) -> Sc
             continue;
         }
         if let Some(existing) = db.find_detail_by_path(&path_to_db(&path))? {
-            db.replace_captions(existing.id, &captions_for(&path, cfg)?)?;
+            db.replace_captions(existing.id, &captions.captions_for(&path, cfg)?)?;
             touched = true;
         }
     }
@@ -1680,27 +1681,48 @@ pub(crate) fn path_excluded(path: &Path, name: &str, cfg: &ScanConfig) -> bool {
 /// rustyDLNA `exclude_file` matching: basename only, ASCII case-insensitive,
 /// with `*` (zero or more bytes) and `?` (one byte).
 pub fn basename_glob_matches(pattern: &str, name: &str) -> bool {
-    fn matches(pattern: &[u8], name: &[u8]) -> bool {
-        match pattern.first().copied() {
-            None => name.is_empty(),
+    basename_glob_matches_counted(pattern.as_bytes(), name.as_bytes(), &mut 0)
+}
+
+/// Iterative glob matcher. Only the most recent `*` is a backtrack point:
+/// a later `*` can absorb anything an earlier one could, so restarting from
+/// the latest star is complete. Work is bounded by `pattern.len() *
+/// name.len()` comparisons instead of growing exponentially with stars.
+/// `steps` counts byte comparisons so tests can assert that bound.
+fn basename_glob_matches_counted(pattern: &[u8], name: &[u8], steps: &mut u64) -> bool {
+    let (mut p, mut n) = (0usize, 0usize);
+    // (pattern index after the latest `*`, name index that star resumes at)
+    let mut restart: Option<(usize, usize)> = None;
+    while n < name.len() {
+        *steps = steps.saturating_add(1);
+        match pattern.get(p).copied() {
             Some(b'*') => {
-                let rest = pattern
-                    .iter()
-                    .position(|byte| *byte != b'*')
-                    .unwrap_or(pattern.len());
-                let pattern = &pattern[rest..];
-                pattern.is_empty()
-                    || (0..=name.len()).any(|offset| matches(pattern, &name[offset..]))
+                p += 1;
+                restart = Some((p, n));
+                continue;
             }
-            Some(b'?') => !name.is_empty() && matches(&pattern[1..], &name[1..]),
-            Some(expected) => {
-                name.first()
-                    .is_some_and(|actual| expected.eq_ignore_ascii_case(actual))
-                    && matches(&pattern[1..], &name[1..])
+            Some(b'?') => {
+                p += 1;
+                n += 1;
+                continue;
             }
+            Some(expected) if expected.eq_ignore_ascii_case(&name[n]) => {
+                p += 1;
+                n += 1;
+                continue;
+            }
+            _ => {}
         }
+        let Some((star_p, star_n)) = restart else {
+            return false;
+        };
+        // Let the latest star absorb one more byte and retry from there.
+        let resume = star_n + 1;
+        restart = Some((star_p, resume));
+        p = star_p;
+        n = resume;
     }
-    matches(pattern.as_bytes(), name.as_bytes())
+    pattern[p..].iter().all(|byte| *byte == b'*')
 }
 
 /// rustyDLNA `exclude_dir`: a path component (`incomplete`) or a suffix
@@ -1799,6 +1821,131 @@ fn captions_from_candidates(file: &Path, candidates: &[PathBuf]) -> Vec<Caption>
         .collect()
 }
 
+/// Caption-format files one directory inventory may retain. A directory with
+/// more caption sidecars than this is not cached; each media file in it falls
+/// back to its own directory read, which keeps only that file's matches. This
+/// caps inventory memory at this many paths per cached directory while keeping
+/// ordinary flat libraries at one directory read per batch.
+const CAPTION_INVENTORY_MAX_CANDIDATES: usize = 4096;
+/// Parent directories one inventory cache retains before it is cleared. A
+/// clear only costs a later re-read; caption results are unchanged.
+const CAPTION_INVENTORY_MAX_DIRECTORIES: usize = 256;
+
+/// Caption-format files of one directory, enumerated once and indexed by every
+/// media stem that could own them under [`caption_path_matches_media`].
+#[derive(Debug, Default)]
+struct CaptionInventory {
+    /// Allowed caption files sorted by path, as the per-file read sorts them.
+    candidates: Vec<PathBuf>,
+    /// Raw owner-stem bytes to ascending indexes into `candidates`.
+    by_owner_stem: HashMap<Vec<u8>, Vec<usize>>,
+}
+
+impl CaptionInventory {
+    fn new(mut candidates: Vec<PathBuf>) -> Self {
+        candidates.sort();
+        let mut by_owner_stem: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            let Some(stem) = candidate.file_stem().map(OsStr::as_encoded_bytes) else {
+                continue;
+            };
+            // A sidecar can belong only to a media stem equal to its own stem
+            // or to a prefix that ends just before one of its `.` bytes. The
+            // exact ownership rule is re-applied by `captions_from_candidates`.
+            for (end, byte) in stem.iter().enumerate() {
+                if *byte == b'.' {
+                    by_owner_stem
+                        .entry(stem[..end].to_vec())
+                        .or_default()
+                        .push(index);
+                }
+            }
+            by_owner_stem.entry(stem.to_vec()).or_default().push(index);
+        }
+        Self {
+            candidates,
+            by_owner_stem,
+        }
+    }
+
+    fn captions_for(&self, file: &Path) -> Vec<Caption> {
+        let Some(stem) = file.file_stem().map(OsStr::as_encoded_bytes) else {
+            return Vec::new();
+        };
+        let Some(indexes) = self.by_owner_stem.get(stem) else {
+            return Vec::new();
+        };
+        // Indexes were pushed in ascending candidate order, so the owned list
+        // keeps the sorted order the per-file read produced.
+        let owned: Vec<PathBuf> = indexes
+            .iter()
+            .filter_map(|index| self.candidates.get(*index).cloned())
+            .collect();
+        captions_from_candidates(file, &owned)
+    }
+}
+
+#[derive(Debug)]
+enum CaptionDirectory {
+    Indexed(CaptionInventory),
+    /// More than [`CAPTION_INVENTORY_MAX_CANDIDATES`] caption files.
+    Oversized,
+}
+
+/// Caption discovery for one indexing pass or batch. Each parent directory is
+/// enumerated once while it stays cached, instead of once per media file in it.
+#[derive(Debug, Default)]
+pub(crate) struct CaptionInventoryCache {
+    directories: HashMap<PathBuf, CaptionDirectory>,
+}
+
+impl CaptionInventoryCache {
+    fn captions_for(&mut self, file: &Path, cfg: &ScanConfig) -> ScanResult<Vec<Caption>> {
+        if !cfg.subtitles {
+            return Ok(Vec::new());
+        }
+        let Some(parent) = file.parent() else {
+            return Ok(Vec::new());
+        };
+        if !self.directories.contains_key(parent) {
+            if self.directories.len() >= CAPTION_INVENTORY_MAX_DIRECTORIES {
+                self.directories.clear();
+            }
+            let directory = read_caption_directory(parent, cfg)?;
+            self.directories.insert(parent.to_path_buf(), directory);
+        }
+        match self.directories.get(parent) {
+            Some(CaptionDirectory::Indexed(inventory)) => Ok(inventory.captions_for(file)),
+            Some(CaptionDirectory::Oversized) | None => captions_for(file, cfg),
+        }
+    }
+}
+
+/// Enumerate caption-format files once. Every retained candidate passes the
+/// same rooted confinement check the per-file read applies.
+fn read_caption_directory(dir: &Path, cfg: &ScanConfig) -> ScanResult<CaptionDirectory> {
+    #[cfg(test)]
+    record_caption_directory_read(dir);
+    let rd = std::fs::read_dir(dir).map_err(|error| scan_io(dir, error))?;
+    let mut candidates = Vec::new();
+    for entry in rd {
+        let entry = entry.map_err(|error| scan_io(dir, error))?;
+        if caption_format_for_os_name(&entry.file_name()).is_none() {
+            continue;
+        }
+        let path = entry.path();
+        if !path_is_allowed_file(&path, cfg) {
+            continue;
+        }
+        if candidates.len() >= CAPTION_INVENTORY_MAX_CANDIDATES {
+            return Ok(CaptionDirectory::Oversized);
+        }
+        candidates.push(path);
+    }
+    Ok(CaptionDirectory::Indexed(CaptionInventory::new(candidates)))
+}
+
+/// Single-file caption discovery. Batch callers use [`CaptionInventoryCache`].
 fn captions_for(file: &Path, cfg: &ScanConfig) -> ScanResult<Vec<Caption>> {
     if !cfg.subtitles {
         return Ok(Vec::new());
@@ -1807,17 +1954,50 @@ fn captions_for(file: &Path, cfg: &ScanConfig) -> ScanResult<Vec<Caption>> {
         Some(p) => p,
         None => return Ok(Vec::new()),
     };
+    #[cfg(test)]
+    record_caption_directory_read(parent);
     let rd = std::fs::read_dir(parent).map_err(|error| scan_io(parent, error))?;
     let mut names = Vec::new();
     for entry in rd {
         let entry = entry.map_err(|error| scan_io(parent, error))?;
         let path = entry.path();
-        if path_is_allowed_file(&path, cfg) && caption_path_matches_media(&path, file) {
+        if caption_path_matches_media(&path, file) && path_is_allowed_file(&path, cfg) {
             names.push(path);
         }
     }
     names.sort();
     Ok(captions_from_candidates(file, &names))
+}
+
+#[cfg(test)]
+static CAPTION_DIRECTORY_READS: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn record_caption_directory_read(dir: &Path) {
+    let mut reads = CAPTION_DIRECTORY_READS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(count) = reads.get_mut(dir) {
+        *count += 1;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_caption_directory_read_count(dir: &Path) {
+    CAPTION_DIRECTORY_READS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(dir.to_path_buf(), 0);
+}
+
+#[cfg(test)]
+pub(crate) fn take_caption_directory_read_count(dir: &Path) -> usize {
+    CAPTION_DIRECTORY_READS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(dir)
+        .unwrap_or_default()
 }
 
 /// Cheap HDR guess from a title or path. Browse uses this so a folder
@@ -3218,6 +3398,7 @@ fn monitor_dirty_with_db(
         }
     }
     let mut indexing_artwork = ArtworkSelectionCache::default();
+    let mut indexing_captions = CaptionInventoryCache::default();
     for (path_s, st) in &listed {
         cfg.check_cancelled()?;
         let key = media_rel_key_for_config(&st.path, cfg);
@@ -3339,6 +3520,7 @@ fn monitor_dirty_with_db(
                         &st.path,
                         &folder_id,
                         sidecar.as_deref(),
+                        &mut indexing_captions,
                     )? {
                         log_library_file(&st.path, "added", "library file added");
                         added += 1;
@@ -3881,6 +4063,7 @@ pub(crate) fn index_one_file(
         folder_id,
         None,
         IndexArtworkSelection::Discover,
+        &mut CaptionInventoryCache::default(),
     )
 }
 
@@ -3890,6 +4073,7 @@ fn index_one_file_with_prepared(
     path: &Path,
     folder_id: &str,
     prepared: Option<&PreparedPhysicalFile>,
+    captions: &mut CaptionInventoryCache,
 ) -> ScanResult<bool> {
     index_one_file_with_artwork(
         db,
@@ -3898,6 +4082,7 @@ fn index_one_file_with_prepared(
         folder_id,
         prepared,
         IndexArtworkSelection::Discover,
+        captions,
     )
 }
 
@@ -3907,6 +4092,7 @@ fn index_one_file_with_selected_artwork(
     path: &Path,
     folder_id: &str,
     sidecar: Option<&Path>,
+    captions: &mut CaptionInventoryCache,
 ) -> ScanResult<bool> {
     index_one_file_with_artwork(
         db,
@@ -3915,6 +4101,7 @@ fn index_one_file_with_selected_artwork(
         folder_id,
         None,
         IndexArtworkSelection::Selected(sidecar),
+        captions,
     )
 }
 
@@ -3925,6 +4112,7 @@ fn index_one_file_with_artwork(
     folder_id: &str,
     prepared: Option<&PreparedPhysicalFile>,
     artwork_selection: IndexArtworkSelection<'_>,
+    captions: &mut CaptionInventoryCache,
 ) -> ScanResult<bool> {
     let name = path
         .file_name()
@@ -4132,6 +4320,9 @@ fn index_one_file_with_artwork(
         }
         if source.size == size && source.timestamp >= mtime {
             let id = db.clone_detail_for_path(source.id, &path_s, size, mtime, device, inode)?;
+            // Shared inode metadata is cloned, but external sidecars belong to
+            // each logical path: discover this alias's own captions.
+            db.replace_captions(id, &captions.captions_for(path, cfg)?)?;
             // Video defaults belong to each browseable filename. The copied
             // provenance distinguishes a curated NFO title from a base title
             // without reparsing every physical alias during admission.
@@ -4189,7 +4380,7 @@ fn index_one_file_with_artwork(
         dlna_pn: None,
     })?;
     db.set_detail_collection_source(detail, &opened, cfg)?;
-    let caps = captions_for(path, cfg)?;
+    let caps = captions.captions_for(path, cfg)?;
     db.replace_captions(detail, &caps)?;
     if let Some(prepared) = prepared.filter(|prepared| prepared.probe_attempted) {
         persist_prepared_probe(db, cfg, path, detail, prepared.probe.clone())?;
@@ -4348,6 +4539,7 @@ fn rebuild_objects_with_db(cfg: &ScanConfig, db: &LibraryDb) -> ScanResult<Catal
     db.prune_duplicate_folder_inodes()?;
     let mut n = 0usize;
     let mut indexing_artwork = ArtworkSelectionCache::default();
+    let mut indexing_captions = CaptionInventoryCache::default();
     for row in &rows {
         cfg.check_cancelled()?;
         let p = path_from_db(&row.path);
@@ -4356,7 +4548,14 @@ fn rebuild_objects_with_db(cfg: &ScanConfig, db: &LibraryDb) -> ScanResult<Catal
         }
         if let Some(folder) = ensure_folder_chain(db, cfg, &p)? {
             let sidecar = indexing_artwork.select(&p, cfg);
-            if index_one_file_with_selected_artwork(db, cfg, &p, &folder, sidecar.as_deref())? {
+            if index_one_file_with_selected_artwork(
+                db,
+                cfg,
+                &p,
+                &folder,
+                sidecar.as_deref(),
+                &mut indexing_captions,
+            )? {
                 n += 1;
             }
         }
@@ -4795,6 +4994,9 @@ impl DbWalker<'_> {
             &pending,
             &mut self.physical_artwork_inventories,
         )?;
+        // One caption inventory per preparation batch: each parent directory
+        // is enumerated once for the batch rather than once per media file.
+        let mut captions = CaptionInventoryCache::default();
         for (index, file) in pending.iter().enumerate() {
             self.cfg.check_cancelled()?;
             if !prepared.worker_indices.contains(&index) {
@@ -4811,6 +5013,7 @@ impl DbWalker<'_> {
                     file.physical.clone(),
                     file.probe_sidecar_fingerprint.clone(),
                 )),
+                &mut captions,
             )? {
                 self.indexed += 1;
                 if self.indexed / 100 * 100 == self.indexed {

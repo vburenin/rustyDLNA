@@ -2071,20 +2071,10 @@ impl LibraryDb {
              FROM DETAILS WHERE ID = ?6",
             params![path, size, mtime, device, inode, src_id],
         )?;
-        let id = self.conn.last_insert_rowid();
-        let n: i64 =
-            self.conn
-                .query_row("SELECT count(*) FROM CAPTIONS WHERE ID = ?1", [id], |r| {
-                    r.get(0)
-                })?;
-        if n == 0 {
-            self.conn.execute(
-                "INSERT OR IGNORE INTO CAPTIONS (ID, PATH)
-                 SELECT ?1, PATH FROM CAPTIONS WHERE ID = ?2",
-                params![id, src_id],
-            )?;
-        }
-        Ok(id)
+        // External caption sidecars belong to each logical path, not to the
+        // shared inode, so they are never copied here. The caller discovers
+        // the alias path's own captions.
+        Ok(self.conn.last_insert_rowid())
     }
 
     pub fn all_detail_stats(&self) -> rusqlite::Result<Vec<DetailStat>> {

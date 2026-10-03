@@ -29,6 +29,13 @@ publish a signed, content-addressed OCI image with SBOM and provenance.
 - Kept slow clients connected for large prepared responses: the server's write
   timeout now bounds writes that make no progress, not the total time to send
   a response of up to 8 MiB.
+- Made first scans of large flat folders linear: caption sidecars are found
+  from one directory listing per batch instead of re-reading the folder for
+  every video.
+- Hard-link and symlink aliases now publish their own caption sidecars on the
+  first scan instead of copying the original path's captions.
+- Replaced exponential backtracking in exclusion-glob matching with a bounded
+  matcher; matching results are unchanged.
 - Increased the Media Source playback reserve from ten media seconds to about
   30 seconds of real time, scaled by the playback rate, within the existing
   compressed-byte budget.

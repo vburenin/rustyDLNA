@@ -155,7 +155,9 @@ remain byte-exact when deriving the child directory beneath `.rusty_previews`.
 ## Symlink aliases
 
 Every path is browseable. Physical probe work is shared per inode (device +
-inode), while probe-sidecar overlays remain path-local. Later NFO/poster updates
+inode), while probe-sidecar overlays remain path-local. External caption
+sidecars are also path-local: from its first publication, each alias lists only
+the captions owned by its own path, or none. Later NFO/poster updates
 rewrite every compatible alias. Deleting one path must not delete the others.
 
 Recursive `tvshow.nfo` refresh follows the catalog walker's ancestor device/inode

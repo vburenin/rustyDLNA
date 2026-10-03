@@ -7594,3 +7594,401 @@ fn controlled_recent_views_match_legacy_alias_order_limits_and_cancel() {
         .displayed_container_count_controlled(BROWSEDIR_ID, |count| count < 2)
         .is_none());
 }
+
+fn caption_identity(captions: &[Caption]) -> Vec<(u32, PathBuf, String)> {
+    captions
+        .iter()
+        .map(|caption| (caption.index, caption.path.clone(), caption.ext.clone()))
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn caption_discovery_reads_each_media_directory_once_per_batch() {
+    use std::os::unix::ffi::OsStringExt;
+
+    const PLAIN_MEDIA: usize = 40;
+
+    let tmp = TempPath::new("caption-inventory");
+    let flat = tmp.join("flat");
+    std::fs::create_dir_all(&flat).unwrap();
+    let template = tmp.join("template.mkv.part");
+    write_fake_mkv(&template, 64);
+    let mut media = Vec::new();
+    let mut add_media = |name: OsString| {
+        let path = flat.join(name);
+        std::fs::copy(&template, &path).unwrap();
+        media.push(path);
+    };
+    for index in 0..PLAIN_MEDIA {
+        add_media(format!("Clip {index:03}.mkv").into());
+    }
+    for name in ["Movie.mkv", "Movie 2.mkv", "Movie.2020.mkv", "Movie.en.mkv"] {
+        add_media(name.into());
+    }
+    add_media(OsString::from_vec(b"Caf\xe9.mkv".to_vec()));
+    let mut sidecars: Vec<OsString> = [
+        "Clip 000.srt",
+        "Clip 000.en.vtt",
+        "Clip 000.en.forced.ass",
+        "Clip 001.fr.srt",
+        "Clip 0011.srt",
+        "Clip 001.txt",
+        "Movie.srt",
+        "Movie.en.srt",
+        "Movie.zz.sub",
+        "Movie 2.srt",
+        "Movie 2.en.vtt",
+        "Movie.2020.srt",
+        "Movie.2020.de.smi",
+        "Movie..srt",
+        "Movieextra.srt",
+        "MOVIE.srt",
+        "Movie.en.srt.bak",
+        "Movie.ssa",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    sidecars.push(OsString::from_vec(b"Caf\xe9.srt".to_vec()));
+    sidecars.push(OsString::from_vec(b"Caf\xe9.\xff.srt".to_vec()));
+    sidecars.push(OsString::from_vec(b"Movie.\xfe.vtt".to_vec()));
+    for name in &sidecars {
+        std::fs::write(flat.join(name), "1\n00:00:00,000 --> 00:00:01,000\nhi\n").unwrap();
+    }
+    std::fs::remove_file(&template).unwrap();
+    let cfg = ScanConfig {
+        media_roots: Vec::new(),
+        media_dirs: vec![tmp.clone()],
+        db_path: Some(tmp.join("files.db")),
+        types: MediaTypes::video_only(),
+        thumbnails: false,
+        ..Default::default()
+    };
+
+    reset_caption_directory_read_count(&flat);
+    let catalog = scan(&cfg).unwrap();
+    assert_eq!(
+        take_caption_directory_read_count(&flat),
+        1,
+        "a first scan must enumerate the flat media directory once, not once per media file"
+    );
+
+    let captions_of = |catalog: &Catalog, path: &Path| {
+        catalog
+            .items
+            .values()
+            .find(|item| item.ref_id.is_none() && item.path == path)
+            .map(|item| caption_identity(&item.captions))
+            .unwrap_or_else(|| panic!("{} indexed", path.display()))
+    };
+    // Every result must equal the single-file discovery the scanner used
+    // before directory inventories existed.
+    for path in &media {
+        assert_eq!(
+            captions_of(&catalog, path),
+            caption_identity(&captions_for(path, &cfg).unwrap()),
+            "{}",
+            path.display()
+        );
+    }
+    let names = |catalog: &Catalog, media: &str| -> Vec<OsString> {
+        captions_of(catalog, &flat.join(media))
+            .into_iter()
+            .map(|(_, path, _)| path.file_name().unwrap().to_os_string())
+            .collect()
+    };
+    assert_eq!(
+        names(&catalog, "Clip 000.mkv"),
+        ["Clip 000.en.forced.ass", "Clip 000.en.vtt", "Clip 000.srt"]
+            .map(OsString::from)
+            .to_vec()
+    );
+    assert_eq!(
+        names(&catalog, "Clip 001.mkv"),
+        vec![OsString::from("Clip 001.fr.srt")]
+    );
+    assert_eq!(
+        names(&catalog, "Movie.mkv"),
+        vec![
+            OsString::from("Movie.2020.de.smi"),
+            OsString::from("Movie.2020.srt"),
+            OsString::from("Movie.en.srt"),
+            OsString::from("Movie.srt"),
+            OsString::from("Movie.ssa"),
+            OsString::from("Movie.zz.sub"),
+            OsString::from_vec(b"Movie.\xfe.vtt".to_vec()),
+        ]
+    );
+    assert_eq!(
+        names(&catalog, "Movie 2.mkv"),
+        ["Movie 2.en.vtt", "Movie 2.srt"]
+            .map(OsString::from)
+            .to_vec()
+    );
+    assert_eq!(
+        names(&catalog, "Movie.2020.mkv"),
+        ["Movie.2020.de.smi", "Movie.2020.srt"]
+            .map(OsString::from)
+            .to_vec()
+    );
+    assert_eq!(
+        names(&catalog, "Movie.en.mkv"),
+        vec![OsString::from("Movie.en.srt")]
+    );
+    assert_eq!(
+        captions_of(
+            &catalog,
+            &flat.join(OsString::from_vec(b"Caf\xe9.mkv".to_vec()))
+        )
+        .into_iter()
+        .map(|(_, path, _)| path.file_name().unwrap().to_os_string())
+        .collect::<Vec<_>>(),
+        vec![
+            OsString::from_vec(b"Caf\xe9.srt".to_vec()),
+            OsString::from_vec(b"Caf\xe9.\xff.srt".to_vec()),
+        ]
+    );
+
+    // A targeted watcher batch of new media in the same directory also
+    // enumerates it once for the whole batch.
+    let template = tmp.join("template2.mkv.part");
+    write_fake_mkv(&template, 64);
+    let mut dirty = Vec::new();
+    for index in 0..PLAIN_MEDIA {
+        let path = flat.join(format!("Late {index:03}.mkv"));
+        std::fs::copy(&template, &path).unwrap();
+        std::fs::write(
+            flat.join(format!("Late {index:03}.en.srt")),
+            "1\n00:00:00,000 --> 00:00:01,000\nhi\n",
+        )
+        .unwrap();
+        dirty.push(path);
+    }
+    std::fs::remove_file(&template).unwrap();
+    reset_caption_directory_read_count(&flat);
+    let (updated, delta) = monitor_dirty(&cfg, &dirty).unwrap();
+    assert_eq!(delta.added, PLAIN_MEDIA);
+    assert_eq!(
+        take_caption_directory_read_count(&flat),
+        1,
+        "a targeted watcher batch must enumerate the media directory once"
+    );
+    let updated = updated.expect("targeted additions publish");
+    for path in &dirty {
+        let captions = captions_of(&updated, path);
+        assert_eq!(
+            captions,
+            caption_identity(&captions_for(path, &cfg).unwrap())
+        );
+        assert_eq!(captions.len(), 1);
+    }
+}
+
+#[test]
+fn caption_inventory_matches_single_file_discovery_for_overlapping_stems() {
+    let dir = Path::new("/library/flat");
+    let names = [
+        "Movie.srt",
+        "Movie 2.srt",
+        "Movie.2.srt",
+        "Movie..srt",
+        "Movie.a.b.c.vtt",
+        "Movie.a.srt",
+        "Movie.a.b.srt",
+        ".srt",
+        "Movie.SRT",
+        "Moviex.srt",
+    ];
+    let candidates: Vec<PathBuf> = names.iter().map(|name| dir.join(name)).collect();
+    let inventory = CaptionInventory::new(candidates.clone());
+    let mut sorted = candidates;
+    sorted.sort();
+    for media in [
+        "Movie.mkv",
+        "Movie 2.mkv",
+        "Movie.2.mkv",
+        "Movie..mkv",
+        "Movie.a.mkv",
+        "Movie.a.b.mkv",
+        "Movie.a.b.c.mkv",
+        "Moviex.mkv",
+        "Movi.mkv",
+        ".mkv",
+        "noext",
+    ] {
+        let media = dir.join(media);
+        assert_eq!(
+            caption_identity(&inventory.captions_for(&media)),
+            caption_identity(&captions_from_candidates(&media, &sorted)),
+            "{}",
+            media.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn inode_aliases_publish_their_own_caption_sidecars_on_first_scan() {
+    let tmp = TempPath::new("alias-own-captions");
+    let first_dir = tmp.join("a");
+    let hardlink_dir = tmp.join("b");
+    let bare_dir = tmp.join("c");
+    let symlink_dir = tmp.join("d");
+    for dir in [&first_dir, &hardlink_dir, &bare_dir, &symlink_dir] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let original = first_dir.join("clip.mkv");
+    write_fake_mkv(&original, 64);
+    let hardlink = hardlink_dir.join("alias.mkv");
+    std::fs::hard_link(&original, &hardlink).unwrap();
+    let bare = bare_dir.join("bare.mkv");
+    std::fs::hard_link(&original, &bare).unwrap();
+    let symlink = symlink_dir.join("linked.mkv");
+    std::os::unix::fs::symlink(&original, &symlink).unwrap();
+    let subtitle = "1\n00:00:00,000 --> 00:00:01,000\nhi\n";
+    let original_caption = first_dir.join("clip.srt");
+    let hardlink_captions = [
+        hardlink_dir.join("alias.en.vtt"),
+        hardlink_dir.join("alias.srt"),
+    ];
+    let symlink_caption = symlink_dir.join("linked.fr.srt");
+    std::fs::write(&original_caption, subtitle).unwrap();
+    for caption in &hardlink_captions {
+        std::fs::write(caption, subtitle).unwrap();
+    }
+    std::fs::write(&symlink_caption, subtitle).unwrap();
+    // Sidecars named after another alias never attach across directories.
+    std::fs::write(bare_dir.join("clip.srt"), subtitle).unwrap();
+    let cfg = ScanConfig {
+        media_roots: Vec::new(),
+        media_dirs: vec![tmp.clone()],
+        db_path: Some(tmp.join("files.db")),
+        types: MediaTypes::video_only(),
+        thumbnails: false,
+        ..Default::default()
+    };
+
+    let expectations = [
+        (&original, vec![original_caption.clone()]),
+        (&hardlink, hardlink_captions.to_vec()),
+        (&bare, Vec::new()),
+        (&symlink, vec![symlink_caption.clone()]),
+    ];
+    let assert_own = |catalog: &Catalog, source: &str| {
+        let details: HashSet<i64> = expectations
+            .iter()
+            .map(|(path, expected)| {
+                let item = catalog
+                    .items
+                    .values()
+                    .find(|item| item.ref_id.is_none() && item.path == **path)
+                    .unwrap_or_else(|| panic!("{source}: {} indexed", path.display()));
+                let captions: Vec<PathBuf> = item
+                    .captions
+                    .iter()
+                    .map(|caption| caption.path.clone())
+                    .collect();
+                assert_eq!(&captions, expected, "{source}: {}", path.display());
+                item.detail_id
+            })
+            .collect();
+        assert_eq!(
+            details.len(),
+            expectations.len(),
+            "{source}: one row per path"
+        );
+    };
+    let initial = scan(&cfg).unwrap();
+    assert_own(&initial, "first published catalog");
+    assert_own(&load_existing(&cfg), "first persisted database");
+}
+
+/// Reference glob semantics: dynamic programming over byte prefixes.
+fn reference_basename_glob(pattern: &[u8], name: &[u8]) -> bool {
+    let mut table = vec![vec![false; name.len() + 1]; pattern.len() + 1];
+    table[0][0] = true;
+    for p in 1..=pattern.len() {
+        if pattern[p - 1] == b'*' {
+            table[p][0] = table[p - 1][0];
+        }
+        for n in 1..=name.len() {
+            table[p][n] = match pattern[p - 1] {
+                b'*' => table[p - 1][n] || table[p][n - 1],
+                b'?' => table[p - 1][n - 1],
+                expected => table[p - 1][n - 1] && expected.eq_ignore_ascii_case(&name[n - 1]),
+            };
+        }
+    }
+    table[pattern.len()][name.len()]
+}
+
+#[test]
+fn basename_glob_matches_reference_semantics_for_generated_cases() {
+    // Deterministic xorshift so failures reproduce.
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    const NAME_BYTES: &[u8] = b"aAbB.*?\xc3\xa9\xff";
+    const PATTERN_BYTES: &[u8] = b"aAbB.**??\xc3\xa9\xff";
+    let mut matched = 0usize;
+    for _ in 0..40_000 {
+        let pattern_len = (next() % 8) as usize;
+        let name_len = (next() % 9) as usize;
+        let pattern: Vec<u8> = (0..pattern_len)
+            .map(|_| PATTERN_BYTES[(next() % PATTERN_BYTES.len() as u64) as usize])
+            .collect();
+        let name: Vec<u8> = (0..name_len)
+            .map(|_| NAME_BYTES[(next() % NAME_BYTES.len() as u64) as usize])
+            .collect();
+        let expected = reference_basename_glob(&pattern, &name);
+        matched += usize::from(expected);
+        assert_eq!(
+            basename_glob_matches_counted(&pattern, &name, &mut 0),
+            expected,
+            "pattern {pattern:?} name {name:?}"
+        );
+        if let (Ok(pattern), Ok(name)) = (std::str::from_utf8(&pattern), std::str::from_utf8(&name))
+        {
+            assert_eq!(basename_glob_matches(pattern, name), expected);
+        }
+    }
+    assert!(
+        matched > 1_000,
+        "generator must exercise matches: {matched}"
+    );
+    assert!(basename_glob_matches("*.MKV", "movie.mkv"));
+    assert!(basename_glob_matches("**", ""));
+    assert!(!basename_glob_matches("?", ""));
+    assert!(!basename_glob_matches("é", "É"), "only ASCII folds");
+    assert!(basename_glob_matches("caf?.mkv", "cafe.mkv"));
+    assert!(
+        !basename_glob_matches("caf?.mkv", "café.mkv"),
+        "`?` is one byte, not one character"
+    );
+    assert!(basename_glob_matches("caf??.mkv", "café.mkv"));
+}
+
+#[test]
+fn basename_glob_matching_has_polynomial_worst_case() {
+    let pattern = b"*a*a*a*a*a*a*a*a*a*a*a*b";
+    let name = vec![b'a'; 4096];
+    let mut steps = 0u64;
+    assert!(!basename_glob_matches_counted(pattern, &name, &mut steps));
+    let bound = (pattern.len() as u64 + 1) * (name.len() as u64 + 1);
+    assert!(
+        steps <= bound,
+        "{steps} comparisons exceed the pattern x name bound {bound}"
+    );
+    let mut matching = name.clone();
+    matching.push(b'b');
+    let mut steps = 0u64;
+    assert!(basename_glob_matches_counted(
+        pattern, &matching, &mut steps
+    ));
+    assert!(steps <= bound + pattern.len() as u64 + 1);
+}
