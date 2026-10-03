@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import math
 import os
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -178,6 +180,62 @@ def tree_snapshot(root: Path) -> list[tuple[str, int, bytes]]:
     return entries
 
 
+class PreviewTimeoutFallbackTests(unittest.TestCase):
+    REQUEST = preview_module.PreviewRequest((64, 64), None, None)
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.source = Path(self.temporary.name) / "Title.mp4"
+        self.source.write_bytes(b"synthetic")
+        self.decoders: list[str] = []
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def generate(self, hwaccel: str, cuda_pipeline: bool, timed_out: set[str]):
+        write_sheets = fake_ffmpeg_sheets(preview_module.layout_for_frame(64, 64))
+
+        def run(command, diagnostics, timeout, name, decoder, *args):
+            self.decoders.append(decoder)
+            pattern = command[-1]
+            if decoder.split("/")[0] in timed_out:
+                # A partial sheet must not survive into the next attempt.
+                with open(pattern % 0, "wb") as output:
+                    output.write(b"partial")
+                raise preview_module.PreviewTimeout("ffmpeg made no progress for 600s")
+            return write_sheets(command)
+
+        with (
+            mock.patch.object(preview_module, "probe_media", return_value=(1, 64, 64)),
+            mock.patch.object(preview_module, "run_ffmpeg_with_progress", side_effect=run),
+            redirect_stderr(io.StringIO()),
+        ):
+            return preview_module.generate_one(
+                self.source, "unused", "unused", True, self.REQUEST,
+                hwaccel, cuda_pipeline, "accurate", "synthetic", threading.Event(),
+            )
+
+    def test_hung_hardware_decoder_falls_back_to_software(self) -> None:
+        _, status = self.generate("auto", True, {"cuda-resident"})
+        self.assertTrue(status.startswith("generated"), status)
+        self.assertIn("software-fallback", status)
+        self.assertEqual(self.decoders, ["cuda-resident/accurate", "none/accurate"])
+
+    def test_software_timeout_fails_without_retrying(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "no progress"):
+            self.generate("auto", True, {"cuda-resident", "none"})
+        self.assertEqual(self.decoders, ["cuda-resident/accurate", "none/accurate"])
+        directory = preview_module.preview_directory(self.source)
+        self.assertEqual(
+            [path.name for path in directory.iterdir() if path.name.startswith(".sheet-")], []
+        )
+
+    def test_explicit_hardware_decoder_without_software_fallback_fails(self) -> None:
+        with self.assertRaises(preview_module.PreviewTimeout):
+            self.generate("cuda", True, {"cuda-resident"})
+        self.assertEqual(self.decoders, ["cuda-resident/accurate"])
+
+
 class PreviewPermissionTests(unittest.TestCase):
     """Preview output never broadens permissions or follows symlinks."""
 
@@ -295,6 +353,31 @@ class PreviewPermissionTests(unittest.TestCase):
             self.assertEqual(preview_module.jpeg_dimensions(sheet), (width, height))
         self.assertFalse(list(directory.glob(".*.tmp*")))
         self.assert_no_world_bits(directory.parent)
+
+
+
+class RequestedVideoTests(unittest.TestCase):
+    def test_every_intake_container_is_a_requested_preview_source(self) -> None:
+        from lib import intake_media
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            requested = []
+            for suffix in sorted(intake_media.VIDEO_EXTENSIONS):
+                path = root / f"movie{suffix}"
+                path.write_bytes(b"movie")
+                requested.append(path)
+            self.assertEqual(
+                preview_module.collect_requested_videos(root, requested),
+                sorted((path.resolve() for path in requested), key=os.fsencode),
+            )
+
+    def test_explicit_unsupported_file_is_still_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "notes.txt").write_text("notes")
+            with self.assertRaisesRegex(ValueError, "not a supported video"):
+                preview_module.collect_requested_videos(root, [Path("notes.txt")])
 
 
 if __name__ == "__main__":

@@ -79,6 +79,7 @@ TEMP_SHEET_RE = re.compile(
 )
 TEMP_MANIFEST_RE = re.compile(r"^\.manifest\..+\.tmp$")
 PROGRESS_INTERVAL_SECONDS = 5
+MIN_STALL_SECONDS = 600
 PROGRESS_READ_BYTES = 4096
 MAX_PROGRESS_LINE_BYTES = 1024
 MEDIA_DURATION_RE = re.compile(
@@ -89,6 +90,10 @@ MEDIA_DURATION_RE = re.compile(
 
 class PreviewInterrupted(Exception):
     """Raised when the user asks active preview work to stop."""
+
+
+class PreviewTimeout(RuntimeError):
+    """Raised when one FFmpeg attempt passes its deadline or stops progressing."""
 
 
 @dataclass(frozen=True)
@@ -736,10 +741,15 @@ def run_ffmpeg_with_progress(
     sheet_count: int,
     title_started: float,
     stop_event: threading.Event,
+    stall_timeout: float | None = None,
 ) -> int:
     attempt_started = time.monotonic()
     deadline = attempt_started + timeout
     last_report = attempt_started
+    # Progress blocks keep arriving while a decoder is hung, so only an
+    # advancing sheet count or output time counts as progress.
+    last_advance = attempt_started
+    output_time = -1
     completed_sheets = 0
     process = subprocess.Popen(
         command,
@@ -764,7 +774,9 @@ def run_ffmpeg_with_progress(
                 raise PreviewInterrupted
             now = time.monotonic()
             if now >= deadline:
-                raise RuntimeError(f"ffmpeg exceeded its {timeout}s deadline")
+                raise PreviewTimeout(f"ffmpeg exceeded its {timeout}s deadline")
+            if stall_timeout is not None and now - last_advance >= stall_timeout:
+                raise PreviewTimeout(f"ffmpeg made no progress for {stall_timeout:g}s")
             for key, _ in selector.select(timeout=min(0.1, deadline - now)):
                 try:
                     chunk = os.read(key.fd, PROGRESS_READ_BYTES)
@@ -788,9 +800,20 @@ def run_ffmpeg_with_progress(
                         name, separator, value = bytes(pending).strip().partition(b"=")
                         if separator and name == b"frame":
                             try:
-                                completed_sheets = max(completed_sheets, min(sheet_count, int(value)))
+                                sheets = min(sheet_count, int(value))
                             except ValueError:
-                                pass
+                                sheets = completed_sheets
+                            if sheets > completed_sheets:
+                                completed_sheets = sheets
+                                last_advance = time.monotonic()
+                        elif separator and name == b"out_time_us":
+                            try:
+                                microseconds = int(value)
+                            except ValueError:
+                                microseconds = output_time
+                            if microseconds > output_time:
+                                output_time = microseconds
+                                last_advance = time.monotonic()
                     pending.clear()
                     dropping_line = False
             now = time.monotonic()
@@ -817,7 +840,7 @@ def run_ffmpeg_with_progress(
         if stop_event.is_set():
             raise PreviewInterrupted
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"ffmpeg exceeded its {timeout}s deadline")
+            raise PreviewTimeout(f"ffmpeg exceeded its {timeout}s deadline")
         return process.wait()
     finally:
         terminate_process(process, process_group=True)
@@ -900,6 +923,12 @@ def generate_one(
             for index in range(sheet_count)
         ]
         timeout = max(600, min(12 * 60 * 60, math.ceil(duration * 2)))
+        # Allow each sheet the same half-realtime decode rate as the whole
+        # attempt, so a hung hardware decoder is noticed long before `timeout`.
+        stall_timeout = min(
+            timeout,
+            max(MIN_STALL_SECONDS, math.ceil(2 * interval * layout.frames_per_sheet)),
+        )
         if hwaccel == "auto" and cuda_pipeline:
             decoder_attempts = [("cuda", True), ("cuda", False), ("none", False)]
         elif hwaccel == "auto":
@@ -915,8 +944,14 @@ def generate_one(
         sampling_status = sampling_mode
         successful = False
         last_failure = "ffmpeg did not produce the complete validated sprite set"
+        software_fallback = ("none", False) in decoder_attempts
+        hardware_timed_out = False
         for sample_attempt in sampling_attempts:
             for decoder, gpu_resident in decoder_attempts:
+                # A timed-out hardware decoder goes straight to software; the
+                # other hardware variants would likely hang the same way.
+                if hardware_timed_out and decoder != "none":
+                    continue
                 for child in directory.iterdir():
                     if TEMP_SHEET_RE.fullmatch(child.name):
                         child.unlink(missing_ok=True)
@@ -981,7 +1016,24 @@ def generate_one(
                             sheet_count,
                             title_started,
                             stop_event,
+                            stall_timeout,
                         )
+                    except PreviewTimeout as error:
+                        for child in directory.iterdir():
+                            if TEMP_SHEET_RE.fullmatch(child.name):
+                                child.unlink(missing_ok=True)
+                        if decoder == "none" or not software_fallback:
+                            raise
+                        hardware_timed_out = True
+                        last_failure = str(error)
+                        print(
+                            f"RETRY\t{display_name}\t{decoder_label}: {last_failure}; "
+                            "trying software decoding\t"
+                            f"elapsed={elapsed_label(time.monotonic() - title_started)}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
                     except PreviewInterrupted:
                         for child in directory.iterdir():
                             if TEMP_SHEET_RE.fullmatch(child.name):

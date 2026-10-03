@@ -14,6 +14,8 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 
+from lib.artwork_names import catalog_item_artwork
+from lib.catalog_config import catalog_files_in_directory
 from lib.intake_media import apply_intake, plan_intake, print_intake_report
 from lib.paths import add_root_argument, require_library_root, state_dir, tools_dir
 
@@ -63,6 +65,24 @@ def write_intake_receipt(library_root: Path, plans: list) -> Path:
     return report
 
 
+def missing_posters(destinations: list[Path]) -> list[Path]:
+    """Return the expected poster path of each destination without artwork.
+
+    The poster fetcher keeps any artwork the scanner already recognizes, so
+    this applies the fetcher's rule: a file's stem art, plus its directory's
+    folder art when it is the only catalog movie file there; a disc
+    directory's folder art.
+    """
+    missing: list[Path] = []
+    for path in destinations:
+        if path.is_dir():
+            if not catalog_item_artwork(path, 0):
+                missing.append(path / "poster.jpg")
+        elif not catalog_item_artwork(path, catalog_files_in_directory(path.parent)):
+            missing.append(path.with_name(f"{path.stem}-poster.jpg"))
+    return missing
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -79,7 +99,7 @@ def main() -> int:
     parser.add_argument(
         "--settle-seconds",
         type=float,
-        default=5,
+        default=30,
         help="seconds over which loose candidates must remain unchanged (default: %(default)s)",
     )
     parser.add_argument(
@@ -197,13 +217,9 @@ def main() -> int:
             run(preview_command)
             run([*preview_command[:7], "--dry-run", *preview_command[7:]])
 
-            missing_posters = [
-                path.with_name(f"{path.stem}-poster.jpg")
-                for path in destinations
-                if not path.with_name(f"{path.stem}-poster.jpg").is_file()
-            ]
-            if missing_posters:
-                for poster in missing_posters:
+            missing = missing_posters(destinations)
+            if missing:
+                for poster in missing:
                     print(
                         f"MISSING-POSTER\t{poster.relative_to(library_root)}",
                         file=sys.stderr,

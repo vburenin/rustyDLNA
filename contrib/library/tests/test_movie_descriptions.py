@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import importlib.util
+import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -12,6 +14,7 @@ from unittest import mock
 
 sys.dont_write_bytecode = True
 SCRIPTS_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS_DIR))
 module_spec = importlib.util.spec_from_file_location(
     "fetch_movie_descriptions", SCRIPTS_DIR / "fetch-movie-descriptions.py"
 )
@@ -148,6 +151,17 @@ class DescriptionSidecarTests(unittest.TestCase):
             self.assertEqual(descriptions.publish_nfo(path, second), "written")
             self.assertEqual(path.read_text(encoding="utf-8"), second)
             self.assertEqual(list(path.parent.glob(".*.tmp")), [])
+
+    def test_published_nfo_follows_umask_without_group_or_world_write(self) -> None:
+        previous = os.umask(0o022)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "movie.nfo"
+                content = f"<!-- {descriptions.MANAGED_MARKER} -->\n<movie />\n"
+                self.assertEqual(descriptions.publish_nfo(path, content), "written")
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+        finally:
+            os.umask(previous)
 
 
 class DescriptionRemoteTests(unittest.TestCase):

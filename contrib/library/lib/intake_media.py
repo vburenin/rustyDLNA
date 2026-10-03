@@ -18,6 +18,7 @@ try:
     from .catalog_config import (
         MOVIE_INTAKE_OVERRIDES,
         MOVIE_SOURCES,
+        VIDEO_EXTENSIONS,
         catalog_item_label,
     )
     from .imdb_index import Candidate, load_imdb_matches, normalized_title
@@ -25,25 +26,18 @@ try:
     from .safe_move import move_without_overwrite as _move_without_overwrite
     from .tmdb_metadata import TmdbClient, TmdbMovie
 except ImportError:  # direct execution/import from scripts/lib workflows
-    from catalog_config import MOVIE_INTAKE_OVERRIDES, MOVIE_SOURCES, catalog_item_label
+    from catalog_config import (
+        MOVIE_INTAKE_OVERRIDES,
+        MOVIE_SOURCES,
+        VIDEO_EXTENSIONS,
+        catalog_item_label,
+    )
     from imdb_index import Candidate, load_imdb_matches, normalized_title
     from paths import state_dir
     from safe_move import move_without_overwrite as _move_without_overwrite
     from tmdb_metadata import TmdbClient, TmdbMovie
 
 
-VIDEO_EXTENSIONS = {
-    ".avi",
-    ".m4v",
-    ".mkv",
-    ".mov",
-    ".mp4",
-    ".mpeg",
-    ".mpg",
-    ".ts",
-    ".webm",
-    ".wmv",
-}
 SIDECAR_EXTENSIONS = {".ass", ".jpg", ".nfo", ".png", ".srt", ".ssa", ".sub"}
 YEAR_RE = re.compile(r"(?<!\d)((?:18|19|20)\d{2})(?!\d)")
 PAREN_YEAR_RE = re.compile(r"\(((?:18|19|20)\d{2})\)")
@@ -190,18 +184,50 @@ def root_video_candidates(library_root: Path) -> list[Path]:
     )
 
 
-def _open_for_writing(path: Path) -> bool:
+LSOF_TIMEOUT_SECONDS = 10
+
+
+def _writer_modes(lsof_output: str) -> set[str]:
+    """Return the access modes lsof reports in `-F fa` field output.
+
+    Each `f` (descriptor) record may be followed by an `a` record whose value
+    is `r`, `w`, or `u`; a blank or space value means the mode is unknown.
+    """
+    modes: set[str] = set()
+    for line in lsof_output.splitlines():
+        if line.startswith("a"):
+            mode = line[1:].strip()
+            if mode:
+                modes.add(mode)
+    return modes
+
+
+def _writer_issue(path: Path) -> str | None:
+    """Return a reason when another process may still be writing `path`.
+
+    lsof sees only processes in this PID namespace that the current user may
+    inspect, so the size/mtime settle window remains the primary guard. When
+    lsof is not installed this check is unavailable and returns None.
+    """
     if shutil.which("lsof") is None:
-        return False
-    completed = subprocess.run(
-        ["lsof", "-F", "f", "--", str(path)],
-        capture_output=True,
-        text=True,
-    )
-    return any(
-        line.startswith("f") and line[-1:] in {"u", "w"}
-        for line in completed.stdout.splitlines()
-    )
+        return None
+    try:
+        completed = subprocess.run(
+            ["lsof", "-w", "-F", "fa", "--", str(path)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=LSOF_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return f"cannot check writers: lsof exceeded {LSOF_TIMEOUT_SECONDS}s"
+    except OSError as error:
+        return f"cannot check writers: {error}"
+    # lsof exits 1 when nothing has the file open; decide from the fields only.
+    if _writer_modes(completed.stdout) & {"u", "w"}:
+        return "file is open for writing"
+    return None
 
 
 def settled_candidates(
@@ -219,8 +245,9 @@ def settled_candidates(
         except OSError as error:
             issues.append(IntakeIssue(path, f"cannot stat candidate: {error}"))
             continue
-        if _open_for_writing(path):
-            issues.append(IntakeIssue(path, "file is open for writing"))
+        writer = _writer_issue(path)
+        if writer is not None:
+            issues.append(IntakeIssue(path, writer))
             continue
         initial[path] = (stat.st_size, stat.st_mtime_ns)
 
@@ -233,8 +260,12 @@ def settled_candidates(
         except OSError as error:
             issues.append(IntakeIssue(path, f"candidate changed while settling: {error}"))
             continue
-        if (stat.st_size, stat.st_mtime_ns) != before or _open_for_writing(path):
-            issues.append(IntakeIssue(path, "size, mtime, or writer changed while settling"))
+        if (stat.st_size, stat.st_mtime_ns) != before:
+            issues.append(IntakeIssue(path, "size or mtime changed while settling"))
+            continue
+        writer = _writer_issue(path)
+        if writer is not None:
+            issues.append(IntakeIssue(path, f"{writer} after settling"))
             continue
         settled.append(path)
     return settled, issues

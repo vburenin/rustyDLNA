@@ -326,6 +326,8 @@ def managed_nfo(path: Path) -> bool:
 
 def publish_nfo(path: Path, content: str) -> str:
     """Atomically publish one owned NFO; never replace a hand-authored file."""
+    from lib.paths import created_file_mode
+
     if path.exists():
         if not managed_nfo(path):
             return "protected"
@@ -347,7 +349,8 @@ def publish_nfo(path: Path, content: str) -> str:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-            os.chmod(temporary, 0o664)
+            # The temporary file is 0600; publish with the operator's umask.
+            os.chmod(temporary, created_file_mode())
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise

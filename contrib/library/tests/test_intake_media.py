@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -440,6 +442,37 @@ class PlanningSafetyTests(unittest.TestCase):
                 ["movie.mkv"],
             )
 
+    def test_every_intake_container_reaches_the_catalog_builders(self) -> None:
+        from lib import catalog_config, dv_profile7
+
+        self.assertLessEqual(intake_media.VIDEO_EXTENSIONS, catalog_config.VIDEO_EXTENSIONS)
+        self.assertLessEqual(
+            dv_profile7.VIDEO_EXTENSIONS - {".m2ts"}, catalog_config.VIDEO_EXTENSIONS
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for suffix in sorted(intake_media.VIDEO_EXTENSIONS):
+                (root / f"movie{suffix}").write_bytes(b"movie")
+            self.assertEqual(
+                [path.name for path in intake_media.root_video_candidates(root)],
+                sorted(f"movie{suffix}" for suffix in intake_media.VIDEO_EXTENSIONS),
+            )
+            catalog = root / "drama"
+            catalog.mkdir()
+            for path in intake_media.root_video_candidates(root):
+                path.rename(catalog / path.name)
+            disc = catalog / "Disc Movie (2001)"
+            (disc / "BDMV" / "STREAM").mkdir(parents=True)
+            (disc / "BDMV" / "index.bdmv").touch()
+            (disc / "BDMV" / "STREAM" / "00000.m2ts").write_bytes(b"stream")
+            items = catalog_config.catalog_movie_items(catalog)
+            self.assertIn(disc, items)
+            self.assertEqual(
+                sorted(path.name for path in items if path != disc),
+                sorted(f"movie{suffix}" for suffix in intake_media.VIDEO_EXTENSIONS),
+            )
+            self.assertFalse(any(path.suffix == ".m2ts" for path in items))
+
     def test_partial_candidates_are_never_settled(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "movie.partial.mkv"
@@ -447,6 +480,47 @@ class PlanningSafetyTests(unittest.TestCase):
             settled, issues = intake_media.settled_candidates([path], 0)
             self.assertEqual(settled, [])
             self.assertIn(".partial", issues[0].reason)
+
+    def test_lsof_field_parser_reads_access_modes_not_descriptors(self) -> None:
+        self.assertEqual(intake_media._writer_modes("p1\nf3\n"), set())
+        self.assertEqual(intake_media._writer_modes("p1\nf3\naw\nf4\nar\n"), {"w", "r"})
+        self.assertEqual(intake_media._writer_modes("p1\nf3\na \nfcwd\n"), set())
+
+    @unittest.skipIf(shutil.which("lsof") is None, "lsof is not installed")
+    def test_open_writer_blocks_candidate_until_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "movie.mkv"
+            path.write_bytes(b"incomplete")
+            with path.open("ab") as writer:
+                writer.write(b"more")
+                writer.flush()
+                self.assertEqual(
+                    intake_media._writer_issue(path), "file is open for writing"
+                )
+                settled, issues = intake_media.settled_candidates([path], 0)
+                self.assertEqual(settled, [])
+                self.assertEqual(issues[0].reason, "file is open for writing")
+            with path.open("rb"):
+                self.assertIsNone(intake_media._writer_issue(path))
+            self.assertIsNone(intake_media._writer_issue(path))
+            settled, issues = intake_media.settled_candidates([path], 0)
+            self.assertEqual((settled, issues), ([path], []))
+
+    def test_unresponsive_lsof_keeps_candidate_out_of_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "movie.mkv"
+            path.write_bytes(b"movie")
+            with (
+                mock.patch.object(intake_media.shutil, "which", return_value="/usr/bin/lsof"),
+                mock.patch.object(
+                    intake_media.subprocess,
+                    "run",
+                    side_effect=subprocess.TimeoutExpired(["lsof"], 10),
+                ),
+            ):
+                settled, issues = intake_media.settled_candidates([path], 0)
+            self.assertEqual(settled, [])
+            self.assertIn("lsof exceeded", issues[0].reason)
 
     def test_recovery_plan_restores_unique_prior_catalog_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

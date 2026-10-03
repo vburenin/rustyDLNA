@@ -9,17 +9,15 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+try:
+    from .catalog_config import VIDEO_EXTENSIONS as CATALOG_VIDEO_EXTENSIONS
+except ImportError:  # direct execution/import from scripts/lib workflows
+    from catalog_config import VIDEO_EXTENSIONS as CATALOG_VIDEO_EXTENSIONS
 
-VIDEO_EXTENSIONS = {
-    ".avi",
-    ".m2ts",
-    ".m4v",
-    ".mkv",
-    ".mov",
-    ".mp4",
-    ".ts",
-    ".webm",
-}
+
+# Catalog movie containers that can carry Dolby Vision, plus loose Blu-ray
+# transport streams. MPEG program streams and WMV cannot carry it.
+VIDEO_EXTENSIONS = (CATALOG_VIDEO_EXTENSIONS - {".mpeg", ".mpg", ".wmv"}) | {".m2ts"}
 
 DEFAULT_PROBE_WORKERS = min(8, os.cpu_count() or 4)
 

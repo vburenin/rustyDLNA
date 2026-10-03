@@ -29,6 +29,13 @@ commit. Base images, FFmpeg package version, `dovi_tool` version/checksums,
 GitHub Actions, Cargo lockfile, and Rust toolchain are pinned.
 The current Rust toolchain is `1.98.1`; the scheduled updater changes this
 documentation, Cargo, Docker, Compose, and every CI/release/soak pin in one tested PR.
+The updater runs `scripts/check.sh`, then pushes the branch and opens the PR
+with the `RUST_UPDATE_TOKEN` repository secret: a fine-grained token with
+Contents, Pull requests, and Workflows write access to this repository.
+`GITHUB_TOKEN` cannot push the workflow pin changes, and GitHub starts no CI for
+pushes or pull requests it creates. Without the secret the updater fails before
+changing any pins. The PR's own CI runs the remaining jobs (Docker smoke,
+browser matrix, coverage, dependency policy, network namespace, and fuzz).
 The isolated Compose test runner uses the same digest-pinned toolchain image,
 checks the exact compiler build, and runs Cargo with `--locked`; it must not be
 used as a floating-toolchain compatibility test.

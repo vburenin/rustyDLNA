@@ -8,22 +8,13 @@ import os
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True
 
-VIDEO_EXTENSIONS = {
-    ".avi",
-    ".iso",
-    ".m2ts",
-    ".m4v",
-    ".mkv",
-    ".mov",
-    ".mp4",
-    ".mpeg",
-    ".mpg",
-    ".ts",
-    ".vob",
-    ".webm",
-    ".wmv",
-}
+from lib.catalog_config import VIDEO_EXTENSIONS as CATALOG_VIDEO_EXTENSIONS
+
+# Report-only: disc images and disc-structure streams are listed too, although
+# the catalog builders represent a disc by its whole directory.
+VIDEO_EXTENSIONS = CATALOG_VIDEO_EXTENSIONS | {".iso", ".m2ts", ".vob"}
 
 # These are not movie catalogs. They are skipped by default so the report does
 # not fill up with episodes, working files, duplicates, and unrelated videos.

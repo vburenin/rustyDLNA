@@ -11,7 +11,26 @@ import os
 from pathlib import Path
 
 
-VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mp4", ".ts"}
+# Movie files that intake may file into a catalog home and that every catalog
+# builder (genre/year/age views, artwork, previews, audits) processes. Each is
+# a video format rustyDLNA admits (crates/protocol/src/media_format.rs). Keep
+# intake and the builders on this one set: a file intake moves but a builder
+# ignores never gets views, artwork, or previews. Disc-structure files
+# (.m2ts/.vob/.iso) stay out; a disc directory is one catalog item.
+VIDEO_EXTENSIONS = frozenset(
+    {
+        ".avi",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp4",
+        ".mpeg",
+        ".mpg",
+        ".ts",
+        ".webm",
+        ".wmv",
+    }
+)
 
 
 def is_disc_directory(path: Path) -> bool:
@@ -42,13 +61,27 @@ def catalog_movie_items(source: Path) -> list[Path]:
                 subdirectories.remove(name)
         for filename in filenames:
             path = directory_path / filename
-            if (
-                not path.is_symlink()
-                and path.is_file()
-                and path.suffix.casefold() in VIDEO_EXTENSIONS
-            ):
+            if is_catalog_movie_file(path):
                 items.append(path)
     return sorted(items, key=lambda path: str(path).casefold())
+
+
+def is_catalog_movie_file(path: Path) -> bool:
+    """Return whether *path* is a movie file that `catalog_movie_items` lists."""
+    return (
+        not path.is_symlink()
+        and path.is_file()
+        and path.suffix.casefold() in VIDEO_EXTENSIONS
+    )
+
+
+def catalog_files_in_directory(directory: Path) -> int:
+    """Count catalog movie files directly in *directory* (not disc directories)."""
+    try:
+        with os.scandir(directory) as entries:
+            return sum(1 for entry in entries if is_catalog_movie_file(Path(entry.path)))
+    except OSError:
+        return 0
 
 
 # The catalog genre is used as a safe fallback if metadata matching fails.

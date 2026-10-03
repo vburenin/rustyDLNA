@@ -91,6 +91,43 @@ class PreviewProgressExecutionTests(unittest.TestCase):
         self.assertGreater(time.monotonic() - started, 5)
         self.assertLess(time.monotonic() - started, 7.5)
 
+    def test_repeated_progress_without_new_output_is_a_stall(self):
+        started = time.monotonic()
+        stall_child = (
+            'import os,time\n'
+            'os.write(1,b"frame=1\\nout_time_us=5\\n")\n'
+            'while True:\n'
+            '    os.write(1,b"frame=1\\nout_time_us=5\\nprogress=continue\\n");time.sleep(.05)'
+        )
+        with (
+            tempfile.TemporaryFile() as diagnostics,
+            self.assertRaisesRegex(preview.PreviewTimeout, "no progress"),
+        ):
+            run_progress(
+                [sys.executable, "-c", stall_child], diagnostics, 5,
+                "synthetic", "cuda", 10, time.monotonic(), threading.Event(), 0.4,
+            )
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_advancing_output_time_is_not_a_stall(self):
+        advancing_child = (
+            'import os,time\n'
+            'for step in range(8):\n'
+            '    os.write(1,b"frame=0\\nout_time_us=%d\\n" % step);time.sleep(.1)'
+        )
+        with tempfile.TemporaryFile() as diagnostics:
+            self.assertEqual(
+                run_progress(
+                    [sys.executable, "-c", advancing_child], diagnostics, 5,
+                    "synthetic", "none", 10, time.monotonic(), threading.Event(), 0.4,
+                ),
+                0,
+            )
+
+    def test_deadline_is_a_preview_timeout(self):
+        with self.assertRaises(preview.PreviewTimeout):
+            self.run_child('import time;time.sleep(1)')
+
     def test_generation_failure_releases_title_lock(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "source.mp4"

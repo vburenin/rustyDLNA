@@ -4,7 +4,9 @@
 Movie files get `{stem}-poster.jpg` next to the video. Disc directories and TV
 show/season folders get `poster.jpg`, which rustyDLNA uses as folder album art
 for every episode in that directory. New downloads are normalized for browse-
-card use; existing valid JPEGs are left untouched.
+card use. Existing artwork is never deleted: an item that already has any
+sidecar name rustyDLNA recognizes keeps it, and only --refetch-existing or
+--regenerate-existing rewrite the fetcher's own poster names.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +28,7 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -36,8 +40,14 @@ from lib.catalog_config import (
     catalog_movie_items,
     is_disc_directory,
 )
+from lib.artwork_names import owns_folder_art, recognized_artwork
 from lib.imdb_index import _imdb_id, normalized_title
-from lib.paths import add_root_argument, require_library_root, state_dir
+from lib.paths import (
+    add_root_argument,
+    created_file_mode,
+    require_library_root,
+    state_dir,
+)
 
 
 USER_AGENT = "rustyDLNA-artwork/1.0 (local library sidecar fetch)"
@@ -64,11 +74,19 @@ SEASON_DIR_RE = re.compile(r"^Season-\d+$", re.IGNORECASE)
 LOCAL_SHOW_IMDB_IDS: dict[str, str] = {}
 
 
-def make_world_readable(path: Path) -> None:
-    try:
-        os.chmod(path, 0o666)
-    except OSError:
-        pass
+@dataclass(frozen=True)
+class ArtworkTarget:
+    dest: Path
+    imdb_id: str
+    kind: str
+    # Media-file stem whose `{stem}-poster/-fanart` sidecars count as its art.
+    stem: str | None
+    # Whether the directory's folder art (folder.jpg, cover.jpg, ...) is this
+    # item's art: a disc/show/season directory, or a movie alone in its folder.
+    folder_art: bool
+
+    def existing_artwork(self) -> list[Path]:
+        return recognized_artwork(self.dest.parent, self.stem, folder_art=self.folder_art)
 
 
 def is_valid_jpeg(path: Path) -> bool:
@@ -156,7 +174,6 @@ def bytes_to_jpeg_file(data: bytes, _content_type: str, dest: Path) -> bool:
         if not is_valid_jpeg(tmp_path):
             return False
         os.replace(tmp_path, dest)
-        make_world_readable(dest)
         return True
     finally:
         for leftover in (raw_path, tmp_path):
@@ -190,6 +207,34 @@ def movie_poster_path(path: Path) -> Path:
     if path.is_dir() or is_disc_directory(path):
         return path / "poster.jpg"
     return path.with_name(f"{path.stem}-poster.jpg")
+
+
+def movie_artwork_targets(
+    items: list[Path], imdb_ids: dict[Path, str]
+) -> list[ArtworkTarget]:
+    """Build poster targets for catalog movie items that have an IMDb ID."""
+    files_per_directory: dict[Path, int] = defaultdict(int)
+    for path in items:
+        if not path.is_dir():
+            files_per_directory[path.parent] += 1
+    targets: list[ArtworkTarget] = []
+    for path in items:
+        imdb_id = imdb_ids.get(path)
+        if not imdb_id:
+            continue
+        if path.is_dir():
+            targets.append(ArtworkTarget(path / "poster.jpg", imdb_id, "movie", None, True))
+            continue
+        targets.append(
+            ArtworkTarget(
+                movie_poster_path(path),
+                imdb_id,
+                "movie",
+                path.stem,
+                owns_folder_art(path, files_per_directory[path.parent]),
+            )
+        )
+    return targets
 
 
 def load_genre_index(path: Path) -> dict[str, dict[str, str]]:
@@ -375,22 +420,61 @@ def download_poster(imdb_id: str, kind: str, dest: Path, title: str = "") -> str
     return last_error
 
 
-def place_jpeg(source: Path, dest: Path) -> str:
-    if dest.resolve() == source.resolve():
-        return "exists"
-    if dest.exists():
-        if is_valid_jpeg(dest):
-            return "exists"
-        dest.unlink()
-    dest.parent.mkdir(parents=True, exist_ok=True)
+def _create_exclusively(source: Path, dest: Path, mode: int) -> None:
+    """Write *dest* only if no entry (not even a dangling symlink) exists."""
+    descriptor = os.open(
+        dest,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        mode,
+    )
     try:
-        os.link(source, dest)
-        make_world_readable(dest)
-        return "linked"
-    except OSError:
-        shutil.copy2(source, dest)
-        make_world_readable(dest)
-        return "copied" if is_valid_jpeg(dest) else "copy-failed"
+        with os.fdopen(descriptor, "wb") as handle, source.open("rb") as data:
+            shutil.copyfileobj(data, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
+
+
+def place_jpeg(source: Path, dest: Path) -> str:
+    """Publish a new poster without replacing or writing through any entry."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    mode = created_file_mode()
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{dest.name}.",
+        suffix=".tmp.jpg",
+        dir=dest.parent,
+    )
+    os.close(fd)
+    temporary = Path(temporary_name)
+    try:
+        shutil.copyfile(source, temporary)
+        os.chmod(temporary, mode)
+        if not is_valid_jpeg(temporary):
+            return "copy-failed"
+        try:
+            # link() never replaces an existing name and never follows a
+            # symlink at dest, so a concurrently created file or link wins.
+            os.link(temporary, dest)
+        except FileExistsError:
+            return "exists"
+        except OSError:
+            # Some filesystems (FUSE, SMB, ...) refuse hard links with EPERM,
+            # ENOTSUP, ENOSYS, EACCES, or others. An exclusive no-follow create
+            # is equally safe, so fall back to it whatever link() reported.
+            try:
+                _create_exclusively(temporary, dest, mode)
+            except FileExistsError:
+                return "exists"
+        return "written"
+    except OSError as error:
+        return f"write-failed: {error}"
+    finally:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
 
 
 def replace_jpeg(source: Path, dest: Path) -> str:
@@ -403,11 +487,11 @@ def replace_jpeg(source: Path, dest: Path) -> str:
     os.close(fd)
     temporary = Path(temporary_name)
     try:
-        shutil.copy2(source, temporary)
+        shutil.copyfile(source, temporary)
+        os.chmod(temporary, created_file_mode())
         if not is_valid_jpeg(temporary):
             return "copy-failed"
         os.replace(temporary, dest)
-        make_world_readable(dest)
         return "replaced"
     except OSError as error:
         return f"replace-failed: {error}"
@@ -443,8 +527,9 @@ def regenerate_jpeg(path: Path) -> str | None:
     try:
         if not ffmpeg_to_jpeg(path, temporary):
             return "conversion or validation failed"
+        # Keep the poster's existing permissions; never widen them.
+        os.chmod(temporary, stat.S_IMODE(path.stat(follow_symlinks=False).st_mode))
         os.replace(temporary, path)
-        make_world_readable(path)
         return None
     except OSError as error:
         return str(error)
@@ -503,8 +588,8 @@ def regenerate_existing_posters(
     return 1 if failures else 0
 
 
-def collect_targets(library_root: Path) -> tuple[list[tuple[Path, str, str]], list[str]]:
-    targets: list[tuple[Path, str, str]] = []
+def collect_targets(library_root: Path) -> tuple[list[ArtworkTarget], list[str]]:
+    targets: list[ArtworkTarget] = []
     skipped: list[str] = []
     genre_index = load_genre_index(library_root / "genres" / "_genre-index.tsv")
     show_ids = load_show_imdb_ids(library_root / "genres" / "_year-index.tsv")
@@ -514,14 +599,17 @@ def collect_targets(library_root: Path) -> tuple[list[tuple[Path, str, str]], li
         if not source.is_dir():
             skipped.append(f"missing movie source {relative_source}")
             continue
-        for path in catalog_movie_items(source):
+        items = catalog_movie_items(source)
+        movie_ids: dict[Path, str] = {}
+        for path in items:
             relative = str(path.relative_to(library_root))
             row = genre_index.get(relative, {})
             imdb_id = first_imdb_id(row.get("imdb_id", ""))
             if not imdb_id:
                 skipped.append(f"no IMDb id for movie {relative}")
                 continue
-            targets.append((movie_poster_path(path), imdb_id, "movie"))
+            movie_ids[path] = imdb_id
+        targets.extend(movie_artwork_targets(items, movie_ids))
 
     for show_dir in iter_show_roots(library_root):
         relative = str(show_dir.relative_to(library_root))
@@ -534,12 +622,14 @@ def collect_targets(library_root: Path) -> tuple[list[tuple[Path, str, str]], li
         if not imdb_id:
             skipped.append(f"no IMDb id for show {relative}")
             continue
-        targets.append((show_dir / "poster.jpg", imdb_id, "series"))
+        targets.append(ArtworkTarget(show_dir / "poster.jpg", imdb_id, "series", None, True))
         for season in season_directories(show_dir):
-            targets.append((season / "poster.jpg", imdb_id, "series"))
+            targets.append(ArtworkTarget(season / "poster.jpg", imdb_id, "series", None, True))
         movies_dir = show_dir / "Movies"
         if movies_dir.is_dir():
-            for path in catalog_movie_items(movies_dir):
+            show_movies = catalog_movie_items(movies_dir)
+            show_movie_ids: dict[Path, str] = {}
+            for path in show_movies:
                 parsed = movie_title_year(path)
                 movie_id = ""
                 if parsed is not None:
@@ -551,16 +641,49 @@ def collect_targets(library_root: Path) -> tuple[list[tuple[Path, str, str]], li
                         f"no IMDb id for show movie {path.relative_to(library_root)}"
                     )
                     continue
-                targets.append((movie_poster_path(path), movie_id, "movie"))
+                show_movie_ids[path] = movie_id
+            targets.extend(movie_artwork_targets(show_movies, show_movie_ids))
 
-    unique: dict[Path, tuple[str, str]] = {}
-    for dest, imdb_id, kind in targets:
-        unique[dest] = (imdb_id, kind)
-    ordered = sorted(
-        ((dest, imdb_id, kind) for dest, (imdb_id, kind) in unique.items()),
-        key=lambda item: str(item[0]).casefold(),
-    )
+    unique: dict[Path, ArtworkTarget] = {}
+    for target in targets:
+        unique[target.dest] = target
+    ordered = sorted(unique.values(), key=lambda target: str(target.dest).casefold())
     return ordered, skipped
+
+
+def plan_targets(
+    targets: list[ArtworkTarget], refetch_existing: bool
+) -> tuple[list[tuple[ArtworkTarget, bool]], int, list[Path]]:
+    """Split targets into (target, replaces) work, present art, and invalid art.
+
+    Without --refetch-existing an item with any recognized artwork is left
+    alone. A file at the fetcher's own name that is not a usable JPEG is
+    reported, never deleted. With --refetch-existing only the fetcher's own
+    regular-file names are replaced; other recognized names are kept.
+    """
+    pending: list[tuple[ArtworkTarget, bool]] = []
+    present = 0
+    invalid: list[Path] = []
+    for target in targets:
+        dest = target.dest
+        own = os.path.lexists(dest)
+        if own and refetch_existing:
+            if dest.is_symlink() or not dest.is_file():
+                invalid.append(dest)
+            else:
+                pending.append((target, True))
+            continue
+        if own:
+            if is_valid_jpeg(dest):
+                present += 1
+            else:
+                invalid.append(dest)
+            continue
+        if target.existing_artwork():
+            present += 1
+            continue
+        pending.append((target, False))
+    return pending, present, invalid
 
 
 def main() -> int:
@@ -598,26 +721,29 @@ def main() -> int:
             args.dry_run,
         )
     targets, skipped = collect_targets(library_root)
-    pending = [
-        (dest, imdb_id, kind)
-        for dest, imdb_id, kind in targets
-        if args.refetch_existing or not is_valid_jpeg(dest)
-    ]
+    pending, existed, invalid = plan_targets(targets, args.refetch_existing)
     print(
         f"artwork targets: {len(targets)} pending: {len(pending)} "
+        f"present: {existed} invalid-existing: {len(invalid)} "
         f"skipped: {len(skipped)}",
         file=sys.stderr,
     )
     if args.dry_run:
-        for dest, imdb_id, kind in pending:
-            print(f"DRY {kind}\t{imdb_id}\t{dest.relative_to(library_root)}")
+        for target, replaces in pending:
+            action = "replace " if replaces else ""
+            print(
+                f"DRY {action}{target.kind}\t{target.imdb_id}\t"
+                f"{target.dest.relative_to(library_root)}"
+            )
+        for path in invalid:
+            print(f"SKIP invalid-existing {path.relative_to(library_root)}")
         for item in skipped:
             print(f"SKIP {item}")
-        return 0 if not skipped else 0
+        return 0
 
     by_id: dict[tuple[str, str], list[Path]] = defaultdict(list)
-    for dest, imdb_id, kind in pending:
-        by_id[(imdb_id, kind)].append(dest)
+    for target, _replaces in pending:
+        by_id[(target.imdb_id, target.kind)].append(target.dest)
 
     cache_dir = Path(tempfile.mkdtemp(prefix="dlna-artwork-"))
     downloaded: dict[tuple[str, str], Path | None] = {}
@@ -650,27 +776,20 @@ def main() -> int:
                 )
 
     written = 0
-    existed = 0
     failed_dests: list[str] = []
-    for dest, imdb_id, kind in targets:
-        if is_valid_jpeg(dest) and not args.refetch_existing:
-            existed += 1
-            continue
-        source = downloaded.get((imdb_id, kind))
+    for target, replaces in pending:
+        dest = target.dest
+        source = downloaded.get((target.imdb_id, target.kind))
         if source is None:
             failed_dests.append(
-                f"{dest.relative_to(library_root)} ({imdb_id}: "
-                f"{errors.get((imdb_id, kind), 'missing')})"
+                f"{dest.relative_to(library_root)} ({target.imdb_id}: "
+                f"{errors.get((target.imdb_id, target.kind), 'missing')})"
             )
             continue
-        status = (
-            replace_jpeg(source, dest)
-            if args.refetch_existing
-            else place_jpeg(source, dest)
-        )
+        status = replace_jpeg(source, dest) if replaces else place_jpeg(source, dest)
         if status == "exists":
             existed += 1
-        elif status in {"linked", "copied", "replaced"}:
+        elif status in {"written", "replaced"}:
             written += 1
         else:
             failed_dests.append(f"{dest.relative_to(library_root)} ({status})")
@@ -678,9 +797,12 @@ def main() -> int:
     shutil.rmtree(cache_dir, ignore_errors=True)
     print(
         f"wrote {written} sidecars, already present {existed}, "
-        f"failed {len(failed_dests)}, unresolved {len(skipped)}",
+        f"invalid existing {len(invalid)}, failed {len(failed_dests)}, "
+        f"unresolved {len(skipped)}",
         file=sys.stderr,
     )
+    for path in invalid:
+        print(f"SKIP invalid-existing {path.relative_to(library_root)}")
     for item in skipped:
         print(f"SKIP {item}")
     for item in failed_dests:

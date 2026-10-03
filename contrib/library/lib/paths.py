@@ -22,6 +22,32 @@ LIBRARY_ROOT_ENV = (
 )
 
 
+def current_umask() -> int:
+    """Return the process umask without widening it, even briefly."""
+    try:
+        with open("/proc/self/status", encoding="ascii", errors="replace") as status:
+            for line in status:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8) & 0o777
+    except (OSError, ValueError, IndexError):
+        pass
+    # Fallback: while the mask is briefly 0777, a file created concurrently
+    # gets no permission bits at all, never a wider mode than the real umask.
+    mask = os.umask(0o777)
+    os.umask(mask)
+    return mask
+
+
+def created_file_mode() -> int:
+    """Return the mode `open()` would give a new regular file (0666 & ~umask).
+
+    Temporary files from `tempfile` are 0600 regardless of umask; set this mode
+    on them before they replace a library sidecar, so published files follow
+    the operator's umask instead of becoming private or world-writable.
+    """
+    return 0o666 & ~current_umask()
+
+
 class LibraryRootError(ValueError):
     """The media library root is missing or not a directory."""
 
