@@ -898,3 +898,67 @@ async fn original_delivery_benchmark_server() {
         assert!(result.is_ok() || result.unwrap_err().is_cancelled());
     }
 }
+
+#[tokio::test]
+async fn buffered_response_survives_a_slow_progressing_reader_but_not_a_stopped_one() {
+    // Prepared responses up to 8 MiB are written from memory in one call. The
+    // configured timeout must bound stalls, not the duration of a slow link.
+    let tree = TestTree::new("slow-buffered-response");
+    let path = tree.path().join("original.mkv");
+    std::fs::write(&path, b"x").unwrap();
+    let mut configured = configured(&path);
+    configured.cfg.write_timeout_secs = 1;
+    let app = Arc::new(configured);
+    let body: Vec<u8> = (0..512 * 1024).map(|i| (i % 253) as u8).collect();
+
+    let (mut client, mut server) = pair().await;
+    socket2::SockRef::from(&server)
+        .set_send_buffer_size(16 * 1024)
+        .unwrap();
+    socket2::SockRef::from(&client)
+        .set_recv_buffer_size(16 * 1024)
+        .unwrap();
+    let started = Instant::now();
+    let length = body.len();
+    let reader = tokio::spawn(async move {
+        let mut got = vec![0; length];
+        for chunk in got.chunks_mut(32 * 1024) {
+            client.read_exact(chunk).await.unwrap();
+            // Steady progress, but slower than one write deadline overall.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        got
+    });
+    crate::socket_write_all(&app, &mut server, &body)
+        .await
+        .expect("a progressing reader must receive the whole response");
+    let got = tokio::time::timeout(Duration::from_secs(10), reader)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, body);
+    assert!(
+        started.elapsed() > Duration::from_secs(2),
+        "the reader did not outlast the configured write timeout"
+    );
+
+    // Negative control: a reader that stops still fails at the stall deadline.
+    let (stopped, mut server) = pair().await;
+    socket2::SockRef::from(&server)
+        .set_send_buffer_size(16 * 1024)
+        .unwrap();
+    socket2::SockRef::from(&stopped)
+        .set_recv_buffer_size(16 * 1024)
+        .unwrap();
+    let started = Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::socket_write_all(&app, &mut server, &body),
+    )
+    .await
+    .expect("a stalled write must end at its progress deadline")
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    drop(stopped);
+}

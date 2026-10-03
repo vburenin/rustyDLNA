@@ -1658,6 +1658,12 @@ async fn handle_conn_observed(
     Ok(())
 }
 
+/// Sustained throughput a client must accept for a large response to finish.
+const MIN_RESPONSE_WRITE_BYTES_PER_SECOND: u64 = 16 * 1024;
+/// A client that trickles bytes cannot hold a connection and its buffered
+/// response longer than this (unless the configured stall timeout is longer).
+const MAX_RESPONSE_WRITE_DURATION: Duration = Duration::from_secs(300);
+
 pub(crate) async fn socket_write_all(
     app: &App,
     sock: &mut tokio::net::TcpStream,
@@ -1665,12 +1671,27 @@ pub(crate) async fn socket_write_all(
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    let result = tokio::time::timeout(Duration::from_secs(app.cfg.write_timeout_secs), async {
+    // The configured timeout bounds a write that makes no progress. A large
+    // in-memory response still has a whole-response deadline, but a slow link
+    // that keeps accepting bytes at the floor rate is not cut off mid-body.
+    let progress = Duration::from_secs(app.cfg.write_timeout_secs);
+    let total = progress
+        .saturating_add(Duration::from_secs(
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX) / MIN_RESPONSE_WRITE_BYTES_PER_SECOND,
+        ))
+        .min(progress.max(MAX_RESPONSE_WRITE_DURATION));
+    let result = tokio::time::timeout(total, async {
         let mut remaining = bytes;
         while !remaining.is_empty() {
-            let written = match sock.write(remaining).await {
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                result => result?,
+            let written = match tokio::time::timeout(progress, sock.write(remaining)).await {
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "socket write timeout",
+                    ))
+                }
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Ok(result) => result?,
             };
             if written == 0 {
                 return Err(std::io::Error::new(

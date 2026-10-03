@@ -348,7 +348,12 @@ Blocking reads run outside listener tasks, with one bounded buffer per transfer
 and no read-ahead queue. Read admission remains held by a worker until its kernel
 operation returns, even if its connection is cancelled. Admission plus each read
 has the configured `write_timeout_secs` deadline; socket writes keep their
-existing 64 KiB granularity and deadline. Shutdown cancels the asynchronous
+existing 64 KiB granularity. For every socket write, `write_timeout_secs` bounds
+a write that makes no progress. A response written from memory also has a
+whole-response deadline of that timeout plus one second per 16 KiB, at most
+five minutes unless the timeout itself is longer, so a slow
+client that keeps accepting bytes receives a large prepared response instead of
+being cut off mid-body. Shutdown cancels the asynchronous
 transfer without waiting for the socket's write deadline. An uninterruptible
 kernel read may outlive that observer and still delay runtime/process teardown;
 this is not a guarantee of daemon exit during a storage hang.

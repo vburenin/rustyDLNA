@@ -26,6 +26,9 @@ publish a signed, content-addressed OCI image with SBOM and provenance.
   abandoning stream copying or lowering quality. Quality is lowered only after
   those retries are exhausted. A slow link that keeps delivering a large
   fragment is no longer cut off by a fixed whole-request deadline.
+- Kept slow clients connected for large prepared responses: the server's write
+  timeout now bounds writes that make no progress, not the total time to send
+  a response of up to 8 MiB.
 - Increased the Media Source playback reserve from ten media seconds to about
   30 seconds of real time, scaled by the playback rate, within the existing
   compressed-byte budget.
