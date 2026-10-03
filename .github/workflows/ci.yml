@@ -78,7 +78,15 @@ jobs:
             /source/scripts/generate-dolby-vision-fixture.sh /tmp/dvp7.mkv
             cmp /tmp/dvp7.mkv /source/testdata/library/video/dvp7.mkv
           '
-      - run: RUN_DOCKER_SMOKE=1 scripts/compose-smoke.sh
+      # Step bounds keep a hung smoke from running to the 6-hour job default.
+      - name: Production image DLNA and rustyView web contract smoke
+        timeout-minutes: 30
+        run: RUN_DOCKER_SMOKE=1 scripts/compose-smoke.sh
+      - name: Browser gateway image, nginx -t, and route policy
+        timeout-minutes: 20
+        env:
+          RUSTY_DLNA_GATEWAY_BACKEND_IMAGE: rustydlna-ci
+        run: scripts/web-gateway-ci.sh
       - name: Host-network multicast discovery on disposable runner
         env:
           RUSTY_DLNA_HOST_IMAGE: rustydlna-ci

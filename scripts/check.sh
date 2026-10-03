@@ -51,6 +51,8 @@ test -x scripts/playwright-process-group.sh
 test -x scripts/playwright-server.sh
 test -x scripts/test-playwright-server.sh
 test -x scripts/web-gateway-smoke.sh
+test -x scripts/web-gateway-ci.sh
+test -x scripts/web-contract-smoke.sh
 test -x restart-web.sh
 test -f Dockerfile.web
 test -f docker-compose.web.yaml
@@ -110,7 +112,7 @@ if [ "$NODE_MAJOR" -lt 20 ]; then
 fi
 (bash -n restart.sh)
 (bash -n restart-web.sh)
-(sh -n scripts/web-gateway-smoke.sh)
+(sh -n scripts/web-gateway-smoke.sh scripts/web-gateway-ci.sh scripts/web-contract-smoke.sh)
 (bash -n scripts/ssdp-netns-e2e.sh scripts/host-network-e2e.sh scripts/compose-smoke.sh scripts/large-library-benchmark.sh scripts/generate-advanced-fixtures.sh scripts/generate-dolby-vision-fixture.sh scripts/promote-fuzz-regression.sh)
 python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding="utf-8")) for path in ("scripts/large-library-http-benchmark.py", "scripts/large-library-restart-benchmark.py", "scripts/check-targeted-coverage.py")]'
 node --check scripts/library-browser-benchmark.mjs
@@ -129,6 +131,10 @@ node --check scripts/persistent-soak.mjs
 grep -F -q 'rusty-dlna-cache-volume-init' restart.sh
 ! grep -F -q 'chown -R' restart.sh
 grep -F -q 'rusty-dlna-cache:/var/cache/rusty-dlna' docker-compose.yaml
+# Outer stop deadlines stay above the default 15-second shutdown budget.
+grep -E -q '^    stop_grace_period: 45s$' docker-compose.yaml
+grep -F -q 'docker compose stop --timeout 45 rusty-dlna' restart.sh
+grep -F -q 'TimeoutStopSec=45s' contrib/systemd/rusty-dlna.service
 ! grep -F -q ':/var/cache/rusty-dlna' docker-compose.override.yaml.example
 grep -F -q 'docker compose create rusty-dlna' restart.sh
 grep -F -q 'docker compose rm --force rusty-dlna' restart.sh

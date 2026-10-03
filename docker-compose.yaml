@@ -14,6 +14,10 @@ services:
     image: rusty-dlna:local
     restart: unless-stopped
     init: true
+    # Above the 15-second shutdown_timeout_secs budget so remux cancellation,
+    # helper reaping, and the shutdown log finish before Docker sends SIGKILL.
+    # Raise it together with shutdown_timeout_secs.
+    stop_grace_period: 45s
     network_mode: host
     environment:
       TZ: ${TZ:-UTC}

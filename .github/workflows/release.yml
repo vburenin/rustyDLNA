@@ -119,7 +119,9 @@ jobs:
             --build-arg 'BUILD_DATE=${{ needs.validate.outputs.date }}' \
             --build-arg 'SOURCE_DATE_EPOCH=${{ needs.validate.outputs.epoch }}' \
             .
+      # QEMU emulation makes arm64 slow; the bound still stops a hung smoke.
       - name: Scan, Browse, media, tools, labels, and shutdown smoke
+        timeout-minutes: 60
         env:
           DOCKER_DEFAULT_PLATFORM: ${{ matrix.platform }}
           RUSTY_DLNA_SMOKE_IMAGE: rusty-dlna:release-${{ matrix.suffix }}
@@ -167,6 +169,7 @@ jobs:
           provenance: mode=max
           sbom: true
       - name: Smoke the exact staged digest on both architectures
+        timeout-minutes: 90
         env:
           IMAGE: ${{ needs.validate.outputs.image }}
           DIGEST: ${{ steps.image.outputs.digest }}

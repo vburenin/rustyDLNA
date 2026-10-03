@@ -36,12 +36,18 @@ chmod 0777 \
 cp "$ROOT/testdata/library/video/dvp7.mkv" "$RUSTY_DLNA_SMOKE_MEDIA/movie.mkv"
 cp "$ROOT/testdata/library/video/movie.nfo" "$RUSTY_DLNA_SMOKE_MEDIA/movie.nfo"
 cp "$ROOT/testdata/library/video/movie-poster.jpg" "$RUSTY_DLNA_SMOKE_MEDIA/movie-poster.jpg"
+# A short H.264/AAC title for the rustyView web contract. The DLNA checks below
+# select the Dolby Vision Matroska item explicitly.
+mkdir -p "$RUSTY_DLNA_SMOKE_MEDIA/web"
+chmod 0755 "$RUSTY_DLNA_SMOKE_MEDIA/web"
+cp "$ROOT/testdata/library/video/tagged.mp4" "$RUSTY_DLNA_SMOKE_MEDIA/web/contract.mp4"
 printf '%s\n' \
     'friendly_name = "rustyDLNA smoke"' \
     'media_dir = ["V,/storage/video"]' \
     'listen_ip = "0.0.0.0"' \
     'cache_dir = "/var/cache/rusty-dlna"' \
     'rescan_secs = 1' \
+    'rescan_max_secs = 0' \
     '[transcode]' \
     'enable = true' \
     'max_jobs = 1' \
@@ -119,7 +125,7 @@ $COMPOSE exec -T rusty-dlna-smoke sh -ec '
       --data "$soap" http://127.0.0.1:18200/ctl/ContentDir \
     )
     printf "%s" "$browse" | grep -q "NumberReturned"
-    media_path=$(printf "%s" "$browse" | grep -oE "/MediaItems/[0-9]+\\.[A-Za-z0-9]+" | head -n 1)
+    media_path=$(printf "%s" "$browse" | grep -oE "/MediaItems/[0-9]+\\.mkv" | head -n 1)
     test -n "$media_path"
     media_id=$(printf "%s" "$media_path" | sed -n "s|/MediaItems/\\([0-9][0-9]*\\)\\..*|\\1|p")
     test -n "$media_id"
@@ -175,7 +181,7 @@ $COMPOSE exec -T rusty-dlna-smoke sh -ec '
       -H "Content-Type: text/xml" \
       -H "User-Agent: CrKey/1.54" \
       --data "$soap" http://127.0.0.1:18200/ctl/ContentDir)
-    media_id=$(printf "%s" "$browse" | grep -oE "/MediaItems/[0-9]+\\.[A-Za-z0-9]+" \
+    media_id=$(printf "%s" "$browse" | grep -oE "/MediaItems/[0-9]+\\.mkv" \
       | head -n 1 | sed -n "s|/MediaItems/\\([0-9][0-9]*\\)\\..*|\\1|p")
     test -n "$media_id"
     curl --fail --silent --max-time 30 -H "User-Agent: CrKey/1.54" \
@@ -196,6 +202,10 @@ $COMPOSE exec -T rusty-dlna-smoke sh -ec '
     ! grep -q "DOVI configuration record" /tmp/fallback-probe.json
     ffmpeg -nostdin -v error -i /tmp/fallback.mp4 -map 0:v:0 -frames:v 1 -f null -
 '
+# The native client's HTTP contract against the shipped FFmpeg and architecture.
+echo "smoke: rustyView web contract"
+$COMPOSE exec -T rusty-dlna-smoke sh -s -- http://127.0.0.1:18200 contract.mp4 full \
+    <"$ROOT/scripts/web-contract-smoke.sh"
 $COMPOSE kill --signal SIGTERM rusty-dlna-smoke
 
 tries=0

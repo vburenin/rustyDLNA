@@ -78,7 +78,7 @@ docker compose config --quiet
 docker compose build
 
 # Stop before touching the persistent catalog. This is a no-op on first use.
-docker compose stop --timeout 30 rusty-dlna
+docker compose stop --timeout 45 rusty-dlna
 
 if [[ "$CLEAN" -eq 1 ]]; then
     if docker inspect "$CONTAINER" >/dev/null 2>&1; then
