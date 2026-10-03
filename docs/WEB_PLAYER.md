@@ -479,10 +479,20 @@ does not discard an otherwise healthy compatible stream. Playlist fetch,
 fragment fetch, and SourceBuffer failures use the same producer-status and
 codec/quality recovery policy as native media-element errors; a temporarily
 busy producer therefore retries instead of becoming an immediate terminal
-Media Source failure. Playlist headers have 120 seconds of preparation grace;
+Media Source failure. A transfer failure is not decoder evidence: an interrupted
+connection, a header or body-progress timeout, a truncated body, or HTTP 408,
+429, 502, 503 or 504 first retries the same rendition at the current position.
+Only when the generation retry budget is spent does it enter the codec/quality
+recovery order, which lowers the bitrate for a link that cannot sustain the
+rendition. If the producer-status request cannot reach the server either, the
+player reports the network problem rather than lowering quality. HTTP 500 is
+the producer's own failure and keeps the ordinary recovery order.
+Playlist headers have 120 seconds of preparation grace;
 initialization and fragment headers have 30 seconds. Once headers arrive,
 each nonempty body chunk must arrive within 15 seconds. The entire request
-is limited to 180 seconds for a playlist and 120 seconds for media. Bodies are
+is limited to 180 seconds for a playlist. For media it is 120 seconds or the
+time to transfer the fragment at 32 KiB/s, whichever is longer, so a slow
+link that keeps delivering a large copied fragment is not cut off. Bodies are
 counted while streaming, including responses without `Content-Length`: playlists
 are capped at 4 MiB, media resources at 32 MiB, and either at 65,536 reads.
 The server advertises `capabilities.mse_resource_max_bytes` and applies the same

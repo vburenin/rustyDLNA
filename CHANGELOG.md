@@ -20,6 +20,12 @@ publish a signed, content-addressed OCI image with SBOM and provenance.
 - A failed or rejected Compatible job now answers playlist and fragment requests
   with HTTP 500 `transcode_failed` instead of closing the connection without a
   response, so the player recovers the stream instead of retrying a transfer.
+- Stopped treating network trouble as a decoder failure in Media Source
+  playback. A dropped connection, transfer timeout, truncated fragment, or HTTP
+  408/429/502/503/504 now retries the same stream at the current position instead of
+  abandoning stream copying or lowering quality. Quality is lowered only after
+  those retries are exhausted. A slow link that keeps delivering a large
+  fragment is no longer cut off by a fixed whole-request deadline.
 - Added operator library-maintenance tools under `contrib/library/` for NFO,
   posters, generated genre/year/age views, and timeline previews. They take
   `--root` or `RUSTY_DLNA_MEDIA`, keep caches in `<library>/.rusty-library/`,

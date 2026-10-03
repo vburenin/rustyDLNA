@@ -13,14 +13,45 @@ const MEDIA_SOURCE_BUFFER_AHEAD_SECONDS = 10;
 export class MediaSourceResourceError extends Error {
   constructor(message) { super(message); this.name = "MediaSourceResourceError"; this.code = "resource_limit"; }
 }
+// A transfer that dropped, stalled, or was refused transiently. The media data
+// itself was never judged, so recovery must not treat it as a decoder failure.
+export class MediaDeliveryNetworkError extends Error {
+  constructor(message, options) { super(message, options); this.name = "MediaDeliveryNetworkError"; this.code = "network"; }
+}
 const MEDIA_SOURCE_RETAIN_BEHIND_SECONDS = 5;
 const MEDIA_SOURCE_PLAYLIST_POLL_MS = 500;
 const MEDIA_SOURCE_EVENT_TIMEOUT_MS = 20_000;
 const MEDIA_SOURCE_BODY_PROGRESS_MS = 15_000;
+// A finite fragment that keeps arriving is not stalled. Its whole-request
+// deadline allows this sustained floor; the progress timer catches stalls.
+const MEDIA_SOURCE_MIN_TRANSFER_BYTES_PER_SECOND = 32 * 1024;
 const MEDIA_SOURCE_SEEK_SETTLE_MS = 100;
 
 function timeoutError(phase) {
   return new Error(`Media Source ${phase} timed out.`);
+}
+
+function transferTimeoutError(phase) {
+  return new MediaDeliveryNetworkError(`Media Source ${phase} timed out.`);
+}
+
+// The server answers deterministic producer failures with 500; only gateway
+// and overload statuses describe the transfer itself.
+function transientHttpStatus(status) {
+  return [408, 429, 502, 503, 504].includes(status);
+}
+
+// Fetch reports refused, reset, and interrupted connections as TypeError.
+// Classify only the network operations, not ordinary programming errors.
+async function networkOperation(promise, signal) {
+  try {
+    return await promise;
+  } catch (error) {
+    if (error?.name === "TypeError" && !signal.aborted) {
+      throw new MediaDeliveryNetworkError("The media connection was interrupted.", { cause: error });
+    }
+    throw error;
+  }
 }
 
 // Race the operation as well as aborting fetch: a body implementation must not
@@ -53,16 +84,21 @@ export async function fetchResource(url, signal, { playlist = false, resourceMax
   }
   // Playlist headers may wait for helper admission, preparation, and the first
   // complete fragment. Subsequent finite-resource requests need less grace.
-  let progressTimer = window.setTimeout(() => controller.abort(timeoutError("headers")), playlist ? 120_000 : 30_000);
-  const absoluteTimer = window.setTimeout(() => controller.abort(timeoutError("request")), playlist ? 180_000 : 120_000);
+  let progressTimer = window.setTimeout(() => controller.abort(transferTimeoutError("headers")), playlist ? 120_000 : 30_000);
+  const requestLimitMs = playlist ? 180_000 : Math.max(120_000,
+    Math.ceil(((expectedBytes ?? limit) / MEDIA_SOURCE_MIN_TRANSFER_BYTES_PER_SECOND) * 1_000));
+  const absoluteTimer = window.setTimeout(() => controller.abort(transferTimeoutError("request")), requestLimitMs);
   let reader;
   let completed = false;
   try {
-    const response = await withAbort(fetch(url, {
+    const response = await networkOperation(withAbort(fetch(url, {
       cache: "no-store", credentials: "same-origin", signal: controller.signal,
-    }), controller.signal);
+    }), controller.signal), signal);
     if (response.status === 413) throw new MediaSourceResourceError("Media Source resource is too large.");
-    if (!response.ok) throw new Error(`Media Source resource returned HTTP ${response.status}.`);
+    if (!response.ok) {
+      const message = `Media Source resource returned HTTP ${response.status}.`;
+      throw transientHttpStatus(response.status) ? new MediaDeliveryNetworkError(message) : new Error(message);
+    }
     if (Number(response.headers.get("content-length")) > limit) throw new MediaSourceResourceError("Media Source resource is too large.");
     const declared = response.headers.get("content-length");
     if (expectedBytes !== undefined && (response.status !== 200 || response.headers.has("content-range")
@@ -80,11 +116,11 @@ export async function fetchResource(url, signal, { playlist = false, resourceMax
     let reads = 0;
     const resetProgress = () => {
       window.clearTimeout(progressTimer);
-      progressTimer = window.setTimeout(() => controller.abort(timeoutError("body progress")), MEDIA_SOURCE_BODY_PROGRESS_MS);
+      progressTimer = window.setTimeout(() => controller.abort(transferTimeoutError("body progress")), MEDIA_SOURCE_BODY_PROGRESS_MS);
     };
     resetProgress();
     while (true) {
-      const { value, done } = await withAbort(reader.read(), controller.signal);
+      const { value, done } = await networkOperation(withAbort(reader.read(), controller.signal), signal);
       if (done) break;
       if (++reads > 65_536) throw new Error("Media Source resource has too many chunks.");
       if (value.byteLength) resetProgress();
@@ -96,7 +132,9 @@ export async function fetchResource(url, signal, { playlist = false, resourceMax
       } else if (value.byteLength) chunks.push(value);
     }
     if (length === 0) throw new Error("Media Source resource is empty.");
-    if (expectedBytes !== undefined && length !== expectedBytes) throw new Error("Media Source resource ended before its requested range.");
+    if (expectedBytes !== undefined && length !== expectedBytes) {
+      throw new MediaDeliveryNetworkError("Media Source resource ended before its requested range.");
+    }
     const bytes = destination || new Uint8Array(length);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }

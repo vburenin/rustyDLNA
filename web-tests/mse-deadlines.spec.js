@@ -124,8 +124,8 @@ test("MSE replacement aborts a held body without waiting for its deadline", asyn
   expect(result).toEqual({ name: "AbortError", cancelled: true });
 });
 
-async function installPlayerFault(page, { fault, hevc = false, persistent = false }) {
-  await page.addInitScript(({ fault, persistent, hevc }) => {
+async function installPlayerFault(page, { fault, hevc = false, persistent = false, failGenerations = 1, statusUnreachable = false }) {
+  await page.addInitScript(({ fault, persistent, hevc, failGenerations, statusUnreachable }) => {
     localStorage.setItem("rustydlna.stream", "compat");
     localStorage.setItem("rustydlna.quality", hevc ? "auto" : "data_saver");
     Object.defineProperty(navigator, "userAgent", { configurable: true,
@@ -133,7 +133,7 @@ async function installPlayerFault(page, { fault, hevc = false, persistent = fals
     Object.defineProperty(navigator, "mediaCapabilities", { configurable: true,
       value: { decodingInfo: async () => ({ supported: true, smooth: true, powerEfficient: true }) } });
     HTMLMediaElement.prototype.canPlayType = (type) => /mpegurl|ac-3/.test(type) ? "" : "probably";
-    const state = window.__msePlayerFault = { generations: 0, requests: [], cancelled: [], aborted: [],
+    const state = window.__msePlayerFault = { generations: 0, requests: [], modes: [], cancelled: [], aborted: [],
       reached: false, status: "ready", produced: 1, ready: 0, time: 0, seeking: false, paused: true };
     const objects = new Map();
     const sources = new WeakMap();
@@ -149,7 +149,7 @@ async function installPlayerFault(page, { fault, hevc = false, persistent = fals
           remove() { queueMicrotask(() => buffer.dispatchEvent(new Event("updateend"))); },
           appendBuffer() {
             appends += 1;
-            const broken = persistent || generation === 1;
+            const broken = persistent || generation <= failGenerations;
             if (broken && fault === "append") { state.reached = true; return; }
             queueMicrotask(() => {
               buffer.dispatchEvent(new Event("updateend"));
@@ -215,13 +215,27 @@ async function installPlayerFault(page, { fault, hevc = false, persistent = fals
     window.fetch = async (input, options) => {
       const url = new URL(input, location.href);
       if (url.pathname.startsWith("/api/web/transcode/")) {
+        if (statusUnreachable && state.reached) throw new TypeError("Failed to fetch");
         if (options?.method === "DELETE") state.cancelled.push(url.searchParams.get("request"));
         return new Response(JSON.stringify({ schema_version: 2, state: state.status,
           produced_seconds: state.produced, retry_after_seconds: 0.25 }), { headers: { "Content-Type": "application/json" } });
       }
       if (!url.pathname.startsWith("/web/media/")) return originalFetch(input, options);
       const delivery = url.searchParams.get("delivery");
-      if (delivery === "mse") state.requests.push(url.searchParams.get("request"));
+      if (delivery === "mse") {
+        state.requests.push(url.searchParams.get("request"));
+        state.modes.push(`${url.searchParams.get("video_mode")}/${url.searchParams.get("quality")}`);
+      }
+      if (fault === "segment network" && delivery === "mse_segment"
+        && (persistent || state.generations <= failGenerations)) {
+        state.reached = true;
+        throw new TypeError("Failed to fetch");
+      }
+      if (fault === "segment 500" && delivery === "mse_segment"
+        && (persistent || state.generations <= failGenerations)) {
+        state.reached = true;
+        return new Response("transcode_failed", { status: 500 });
+      }
       if ((persistent || state.generations === 1) && fault === "playlist headers" && delivery === "mse") {
         state.reached = true;
         options.signal.addEventListener("abort", () => state.aborted.push(url.searchParams.get("request")), { once: true });
@@ -234,7 +248,7 @@ async function installPlayerFault(page, { fault, hevc = false, persistent = fals
       fragment.searchParams.set("delivery", "mse_segment"); fragment.searchParams.set("hls_offset", "1");
       return new Response(`#EXTM3U\n#EXT-X-MAP:URI="${init}"\n#EXTINF:2,\n${fragment}\n#EXT-X-ENDLIST\n`);
     };
-  }, { fault, persistent, hevc });
+  }, { fault, persistent, hevc, failGenerations, statusUnreachable });
   await page.route("**/api/web/library?**", async (route) => {
     const response = await route.fetch();
     const payload = await response.json();
@@ -279,6 +293,68 @@ for (const fault of ["playlist headers", "sourceopen", "append", "first frame", 
     await expect(page.locator("#player-message[role=alert]")).toBeHidden();
   });
 }
+
+test("MSE retries dropped media transfers with the same copied rendition", async ({ page }) => {
+  // Two consecutive generations lose their media connection. A decode failure
+  // would spend its single reconnect and then abandon stream copying.
+  await installPlayerFault(page, { fault: "segment network", hevc: true, failGenerations: 2 });
+  await expect.poll(() => page.evaluate(() => window.__msePlayerFault.generations)).toBe(3);
+  await expect.poll(() => page.locator("#video-player").evaluate((player) => player.readyState)).toBe(3);
+  const state = await page.evaluate(() => window.__msePlayerFault);
+  expect(state.modes.length).toBeGreaterThanOrEqual(3);
+  expect(new Set(state.modes)).toEqual(new Set(["copy/auto"]));
+  await expect(page.locator("#player-message[role=alert]")).toBeHidden();
+});
+
+test("MSE decode failures still abandon copying after the reconnect", async ({ page }) => {
+  // Control for the network test: the same two failures as appends are decode
+  // evidence, so the third generation must use a portable encoded stream.
+  await installPlayerFault(page, { fault: "append", hevc: true, failGenerations: 2 });
+  await page.clock.fastForward(21_000);
+  await expect.poll(() => page.evaluate(() => window.__msePlayerFault.generations)).toBe(2);
+  await page.clock.fastForward(21_000);
+  await expect.poll(() => page.evaluate(() => window.__msePlayerFault.generations)).toBe(3);
+  const modes = await page.evaluate(() => window.__msePlayerFault.modes);
+  expect(modes[0]).toBe("copy/auto");
+  expect(modes.at(-1)).not.toMatch(/^copy\//);
+});
+
+test("MSE treats a server error as stream evidence rather than a transfer retry", async ({ page }) => {
+  // The producer answers deterministic failures with HTTP 500. Restarting the
+  // same rendition would only reproduce it, so recovery changes the stream.
+  await installPlayerFault(page, { fault: "segment 500", hevc: true, failGenerations: 2 });
+  await expect.poll(() => page.evaluate(() => window.__msePlayerFault.generations)).toBe(3);
+  const modes = await page.evaluate(() => window.__msePlayerFault.modes);
+  expect(modes[0]).toBe("copy/auto");
+  expect(modes.at(-1)).not.toMatch(/^copy\//);
+});
+
+test("MSE reports an unreachable server instead of lowering quality", async ({ page }) => {
+  await installPlayerFault(page, { fault: "segment network", hevc: true, persistent: true, statusUnreachable: true });
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    if (await page.locator("#player-message[role=alert]").isVisible()) break;
+    await page.clock.fastForward(2_000);
+    await page.waitForTimeout(50);
+  }
+  await expect(page.locator("#player-message[role=alert]")).toBeVisible();
+  const state = await page.evaluate(() => window.__msePlayerFault);
+  expect(new Set(state.modes)).toEqual(new Set(["copy/auto"]));
+  expect(state.generations).toBeLessThanOrEqual(5);
+});
+
+test("MSE persistent transfer failure ends within the bounded recovery budget", async ({ page }) => {
+  await installPlayerFault(page, { fault: "segment network", hevc: true, persistent: true });
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    if (await page.locator("#player-message[role=alert]").isVisible()) break;
+    await page.clock.fastForward(2_000);
+    await page.waitForTimeout(50);
+  }
+  const state = await page.evaluate(() => window.__msePlayerFault);
+  // Same-rendition retries come first, then the ordered bitrate fallback.
+  expect(state.modes.slice(0, 4)).toEqual(Array(4).fill("copy/auto"));
+  expect(state.modes.at(-1)).not.toMatch(/^copy\//);
+  expect(state.generations).toBeLessThanOrEqual(10);
+});
 
 test("MSE first-frame recovery adopts a HEVC producer once, then cancels abandoned and terminal generations", async ({ page }) => {
   await installPlayerFault(page, { fault: "first frame", hevc: true, persistent: true });

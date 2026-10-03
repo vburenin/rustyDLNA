@@ -1902,7 +1902,8 @@ export class PlaybackController {
     const preferences = this.#store.getState().preferences;
     const capabilities = this.#store.getState().server.capabilities;
     const outputQuality = this.#store.getState().playback.outputQuality || preferences.quality;
-    const mediaCode = this.activePlayer().error?.code || (deliveryError ? 3 : undefined);
+    const networkDelivery = deliveryError?.code === "network";
+    let mediaCode = this.activePlayer().error?.code || (deliveryError ? (networkDelivery ? 2 : 3) : undefined);
     if (sourceMode === SOURCE_MODES.ORIGINAL
       && preferences.streamMode === STREAM_MODES.AUTO
       && capabilities.transcoding) {
@@ -1963,6 +1964,28 @@ export class PlaybackController {
     }
     if (!current()) return;
     intent = this.#store.getState().playback.intent;
+    if (networkDelivery && !this.activePlayer().error) {
+      // A dropped or stalled transfer says nothing about decoding. Retry the
+      // same rendition first. Once the generation budget is spent, treat the
+      // failure like a decode error, whose ordered recovery lowers the bitrate
+      // for a link that cannot sustain this rendition.
+      const serverUnreachable = ["offline", "network"].includes(code);
+      if (sourceMode === SOURCE_MODES.COMPATIBLE
+        && (serverUnreachable || ["starting", "producing", "ready"].includes(producerState))
+        && this.#scheduleCompatibleRetry({
+          sessionId,
+          item,
+          start: this.globalTime() || start,
+          intent,
+          streamNegotiation,
+        })) return;
+      // Lowering quality cannot help when the server cannot be reached.
+      if (serverUnreachable) {
+        this.#failSource(source, playbackError(code, deliveryError.message));
+        return;
+      }
+      mediaCode = 3;
+    }
     if (([3, 4].includes(mediaCode) || producerState === "failed")
       && this.#fallbackNativeHlsCopy(sessionId)) return;
     const recovery = sourceMode === SOURCE_MODES.COMPATIBLE ? compatibleDecodeRecovery({
