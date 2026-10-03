@@ -354,7 +354,10 @@ The server indexes each complete movie fragment as FFmpeg produces it and
 publishes an append-only HLS event playlist whose initialization and media
 segments are separate fixed-length HTTP resources backed by bounded regions of
 the same cache-controlled fragmented MP4. Every advertised segment starts at a
-random-access point; incomplete fragments are never exposed. The playlist
+random-access point; incomplete fragments are never exposed. Fragments are
+timed by the video track. A fragment without video, such as the audio FFmpeg
+flushes after the last video frame, extends the preceding segment by the time
+its audio runs past the video, so the complete audio tail is delivered. The playlist
 gains an end marker only after the producer finishes and the cache file is
 published atomically.
 

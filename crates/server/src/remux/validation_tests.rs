@@ -1403,3 +1403,231 @@ async fn readiness_pin_retries_a_replaced_attempt_without_resetting_its_deadline
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+/// Decode end of the last packet of one stream, measured independently of the
+/// HLS index by FFprobe. Presentation times would add B-frame delay.
+fn probed_stream_end(path: &Path, selector: &str) -> f64 {
+    let output = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", selector])
+        .args([
+            "-show_entries",
+            "packet=dts_time,duration_time",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(',');
+            let dts = fields.next()?.parse::<f64>().ok()?;
+            let duration = fields.next()?.parse::<f64>().ok()?;
+            Some(dts + duration)
+        })
+        .fold(0.0, f64::max)
+}
+
+/// Movie fragments carrying no sample entry for `track_id` (FFmpeg numbers
+/// the first mapped stream, video here, as track 1).
+fn fragments_without_track(path: &Path, track_id: u32) -> usize {
+    fn children(bytes: &[u8]) -> Vec<(&[u8; 4], &[u8])> {
+        let mut offset = 0;
+        let mut found = Vec::new();
+        while offset + 8 <= bytes.len() {
+            let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            assert!(size >= 8 && offset + size <= bytes.len());
+            found.push((
+                bytes[offset + 4..offset + 8].try_into().unwrap(),
+                &bytes[offset + 8..offset + size],
+            ));
+            offset += size;
+        }
+        found
+    }
+    let bytes = std::fs::read(path).unwrap();
+    children(&bytes)
+        .into_iter()
+        .filter(|(kind, _)| *kind == b"moof")
+        .filter(|(_, moof)| {
+            !children(moof)
+                .into_iter()
+                .filter(|(kind, _)| *kind == b"traf")
+                .any(|(_, traf)| {
+                    children(traf)
+                        .into_iter()
+                        .any(|(kind, tfhd)| kind == b"tfhd" && tfhd[4..8] == track_id.to_be_bytes())
+                })
+        })
+        .count()
+}
+
+/// End of the last top-level `mdat`; a trailing `mfra` index is not media.
+fn last_media_data_end(path: &Path) -> u64 {
+    let bytes = std::fs::read(path).unwrap();
+    let mut offset = 0_usize;
+    let mut media_end = 0;
+    while offset + 8 <= bytes.len() {
+        let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        assert!(size >= 8, "fixture uses only 32-bit box sizes");
+        if &bytes[offset + 4..offset + 8] == b"mdat" {
+            media_end = offset + size;
+        }
+        offset += size;
+    }
+    assert_eq!(offset, bytes.len());
+    media_end as u64
+}
+
+/// Byte ranges a playlist tells a client to fetch after the initialization.
+fn playlist_ranges(playlist: &str) -> Vec<(u64, u64)> {
+    playlist
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let field = |name: &str| {
+                line.split(['?', '&'])
+                    .find_map(|pair| pair.strip_prefix(name))
+                    .and_then(|value| value.parse::<u64>().ok())
+            };
+            Some((field("hls_offset=")?, field("hls_length=")?))
+        })
+        .collect()
+}
+
+#[test]
+fn muxer_audio_tail_fragments_are_indexed_and_delivered() {
+    // FFmpeg flushes audio that ends after the last video sample into a final
+    // movie fragment with no video track. Equal requested durations still end
+    // that way because AAC frames do not align with video frames.
+    // Sparse video (one frame per two seconds) makes the same muxer cut
+    // audio-only fragments in the middle of the stream as well.
+    let dir = temp_dir("audio-tail-fragments");
+    for (label, video_seconds, audio_seconds, audio_only_expected) in [
+        ("equal", "4", "4", true),
+        ("audio-longer", "3", "4.5", true),
+        ("video-longer", "4", "2.5", false),
+        ("sparse", "8", "8", true),
+    ] {
+        let source = dir.join(format!("{label}-source.mp4"));
+        let path = dir.join(format!("{label}.mp4"));
+        if label == "sparse" {
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-nostdin", "-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc2=size=64x64:rate=0.5:duration=8")
+                .args([
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=48000:duration=8",
+                ])
+                .args(["-c:v", "libx264", "-threads", "1", "-g", "1", "-c:a", "aac"])
+                .args(["-movflags", "+frag_keyframe+empty_moov+default_base_moof"])
+                .args(["-f", "mp4", "-y"])
+                .arg(&source)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "sparse fixture generation failed");
+        } else {
+            // Default libx264 settings keep B-frame composition offsets.
+            generate_with_durations(
+                &source,
+                "10",
+                "libx264",
+                Some("aac"),
+                Some((video_seconds, audio_seconds)),
+            );
+        }
+        // Re-fragment with the browser output's muxer settings, whose
+        // one-second fragment ceiling also cuts audio-only fragments.
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-i"])
+            .arg(&source)
+            .args([
+                "-c",
+                "copy",
+                "-avoid_negative_ts",
+                "make_zero",
+                "-flush_packets",
+                "1",
+            ])
+            .args(["-frag_duration", "1000000", "-f", "mp4", "-movflags"])
+            .arg("frag_keyframe+empty_moov+delay_moov+default_base_moof")
+            .arg("-y")
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{label}: re-fragmenting failed");
+        let media_end = last_media_data_end(&path);
+        assert_eq!(
+            fragments_without_track(&path, 1) > 0,
+            audio_only_expected,
+            "{label}: unexpected fixture fragment layout"
+        );
+        let mut index = hls::Index::default();
+        index
+            .update(&path, true)
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+
+        // Every byte after the initialization is delivered exactly once, in
+        // order, through both the Media Source and the native playlists.
+        let mse = index.mse_playlist_after("init?x=1", "seg?x=1", 0).unwrap();
+        let native = index.playlist("init?x=1", "seg?x=1").unwrap();
+        let independent = index
+            .independent_fragment_playlist("init?x=1", "seg?x=1")
+            .unwrap();
+        for (kind, playlist) in [
+            ("mse", &mse),
+            ("native", &native),
+            ("independent", &independent),
+        ] {
+            assert!(playlist.ends_with("#EXT-X-ENDLIST\n"), "{label} {kind}");
+            let ranges = playlist_ranges(playlist);
+            assert!(!ranges.is_empty(), "{label} {kind}");
+            for pair in ranges.windows(2) {
+                assert_eq!(pair[0].0 + pair[0].1, pair[1].0, "{label} {kind} gap");
+            }
+            let (offset, length) = *ranges.last().unwrap();
+            assert_eq!(
+                offset + length,
+                media_end,
+                "{label} {kind} omits the media tail"
+            );
+            if kind == "mse" {
+                // Audio-only fragments must not disable Media Source timing
+                // (and with it seek reuse) for the rest of the stream.
+                assert_eq!(
+                    playlist.matches("#EXT-X-RUSTY-TIMING:").count(),
+                    ranges.len(),
+                    "{label}: fragment timing became unreliable"
+                );
+            }
+        }
+
+        // Fragments are timed by video. Audio sharing a fragment with video
+        // is delivered within that fragment's span; audio continuing alone
+        // extends the timeline to its own end.
+        let video_end = probed_stream_end(&path, "v:0");
+        let audio_end = probed_stream_end(&path, "a:0");
+        let covered = index.produced_duration_seconds().unwrap();
+        let context = format!(
+            "{label}: indexed {covered:.3}s, streams end at video {video_end:.3}s audio {audio_end:.3}s"
+        );
+        assert!(covered > video_end - 0.002, "{context}");
+        assert!(covered < video_end.max(audio_end) + 0.002, "{context}");
+        if audio_end > video_end + 0.5 {
+            assert!((covered - audio_end).abs() < 0.002, "{context}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

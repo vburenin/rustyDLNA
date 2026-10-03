@@ -5,6 +5,11 @@ publish a signed, content-addressed OCI image with SBOM and provenance.
 
 ## Unreleased
 
+- Fixed Compatible stream indexing at the end of a title. FFmpeg writes the
+  audio that runs past the last video frame as a final movie fragment without
+  video; the fragment index rejected it and failed every later playlist request
+  for that job, including seeks and reopening finished output. That audio tail
+  is now delivered as part of the final segment.
 - Added operator library-maintenance tools under `contrib/library/` for NFO,
   posters, generated genre/year/age views, and timeline previews. They take
   `--root` or `RUSTY_DLNA_MEDIA`, keep caches in `<library>/.rusty-library/`,

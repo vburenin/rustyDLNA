@@ -90,6 +90,7 @@ fn native_target_is_frozen_and_later_larger_copied_gop_requires_restart() {
                     offset,
                     duration: seconds,
                     random_access,
+                    continuation: false,
                 },
                 offset + 16,
             )
@@ -107,6 +108,7 @@ fn native_target_is_frozen_and_later_larger_copied_gop_requires_restart() {
                 offset,
                 duration: 2.49,
                 random_access: true,
+                continuation: false,
             },
             offset + 16,
         )
@@ -124,6 +126,7 @@ fn native_target_is_frozen_and_later_larger_copied_gop_requires_restart() {
                 offset,
                 duration: 3.0,
                 random_access: true,
+                continuation: false,
             },
             offset + 16,
         )
@@ -139,6 +142,7 @@ fn native_target_is_frozen_and_later_larger_copied_gop_requires_restart() {
                 offset,
                 duration: 1.0,
                 random_access: true,
+                continuation: false,
             },
             offset + 16,
         )
@@ -438,7 +442,8 @@ fn parser_rejects_metadata_and_fragment_budget_exhaustion() {
             Fragment {
                 offset: 32,
                 duration: 1.0,
-                random_access: true
+                random_access: true,
+                continuation: false,
             },
             48
         )

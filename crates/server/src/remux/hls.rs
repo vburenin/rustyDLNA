@@ -42,12 +42,17 @@ pub(super) struct Index {
     scan_offset: u64,
     init_end: Option<u64>,
     selected_track: Option<Track>,
+    tracks: Vec<Track>,
     defaults: HashMap<u32, TrackDefaults>,
     pending_fragment: Option<Fragment>,
     pending_segment: Option<Segment>,
     fragments: History<Segment>,
     fragment_timing: History<Option<(f64, f64)>>,
     timeline_end: Option<f64>,
+    /// End of all indexed media, including continuation audio that ran past
+    /// the timing track. Durations are measured from here so overlapping
+    /// audio is never counted twice.
+    covered_end: Option<f64>,
     timing_reliable: bool,
     fragment_time: f64,
     decode_start: f64,
@@ -83,6 +88,10 @@ struct Fragment {
     offset: u64,
     duration: f64,
     random_access: bool,
+    /// The fragment carries other selected tracks but no sample of the timing
+    /// track, such as the AAC tail a muxer flushes after the last video frame.
+    /// It extends the current segment without starting or depending on a GOP.
+    continuation: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -172,8 +181,9 @@ impl Index {
                     }
                     let bytes = read_box(file, header)
                         .map_err(|error| format!("read fragmented MP4 initialization: {error}"))?;
-                    let (track, defaults) = parse_moov(&bytes)?;
+                    let (track, tracks, defaults) = parse_moov(&bytes)?;
                     self.selected_track = Some(track);
+                    self.tracks = tracks;
                     self.defaults = defaults;
                     self.init_end = Some(end);
                 }
@@ -189,23 +199,42 @@ impl Index {
                     }
                     let bytes = read_box(file, header)
                         .map_err(|error| format!("read fragmented MP4 movie fragment: {error}"))?;
-                    let timing = parse_moof(&bytes, track, self.defaults.get(&track.id).copied())?;
+                    let covered = self.covered_end.or(self.timeline_end);
+                    let timing = parse_moof(&bytes, track, &self.tracks, &self.defaults, covered)?;
                     self.indexed_samples = self.indexed_samples.saturating_add(timing.samples);
                     if self.indexed_samples > MAX_INDEX_SAMPLES {
                         return Err("fragmented MP4 exceeds index sample budget".into());
                     }
-                    let contiguous = timing.decode_time.is_some_and(|start| {
-                        self.timeline_end
-                            .is_none_or(|end| (start - end).abs() <= 0.002)
-                    });
-                    self.timing_reliable = (self.fragments.is_empty() || self.timing_reliable)
-                        && contiguous
-                        && timing.reuse_safe;
-                    self.timeline_end = timing.decode_time.map(|start| start + timing.duration);
+                    let mut duration = timing.duration;
+                    if timing.continuation {
+                        // Contiguity is judged on the timing track alone.
+                        self.covered_end = timing.decode_time.map(|start| start + duration);
+                    } else {
+                        let contiguous = timing.decode_time.is_some_and(|start| {
+                            self.timeline_end
+                                .is_none_or(|end| (start - end).abs() <= 0.002)
+                        });
+                        self.timing_reliable = (self.fragments.is_empty() || self.timing_reliable)
+                            && contiguous
+                            && timing.reuse_safe;
+                        let end = timing.decode_time.map(|start| start + timing.duration);
+                        self.timeline_end = end;
+                        if let (Some(end), Some(covered)) = (end, self.covered_end) {
+                            // A preceding continuation already counted audio
+                            // reaching into this fragment's span.
+                            if covered > end - timing.duration {
+                                duration = (end - covered).max(MIN_CONTINUATION_SECONDS);
+                            }
+                            self.covered_end = Some(covered.max(end));
+                        } else {
+                            self.covered_end = end;
+                        }
+                    }
                     self.pending_fragment = Some(Fragment {
                         offset: header.offset,
-                        duration: timing.duration,
+                        duration,
                         random_access: !track.video || timing.random_access,
+                        continuation: timing.continuation,
                     });
                 }
                 b"mdat" => {
@@ -402,6 +431,7 @@ impl Index {
                 * (std::mem::size_of::<(bool, PlaylistGeneration)>()
                     + std::mem::size_of::<u64>()
                     + 16)
+            + self.tracks.capacity() * std::mem::size_of::<Track>()
             + self.defaults.capacity()
                 * (std::mem::size_of::<u32>() + std::mem::size_of::<TrackDefaults>() + 16)
     }
@@ -421,10 +451,14 @@ impl Index {
         if !fragment.duration.is_finite() || fragment.duration <= 0.0 {
             return Err("fragmented MP4 has an invalid fragment duration".into());
         }
-        if !fragment.random_access && self.pending_segment.is_none() {
+        // A continuation has no timing-track sample, so it neither depends on
+        // nor provides a decoder entry point; it joins the GOP before it.
+        let continuation = fragment.continuation && self.pending_segment.is_some();
+        let random_access = fragment.random_access && !continuation;
+        if !random_access && !continuation && self.pending_segment.is_none() {
             return Err("fragmented MP4 begins without a random-access point".into());
         }
-        if fragment.random_access {
+        if random_access {
             self.decode_start = self.fragment_time;
         }
         self.fragment_timing.push(
@@ -440,10 +474,10 @@ impl Index {
             length: end.saturating_sub(fragment.offset),
             duration: fragment.duration,
         });
-        if !fragment.random_access {
+        if !random_access && !continuation {
             self.dependent_fragments = self.dependent_fragments.saturating_add(1);
         }
-        if fragment.random_access {
+        if random_access {
             if let Some(segment) = self.pending_segment.replace(Segment {
                 offset: fragment.offset,
                 length: end.saturating_sub(fragment.offset),
@@ -593,7 +627,9 @@ fn boxes(mut bytes: &[u8]) -> Result<Vec<SliceBox<'_>>, String> {
     Ok(parsed)
 }
 
-fn parse_moov(bytes: &[u8]) -> Result<(Track, HashMap<u32, TrackDefaults>), String> {
+type ParsedMoov = (Track, Vec<Track>, HashMap<u32, TrackDefaults>);
+
+fn parse_moov(bytes: &[u8]) -> Result<ParsedMoov, String> {
     let mut tracks = Vec::new();
     let mut defaults = HashMap::new();
     for child in boxes(bytes)? {
@@ -624,7 +660,7 @@ fn parse_moov(bytes: &[u8]) -> Result<(Track, HashMap<u32, TrackDefaults>), Stri
         .or_else(|| tracks.first().copied())
         .filter(|track| track.timescale > 0)
         .ok_or_else(|| "fragmented MP4 has no usable media track".to_owned())?;
-    Ok((track, defaults))
+    Ok((track, tracks, defaults))
 }
 
 fn parse_trak(bytes: &[u8]) -> Result<Track, String> {
@@ -675,22 +711,81 @@ struct FragmentTiming {
     decode_time: Option<f64>,
     reuse_safe: bool,
     random_access: bool,
+    continuation: bool,
 }
+
+/// Shortest duration recorded for a continuation whose samples end at or
+/// before the timing track's end. Its bytes must still be delivered, and HLS
+/// and the index reject non-positive segment durations.
+const MIN_CONTINUATION_SECONDS: f64 = 0.001;
 
 fn parse_moof(
     bytes: &[u8],
     selected: Track,
-    trex: Option<TrackDefaults>,
+    tracks: &[Track],
+    defaults: &HashMap<u32, TrackDefaults>,
+    covered_end_before: Option<f64>,
 ) -> Result<FragmentTiming, String> {
-    for child in boxes(bytes)? {
-        if &child.kind != b"traf" {
-            continue;
-        }
-        if let Some(timing) = parse_traf(child.payload, selected, trex)? {
+    let trafs = boxes(bytes)?
+        .into_iter()
+        .filter(|child| &child.kind == b"traf")
+        .collect::<Vec<_>>();
+    for traf in &trafs {
+        if let Some(timing) =
+            parse_traf(traf.payload, selected, defaults.get(&selected.id).copied())?
+        {
             return Ok(timing);
         }
     }
-    Err("movie fragment omits the selected track".into())
+    // Muxers flush the remaining audio after the final video sample into its
+    // own fragment, as they do for audio across a gap of more than a fragment
+    // in sparse video. Time it by the tracks it does contain, measured from
+    // the end of everything already indexed so the timeline stays contiguous.
+    let mut samples = 0_u64;
+    let mut covered_end = None::<f64>;
+    let mut longest = 0.0_f64;
+    let mut timed = true;
+    for traf in &trafs {
+        for track in tracks.iter().filter(|track| track.id != selected.id) {
+            let other = Track {
+                video: false,
+                ..*track
+            };
+            if let Some(timing) = parse_traf(traf.payload, other, defaults.get(&track.id).copied())?
+            {
+                samples = samples.saturating_add(timing.samples);
+                longest = longest.max(timing.duration);
+                match timing.decode_time {
+                    Some(start) => {
+                        let end = start + timing.duration;
+                        covered_end = Some(covered_end.map_or(end, |known| known.max(end)));
+                    }
+                    None => timed = false,
+                }
+                break;
+            }
+        }
+    }
+    if samples == 0 {
+        return Err("movie fragment omits the selected track".into());
+    }
+    let extension = match (timed, covered_end, covered_end_before) {
+        (true, Some(end), Some(before)) => end - before,
+        _ => longest,
+    };
+    let duration = if extension.is_finite() {
+        extension.max(MIN_CONTINUATION_SECONDS)
+    } else {
+        MIN_CONTINUATION_SECONDS
+    };
+    Ok(FragmentTiming {
+        duration,
+        samples,
+        decode_time: covered_end_before,
+        reuse_safe: true,
+        random_access: false,
+        continuation: true,
+    })
 }
 
 fn parse_traf(
@@ -815,6 +910,7 @@ fn parse_traf(
         reuse_safe: bounded_reordering && (!selected.video || first_flags.is_some()),
         duration: duration as f64 / f64::from(selected.timescale),
         random_access: first_flags.is_none_or(|flags| flags & 0x0001_0000 == 0),
+        continuation: false,
     }))
 }
 
@@ -1013,6 +1109,7 @@ pub(super) mod tests {
                         offset: 64,
                         duration: 1.0,
                         random_access: true,
+                        continuation: false,
                     },
                     64 + length,
                 )
