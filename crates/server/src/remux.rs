@@ -27,6 +27,7 @@ mod hls;
 pub(crate) mod performance;
 mod positional;
 mod profile8;
+mod source_evidence;
 #[cfg(test)]
 mod validation_tests;
 
@@ -1756,7 +1757,36 @@ fn publish_finished_output(
         }
         if let Some(expected) = expectation {
             let started = Instant::now();
-            let stats = hls::validate_finished(file, expected, deadline, &job.cancelled)?;
+            let (stats, coverage) =
+                hls::validate_finished_structure(file, expected, deadline, &job.cancelled)?;
+            if let Err(error) = hls::validate_coverage(&coverage, expected, Default::default()) {
+                // The catalog duration describes the container. Only the
+                // source can show that the selected streams end earlier or
+                // that a copied seek needs a longer keyframe lead-in.
+                let source = spec
+                    .source_file
+                    .as_ref()
+                    .filter(|_| hls::coverage_needs_source_evidence(&error))
+                    .ok_or_else(|| error.clone())?;
+                let evidence = source_evidence::gather(
+                    source,
+                    expected,
+                    coverage.longest(),
+                    spec.audio_index,
+                    deadline,
+                    &job.cancelled,
+                )
+                .map_err(|probe| format!("{error} ({probe})"))?;
+                hls::validate_coverage(&coverage, expected, evidence)
+                    .map_err(|_| format!("{error} (source streams: {evidence:?})"))?;
+                tracing::info!(
+                    id = job.detail_id,
+                    catalog_error = %error,
+                    selected_end = ?evidence.selected_end,
+                    keyframe_before_seek = ?evidence.keyframe_before_seek,
+                    "completed output coverage confirmed by source stream evidence"
+                );
+            }
             tracing::debug!(
                 id = job.detail_id,
                 metadata_bytes = stats.metadata_bytes,

@@ -10,6 +10,13 @@ publish a signed, content-addressed OCI image with SBOM and provenance.
   video; the fragment index rejected it and failed every later playlist request
   for that job, including seeks and reopening finished output. That audio tail
   is now delivered as part of the final segment.
+- Fixed Compatible playback failing at the end of titles whose container runs
+  longer than the selected video and audio (another audio or subtitle stream,
+  or a trailing gap). Completed-output validation now confirms such outputs
+  against the source's own stream endings instead of rejecting them against the
+  container duration. A library check found about 190 such titles.
+- Fixed copied-video seeks into sources whose keyframes are more than ten
+  seconds apart; the actual keyframe lead-in is now confirmed from the source.
 - A failed or rejected Compatible job now answers playlist and fragment requests
   with HTTP 500 `transcode_failed` instead of closing the connection without a
   response, so the player recovers the stream instead of retrying a transfer.

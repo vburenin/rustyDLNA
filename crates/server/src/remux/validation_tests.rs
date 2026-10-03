@@ -1631,3 +1631,199 @@ fn muxer_audio_tail_fragments_are_indexed_and_delivered() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+fn run_ffmpeg(arguments: &[&str]) {
+    let output = std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y"])
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const BROWSER_FRAGMENTS: [&str; 9] = [
+    "-avoid_negative_ts",
+    "make_zero",
+    "-frag_duration",
+    "1000000",
+    "-movflags",
+    "frag_keyframe+empty_moov+delay_moov+default_base_moof",
+    "-f",
+    "mp4",
+    "-flush_packets",
+];
+
+fn coverage_of(
+    output: &Path,
+    expected: &RemuxOutputExpectation,
+) -> (hls::OutputCoverage, Result<(), String>) {
+    let file = std::fs::File::open(output).unwrap();
+    let (_, coverage) = hls::validate_finished_structure(
+        &file,
+        expected,
+        Instant::now() + Duration::from_secs(30),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let catalog_only = hls::validate_coverage(&coverage, expected, Default::default());
+    (coverage, catalog_only)
+}
+
+fn judged_with_source(
+    source: &Path,
+    output: &Path,
+    expected: &RemuxOutputExpectation,
+    audio_index: usize,
+) -> (Result<(), String>, Result<(), String>) {
+    let (coverage, catalog_only) = coverage_of(output, expected);
+    let evidence = source_evidence::gather(
+        &std::fs::File::open(source).unwrap(),
+        expected,
+        coverage.longest(),
+        audio_index,
+        Instant::now() + Duration::from_secs(30),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    (
+        catalog_only,
+        hls::validate_coverage(&coverage, expected, evidence),
+    )
+}
+
+#[test]
+fn selected_streams_ending_before_the_container_are_complete_output() {
+    // Video and the first audio stream end at 4 s; a second audio stream keeps
+    // the container running to 10 s. The catalog only knows the 10 s.
+    let dir = temp_dir("selected-stream-coverage");
+    let source = dir.join("source.mkv");
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=64x64:rate=24:duration=4",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000:duration=4",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=880:sample_rate=48000:duration=10",
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-map",
+        "2:a",
+        "-c:v",
+        "libx264",
+        "-threads",
+        "1",
+        "-g",
+        "24",
+        "-c:a",
+        "aac",
+        source.to_str().unwrap(),
+    ]);
+    let produce = |name: &str, audio: &str, limit: Option<&str>| {
+        let output = dir.join(name);
+        let mut arguments = vec![
+            "-i",
+            source.to_str().unwrap(),
+            "-map",
+            "0:v:0",
+            "-map",
+            audio,
+        ];
+        if let Some(limit) = limit {
+            arguments.extend(["-t", limit]);
+        }
+        arguments.extend(["-c", "copy"]);
+        arguments.extend(BROWSER_FRAGMENTS);
+        arguments.extend(["1", output.to_str().unwrap()]);
+        run_ffmpeg(&arguments);
+        output
+    };
+    let expected = RemuxOutputExpectation {
+        video_copy: true,
+        ..expected(10.0)
+    };
+
+    let complete = produce("complete.mp4", "0:a:0", None);
+    let (catalog_only, with_source) = judged_with_source(&source, &complete, &expected, 0);
+    assert!(catalog_only
+        .unwrap_err()
+        .starts_with("output tracks cover "));
+    with_source.expect("output reaching the selected streams' end is complete");
+
+    // Controls: a truncated output, and a selection whose audio really does
+    // run to 10 s, both stay rejected with the source evidence.
+    let truncated = produce("truncated.mp4", "0:a:0", Some("2"));
+    let (_, with_source) = judged_with_source(&source, &truncated, &expected, 0);
+    assert!(with_source.is_err(), "a truncated output must be rejected");
+    let short_of_long_audio = produce("long-audio-truncated.mp4", "0:a:1", Some("4"));
+    let (_, with_source) = judged_with_source(&source, &short_of_long_audio, &expected, 1);
+    assert!(
+        with_source.is_err(),
+        "the selected 10 s audio was cut short"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn copied_seek_accepts_the_sources_actual_keyframe_lead_in() {
+    // Keyframes every 20 s. A copied seek to 39 s starts at the 20 s keyframe,
+    // more lead-in than the generic ten-second allowance.
+    let dir = temp_dir("long-gop-copied-seek");
+    let source = dir.join("source.mp4");
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=64x64:rate=24:duration=50",
+        "-c:v",
+        "libx264",
+        "-threads",
+        "1",
+        "-preset",
+        "ultrafast",
+        "-g",
+        "480",
+        "-keyint_min",
+        "480",
+        "-sc_threshold",
+        "0",
+        source.to_str().unwrap(),
+    ]);
+    let seeked = dir.join("seeked.mp4");
+    let mut arguments = vec!["-ss", "39", "-i", source.to_str().unwrap(), "-c", "copy"];
+    arguments.extend(BROWSER_FRAGMENTS);
+    arguments.extend(["1", seeked.to_str().unwrap()]);
+    run_ffmpeg(&arguments);
+    let expected = RemuxOutputExpectation {
+        video_codec: Some("h264".into()),
+        audio_codecs: Vec::new(),
+        duration_seconds: Some(50.0),
+        seek_seconds: 39.0,
+        video_copy: true,
+    };
+    let (catalog_only, with_source) = judged_with_source(&source, &seeked, &expected, 0);
+    assert!(catalog_only.unwrap_err().contains(" track covers "));
+    with_source.expect("lead-in from the source's own keyframe is legitimate");
+
+    // Control: output that ignored the seek still overruns the expectation.
+    let unseeked = dir.join("unseeked.mp4");
+    let mut arguments = vec!["-i", source.to_str().unwrap(), "-c", "copy"];
+    arguments.extend(BROWSER_FRAGMENTS);
+    arguments.extend(["1", unseeked.to_str().unwrap()]);
+    run_ffmpeg(&arguments);
+    let (_, with_source) = judged_with_source(&source, &unseeked, &expected, 0);
+    assert!(with_source.unwrap_err().contains(" track covers "));
+    let _ = std::fs::remove_dir_all(dir);
+}

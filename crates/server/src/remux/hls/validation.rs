@@ -31,12 +31,66 @@ struct MediaTrack {
     samples: u64,
 }
 
+/// Track extents of a structurally valid output, in output decode seconds.
+#[derive(Debug, Clone, Default)]
+pub(in crate::remux) struct OutputCoverage {
+    tracks: Vec<CoveredTrack>,
+}
+
+impl OutputCoverage {
+    /// End of the longest media (non-chapter) track.
+    pub(in crate::remux) fn longest(&self) -> f64 {
+        self.tracks
+            .iter()
+            .filter(|track| !track.chapter)
+            .map(|track| track.end)
+            .fold(0.0_f64, f64::max)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CoveredTrack {
+    codec: String,
+    chapter: bool,
+    start: f64,
+    end: f64,
+}
+
+/// Facts read from the source when the catalog duration alone cannot judge
+/// coverage. All times are seconds on the source's own timeline, from zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(in crate::remux) struct SourceEvidence {
+    /// Where the selected video and audio streams actually end. A container
+    /// can run longer than them (another audio or subtitle stream, or a
+    /// trailing gap); coverage is judged against the selected streams.
+    pub selected_end: Option<f64>,
+    /// The copied-video keyframe that a seek must start from.
+    pub keyframe_before_seek: Option<f64>,
+}
+
+/// Whether a coverage failure may be explained by source facts.
+pub(in crate::remux) fn coverage_needs_source_evidence(error: &str) -> bool {
+    error.starts_with("output tracks cover ") || error.contains(" track covers ")
+}
+
+#[cfg(test)]
 pub(in crate::remux) fn validate_finished(
     file: &File,
     expected: &RemuxOutputExpectation,
     deadline: Instant,
     cancelled: &AtomicBool,
 ) -> Result<ValidationStats, String> {
+    let (stats, coverage) = validate_finished_structure(file, expected, deadline, cancelled)?;
+    validate_coverage(&coverage, expected, SourceEvidence::default())?;
+    Ok(stats)
+}
+
+pub(in crate::remux) fn validate_finished_structure(
+    file: &File,
+    expected: &RemuxOutputExpectation,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<(ValidationStats, OutputCoverage), String> {
     let available = file.metadata().map_err(|error| error.to_string())?.len();
     let mut stats = ValidationStats::default();
     let mut offset = 0_u64;
@@ -130,46 +184,76 @@ pub(in crate::remux) fn validate_finished(
     if !initialized || pending.is_some() || sequence.is_none() {
         return Err("completed MP4 has no complete media fragments".into());
     }
-    let expected_duration = expected
-        .duration_seconds
-        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
-        .map(|seconds| (seconds - expected.seek_seconds).max(0.0));
+    let mut coverage = OutputCoverage::default();
     for track in tracks.values() {
         let start = track.start.ok_or("required track has no media samples")?;
-        // Muxer priming/reordering is bounded by 250 ms. Each track may have
-        // its own source ending; the catalog records only the overall duration.
+        // Muxer priming/reordering is bounded by 250 ms.
         if !track.chapter && start.abs() > 0.250 {
             return Err("track begins outside timestamp tolerance".into());
         }
-        if let Some(duration) = expected_duration {
-            let preroll = if expected.video_copy && expected.seek_seconds > 0.0 {
-                10.0
-            } else {
-                0.250
-            };
-            if track.end > duration + preroll + 1.0 {
-                return Err(format!(
-                    "{} track covers {:.3}s, expected {:.3}s",
-                    track.codec, track.end, duration
-                ));
-            }
-        }
+        coverage.tracks.push(CoveredTrack {
+            codec: track.codec.clone(),
+            chapter: track.chapter,
+            start,
+            end: track.end,
+        });
     }
-    if let Some(duration) = expected_duration {
-        let longest = tracks
-            .values()
-            .filter(|track| !track.chapter)
-            .map(|track| track.end)
-            .fold(0.0_f64, f64::max);
-        let shortfall = (duration * 0.05).clamp(0.050, 1.0);
-        if longest + shortfall < duration {
+    checkpoint(deadline, cancelled)?;
+    Ok((stats, coverage))
+}
+
+/// Judge output length. The catalog records only the container duration; when
+/// that cannot explain the output, `evidence` carries the selected streams'
+/// real end and the copied seek's keyframe, read from the source itself.
+pub(in crate::remux) fn validate_coverage(
+    coverage: &OutputCoverage,
+    expected: &RemuxOutputExpectation,
+    evidence: SourceEvidence,
+) -> Result<(), String> {
+    let seek = expected.seek_seconds;
+    let catalog = expected
+        .duration_seconds
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0);
+    let selected = evidence
+        .selected_end
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0);
+    // The selected streams' own end replaces a longer container duration; it
+    // never extends the expectation beyond what the catalog promised.
+    let expected_duration = match (catalog, selected) {
+        (Some(catalog), Some(selected)) => Some(catalog.min(selected)),
+        (catalog, selected) => catalog.or(selected),
+    }
+    .map(|seconds| (seconds - seek).max(0.0));
+    let Some(duration) = expected_duration else {
+        return Ok(());
+    };
+    let copy_seek = expected.video_copy && seek > 0.0;
+    // A copied seek starts at the preceding keyframe. Without source evidence
+    // allow a typical ten-second GOP; with it, allow the actual distance.
+    let preroll = match (copy_seek, evidence.keyframe_before_seek) {
+        (true, Some(keyframe)) if keyframe.is_finite() && keyframe <= seek => {
+            (seek - keyframe + 0.5).max(10.0)
+        }
+        (true, _) => 10.0,
+        (false, _) => 0.250,
+    };
+    for track in &coverage.tracks {
+        debug_assert!(track.chapter || track.start.abs() <= 0.250);
+        if track.end > duration + preroll + 1.0 {
             return Err(format!(
-                "output tracks cover {longest:.3}s, expected {duration:.3}s"
+                "{} track covers {:.3}s, expected {:.3}s",
+                track.codec, track.end, duration
             ));
         }
     }
-    checkpoint(deadline, cancelled)?;
-    Ok(stats)
+    let longest = coverage.longest();
+    let shortfall = (duration * 0.05).clamp(0.050, 1.0);
+    if longest + shortfall < duration {
+        return Err(format!(
+            "output tracks cover {longest:.3}s, expected {duration:.3}s"
+        ));
+    }
+    Ok(())
 }
 
 fn checkpoint(deadline: Instant, cancelled: &AtomicBool) -> Result<(), String> {

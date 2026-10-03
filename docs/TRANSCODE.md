@@ -460,6 +460,17 @@ audio. The catalog records overall duration, not individual track endings, so
 the validator checks every track's samples, start, continuity and upper time
 bound but compares minimum expected coverage against the longest track only.
 It cannot prove that a shorter track reached its individual source ending.
+A container can run longer than the streams a job selected, for example when
+another audio or subtitle stream continues, and a copied seek begins at whatever
+keyframe precedes it. When the catalog duration alone rejects a structurally
+valid output, publication reads the source descriptor once more with a
+supervised, demux-only FFprobe under the same verification deadline: from
+30 seconds before the output's end it finds where the selected video and audio
+streams actually end, and for a copied seek it finds the preceding keyframe
+(searching up to 300 seconds back). The output is accepted if it reaches the
+selected streams' own end, which never exceeds the catalog duration, and stays
+within the actual keyframe lead-in. A truncated output still fails, because the
+selected stream visibly continues past it. Ordinary outputs never run this probe.
 When the catalog has no overall duration, structural and per-track continuity
 checks still apply, but no source-coverage comparison is possible. These checks
 prove structural completeness within those tolerances; they do not claim full

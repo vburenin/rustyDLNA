@@ -7,7 +7,11 @@ mod history;
 #[cfg(test)]
 mod native_evidence;
 mod validation;
-pub(super) use validation::validate_finished;
+pub(super) use validation::{
+    coverage_needs_source_evidence, validate_coverage, validate_finished_structure, SourceEvidence,
+};
+#[cfg(test)]
+pub(super) use validation::{validate_finished, OutputCoverage};
 
 use history::{History, View};
 use std::collections::HashMap;
