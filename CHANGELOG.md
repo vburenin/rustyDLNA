@@ -10,6 +10,9 @@ publish a signed, content-addressed OCI image with SBOM and provenance.
   video; the fragment index rejected it and failed every later playlist request
   for that job, including seeks and reopening finished output. That audio tail
   is now delivered as part of the final segment.
+- A failed or rejected Compatible job now answers playlist and fragment requests
+  with HTTP 500 `transcode_failed` instead of closing the connection without a
+  response, so the player recovers the stream instead of retrying a transfer.
 - Added operator library-maintenance tools under `contrib/library/` for NFO,
   posters, generated genre/year/age views, and timeline previews. They take
   `--root` or `RUSTY_DLNA_MEDIA`, keep caches in `<library>/.rusty-library/`,

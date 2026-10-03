@@ -3218,6 +3218,28 @@ fn fragment_resource_uris(
     ))
 }
 
+/// A request that fails before any response bytes are written still gets an
+/// HTTP answer. Dropping the connection would look like a network fault to
+/// the browser, which retries transfers instead of recovering the stream.
+async fn fail_before_response(
+    app: &App,
+    sock: &mut tokio::net::TcpStream,
+    req: &HttpRequest,
+    job: &RemuxJob,
+    head: bool,
+    error: impl std::fmt::Display,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing::error!(
+        id = job.detail_id,
+        path = %req.path,
+        ua = req.user_agent().unwrap_or("-"),
+        "{error}"
+    );
+    let response = crate::web_ui::transcode_stream_error(500, "transcode_failed");
+    write_remux_response(app, sock, response, head).await?;
+    Ok(())
+}
+
 async fn serve_fragment_playlist(
     app: &App,
     sock: &mut tokio::net::TcpStream,
@@ -3238,7 +3260,9 @@ async fn serve_fragment_playlist(
     let mut first_fragment_observed = false;
     let playlist = loop {
         match job.state() {
-            RemuxState::Failed(error) => return Err(error.into()),
+            RemuxState::Failed(error) => {
+                return fail_before_response(app, sock, req, job, head, error).await;
+            }
             RemuxState::Cancelled => {
                 tracing::debug!(
                     id = job.detail_id,
@@ -3320,7 +3344,9 @@ async fn serve_fragment_playlist(
             Ok(None) if !complete && Instant::now() < deadline => {
                 let notified = job.changed.notified();
                 match job.state() {
-                    RemuxState::Failed(error) => return Err(error.into()),
+                    RemuxState::Failed(error) => {
+                        return fail_before_response(app, sock, req, job, head, error).await;
+                    }
                     RemuxState::Cancelled => {
                         tracing::debug!(
                             id = job.detail_id,
@@ -3342,7 +3368,15 @@ async fn serve_fragment_playlist(
                 if !complete {
                     crate::http_delivery::failed(crate::http_delivery::Outcome::TimedOut);
                 }
-                return Err("transcode produced no complete media segment".into());
+                return fail_before_response(
+                    app,
+                    sock,
+                    req,
+                    job,
+                    head,
+                    "transcode produced no complete media segment",
+                )
+                .await;
             }
             Err(error) => {
                 if error.starts_with("resource_limit:") {
@@ -3367,7 +3401,7 @@ async fn serve_fragment_playlist(
                     write_remux_response(app, sock, response, head).await?;
                     return Ok(());
                 }
-                return Err(error.into());
+                return fail_before_response(app, sock, req, job, head, error).await;
             }
         }
     };
@@ -3466,7 +3500,7 @@ async fn serve_hls_resource(
             write_remux_response(app, sock, response, head).await?;
             return Ok(());
         }
-        return Err(error.into());
+        return fail_before_response(app, sock, req, job, head, error).await;
     }
     if job.state() == RemuxState::Cancelled {
         tracing::debug!(
@@ -3480,7 +3514,15 @@ async fn serve_hls_resource(
         return Ok(());
     }
     if current_len_async(job).await? < slice_end {
-        return Err("HLS resource is outside the compatible output".into());
+        return fail_before_response(
+            app,
+            sock,
+            req,
+            job,
+            head,
+            "HLS resource is outside the compatible output",
+        )
+        .await;
     }
     let range = match req.header("Range") {
         None => None,
@@ -4792,6 +4834,55 @@ mod tests {
         assert!(wire.starts_with("HTTP/1.1 409 Conflict\r\n"), "{wire}");
         assert!(wire.contains("\"code\":\"transcode_cancelled\""), "{wire}");
         assert_eq!(runtime_status(&app).web_failures_producer_total, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_job_playlist_and_segment_requests_get_an_http_error() {
+        use tokio::io::AsyncReadExt;
+
+        // A dropped connection reads as a network fault in the browser, which
+        // then retries the same rendition instead of recovering the stream.
+        let dir = temp_dir("failed-fragment-requests");
+        let app = test_app(&dir, 1);
+        let (_key, job) = completed_ephemeral_job(&app, &dir, 42);
+        job.transition(RemuxState::Failed("controlled verification failure".into()));
+        for (request, playlist) in [
+            ("GET /web/media/42.m3u8?mode=compatible&request=7&delivery=mse&mse_after=0", true),
+            ("GET /web/media/42.m4s?mode=compatible&request=7&delivery=mse_segment&hls_offset=0&hls_length=8", false),
+        ] {
+            let request = HttpRequest::parse_headers(&format!(
+                "{request} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            ))
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_app = app.clone();
+            let served = job.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                if playlist {
+                    serve_fragment_playlist(&server_app, &mut socket, &request, &served, false, true)
+                        .await
+                } else {
+                    serve_hls_resource(
+                        &server_app,
+                        &mut socket,
+                        &request,
+                        &served,
+                        "video/iso.segment",
+                        false,
+                    )
+                    .await
+                }
+            });
+            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut wire = Vec::new();
+            client.read_to_end(&mut wire).await.unwrap();
+            server.await.unwrap().expect("the failure is answered, not dropped");
+            let wire = String::from_utf8(wire).expect("HTTP response is UTF-8");
+            assert!(wire.starts_with("HTTP/1.1 500 "), "{wire}");
+            assert!(wire.contains("\"code\":\"transcode_failed\""), "{wire}");
+        }
     }
 
     #[test]

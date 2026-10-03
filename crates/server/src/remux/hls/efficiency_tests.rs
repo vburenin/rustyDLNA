@@ -298,19 +298,22 @@ async fn same_completed_job_accepts_new_hls_generation_after_longer_copied_gop()
         .unwrap();
     std::fs::rename(&job.part, &job.dest).unwrap();
     job.transition(RemuxState::Complete);
-    assert!(serve(app.clone(), job.clone(), 10)
-        .await
-        .0
-        .unwrap_err()
-        .contains("restart required"));
+    // The old generation's published target cannot grow, so its playlist is
+    // refused with an HTTP error (not a dropped connection) and no playlist.
+    let (result, text) = serve(app.clone(), job.clone(), 10).await;
+    result.unwrap();
+    assert!(text.starts_with("HTTP/1.1 500 "), "{text}");
+    assert!(text.contains("\"code\":\"transcode_failed\""), "{text}");
+    assert!(!text.contains("#EXTM3U"), "{text}");
     let (result, text) = serve(app.clone(), job.clone(), 11).await;
     result.unwrap();
     assert!(text.contains("#EXT-X-TARGETDURATION:3\n"));
     assert_eq!(text.matches("#EXTINF:").count(), 3);
     assert!(text.ends_with("#EXT-X-ENDLIST\n"));
+    let (_, text) = serve(app, job, 10).await;
     assert!(
-        serve(app, job, 10).await.0.is_err(),
-        "the old generation remains frozen"
+        text.starts_with("HTTP/1.1 500 ") && !text.contains("#EXTM3U"),
+        "the old generation remains frozen: {text}"
     );
 }
 
