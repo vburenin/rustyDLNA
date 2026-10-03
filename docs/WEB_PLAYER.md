@@ -520,8 +520,9 @@ or terminating a source aborts its pending reads and clears timers/listeners.
 A live copied-HEVC or encoded-HEVC/HDR generation gets
 one fresh Media Source attachment at the same position and quality. That
 reattachment adopts the existing producer instead of cancelling it first. The
-forward buffer is limited to about ten seconds and retains about five seconds
-behind playback; initial audio priming or reordered-video timestamp gaps are
+forward buffer targets about 30 seconds of wall-clock playback, so it holds
+more media at faster playback rates (60 media seconds at 2x, at most 120), and
+retains about five seconds behind playback; initial audio priming or reordered-video timestamp gaps are
 counted in that limit even before the media clock advances. Initialization and
 retained movie fragments also have a 96 MiB compressed-byte budget; a fragment
 remains fully charged until it is evicted. This is an estimate of encoded data,

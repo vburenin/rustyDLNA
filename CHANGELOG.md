@@ -26,6 +26,10 @@ publish a signed, content-addressed OCI image with SBOM and provenance.
   abandoning stream copying or lowering quality. Quality is lowered only after
   those retries are exhausted. A slow link that keeps delivering a large
   fragment is no longer cut off by a fixed whole-request deadline.
+- Increased the Media Source playback reserve from ten media seconds to about
+  30 seconds of real time, scaled by the playback rate, within the existing
+  compressed-byte budget.
+
 - Added operator library-maintenance tools under `contrib/library/` for NFO,
   posters, generated genre/year/age views, and timeline previews. They take
   `--root` or `RUSTY_DLNA_MEDIA`, keep caches in `<library>/.rusty-library/`,

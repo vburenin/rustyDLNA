@@ -20,6 +20,7 @@ import {
   chooseSource,
   compatibleSegmentStart,
   compatibleDecodeRecovery,
+  mediaSourceBufferAheadSeconds,
   clockLabel,
   compatibleVideoDimensions,
   directSourceSupported,
@@ -1367,4 +1368,15 @@ test("Media Source distinguishes preparation, undecoded bytes, seeking, and stop
   assert.equal(mediaSourceStallReason({ ...progress, firstFragmentAt: 1_000, seeking: true, now: 21_000 }), null);
   assert.equal(mediaSourceStallReason({ ...progress, hasFrame: true, preparationAt: 20_000, now: 20_000 }), "playback progress");
   assert.equal(mediaSourceStallReason({ ...progress, hasFrame: true, playbackAt: 19_999, now: 20_000 }), null);
+});
+
+test("Media Source reserve is wall-clock time at the current playback rate", () => {
+  // Independent expectation: 30 s of wall time, never less than at 1x.
+  assert.equal(mediaSourceBufferAheadSeconds(1), 30);
+  assert.equal(mediaSourceBufferAheadSeconds(2), 60);
+  assert.equal(mediaSourceBufferAheadSeconds(1.5), 45);
+  for (const rate of [0.5, 0, -1, Number.NaN, undefined, "fast"]) {
+    assert.equal(mediaSourceBufferAheadSeconds(rate), 30, String(rate));
+  }
+  assert.equal(mediaSourceBufferAheadSeconds(16), 120);
 });

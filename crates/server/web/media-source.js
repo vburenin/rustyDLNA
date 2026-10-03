@@ -1,6 +1,6 @@
 // Abort-scoped Media Source transport and bounded buffering.
 // Source selection, playback intent, and recovery belong to the player.
-import { bufferedSeekTarget, bufferedRangeSecondsAhead, fallbackMediaSourceType, parseHlsMediaPlaylist, mediaSourceStartupBudget, reusableMediaSourceSeek, retainedMediaSourceBytes } from "./core.js";
+import { bufferedSeekTarget, bufferedRangeSecondsAhead, fallbackMediaSourceType, mediaSourceBufferAheadSeconds, parseHlsMediaPlaylist, mediaSourceStartupBudget, reusableMediaSourceSeek, retainedMediaSourceBytes } from "./core.js";
 
 // Copied UHD fragments can exceed 10 MB per second. Keep the total window
 // below Chromium's practical SourceBuffer quota instead of treating every
@@ -8,7 +8,6 @@ import { bufferedSeekTarget, bufferedRangeSecondsAhead, fallbackMediaSourceType,
 // generation for distant seeks; retain a useful bounded nearby-seek window.
 export const MEDIA_SOURCE_RESOURCE_MAX_BYTES = 32 * 1024 * 1024;
 export const MEDIA_SOURCE_BUFFER_MAX_BYTES = 96 * 1024 * 1024;
-const MEDIA_SOURCE_BUFFER_AHEAD_SECONDS = 10;
 
 export class MediaSourceResourceError extends Error {
   constructor(message) { super(message); this.name = "MediaSourceResourceError"; this.code = "resource_limit"; }
@@ -468,7 +467,7 @@ export async function pumpMediaSource({
         await waitForMediaSourcePlayback(player, signal);
       }
       while (!needsSeekData() && bufferedSecondsAhead(sourceBuffer, player.currentTime)
-        >= MEDIA_SOURCE_BUFFER_AHEAD_SECONDS) {
+        >= mediaSourceBufferAheadSeconds(player.playbackRate)) {
         await abortableDelay(250, signal);
       }
       const advertisedBytes = Number(new URL(segmentUrl).searchParams.get("hls_length"));

@@ -50,6 +50,19 @@ export function itemDuration(item, mediaDuration = 0) {
   return Number.isFinite(mediaDuration) && mediaDuration > 0 ? mediaDuration : 0;
 }
 
+// The Media Source pump keeps a reserve of wall-clock time, not media time:
+// media drains faster at higher playback rates. Slower rates keep the 1x
+// reserve. The separate compressed-byte budget still bounds high-bitrate
+// copied video, so this only lengthens the reserve when memory allows it.
+export const MEDIA_SOURCE_BUFFER_AHEAD_WALL_SECONDS = 30;
+export const MEDIA_SOURCE_BUFFER_AHEAD_MAX_MEDIA_SECONDS = 120;
+
+export function mediaSourceBufferAheadSeconds(playbackRate) {
+  const rate = Number(playbackRate);
+  const scale = Number.isFinite(rate) && rate > 1 ? rate : 1;
+  return Math.min(MEDIA_SOURCE_BUFFER_AHEAD_MAX_MEDIA_SECONDS, MEDIA_SOURCE_BUFFER_AHEAD_WALL_SECONDS * scale);
+}
+
 export function bufferedRangeSecondsAhead(ranges, currentTime, startTolerance = 1) {
   const current = Number(currentTime);
   const tolerance = Math.max(0, Number(startTolerance) || 0);
