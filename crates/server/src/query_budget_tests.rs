@@ -765,7 +765,15 @@ fn heavy_catalog_admission_bounds_fallback_and_leaves_light_routes_available() {
             .status,
         200
     );
-    assert!(start.elapsed() < Duration::from_millis(250));
+    // A route that took the saturated catalog gate would wait out the whole
+    // query budget. Half of it separates that from ordinary handling, whose
+    // debug-build JSON rendering alone can take hundreds of milliseconds while
+    // the full suite saturates the CPU.
+    assert!(
+        start.elapsed() < crate::catalog_query::CATALOG_QUERY_BUDGET / 2,
+        "light routes waited for catalog admission: {:?}",
+        start.elapsed()
+    );
     {
         let mut control = QueryControl::new(app.runtime_metrics.queries.clone());
         control.deadline = Instant::now() + Duration::from_millis(40);
