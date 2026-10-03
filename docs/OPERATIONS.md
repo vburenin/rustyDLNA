@@ -56,6 +56,15 @@ restart and enough underlying storage. Profile-8 delivery normally converts
 small fragments before streaming; `helper_max_jobs = 1` uses sequential
 whole-video staging and needs enough quota for those intermediates.
 
+Set the quota above the largest compatible output you expect. A copied-video
+Compatible output is roughly the source's video and selected audio size, so a
+UHD remux can need tens of GiB. Active outputs are never evicted. When active
+outputs alone exceed the quota or the free-space target, maintenance keeps every
+completed entry (evicting them could not make room), logs a warning naming
+`cache_max_mb`, and stops the oversized producer. New admissions in that state
+return `503 transcode_storage` and count in
+`web_player.failures.storage_total`.
+
 Derived JPEG maintenance reuses an inventory built at startup. Successful cold
 requests update only active output paths and the eviction candidates they need;
 they do not enumerate the directory before and after each image. On-demand
@@ -99,10 +108,16 @@ rollback and privileged retries. Occupied destinations (even dangling symlinks
 or concurrent arrivals) are preserved; cross-device and unsupported native
 rename operations fail without moving the source. A rollback collision reports
 paths that need manual recovery. Existing Streamer derivatives must pass
-compatibility and duration checks before an original is archived. Preview
+compatibility and duration checks before an original is archived. Intake
+waits for loose files to settle, skips files `lsof` reports open for writing,
+and files only containers that every catalog builder also processes. Preview
 generation enforces an absolute per-attempt deadline even when progress output
-stalls mid-line, with at most five seconds of termination grace before killing
-the helper group and reaping its child. See the
+stalls mid-line, plus a stall timeout that moves a hung hardware decoder to
+software decoding, with at most five seconds of termination grace before
+killing the helper group and reaping its child. The poster fetcher never
+deletes or overwrites existing artwork and skips items that already have any
+artwork name rustyDLNA recognizes; posters and NFO files follow the operator's
+umask. See the
 [operator guide](../contrib/library/README.md#safe-intake-and-conversion) for
 platform requirements and replacement options.
 
@@ -130,6 +145,23 @@ Back up the database with SQLite's online backup mechanism or stop the service
 before copying `files.db`, `files.db-wal`, and `files.db-shm` together. Always
 run `rusty-dlna --config CONFIG --database-check` after restore. Generated image
 and transcode files are disposable; the database and persisted UUID are not.
+
+Startup opens the database once with a full SQLite `integrity_check` before any
+long-lived connection exists. If SQLite reports the file as corrupt or not a
+database, startup renames it and its `-wal`/`-shm` files to
+`files.db.corrupt-<timestamp>-<pid>*` and builds a fresh catalog; restore
+bookmarks from that copy or a backup if needed. Later opens (scanner passes,
+stage backups, and writer reopen) skip the full check and never rename the
+live files: corruption found while running is logged as a failed pass and
+reported through the scheduled background `quick_check`, and a restart applies
+the startup recovery.
+
+Rolling back to an older image after an upgrade can leave `files.db` at a
+newer schema version. The older build refuses to open it, and leaves the file
+unchanged, with "library database schema vN is newer than this build supports".
+Run the newer release again or restore a database backup made by the older
+version. Do not delete the file to work around this; that also discards
+bookmarks.
 
 The scanner creates hidden `.rusty-dlna-scan-stage-*` files beside `files.db`.
 It reserves each stage with a lifetime advisory lock, reuses it across watcher
@@ -161,15 +193,28 @@ private scanner stage, even when their old stream-probe revision was current.
 Helper admission and scanner preparation remain bounded, but operators should
 allow one full reconciliation's media-probe time for this upgrade.
 
+The startup stream-metadata backfill also re-probes, once, catalog entries
+whose stored stream descriptor was recorded before embedded-subtitle discovery.
+On a library scanned by an older release this is close to one media probe per
+physical file, so allow that time for the first startup after upgrading.
+The backfill publishes once, at the end; if the server stops before then, the
+next startup begins it again.
+Files whose earlier probe failed are not retried. A probe that reaches its
+helper deadline is logged ("media probe timed out; it will be retried") and
+retried by later reconciliations, up to three consecutive times, before it is
+cached as failed until the file changes. While it waits, an unchanged file
+keeps stream metadata recorded at the current probe revision; a replaced or
+modified file has no stream metadata until a probe succeeds.
+
 ## Alerts
 
 ### Health contract
 
 `/health` is a bounded, cached liveness/readiness check. It does not walk the
 catalog or transcode cache and it does not run SQLite `quick_check` inline.
-The database is checked once during startup; a health/status poll schedules at
-most one background refresh after five minutes, and a result older than fifteen
-minutes is reported as stale. `/api/status` is the detailed operator endpoint
+The database gets a full integrity check once during startup; a health/status
+poll schedules at most one background `quick_check` refresh after five minutes,
+and a result older than fifteen minutes is reported as stale. `/api/status` is the detailed operator endpoint
 and includes catalog counts and all telemetry.
 
 The HTTP contract is deliberate:
@@ -178,7 +223,11 @@ The HTTP contract is deliberate:
   database, helper, and enabled remux components are ready;
 - `degraded` returns 200 because the server remains usable, but requires an
   operator alert. Examples include loss of one redundant scan worker, low cache
-  space, helper saturation, or stale reconcile/integrity freshness; and
+  space, helper saturation, or stale reconcile/integrity freshness. Reconcile
+  freshness (three times the resolved maximum interval, at least fifteen
+  minutes) applies only while periodic reconciliation is enabled; with
+  `rescan_secs = 0` a quiet library publishes nothing, so watcher liveness and
+  `scanner.last_error` remain the scanner signals; and
 - `unhealthy` returns 503 for loss of the HTTP accept loop, a failed database
   integrity result, or complete loss of scan/watch publication.
 
@@ -308,13 +357,21 @@ after process exit.
 
 ## Large-library reconciliation cadence
 
-`rescan_secs` is the minimum interval for a full root reconciliation; zero
-disables the periodic worker. `rescan_max_secs` optionally enables adaptive
-backoff and must be zero or at least the minimum. Zero preserves the fixed
-legacy cadence. With a maximum configured, an unchanged walk doubles the
-interval and a costly walk also targets at most a five-percent reconciliation
-duty cycle, capped by the maximum. A detected change or failure resets the next
-interval to the minimum.
+`rescan_secs` is the minimum interval for a full root reconciliation (default
+300 seconds); zero disables the periodic worker. `rescan_max_secs` is the
+adaptive upper bound. When omitted it is 3600 seconds, or `rescan_secs` when
+that is larger; an explicit value must be zero or at least the minimum, and an
+explicit zero keeps a fixed `rescan_secs` cadence. With a maximum above the
+minimum, an unchanged walk doubles the interval and a costly walk also targets
+at most a five-percent reconciliation duty cycle, capped by the maximum. A
+detected change or failure resets the next interval to the minimum.
+`--print-effective-config` reports the resolved `reconcile_secs = min..max`.
+
+Inotify publishes ordinary local changes without waiting for this walk. On
+NFS, SMB/CIFS, and FUSE mounts, changes made by another host raise no inotify
+events, so the periodic walk is the only way those files are discovered: an
+idle library notices them within the maximum interval. Lower `rescan_max_secs`
+(or set it to zero) for such roots when new media must appear sooner.
 
 Normal inotify file bursts remain targeted and do not walk every media root.
 Directory topology changes, queue overflow, or a burst of at least 256 unique
@@ -341,6 +398,76 @@ reported as `scanner.watch_count`. If a replacement runs out of watch capacity,
 the old tree remains active and rustyDLNA retries the rebuild and full
 reconciliation with bounded backoff; raising the host limit lets this retry
 recover without a restart.
+
+### Unavailable roots and unreadable directories
+
+rustyDLNA holds a configured media root, instead of reading it as deleted
+media, when the root is missing, is not a directory, or cannot be listed. A
+whole-library pass (periodic reconciliation, a full scan, or an object rebuild)
+also holds a root that lists no entries while the catalog still has items under
+it, if the root's device (`st_dev`) differs from the one the last successful
+pass recorded. An unmounted NFS, SMB, or USB mount point looks like that, and so
+does a bind mount that captured the empty directory underneath one. rustyDLNA
+logs a `media root unavailable` warning on each pass. The held root's items,
+item IDs, Kodi/DLNA bookmarks, NFO metadata, and playlists stay as they are.
+Every other root is reconciled normally, and startup is not blocked. The root is
+reconciled again on the first pass after it returns: a remount triggers no
+inotify event, so that is normally the next periodic reconciliation.
+
+Root availability is checked when a pass starts and again after its walk,
+before any row is judged, so a root that disappears while earlier roots are
+being walked is held as well. A symlink or hard link in another root does not
+bypass the hold: when a dangling link is removed, the rows of the same physical
+file under a held root are kept. An inotify-targeted pass checks only the roots
+owning its events, so it also keeps such rows while their root lists no
+entries and leaves them to the next whole-library pass.
+
+The inotify watcher still requires every configured root to exist and be
+readable. If a root is missing or unreadable when the watcher starts, the
+watcher does not start and the scanner status reports `degraded`. Periodic
+reconciliation keeps running, and restarting the server after the root returns
+restores live watching. If a root disappears while the watcher is running, the
+watcher keeps its current tree and retries the rebuild with bounded backoff.
+An empty mount point does not affect the watcher.
+
+A root that is emptied on the device the server last recorded converges
+normally. That covers deleting its last file or last folder, including a
+recordings or `Incoming` root that is often empty. One exception: a catalog
+written before root devices were recorded cannot tell an emptied root from an
+unmounted one. Such a root is held until any entry appears in it (an empty
+`.keep` file is enough) or the root is removed from configuration. After that,
+the device is recorded and later emptying converges. Targeted inotify passes
+never apply the empty-root rule.
+
+A directory nested inside a root that is itself a mount point (for example
+`/media/nas` inside the root `/media`) is not a configured root. If that mount
+drops and leaves an empty directory, its items are removed like any other
+deleted folder. Configure such a mount as its own root to have it held.
+
+A subdirectory below a root that the server cannot read (`EACCES`/`EPERM`, for
+example a `0700` folder owned by another user while the container runs as uid
+10001) is held the same way, with one warning per path. It does not fail the
+scan or the watcher. Items already in the catalog under it keep their IDs,
+bookmarks, NFO metadata, and playlists. A file the OS refuses to open, or one
+that returns a stale handle or an I/O error, is kept rather than treated as
+deleted. That holds for full reconciliation and inotify-targeted passes alike,
+and for a symlink whose target cannot be opened. Only affirmative absence
+(`ENOENT`, `ENOTDIR`, `ELOOP`), root confinement, or configured exclusions
+remove a row.
+
+Other errors while listing a subdirectory, such as `EIO`, `ENOTCONN`, or a
+stale NFS handle, fail the whole-library pass so a failing mount cannot hide
+content. A single dead nested FUSE or NFS directory therefore stops every
+periodic reconciliation and full scan until it is fixed or unmounted. The
+published catalog stays as it is, the scanner status reports the error, and the
+pass is retried. Targeted inotify passes for other directories keep working.
+
+A held subdirectory gets no inotify watch. The watcher does not observe
+permission changes, so after the permissions are fixed, the next periodic
+reconciliation indexes the directory. The directory is watched again on the
+next watcher tree rebuild, which happens after a directory is created, removed,
+or renamed, or after a queue overflow. Until then, changes inside it are picked
+up only by periodic reconciliation.
 
 ## Original-file delivery measurements
 
@@ -412,8 +539,18 @@ The structured shutdown log includes `duration_ms`, `budget_ms`,
 `deadline_exceeded`, `jobs_remaining`, and `notifications_stopped`. Alert when
 `deadline_exceeded` is true, `jobs_remaining` is nonzero, or
 `notifications_stopped` is false. Keep an outer supervisor deadline above the
-application budget; the shipped systemd unit uses `TimeoutStopSec=45s` for the
-default 15-second application budget.
+application budget; the shipped systemd unit uses `TimeoutStopSec=45s` and the
+live `docker-compose.yaml` uses `stop_grace_period: 45s` for the default
+15-second application budget, and `restart.sh` stops the container with the
+same 45-second timeout. If you raise `shutdown_timeout_secs` (at most 120),
+raise those outer deadlines with it, or the supervisor can `SIGKILL` the daemon
+before helpers are reaped and the shutdown log is written.
+
+After `graceful shutdown complete`, the runtime gets one more second to join
+blocking work. A blocking read still stuck on a hung media mount is then
+abandoned to process exit, like late scan and notification workers, rather than
+holding the process until the supervisor kills it. Only a thread blocked in an
+uninterruptible kernel wait can still delay the final exit.
 
 Poll `/api/status` and alert on these conditions:
 

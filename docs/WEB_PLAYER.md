@@ -54,8 +54,16 @@ A numbered movie has the filename form `NN - Title (YYYY) ...`; episode and
 workout filenames without that movie year remain ordinary entries. Nested
 collection folders form their own groups. The browser shows a heading for each
 collection and joins its cards across page boundaries. Recently added,
-episode/track ordering, physical folder browsing, and DLNA sorting retain their
-existing behavior. No media filenames or metadata are rewritten.
+episode/track ordering, physical folder browsing, and DLNA sorting do not
+group collections. No media filenames or metadata are rewritten.
+
+Recently added (`sort=date_desc`) orders by the stored file modification time,
+newest first, like the DLNA Recently Added views. NFO premiere dates and
+embedded or container dates never reorder it. Copies that preserve the old
+modification time (`rsync -a`, `cp -p`) therefore sort by that original time.
+Folders honors the selected sort for its media: subfolders always come first in
+name order, then media follow Title (file name), Recently added, or
+Episode/track order.
 
 Folders follows the physical media tree. All media, Videos, and Audio use the
 SQLite-backed searchable catalog, with a bounded in-memory fallback if the
@@ -79,6 +87,14 @@ also offers Download original for the current video, using the same download
 endpoint without restarting or changing playback.
 Empty searches offer Clear search without changing the current view or playback.
 An empty Continue watching view explains that progress is saved in this browser.
+Continue watching is always ordered by most recent progress, so it hides the Sort
+control and ignores `sort`. Its URL still carries the sort chosen for the other
+views, so that choice survives a reload or Back/Forward onto Continue watching.
+Clear progress moves keyboard focus to the neighbouring card (or the library
+panel when the list becomes empty) and announces which title was cleared.
+While a view loads, the header and result summary say “Loading…” (“Connecting…”
+only before the server first answers) instead of the previous view's count. A
+failed load clears the previous count and folder path.
 
 On short touch-screen landscape viewports, Watch keeps the compact application
 header in the page and places the 16:9 player beside an independently scrolling
@@ -104,6 +120,22 @@ keeps a singleton queue. Card selection retains the complete loaded-list snapsho
 A changed generation causes a guarded item refetch; a superseded navigation
 cannot start playback or move focus. Queue changes also update the URL,
 page title, and current library card without adding history entries.
+Library navigation while a title plays keeps that title in each new URL. Back
+or Forward to an entry for the title that is already playing changes only the
+library: playback, its source, queue, and position continue, and an old `t` in
+that entry does not seek. This includes a title that has already finished: it
+stays on Replay rather than restarting. A failed session can still be retried
+from history.
+Each history entry also remembers its list position and the card that was
+opened from it. Back/Forward restores that position after the list loads (in
+the independently scrolling landscape library, its own scroll offset) and
+focuses the folder card that was opened, unless a title selection owns focus.
+The URL remains the navigation identity; the remembered position is only a hint
+and falls back to the top when the card no longer exists. Reloading a page
+restores its position the same way. The position is saved before each
+navigation, when scrolling settles (500 ms), and on `pagehide`; it is
+best-effort, so Back pressed within that interval after scrolling leaves the
+entry with its last settled position.
 
 Metadata titles from NFO files or tags are primary. The filename is shown only
 as secondary information when it differs. For videos, Details exposes the
@@ -128,7 +160,16 @@ its cards. It assembles one catalog generation using batches of up to 200 entrie
 and at most four concurrent requests. The complete list stays in browser memory;
 scrolling loads only nearby posters and does not insert cards or adjust the scroll
 position. Changing views cancels unfinished metadata requests, and a failed batch
-offers Retry without exposing an incomplete list.
+offers Retry without exposing an incomplete list. A catalog publication during
+loading (`409 catalog_changed`, or a page from a different generation) and a
+momentarily busy server (`503 catalog_busy`) are retried automatically twice,
+after about 250 ms and 1 s with jitter. Each retry restarts the whole snapshot
+from its first page; navigation during a backoff cancels it. Other errors, and a
+race that persists, show Retry. A busy server is described as busy rather than
+as a connection problem. When the browser comes back online, a load that failed
+in transport is retried once. A reload that hides a focused Retry or empty-state
+action, whether started by the user or by reconnecting, moves keyboard focus to
+the library panel; if that load fails again, focus returns to the same Retry.
 For lists of at least 500 entries, browsers supporting `content-visibility`
 skip offscreen rendering in batches of cards. Card creation yields between
 bounded private batches, then publishes the complete list at once. Navigation
@@ -274,6 +315,32 @@ supported AAC, AC-3, E-AC-3, or MP3 audio are copied unchanged into fragmented
 MP4. Only unsupported streams are re-encoded. Any explicit quality still
 re-encodes video to apply the requested output envelope.
 
+Server-side copy eligibility is stricter than a codec name. H.264 must be
+8-bit 4:2:0 Baseline, Main, or High at level 5.1 or lower. HEVC must be Main,
+Main 10, or Main Still Picture, 4:2:0, at most 10 bits, and SDR, HDR10, or Dolby
+Vision Profile 8; Range Extensions (4:2:2, 4:4:4, 12-bit) are re-encoded. HEVC
+profile, pixel-format, and bit-depth facts that item enrichment has not probed
+yet do not block a copy. Each video DTO
+reports the result as `video_copy_available`, which also accounts for sources
+that need frame-order repair and is false whenever compatible playback is
+disabled. `video_content_type` stays the browser's codec probe input: it is
+null when the codec, profile, or bit depth is not copy-eligible or no RFC 6381
+string is stored, but it can be non-null for a source that needs frame-order
+repair or on a server with transcoding disabled. Clients decide whether to copy
+from `video_copy_available`, not from `video_content_type`.
+
+A browser `video_mode=copy` request for an ineligible source returns
+`400 video_copy_unavailable`; the player negotiates from the DTO first. A native
+request marked `reason=native_ios` at Auto quality is encoded instead, because
+installed clients request copy for every H.264/HEVC source and cannot retry a
+rejected download. An SDR source becomes the same H.264 SDR encode as an
+explicit `video_mode=transcode&video_output=h264_sdr` request. An HDR source
+becomes the explicit `hevc_hdr10` encode when `prepared_video_outputs` lists
+it; otherwise the request is still rejected so HDR is never silently replaced
+by SDR. The fallback is derived only from the URL and stored probe facts, so
+seeks, HLS resources, downloads and cache identity resolve to that encode, and
+`/api/web/transcode` reports its effective encoder.
+
 The scanner also samples presentation and decode timestamps before approving
 H.264/HEVC stream copy. Some malformed MP4 files contain reordered frames but
 store every presentation timestamp in decode order; copying those packets
@@ -288,7 +355,15 @@ at playback time, the player retries once with portable H.264 and AAC. The
 information dialog states that a repair encode is active and why it is needed.
 
 When available, Media Session receives title, artist, album, artwork, duration,
-position, and transport handlers. Fullscreen or expanded video requests Screen
+position, and transport handlers. Previous and Next track handlers are
+registered only while they can act, so lock-screen, notification, and browser
+media controls hide them for a single title or at the ends of a queue. With
+chapters, Previous stays available after the first three seconds of the first
+chapter (it restarts the chapter), and Next stays available until the final
+chapter. A pause from Media Session or the keyboard is the user's choice even
+while the page is hidden; only a pause the platform makes on its own there
+(device lock or background suspension) keeps the previous playing intent.
+Fullscreen or expanded video requests Screen
 Wake Lock while playing and releases it on pause, end, error, source replacement
 or cancellation, visibility loss, or exit. A request that finishes after one
 of those transitions is released instead of being retained; unsupported or
@@ -297,7 +372,11 @@ denied platform APIs are nonfatal.
 ## Keyboard shortcuts
 
 Shortcuts apply only while the player is focused or hovered, or while it is in
-fullscreen. They are not captured in inputs, selects, or text areas. Transport
+fullscreen. They are not captured in inputs, selects, or text areas, except
+the position slider: while it has focus, Left/Down and Right/Up move back or
+forward 10 seconds, Page Down and Page Up move 60 seconds, and Home and End go
+to the start or end, instead of the range's native 0.1-second step. Rapid
+presses accumulate and share the normal Compatible seek debounce. Transport
 shortcuts leave buttons alone. Open modal dialogs own their keyboard input, so
 Escape closes the dialog without changing playback or display mode. Escape in
 the captions popup closes it and restores focus to Captions before exiting
@@ -365,6 +444,10 @@ Publication preserves the generation's pinned output descriptor for playlist,
 fragment and range reads. Stopping and immediately restarting the same output
 waits up to two seconds for the cancelled producer to release its helper/GPU
 permits and finish cleanup; longer cleanup returns `503 transcode_busy`.
+Admission that cannot fit the transcode cache quota or minimum free space
+returns `503 transcode_storage` with `Retry-After: 30` instead, because another
+generation finishing does not clear it. The browser player treats it like other
+503 responses.
 New generations never attach to a producer whose cancellation has begun.
 Cancelling one session leaves a producer owned by other sessions usable.
 
@@ -462,9 +545,13 @@ Stream details show the successful recipe, including cached fallback reuse.
 Native HLS advertises independently
 decodable keyframe-aligned segments, grouping dependent copied fragments;
 encoded segments are approximately one second. It retains the complete EVENT
-history. A later copied GOP above an already published target duration requires
-a new playlist generation, which can use the larger known maximum. Native Safari
-recovery for that case is not established by WebKit automation. After Media
+history. A growing copied-video generation first waits up to five seconds for
+20 seconds of complete segments, then publishes a target duration of at least
+10 seconds, so ordinary encoder keyframe intervals that grow after startup stay
+within it; complete output uses its exact longest segment. A later copied GOP
+above an already published target duration still requires a new playlist
+generation, which can use the larger known maximum. Native Safari recovery for
+that case is not established by WebKit automation. After Media
 Source has one playable fragment, pausing also suspends its playlist polling and media
 downloads until Play. An exact seek within a ten-second server bucket keeps
 its target pending until the corresponding fragment is buffered and the native
@@ -513,7 +600,13 @@ clock. Before the first fragment, or while a seek target is being assembled,
 triggers recovery; preparation has an absolute five-minute limit. Deliberate
 pause, an autoplay block, and background suspension suspend the playback
 watchdog; resuming gets the normal grace without replenishing automatic retry
-budgets. A pending seek keeps its preparation budget even while paused. Network
+budgets. A decoded element that the platform paused on its own while the page
+was hidden also suspends the playback-progress check, even
+though playing intent is kept for the next Play or seek; returning to the page
+does not restart such a stream. Any other paused element whose intent is still
+playing (for example a rejected `play()`) keeps the watchdog. The startup, first-frame, and preparation
+limits still apply to a paused element that has not presented a frame. A
+pending seek keeps its preparation budget even while paused. Network
 and SourceBuffer operations remain bounded while paused.
 All deadline failures share the existing source-owned recovery promise. Replacing
 or terminating a source aborts its pending reads and clears timers/listeners.
@@ -555,7 +648,10 @@ a seek. Unsupported video or audio is converted to portable H.264/AAC before
 fragmented delivery. Desktop copied H.264 or HEVC with converted AAC also uses
 Media Source when its exact type is accepted; through the native loader,
 Chrome can keep playing the converted audio while the copied video never
-decodes.
+decodes. These advertised types declare a video track, so Compatible audio
+titles never use Media Source; their audio-only `audio/mp4` output uses the
+browser's native loader, and a seek restarts it at the new position. Automatic
+recovery for audio never lowers the (video) quality profile.
 When Auto chooses an advertised-supported Original video but it remains loading
 or buffering for twelve seconds without playing, the player preserves the
 position and switches to the safest lower-bandwidth Compatible profile. This
@@ -565,7 +661,14 @@ When Safari hides the page for device sleep or backgrounding, the player marks
 the native HLS attachment as suspended. The next Play—whether it comes from
 rustyDLNA's controls or native media controls—starts a fresh HLS generation at
 the saved global position instead of trusting Safari's stale buffered-ready
-state. A newly attached playlist that requests no media fragments is reopened
+state. Safari keeps a background tab (or Picture in Picture) playing; if the
+element is still playing when the page returns and its media clock advanced by
+at least half of the hidden wall-clock time (scaled by the playback rate), the
+attachment was never suspended and a later pause and play resumes it without a
+new generation. Device sleep can drain about a second of buffer before the
+decoder stops without a pause event, so a long hidden period with only a little
+clock progress keeps the suspension mark; the cost of a wrong mark is one extra
+generation, while a wrong clear would stall the resume. A newly attached playlist that requests no media fragments is reopened
 after twelve seconds; a second startup stall advances to the normal bounded
 fresh-generation recovery instead of leaving the controls on `Preparing
 video…` indefinitely. Title selection requests playback while the selecting
@@ -756,7 +859,13 @@ so repeated exact seeks cannot retain movie-length cache tails. A nonzero
 mixed seek with copied audio decodes a bounded five-second lead and then trims
 both streams at the requested time, preventing copied AAC preroll from starting
 ahead of newly encoded video. A copied-video seek retains keyframe preroll so
-the first output video packet remains independently decodable.
+the first output video packet remains independently decodable. Output time zero
+is therefore that keyframe, not the requested start; the generation status
+reports it as `stream_start_seconds` once known, to within a fraction of a
+second, and only to the session and generation that own it. It stays `null`
+when a generic-seek container such as MPEG-TS lands between keyframes, because
+audio then starts before the first copied video frame. The embedded player
+does not yet use that field and keeps its requested-start offset.
 
 The browser keeps the last decoded video frame visible while a direct seek or
 compatible replacement stream is pending. The held frame is bounded to about
@@ -853,19 +962,33 @@ preloads the next window within 45 seconds of its edge, and adds each cue once.
 Busy (503), timed-out (504), and network failures retry up to three times before
 the caption error is shown. Sidecar tracks keep loading their complete `url`. Unknown or duplicate parameters are rejected. Generated events with
 nonpositive duration are omitted instead of invalidating the whole track;
-sidecar validation remains strict.
+SubRip and ASS/SSA sidecars omit individual unusable cues the same way (see
+below); WebVTT sidecar validation remains strict.
 
 Item DTOs include `embedded_captions_complete`. When false, fetch the same item
 with `enrich=1` to discover tracks from an older catalog without a rescan. New
-scans persist subtitle descriptors. Clients can store all advertised supported
-tracks alongside an offline video, independently of the current selection.
+scans persist subtitle descriptors, and startup backfill re-probes catalog rows
+recorded before subtitle discovery once. A file whose scan probe failed (cached
+until the file changes) reports `true`: a live probe cannot discover anything
+more, so clients should not request enrichment for it. Enrichment applies the
+media path's `.probe.toml` overrides exactly as the catalog does. Clients can
+store all advertised supported tracks alongside an offline video,
+independently of the current selection.
 
 Indexed sidecar `.vtt`, `.srt`, `.ass`, `.ssa`, `.smi`, and `.sub` captions are
 exposed with stable indexes, labels, an inferred language subtag from the
 dot-owned filename variant, and source format. Browser-selectable entries also
-receive a same-origin WebVTT URL. Text must be valid UTF-8 and pass the bounded
-sidecar read and cue validation. VTT is normalized; SRT, ASS/SSA, and SMI are
-converted to WebVTT. Literal `-->` in SubRip cue text is escaped for WebVTT
+receive a same-origin WebVTT URL. Text must pass the bounded sidecar read and
+cue validation. Valid UTF-8 is used as is; a UTF-16 byte-order mark selects
+UTF-16; any other text is decoded as Windows-1252, the usual encoding of older
+Western subtitles. Other legacy code pages (for example Cyrillic Windows-1251)
+therefore display incorrect characters instead of failing the track. Undecodable
+UTF-16 returns `422 caption_encoding`. VTT is normalized; SRT, ASS/SSA, and SMI
+are converted to WebVTT. In SRT and ASS/SSA, a cue with an unreadable or
+nonpositive timing, or with no text, is omitted rather than failing the file;
+an SRT text block without a timing line continues the previous cue, which
+handles a stray blank line inside dialogue. A file with no usable cue still
+returns `422 caption_malformed`. Literal `-->` in SubRip cue text is escaped for WebVTT
 so it remains visible text while supported cue markup is preserved.
 WebVTT validation distinguishes the signature from annotations, requires valid
 cue timestamps, and retains supported cue identifiers, settings, markup, comments,
@@ -911,8 +1034,11 @@ late loads or errors cannot affect the current selection.
 
 Audio language, title, channel count, codec, default disposition, and chapters
 are normally read from compact scan metadata. Legacy records can request a
-strict, helper-admitted one-item enrichment probe. The UI shows loading and a
-retry action if that probe fails. Selecting a different audio track explains
+strict, helper-admitted one-item enrichment probe. It waits at most ten seconds
+for helper admission (less when `helper_queue_timeout_secs` is lower) and the
+probe itself at most ten seconds, so a busy server answers `503 transcode_busy`
+with `Retry-After` before common 30-second client timeouts. The UI shows
+loading and a retry action if that probe fails. Selecting a different audio track explains
 that Compatible playback is required. English-tagged audio (`eng`, `en`, and
 regional variants) is preferred over a non-English file default. In Auto mode,
 the player starts Compatible playback when necessary to enforce that choice;
@@ -938,11 +1064,36 @@ discarded. A partially watched title offers Resume and Start over, appears in
 Continue watching, and starts Compatible playback directly at the saved
 offset. The resume choice is the top player overlay, suppresses transient video
 controls until a choice is made, and keeps both actions at touch-target size on
-small screens. Blocked/private storage degrades without preventing playback.
+small screens. When it appears, Resume takes keyboard focus if the user chose
+the title from a card or focus is unclaimed or inside the player; focus that
+moved to another control, an editable field, or a dialog while metadata loaded
+is left alone. The polite playback status announces “Continue watching? Resume
+at m:ss, or start over.” Choosing either action keeps focus on the player
+instead of the hidden button. Blocked/private storage degrades without
+preventing playback.
+
+Every media card in every view shows the same browser-local state as an
+overlay on its artwork, so card geometry never changes: a thin bar for a
+resumable position, or a “Watched” badge after the title genuinely ended in
+this browser. The card's accessible name ends with the same text, for example
+“25% watched, 7:30 left”. A resumable position wins over an earlier completion.
+Completion is recorded only by a media `ended` event at the title's known
+duration. A stream or file that ends early (a Compatible end that triggers
+recovery, or a truncated direct file), an explicit seek to or past the end
+(which shows Replay without playing), and Start over do not mark a title
+watched. Scrubbing to shortly before the end and letting the title play out
+does mark it watched. Completion markers live in a
+separate bounded `localStorage` map (500 most recent titles), never appear in
+Continue watching, and never offer Resume. Cards read progress once per loaded
+list and show the state as of that load.
 
 ## Status and recovery
 
 The library indicator distinguishes connecting, ready, empty, and error states.
+`empty` means the server has no indexed browser-playable media at all; an empty
+folder, kind, or search on a populated server stays `ready` and explains that
+the view is empty. An empty server shows “No media indexed yet” and points to
+Server status.
 Loading, buffering, seeking, compatible preparation, and paused playback
 states are rendered from the active playback session. If browser autoplay
 policy blocks a requested start, the player remains visibly paused with its
@@ -1022,7 +1173,11 @@ A mobile or desktop browser that rejects a copied compatible codec with either a
 decode or source-support media error, the player retries once with portable
 H.264 video and AAC audio instead of repeating the rejected stream.
 Depending on the category, recovery offers Retry, Try prepared streaming, Play
-original, or Return to library. Raw helper output is never primary copy;
+original, or Return to library. Play (the button, `Space`/`K`, a click on the
+video, or Media Session play) while an error is shown performs the first of
+Retry, Try prepared streaming, or Play original that the message offers; when
+it offers none of them, Play repeats the error message for assistive
+technology. Raw helper output is never primary copy;
 limited technical details remain in a disclosure.
 
 ## Versioned API and caching
@@ -1031,6 +1186,15 @@ All JSON success and error documents include `schema_version: 2`. Errors use
 `error.code`, `message`, `recoverable`, and optional `action`. Query names,
 enum values, numbers, duplicates, percent encoding, UTF-8, and item-path IDs are
 validated strictly.
+
+A media file that is missing, unreadable, or rejected by root confinement
+returns `404 media_missing` from `/api/web/item/{id}`, `/web/media/{id}...`
+(including `mode=direct`), and `/web/download/{id}`. These routes never use 401
+or 403 for media availability, so clients that classify by status do not
+mistake it for an authentication failure. A refused open (unreadable or outside
+the roots) is `recoverable: false` with `action: "return_to_library"`; a file
+that vanished is recoverable. The DLNA `/MediaItems` route keeps its HTML 403
+and 404 responses.
 
 Media `id` and `item_id` fields are canonical decimal strings. Treat them as
 opaque identifiers rather than JavaScript numbers: SQLite IDs can exceed the
@@ -1044,7 +1208,7 @@ used in item, media, caption, preview, and transcode-status URLs.
 | `/web/{app,api,core,library,player,preferences,store,captions,media-source,playback-source,source-selection,playback-timing,preview-cache}.js` | Embedded ES modules |
 | `/api/web/library` | Versioned folder, flat-library, or bounded Continue Watching hydration page, plus server root, capabilities, generation, and item DTOs |
 | `/api/web/item/{id}` | One item and its catalog `generation`; optional `generation` requires a matching snapshot (409 otherwise); `enrich=1` explicitly probes legacy stream metadata |
-| `/api/web/transcode/{id}?session={session_id}&request={generation_id}` | GET returns generation-scoped `queued`, `starting`, `producing`, `ready`, `cancelled`, or `failed` state plus optional `produced_seconds` measured from complete output-fragment timestamps; POST with a bounded startup `event` records the current generation's server-clock observation, or `selection_to_frame`, `seek_to_frame`, and `capability_negotiation` with an integer `elapsed_ms` from 0–120,000 records browser-local elapsed time; DELETE records and cancels an abandoned generation |
+| `/api/web/transcode/{id}?session={session_id}&request={generation_id}` | GET returns generation-scoped `queued`, `starting`, `producing`, `ready`, `cancelled`, or `failed` state plus optional `produced_seconds` measured from complete output-fragment timestamps and optional `stream_start_seconds`, the source time that output time zero represents (the requested start for encoded or trimmed output; for a nonzero copied-video seek, the preceding keyframe FFmpeg begins at, or `null` until a bounded source probe establishes it or when the landing is not a keyframe; reported only with the owning `request`); POST with a bounded startup `event` records the current generation's server-clock observation, or `selection_to_frame`, `seek_to_frame`, and `capability_negotiation` with an integer `elapsed_ms` from 0–120,000 records browser-local elapsed time; DELETE records and cancels an abandoned generation |
 | `/web/download/{id}` | Original video as an attachment, with byte ranges and the source filename |
 | `/web/media/{id}.mp4?mode=direct` | Original jailed media with byte ranges |
 | `/web/media/{id}.mp4?...` | Compatible stream with validated audio track, start, quality, negotiated `video_mode`/`video_output`/`audio_mode`, reason, playback session, and generation parameters |
@@ -1083,16 +1247,30 @@ Browse parameters are `view=folders|library`, `folder`,
 `limit`, and `generation`. The server default page is 60 and the maximum is
 200; the browser collects the complete current view in batches of up to 200,
 with at most four requests in flight, before publishing the list.
+Media DTOs carry a nullable `art_url`. It is present only when the catalog has
+stored artwork for the item (including generated video thumbnails); otherwise
+it is `null`, so clients show their own placeholder instead of requesting an
+image that cannot exist.
 Media DTOs include a nullable `collection` with an opaque directory `id`, a
 folder `title`, and numeric `sequence`. Collection ordering happens before
 pagination in both SQLite and the in-memory fallback.
 Passing the first page's generation on later pages gives stable pagination; a
 catalog change returns `409 catalog_changed` rather than mixing snapshots.
+Every library page's `library_state` describes the whole catalog in that
+generation: `ready` when it holds any browser-playable video or audio, `empty`
+otherwise. It never reflects the requested folder, kind, or search.
 Metadata loading is independent of scrolling. A view change aborts the whole
 load, and stale responses cannot replace a newer view. Card artwork is lazy,
 asynchronously decoded, and explicitly lower priority than
-library API traffic. The UI serves versioned
-scanner artwork directly with a one-day private browser cache; a deployment
+library API traffic. The UI serves scanner artwork directly with a one-day
+private browser cache. `/AlbumArt` and `/Thumbnails` responses carry a strong
+`ETag` derived from the opened image file's identity, size, and modification
+times; a matching `If-None-Match` (a weak or listed match, or `*` on its own)
+returns a bodyless 304. A JPEG poster sidecar replaced in place gets a new art ID, and therefore
+a new URL, when its watcher event is processed. A replacement the watcher does
+not observe, such as one made while the server was stopped, keeps its URL, so it
+can stay cached for up to a day before ETag revalidation picks up the new
+image. A deployment
 that prepares 360x540 posters therefore performs no request-time resize. At
 most four near-viewport artwork requests run at once, and quickly skipped cards
 leave the queue before they consume server capacity. The browser checks nearby
@@ -1102,11 +1280,15 @@ offers a full refresh without displaying an incomplete list or mixing pages from
 different generations.
 The flat view performs at most three total SQLite snapshot attempts, uses
 deterministic ordering, and only materializes the requested page. Browser search
-uses Unicode lowercase substring matching over title, artist, album artist,
-album, and filename in both SQLite and memory. Accents and combining marks remain
-distinct; parent directory names are outside the search domain, and `%`, `_`, and
-backslash are literal characters. Date order breaks equal dates by normalized
-title and detail ID; episode/track order uses normalized album, disc, track,
+splits the query on whitespace and requires every term to occur, as a Unicode
+lowercase substring, in at least one of title, artist, album artist, album, or
+filename; different terms may match different fields and appear in any order.
+Up to 16 distinct terms are considered; later words are ignored. SQLite, the
+memory fallback, folder search (over folder titles and the same media fields),
+and Continue Watching filtering use the same rule. Accents and combining marks
+remain distinct; parent directory names are outside the search domain, and `%`,
+`_`, and backslash are literal characters. Recently added order breaks equal
+modification times by normalized title and detail ID; episode/track order uses normalized album, disc, track,
 normalized title, and detail ID.
 
 Later SQLite pages reuse generation-scoped population and matching counts in the
@@ -1114,7 +1296,7 @@ bounded catalog query cache. Identical SQLite pages also reuse validated IDs
 and counts; each response hydrates current metadata after generation and private
 epoch checks. The shared cache holds at most 256 entries. Physical-folder pages
 reuse ordered ID projections
-for up to eight folder/query combinations within 32 MiB; child counts have their
+for up to eight folder/query/sort combinations within 32 MiB; child counts have their
 own bounded cache. Generation publication invalidates these caches, including
 when the public generation wraps. Search-key collection and child counting use
 bounded catalog-lock intervals; sorting and page DTO construction release the
@@ -1140,10 +1322,23 @@ catalog to reconstruct the view.
 Library and item responses use API-schema-, representation-revision-, and
 generation-based weak ETags with `private, max-age=0, must-revalidate`. The
 representation revision invalidates cached capabilities and metadata after an
-upgrade even when the media catalog generation is unchanged. A matching
-`If-None-Match` receives 304.
+upgrade even when the media catalog generation is unchanged. Each server
+instance also appends an opaque per-start tag, because configuration (for
+example transcoding, the encoder's video outputs, captions, or the server name)
+can change across a restart without a generation change. Clients therefore
+revalidate once with a full response after every restart. A matching
+`If-None-Match` receives 304. The JSON `generation` field does not include
+that tag and keeps its paging meaning.
 Embedded assets deliberately use `Cache-Control: no-cache`, so browsers may
 store them but must revalidate; HTML contains no hand-maintained cachebuster.
+The player document and every embedded module and stylesheet carry a strong
+`ETag` hashed from their exact embedded bytes, so any build that changes an
+asset changes its validator. A matching `If-None-Match` (a weak or listed
+match, or `*` on its own) receives 304 with the same validator and, for the
+document, the same security headers. Artwork, embedded assets, and generation
+validators share one evaluator, so a `*` inside a tag list is not a match on
+any route. The status page served when the web
+player is disabled is generated per request and has no validator.
 Media and captions keep their route-specific range and safety policies.
 Video item DTOs advertise `download_url`; audio item DTOs return `null`. The
 download endpoint accepts no query parameters, never invokes FFmpeg, and opens
@@ -1239,9 +1434,25 @@ application. Keep TLS and authentication at the outer reverse proxy and send
 that proxy to the gateway's TCP port rather than the server's TCP 8200. The
 default gateway bind is `127.0.0.1:8201`; a reverse proxy in another container can set
 `RUSTY_WEB_BIND_IP` to a host address it can reach. `scripts/web-gateway-smoke.sh`
-verifies both the allowed browser paths and denied DLNA surface.
-`restart-web.sh` rebuilds and recreates only the gateway, waits for it to become
-healthy, runs that smoke test, and leaves the DLNA service untouched.
+verifies both the allowed browser paths and denied DLNA surface, plus the
+methods native clients use through the gateway: HEAD, `Range` on original
+media, and DELETE cancellation reaching the server. It never starts a
+transcode. It does request the first listed video with `enrich=1`, which
+probes an unenriched item and records its stream metadata in the catalog, as
+opening that item in the player would; media files are only read. If the
+first 200 library entries contain no media (an empty library, or only
+folders), it skips the media checks. `restart-web.sh` rebuilds and recreates only the gateway, waits for
+it to become healthy, runs that smoke test, and leaves the DLNA service
+untouched. CI builds the gateway image, runs `nginx -t`, and runs the same smoke
+through the shipped configuration against a disposable backend
+(`scripts/web-gateway-ci.sh`).
+
+`scripts/web-contract-smoke.sh` checks the native-client HTTP contract against a
+running server: schema 2 JSON with string IDs and only `video`/`audio` kinds,
+native HLS playlists that use only the tags the native relay accepts and
+same-origin `/web/media` URIs, and the progressive download `206`/`202`/`416`
+and completed `HEAD` semantics. The production-image smoke runs it inside the
+container, so CI covers the shipped FFmpeg and each release architecture.
 
 ## Playback measurements
 

@@ -297,6 +297,32 @@ requested timestamp. This prevents copied audio packets from the demuxer's
 preceding video keyframe from starting ahead of the newly encoded video. Mixed
 seeks that copy video retain the preceding independently decodable keyframe.
 
+Every nonzero seek that copies video from an index-seeking container
+(Matroska, MP4) therefore begins at the keyframe FFmpeg's demuxer lands on,
+which `-avoid_negative_ts make_zero` moves to output time zero. Beside the
+producer, and only on spare helper capacity, a supervised demux-only FFprobe
+of the rooted source descriptor repeats that seek under a ten-second deadline:
+one stream-information read, then one video packet. It applies FFmpeg's
+3/23-second decode-time allowance for delayed video in containers other than
+MOV/MP4. When that packet is a keyframe, its time is reported as the
+generation's `stream_start_seconds`. Output zero is the earliest timestamp
+across the muxed streams, so audio and B-frame decode lead around the keyframe
+can place it a fraction of a second earlier; the value is accurate to well
+under a second, not to one frame. A generic timestamp seek (MPEG-TS, M2TS) can
+land between keyframes; FFmpeg then emits audio from the landing while copied
+video waits for its next keyframe, so the origin depends on the mapped streams
+and the value stays `null`, as it does if the probe is skipped or fails. A
+skipped probe is optional work, not a refused request: it does not count
+toward `helpers.saturated_total` or `helpers.rejected_total`. Producer
+admission does not wait for a helper slot, so the probe never takes one a
+producer could need. It runs only when no FIFO waiter is queued and, with its
+slot held, every free `transcode.max_jobs` permit could still admit the largest
+producer (two slots, or one when `helper_max_jobs = 1`). Otherwise it is
+skipped. The probe stops when
+its generation is cancelled or shutdown begins. Graceful shutdown waits, within
+its budget, until every probe has reaped FFprobe and released its slot, as it
+waits for title jobs. FFmpeg arguments and output bytes are unchanged.
+
 Fragmented browser encoding forces a one-second keyframe interval. Native HLS
 therefore publishes its first completed movie fragment immediately as an
 independently decodable segment instead of waiting for the following keyframe
@@ -324,9 +350,17 @@ eviction and reservations keep their existing contract. Process restart reparses
 the index. Active pinned views survive publication or unlinking of their inode.
 
 Native HLS keeps the complete EVENT history and its network cost. Target duration
-is frozen for each session/request generation. If a later copied GOP exceeds the
-published rounded target, that generation reports restart required; a new
-generation chooses the known larger maximum without discarding old segments.
+is frozen for each session/request generation. Copied video has no proven GOP
+maximum while it grows, so its first publication waits up to five seconds from
+the playlist request for 20 seconds of complete segments (falling back to the
+ordinary one-second startup buffer) and then freezes a target of at least
+10 seconds. That covers the 250-frame default keyframe interval of x264 and
+x265 at 23.976 fps and above without adding playlist tags; a larger target only
+lengthens client reloads. Encoded independent fragments, Media Source playlists
+and finalized output keep their exact targets. If a later copied GOP still
+exceeds the published rounded target, that generation reports restart required;
+a new generation chooses the known larger maximum without discarding old
+segments.
 One session's cancellation cannot reset another session's target. This fixes
 target mutation but does not establish seamless native Safari recovery for
 variable-GOP copies; native-device validation remains necessary before introducing

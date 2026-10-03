@@ -41,6 +41,13 @@ derived_image_cache_age_days = 30
 # browser/DLNA resize responses. Scanner thumbnails retain their own setting.
 derived_image_quality = 8
 cache_min_free_mb = 128
+# Inotify publishes ordinary local changes. The periodic full walk is a safety
+# net, and the only change detection for NFS/SMB/FUSE roots whose remote writes
+# raise no inotify events. Unchanged walks back off from rescan_secs to
+# rescan_max_secs; a change resets to rescan_secs. rescan_secs = 0 disables the
+# walk; rescan_max_secs = 0 keeps a fixed cadence.
+rescan_secs = 300
+rescan_max_secs = 3600
 # Kodi resume positions/play counts: 0 = retain indefinitely.
 bookmark_retention_days = 0
 

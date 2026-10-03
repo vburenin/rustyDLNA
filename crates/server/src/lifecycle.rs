@@ -115,6 +115,34 @@ pub async fn serve(app: Arc<App>) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Time the runtime may spend joining blocking work after [`serve`] returns.
+/// `serve` already spent the graceful-shutdown budget; a blocking read stuck
+/// on a hung media mount is abandoned to process exit, like late scan and
+/// GENA workers, instead of holding the daemon until the supervisor kills it.
+const RUNTIME_TEARDOWN_GRACE: Duration = Duration::from_secs(1);
+
+/// Run [`serve`] on a dedicated multi-threaded runtime, then tear the runtime
+/// down within a bounded grace instead of waiting for every blocking task.
+pub fn run_daemon(app: App) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(serve(Arc::new(app)));
+    shutdown_runtime_bounded(runtime);
+    result
+}
+
+pub(super) fn shutdown_runtime_bounded(runtime: tokio::runtime::Runtime) {
+    let started = Instant::now();
+    runtime.shutdown_timeout(RUNTIME_TEARDOWN_GRACE);
+    if started.elapsed() >= RUNTIME_TEARDOWN_GRACE {
+        tracing::warn!(
+            grace_ms = duration_millis_saturating(RUNTIME_TEARDOWN_GRACE),
+            "blocking work outlived runtime teardown; abandoning it to process exit"
+        );
+    }
+}
+
 fn shutdown_deadline_exceeded(
     elapsed: Duration,
     budget: Duration,
@@ -124,8 +152,34 @@ fn shutdown_deadline_exceeded(
     elapsed > budget || jobs_remaining != 0 || !notifications_stopped
 }
 
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+const ACCEPT_WARNING_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Exhausted descriptors or kernel memory leave the pending connection in the
+/// backlog, so the listener stays readable and `accept` fails again at once.
+/// Those errors back off exponentially; per-connection failures such as
+/// `ECONNABORTED` return `None` so one aborted handshake delays nobody.
+pub(super) fn next_accept_backoff(
+    current: Option<Duration>,
+    error: &std::io::Error,
+) -> Option<Duration> {
+    let exhausted = matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    );
+    exhausted.then(|| {
+        current
+            .map_or(ACCEPT_BACKOFF_MIN, |delay| delay.saturating_mul(2))
+            .clamp(ACCEPT_BACKOFF_MIN, ACCEPT_BACKOFF_MAX)
+    })
+}
+
 pub(super) async fn accept_loop(listener: tokio::net::TcpListener, app: Arc<App>) {
     let connections = Arc::new(tokio::sync::Semaphore::new(app.cfg.max_connections));
+    let mut backoff = None;
+    let mut last_warning: Option<Instant> = None;
+    let mut suppressed_warnings = 0_u64;
     loop {
         let permit = match connections.clone().acquire_owned().await {
             Ok(permit) => permit,
@@ -134,11 +188,29 @@ pub(super) async fn accept_loop(listener: tokio::net::TcpListener, app: Arc<App>
         let (sock, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
+                // Every failure is counted; the log is rate-limited so a
+                // persistent condition cannot flood it.
                 app.runtime_metrics.accept_error();
-                tracing::warn!("accept: {e}");
+                let now = Instant::now();
+                if last_warning
+                    .is_none_or(|warned| now.duration_since(warned) >= ACCEPT_WARNING_INTERVAL)
+                {
+                    tracing::warn!(suppressed = suppressed_warnings, "accept: {e}");
+                    last_warning = Some(now);
+                    suppressed_warnings = 0;
+                } else {
+                    suppressed_warnings = suppressed_warnings.saturating_add(1);
+                }
+                if let Some(delay) = next_accept_backoff(backoff, &e) {
+                    backoff = Some(delay);
+                    drop(permit);
+                    // Cancellation-safe: shutdown drops this future mid-sleep.
+                    tokio::time::sleep(delay).await;
+                }
                 continue;
             }
         };
+        backoff = None;
         app.runtime_metrics.connection_opened();
         let app = app.clone();
         tokio::spawn(async move {
@@ -668,11 +740,7 @@ fn run_startup_maintenance_until_success(app: &App) -> bool {
 
 pub(super) fn spawn_library_watch(app: Arc<App>) -> std::io::Result<()> {
     let rescan_secs = app.cfg.rescan_secs;
-    let rescan_max_secs = if app.cfg.rescan_max_secs == 0 {
-        rescan_secs
-    } else {
-        app.cfg.rescan_max_secs
-    };
+    let rescan_max_secs = app.cfg.reconcile_max_secs();
     let inotify_app = app.clone();
     let inotify_handle = std::thread::Builder::new()
         .name("inotify".into())
@@ -1330,6 +1398,8 @@ async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(
         app.notify_interval.max(1) as u64,
     ));
+    // Readers stop when this loop returns: dropping the JoinSet aborts them.
+    let (_unicast_readers, mut unicast_rx) = spawn_unicast_ssdp_readers(&sends);
     let renderer_workers = Arc::new(tokio::sync::Semaphore::new(4));
     let reply_workers = Arc::new(tokio::sync::Semaphore::new(64));
     let mut renderer_limiter = RendererFetchLimiter::default();
@@ -1400,55 +1470,204 @@ async fn ssdp_loop(app: Arc<App>) -> std::io::Result<()> {
                     &app.ssdp_interfaces,
                     iface,
                 );
-                let date = now_imf_date();
-                let replies = match try_msearch_replies(
-                    &app.uuid,
-                    &ms.st,
-                    &reply_ip.to_string(),
-                    app.http_port,
-                    app.notify_interval,
-                    &app.server,
-                    &date,
-                ) {
-                    Ok(replies) => replies,
-                    Err(error) => {
-                        tracing::error!(%error, "cannot construct SSDP search replies");
-                        continue;
-                    }
-                };
-                if replies.is_empty() {
-                    continue;
-                }
-                if !reply_limiter.allow(*sender.ip(), replies.len(), std::time::Instant::now()) {
-                    tracing::debug!(%from, replies = replies.len(), "M-SEARCH reply rate-limited");
-                    continue;
-                }
-                let Ok(permit) = reply_workers.clone().try_acquire_owned() else {
-                    tracing::debug!(%from, "M-SEARCH scheduler full");
-                    continue;
-                };
-                tracing::info!(%from, st = %ms.st, n = replies.len(), "SSDP M-SEARCH reply");
-                let all = ms.st == rusty_dlna_protocol::ssdp::ST_ALL;
                 let out = sends
                     .iter()
                     .find(|(ip, _)| *ip == reply_ip)
                     .map(|(_, socket)| Arc::clone(socket))
                     .unwrap_or_else(|| Arc::clone(&recv));
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    tokio::time::sleep(Duration::from_millis(jitter_ms(
-                        msearch_jitter_ms_range_for_mx(all, ms.mx),
-                    )))
-                    .await;
-                    for reply in replies {
-                        if let Err(error) = out.send_to(reply.as_bytes(), from).await {
-                            tracing::warn!(%from, %error, "SSDP reply send failed");
-                        }
-                    }
-                });
+                schedule_msearch_reply(
+                    &app,
+                    &mut reply_limiter,
+                    &reply_workers,
+                    ms,
+                    sender,
+                    (reply_ip, out),
+                    false,
+                );
+            }
+            Some(datagram) = unicast_rx.recv() => {
+                handle_unicast_ssdp_datagram(
+                    &app,
+                    &mut reply_limiter,
+                    &reply_workers,
+                    datagram,
+                );
             }
         }
     }
+}
+
+/// One datagram addressed to an announced interface's unicast address.
+pub(super) struct UnicastSsdpDatagram {
+    pub(super) bytes: Vec<u8>,
+    pub(super) from: SocketAddr,
+    /// Announced interface address that received it.
+    pub(super) ingress: Ipv4Addr,
+    /// That interface's port-1900 socket, which also sends the reply.
+    pub(super) socket: Arc<tokio::net::UdpSocket>,
+}
+
+/// Bounded queue between the per-interface readers and the SSDP loop. A full
+/// queue drops the datagram, exactly like an overflowing socket buffer.
+const UNICAST_SSDP_QUEUE: usize = 64;
+
+pub(super) fn spawn_unicast_ssdp_readers(
+    sends: &[(Ipv4Addr, Arc<tokio::net::UdpSocket>)],
+) -> (
+    tokio::task::JoinSet<()>,
+    tokio::sync::mpsc::Receiver<UnicastSsdpDatagram>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(UNICAST_SSDP_QUEUE);
+    let mut readers = tokio::task::JoinSet::new();
+    for (ingress, socket) in sends {
+        let (ingress, socket, tx) = (*ingress, Arc::clone(socket), tx.clone());
+        readers.spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                match socket.recv_from(&mut buf).await {
+                    Ok((n, from)) => {
+                        let datagram = UnicastSsdpDatagram {
+                            bytes: buf[..n].to_vec(),
+                            from,
+                            ingress,
+                            socket: Arc::clone(&socket),
+                        };
+                        if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =
+                            tx.try_send(datagram)
+                        {
+                            return;
+                        }
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+            }
+        });
+    }
+    (readers, rx)
+}
+
+/// Whether a unicast M-SEARCH from `sender` that arrived on the announced
+/// interface `ingress` may be answered. Multicast searches are confined to the
+/// link because 239.255.255.250 is not routed, but a unicast datagram to
+/// `<interface>:1900` is routable. Answering it for off-link (or spoofed
+/// off-link) sources would turn a public, DMZ or routed-VPN address into an
+/// SSDP reflection source, so the sender must be a usable LAN address on the
+/// ingress interface's own subnet.
+pub(super) fn unicast_msearch_sender_is_on_link(
+    sender: Ipv4Addr,
+    ingress: Ipv4Addr,
+    interfaces: &[(Ipv4Addr, Ipv4Addr)],
+) -> bool {
+    if !usable_lan_ipv4(sender) {
+        return false;
+    }
+    let Some((_, mask)) = interfaces.iter().find(|(address, _)| *address == ingress) else {
+        return false;
+    };
+    let mask = u32::from(*mask);
+    let host_bits = !mask;
+    let sender = u32::from(sender);
+    // On a /30 or wider subnet, the all-ones and all-zeros host addresses are
+    // the directed broadcast and network addresses, never a single searcher.
+    let host = sender & host_bits;
+    let reserved_host = host_bits > 1 && (host == 0 || host == host_bits);
+    mask != 0 && !reserved_host && sender & mask == u32::from(ingress) & mask
+}
+
+/// Answer one datagram read from an announced interface's unicast socket.
+/// Unicast datagrams to `<interface>:1900` land on that interface's
+/// exact-address egress socket. Only an M-SEARCH from an on-link sender is
+/// answered: off-link senders, unicast NOTIFYs and stray responses meant for
+/// other host SSDP stacks are dropped and never start renderer fetches or
+/// touch the reply limiter. Returns whether a reply was scheduled.
+pub(super) fn handle_unicast_ssdp_datagram(
+    app: &Arc<App>,
+    reply_limiter: &mut SsdpReplyLimiter,
+    reply_workers: &Arc<tokio::sync::Semaphore>,
+    datagram: UnicastSsdpDatagram,
+) -> bool {
+    let SocketAddr::V4(sender) = datagram.from else {
+        return false;
+    };
+    if !unicast_msearch_sender_is_on_link(*sender.ip(), datagram.ingress, &app.ssdp_interfaces) {
+        tracing::debug!(from = %datagram.from, ingress = %datagram.ingress, "off-link unicast SSDP datagram dropped");
+        return false;
+    }
+    let text = String::from_utf8_lossy(&datagram.bytes);
+    let Ok(ms) = parse_unicast_msearch(&text) else {
+        return false;
+    };
+    schedule_msearch_reply(
+        app,
+        reply_limiter,
+        reply_workers,
+        ms,
+        sender,
+        (datagram.ingress, datagram.socket),
+        true,
+    )
+}
+
+/// Rate-limit, admit and send the replies to one parsed M-SEARCH from the
+/// socket whose address LOCATION names. Unicast searches are answered at once;
+/// multicast searches keep the MX-derived jitter.
+pub(super) fn schedule_msearch_reply(
+    app: &Arc<App>,
+    reply_limiter: &mut SsdpReplyLimiter,
+    reply_workers: &Arc<tokio::sync::Semaphore>,
+    ms: rusty_dlna_ssdp::MSearch,
+    sender: std::net::SocketAddrV4,
+    (reply_ip, out): (Ipv4Addr, Arc<tokio::net::UdpSocket>),
+    unicast: bool,
+) -> bool {
+    let from = SocketAddr::V4(sender);
+    let date = now_imf_date();
+    let replies = match try_msearch_replies(
+        &app.uuid,
+        &ms.st,
+        &reply_ip.to_string(),
+        app.http_port,
+        app.notify_interval,
+        &app.server,
+        &date,
+    ) {
+        Ok(replies) => replies,
+        Err(error) => {
+            tracing::error!(%error, "cannot construct SSDP search replies");
+            return false;
+        }
+    };
+    if replies.is_empty() {
+        return false;
+    }
+    if !reply_limiter.allow(*sender.ip(), replies.len(), std::time::Instant::now()) {
+        tracing::debug!(%from, replies = replies.len(), "M-SEARCH reply rate-limited");
+        return false;
+    }
+    let Ok(permit) = reply_workers.clone().try_acquire_owned() else {
+        tracing::debug!(%from, "M-SEARCH scheduler full");
+        return false;
+    };
+    tracing::info!(%from, st = %ms.st, n = replies.len(), unicast, "SSDP M-SEARCH reply");
+    let delay = if unicast {
+        0
+    } else {
+        let all = ms.st == rusty_dlna_protocol::ssdp::ST_ALL;
+        jitter_ms(msearch_jitter_ms_range_for_mx(all, ms.mx))
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        for reply in replies {
+            if let Err(error) = out.send_to(reply.as_bytes(), from).await {
+                tracing::warn!(%from, %error, "SSDP reply send failed");
+            }
+        }
+    });
+    true
 }
 
 pub(super) async fn handle_conn(
@@ -1477,6 +1696,9 @@ async fn handle_conn_observed(
     use tokio::io::AsyncReadExt;
     const MAX_HEADER_BYTES: usize = 64 * 1024;
 
+    // The ingress address selects which announced interface absolute DLNA
+    // URLs name; an unavailable address keeps the primary advertise IP.
+    let local = sock.local_addr().ok();
     let mut persist_left = 100u32;
     let mut pending = Vec::new();
     let mut request_number = 0u32;
@@ -1512,6 +1734,12 @@ async fn handle_conn_observed(
             }
             let n = match tokio::time::timeout_at(header_deadline, sock.read(&mut tmp)).await {
                 Ok(read) => read?,
+                // An idle connection (keep-alive or a preconnect that never
+                // sent a byte) has no request to answer. Close it silently so
+                // a client reusing the socket cannot read an unsolicited 408
+                // as the reply to its next request, and so delivery metrics
+                // count only genuine header timeouts.
+                Err(_) if pending.is_empty() => return Ok(()),
                 Err(_) => {
                     let response = HttpResponse::html(408, "Request Timeout", "header timeout");
                     let _ = crate::socket_write_http_response(&app, &mut sock, &response).await;
@@ -1592,7 +1820,10 @@ async fn handle_conn_observed(
         let cancel_query = CancelQueryOnDrop(query_control.cancellation.clone());
         let mut worker = tokio::task::spawn_blocking(move || {
             let _scope = enter_query_scope(query_control);
-            handler_app.handle_from(&handler_request, peer)
+            match local {
+                Some(local) => handler_app.handle_from_local(&handler_request, peer, local),
+                None => handler_app.handle_from(&handler_request, peer),
+            }
         });
         let mut poll = tokio::time::interval(Duration::from_millis(20));
         let mut resp = loop {

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 /// Reject non-media before probing. Strong container magic
 /// (EBML/ftyp/RIFF/…) is proof the file is a real bitstream, not text.
-/// Ambiguous headers (TS/MPEG/MP3) get a short `ffprobe`.
+/// Ambiguous headers (TS/BDAV/MPEG/MP3) get a short `ffprobe`.
 pub fn file_is_viable(path: &Path) -> bool {
     file_is_viable_with_timeout(path, std::time::Duration::from_secs(30))
 }
@@ -41,36 +41,83 @@ enum Sniff {
     Weak,
 }
 
+/// Bytes read for the header sniff. Large enough to see the sync byte of
+/// the first three 192-byte BDAV/AVCHD transport packets (offsets 4, 196, 388).
+const SNIFF_BYTES: u64 = 512;
+const BDAV_PACKET_BYTES: usize = 192;
+
 fn sniff_container(path: &Path) -> Sniff {
-    if looks_like_av_container(path) {
-        // looks_like already distinguished strong vs anything; refine:
-        use std::io::Read;
-        let mut f = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(_) => return Sniff::Reject,
-        };
-        let mut buf = [0u8; 16];
-        let n = match f.read(&mut buf) {
-            Ok(n) => n,
-            Err(_) => return Sniff::Reject,
-        };
-        if n < 4 {
-            return Sniff::Reject;
-        }
-        if (buf[0] == 0x1a && buf[1] == 0x45 && buf[2] == 0xdf && buf[3] == 0xa3)
-            || (n >= 8 && matches!(&buf[4..8], b"ftyp" | b"mdat" | b"moov" | b"wide" | b"free"))
-            || &buf[0..4] == b"RIFF"
-            || &buf[0..3] == b"FLV"
-            || (buf[0] == 0x30 && buf[1] == 0x26 && buf[2] == 0xb2 && buf[3] == 0x75)
-            || &buf[0..4] == b"OggS"
-            || (buf[0] == 0xff && buf[1] == 0xd8 && buf[2] == 0xff)
-            || &buf[0..4] == b"fLaC"
-        {
-            return Sniff::Strong;
-        }
-        return Sniff::Weak;
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Sniff::Reject;
+    };
+    let mut buf = Vec::with_capacity(SNIFF_BYTES as usize);
+    if file.take(SNIFF_BYTES).read_to_end(&mut buf).is_err() {
+        return Sniff::Reject;
     }
-    Sniff::Reject
+    classify_header(&buf)
+}
+
+/// Classify a file's first bytes. Strong container magic (EBML/ftyp/RIFF/…)
+/// is proof the file is a real bitstream, not text. Ambiguous headers
+/// (TS/BDAV/MPEG/MP3) are only plausible and get a short `ffprobe`.
+fn classify_header(buf: &[u8]) -> Sniff {
+    let n = buf.len();
+    if n < 4 {
+        return Sniff::Reject;
+    }
+    let strong = (buf[0] == 0x1a && buf[1] == 0x45 && buf[2] == 0xdf && buf[3] == 0xa3)
+        // ISO BMFF (mp4/m4v/mov): size + "ftyp" / "mdat" / "moov"
+        || (n >= 8 && matches!(&buf[4..8], b"ftyp" | b"mdat" | b"moov" | b"wide" | b"free"))
+        // RIFF AVI / WAV
+        || &buf[0..4] == b"RIFF"
+        || &buf[0..3] == b"FLV"
+        // ASF / WMV
+        || (buf[0] == 0x30 && buf[1] == 0x26 && buf[2] == 0xb2 && buf[3] == 0x75)
+        || &buf[0..4] == b"OggS"
+        // JPEG
+        || (buf[0] == 0xff && buf[1] == 0xd8 && buf[2] == 0xff)
+        || &buf[0..4] == b"fLaC"
+        // DSD Stream File (.dsf): "DSD " plus its fixed 28-byte (LE u64)
+        // header-chunk size, so a text file starting "DSD " is not admitted.
+        || (n >= 12 && &buf[0..4] == b"DSD " && buf[4..12] == 28u64.to_le_bytes())
+        // DSDIFF (.dff): "FRM8", 8-byte size, form type "DSD "
+        || (n >= 16 && &buf[0..4] == b"FRM8" && &buf[12..16] == b"DSD ")
+        // RealMedia (.rm/.rmvb)
+        || &buf[0..4] == b".RMF";
+    if strong {
+        return Sniff::Strong;
+    }
+    let weak =
+        // MPEG-TS sync
+        buf[0] == 0x47
+        // BDAV/AVCHD transport stream (.m2ts/.mts): 4-byte TP_extra_header
+        // before each 188-byte packet, so the sync byte repeats every 192.
+        || bdav_sync_bytes_present(buf)
+        // MPEG-PS / VOB pack
+        || (buf[0] == 0x00 && buf[1] == 0x00 && buf[2] == 0x01)
+        // ID3 / MP3 frame sync
+        || &buf[0..3] == b"ID3"
+        || (buf[0] == 0xff && (buf[1] & 0xe0) == 0xe0);
+    if weak {
+        Sniff::Weak
+    } else {
+        Sniff::Reject
+    }
+}
+
+fn bdav_sync_bytes_present(buf: &[u8]) -> bool {
+    let offsets = [4, 4 + BDAV_PACKET_BYTES, 4 + 2 * BDAV_PACKET_BYTES];
+    // A clip shorter than three packets only needs the packets it holds.
+    let mut checked = 0usize;
+    for offset in offsets {
+        match buf.get(offset) {
+            Some(0x47) => checked += 1,
+            Some(_) => return false,
+            None => break,
+        }
+    }
+    checked > 0 && (checked == offsets.len() || buf.len() < offsets[checked])
 }
 
 fn ffprobe_has_av_stream(path: &Path, timeout: std::time::Duration) -> Option<bool> {
@@ -145,64 +192,7 @@ fn ffprobe_file_has_av_stream(file: &std::fs::File, cfg: &ScanConfig) -> Option<
 
 /// First-bytes sniff so a `.mkv` that is actually text/NFO is not indexed.
 pub fn looks_like_av_container(path: &Path) -> bool {
-    use std::io::Read;
-    let mut f = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let mut buf = [0u8; 16];
-    let n = match f.read(&mut buf) {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    if n < 4 {
-        return false;
-    }
-    // Matroska / WebM EBML
-    if buf[0] == 0x1a && buf[1] == 0x45 && buf[2] == 0xdf && buf[3] == 0xa3 {
-        return true;
-    }
-    // ISO BMFF (mp4/m4v/mov): size + "ftyp" / "mdat" / "moov"
-    if n >= 8 && matches!(&buf[4..8], b"ftyp" | b"mdat" | b"moov" | b"wide" | b"free") {
-        return true;
-    }
-    // RIFF AVI / WAV
-    if &buf[0..4] == b"RIFF" {
-        return true;
-    }
-    // MPEG-TS sync
-    if buf[0] == 0x47 {
-        return true;
-    }
-    // MPEG-PS / VOB pack
-    if buf[0] == 0x00 && buf[1] == 0x00 && buf[2] == 0x01 {
-        return true;
-    }
-    // FLV
-    if &buf[0..3] == b"FLV" {
-        return true;
-    }
-    // ASF / WMV
-    if buf[0] == 0x30 && buf[1] == 0x26 && buf[2] == 0xb2 && buf[3] == 0x75 {
-        return true;
-    }
-    // Ogg
-    if &buf[0..4] == b"OggS" {
-        return true;
-    }
-    // JPEG
-    if buf[0] == 0xff && buf[1] == 0xd8 && buf[2] == 0xff {
-        return true;
-    }
-    // ID3 / MP3
-    if &buf[0..3] == b"ID3" || (buf[0] == 0xff && (buf[1] & 0xe0) == 0xe0) {
-        return true;
-    }
-    // FLAC
-    if &buf[0..4] == b"fLaC" {
-        return true;
-    }
-    false
+    sniff_container(path) != Sniff::Reject
 }
 
 /// Minimal EBML header so tests can stand in for a real MKV without libav.
@@ -308,4 +298,56 @@ pub(super) fn mime_and_class(name: &str) -> (&'static str, &'static str, &'stati
     resolved_media_format(name, None)
         .map(|format| (format.mime, format.upnp_class(), format.extension))
         .unwrap_or(("application/octet-stream", "item.videoItem", "bin"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bdav_header(len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        for packet in buf.chunks_mut(BDAV_PACKET_BYTES) {
+            let header = [0x0e, 0xbf, 0x46, 0x22, 0x47];
+            let n = header.len().min(packet.len());
+            packet[..n].copy_from_slice(&header[..n]);
+        }
+        buf
+    }
+
+    #[test]
+    fn header_classifier_recognizes_bdav_dsd_and_realmedia() {
+        assert_eq!(classify_header(&bdav_header(512)), Sniff::Weak);
+        assert_eq!(classify_header(&bdav_header(300)), Sniff::Weak);
+        let mut broken = bdav_header(512);
+        broken[196] = 0;
+        assert_eq!(classify_header(&broken), Sniff::Reject);
+        let mut broken = bdav_header(512);
+        broken[388] = 0;
+        assert_eq!(classify_header(&broken), Sniff::Reject);
+
+        assert_eq!(classify_header(b"DSD \x1c\0\0\0\0\0\0\0"), Sniff::Strong);
+        assert_eq!(classify_header(b"DSD notes about a track"), Sniff::Reject);
+        assert_eq!(classify_header(b"DSD \x1c\0\0"), Sniff::Reject);
+        assert_eq!(
+            classify_header(b"FRM8\0\0\0\0\0\0\x01\0DSD "),
+            Sniff::Strong
+        );
+        assert_eq!(
+            classify_header(b"FRM8\0\0\0\0\0\0\x01\0AIFF"),
+            Sniff::Reject
+        );
+        assert_eq!(classify_header(b".RMF\0\0\0\x12"), Sniff::Strong);
+    }
+
+    #[test]
+    fn header_classifier_keeps_existing_strong_weak_and_reject_rules() {
+        assert_eq!(classify_header(&[0x1a, 0x45, 0xdf, 0xa3]), Sniff::Strong);
+        assert_eq!(classify_header(b"\0\0\0\x20ftypisom"), Sniff::Strong);
+        assert_eq!(classify_header(b"fLaC\0\0\0\x22"), Sniff::Strong);
+        assert_eq!(classify_header(&[0x47, 0x40, 0x11, 0x10]), Sniff::Weak);
+        assert_eq!(classify_header(&[0x00, 0x00, 0x01, 0xba]), Sniff::Weak);
+        assert_eq!(classify_header(b"ID3\x04"), Sniff::Weak);
+        assert_eq!(classify_header(b"readme pretending"), Sniff::Reject);
+        assert_eq!(classify_header(b"DSD"), Sniff::Reject);
+    }
 }

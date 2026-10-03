@@ -523,6 +523,9 @@ pub struct RemuxJobSpec {
     pub profile8_toolchain: Option<rusty_dlna_transcode::Profile8ToolchainSnapshot>,
     pub audio_index: usize,
     pub audio: RemuxAudio,
+    /// Samsung `CaptionInfo.sec` URL for this DLNA request's successful
+    /// media responses. Per request; never part of job or cache identity.
+    pub caption_info_sec: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -708,7 +711,9 @@ pub fn wants_caption_info_sec(req: &HttpRequest) -> bool {
     req.header(GET_CAPTION_INFO_SEC).is_some()
 }
 
-/// `http://{host}:{port}/Captions/{detail_id}.srt` (first/default caption).
+/// `http://{host}:{port}/Captions/{detail_id}.srt`, the non-indexed SRT route.
+/// The server chooses the advertised default caption itself and uses this
+/// form only when that default is an SRT; other formats use indexed URLs.
 pub fn caption_info_sec_url(host: &str, port: u16, detail_id: i64) -> String {
     caption_default_url(host, port, detail_id)
 }

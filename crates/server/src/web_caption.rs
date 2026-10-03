@@ -60,10 +60,10 @@ pub(super) fn caption_to_webvtt(
     if body.len() > MAX_INPUT_BYTES {
         return Err(BrowserCaptionError::Malformed);
     }
-    let text = std::str::from_utf8(body).map_err(|_| BrowserCaptionError::Encoding)?;
+    let text = decode_sidecar_text(body)?;
     let text = text
         .strip_prefix('\u{feff}')
-        .unwrap_or(text)
+        .unwrap_or(&text)
         .replace("\r\n", "\n")
         .replace('\r', "\n");
     if text.contains('\0') {
@@ -76,6 +76,48 @@ pub(super) fn caption_to_webvtt(
         CaptionWebVttConversion::SamiToWebVtt => smi_to_webvtt(&text)?,
     };
     Ok(output.into_bytes())
+}
+
+/// Decode sidecar bytes deterministically. A UTF-16 byte-order mark selects
+/// UTF-16; otherwise valid UTF-8 is used as is. Remaining legacy text is read
+/// as Windows-1252, the common encoding of older Western subtitles. Other
+/// legacy code pages decode readably wrong rather than failing the track.
+fn decode_sidecar_text(body: &[u8]) -> Result<std::borrow::Cow<'_, str>, BrowserCaptionError> {
+    let utf16 = match body {
+        [0xff, 0xfe, rest @ ..] => Some((rest, u16::from_le_bytes as fn([u8; 2]) -> u16)),
+        [0xfe, 0xff, rest @ ..] => Some((rest, u16::from_be_bytes as fn([u8; 2]) -> u16)),
+        _ => None,
+    };
+    if let Some((rest, unit)) = utf16 {
+        if rest.len() % 2 != 0 {
+            return Err(BrowserCaptionError::Encoding);
+        }
+        let units = rest.as_chunks::<2>().0.iter().map(|pair| unit(*pair));
+        return char::decode_utf16(units)
+            .collect::<Result<String, _>>()
+            .map(std::borrow::Cow::Owned)
+            .map_err(|_| BrowserCaptionError::Encoding);
+    }
+    Ok(match std::str::from_utf8(body) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(_) => std::borrow::Cow::Owned(body.iter().map(|&byte| windows_1252(byte)).collect()),
+    })
+}
+
+fn windows_1252(byte: u8) -> char {
+    // Bytes 0x80..=0x9F differ from Latin-1; the five unassigned positions keep
+    // their C1 code points, matching the WHATWG Encoding Standard mapping.
+    const HIGH: [char; 32] = [
+        '\u{20ac}', '\u{81}', '\u{201a}', '\u{192}', '\u{201e}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{2c6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8d}', '\u{17d}',
+        '\u{8f}', '\u{90}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}',
+        '\u{2014}', '\u{2dc}', '\u{2122}', '\u{161}', '\u{203a}', '\u{153}', '\u{9d}', '\u{17e}',
+        '\u{178}',
+    ];
+    match byte {
+        0x80..=0x9f => HIGH[usize::from(byte - 0x80)],
+        _ => char::from(byte),
+    }
 }
 
 fn validate_webvtt(text: &str) -> Result<String, BrowserCaptionError> {
@@ -140,43 +182,79 @@ fn caption_timing(line: &str, subrip: bool) -> Result<(u64, u64, &str), BrowserC
     Ok((start, end, &rest[end_len..]))
 }
 
+/// SubRip sidecars are hand-edited and often slightly irregular. Each cue is
+/// judged on its own: unusable timings and empty cues are omitted, and a text
+/// block without a timing line continues the preceding cue (a stray blank line
+/// inside dialogue). The file is rejected only when no cue survives.
 fn srt_to_webvtt(text: &str) -> Result<String, BrowserCaptionError> {
     let mut output = String::from("WEBVTT\n\n");
     let mut cues = 0usize;
+    // The open cue's timing line and its payload lines, written once complete.
+    let mut pending: Option<(String, String)> = None;
     for block in text.split("\n\n").filter(|block| !block.trim().is_empty()) {
-        let mut lines = block.lines();
-        let first = lines.next().ok_or(BrowserCaptionError::Malformed)?;
-        let timing = if first.contains("-->") {
-            first
-        } else {
-            if !first.trim().bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(BrowserCaptionError::Malformed);
+        let block = block.trim_matches('\n');
+        let lines = block.lines().collect::<Vec<_>>();
+        // A cue's timing line is first, or follows a numeric/identifier line.
+        let timing_index = lines.iter().take(2).position(|line| line.contains("-->"));
+        let numbered = lines.len() > 1
+            && !lines[0].trim().is_empty()
+            && lines[0].trim().bytes().all(|byte| byte.is_ascii_digit());
+        if timing_index.is_none() && !numbered {
+            if let Some((_, payload)) = pending.as_mut() {
+                check_output_growth(
+                    output.len().saturating_add(payload.len()),
+                    block.len().saturating_add(1),
+                )?;
+                if !payload.is_empty() {
+                    payload.push('\n');
+                }
+                payload.push_str(&block.replace("-->", "--&gt;"));
             }
-            lines.next().ok_or(BrowserCaptionError::Malformed)?
+            continue;
+        }
+        // A numbered block without a usable timing line is a broken cue: it ends
+        // the previous cue and its text is omitted.
+        cues += flush_srt_cue(&mut output, pending.take())?;
+        let Some(timing_index) = timing_index else {
+            continue;
         };
-        let (start, end, settings) = caption_timing(timing, true)?;
+        let Ok((start, end, settings)) = caption_timing(lines[timing_index], true) else {
+            continue;
+        };
         if end <= start {
-            return Err(BrowserCaptionError::Malformed);
+            continue;
         }
-        let payload = lines.collect::<Vec<_>>();
-        if payload.is_empty() {
-            return Err(BrowserCaptionError::Malformed);
-        }
-        output.push_str(&millis_vtt(start));
-        output.push_str(" --> ");
-        output.push_str(&millis_vtt(end));
-        output.push_str(settings);
-        output.push('\n');
+        let timing = format!("{} --> {}{settings}", millis_vtt(start), millis_vtt(end));
         // WebVTT treats a literal arrow in cue text as a new timing line.
         // Escape only the arrow, preserving SubRip's supported cue markup.
-        output.push_str(&payload.join("\n").replace("-->", "--&gt;"));
-        output.push_str("\n\n");
-        check_output_growth(output.len(), 0)?;
-        cues += 1;
+        let payload = lines[timing_index + 1..]
+            .join("\n")
+            .replace("-->", "--&gt;");
+        check_output_growth(output.len(), timing.len().saturating_add(payload.len()))?;
+        pending = Some((timing, payload));
     }
+    cues += flush_srt_cue(&mut output, pending)?;
     (cues > 0)
         .then_some(output)
         .ok_or(BrowserCaptionError::Malformed)
+}
+
+fn flush_srt_cue(
+    output: &mut String,
+    cue: Option<(String, String)>,
+) -> Result<usize, BrowserCaptionError> {
+    let Some((timing, payload)) = cue.filter(|(_, payload)| !payload.trim().is_empty()) else {
+        return Ok(0);
+    };
+    check_output_growth(
+        output.len(),
+        timing.len().saturating_add(payload.len()).saturating_add(3),
+    )?;
+    output.push_str(&timing);
+    output.push('\n');
+    output.push_str(&payload);
+    output.push_str("\n\n");
+    Ok(1)
 }
 
 fn ass_to_webvtt(text: &str) -> Result<String, BrowserCaptionError> {
@@ -222,7 +300,7 @@ fn ass_to_webvtt(text: &str) -> Result<String, BrowserCaptionError> {
             .map(str::trim)
             .collect::<Vec<_>>();
         if fields.len() != columns.len() {
-            return Err(BrowserCaptionError::Malformed);
+            continue;
         }
         let field = |name: &str| {
             columns
@@ -230,14 +308,21 @@ fn ass_to_webvtt(text: &str) -> Result<String, BrowserCaptionError> {
                 .position(|column| column == name)
                 .and_then(|index| fields.get(index).copied())
         };
-        let start = ass_time(field("start").ok_or(BrowserCaptionError::Malformed)?)
-            .ok_or(BrowserCaptionError::Malformed)?;
-        let end = ass_time(field("end").ok_or(BrowserCaptionError::Malformed)?)
-            .ok_or(BrowserCaptionError::Malformed)?;
+        // Like SubRip, one unusable event is omitted instead of failing the
+        // track; the declared Format line itself must still be coherent.
+        let (Some(start), Some(end), Some(text)) = (
+            field("start").and_then(ass_time),
+            field("end").and_then(ass_time),
+            field("text"),
+        ) else {
+            continue;
+        };
         if end <= start {
-            return Err(BrowserCaptionError::Malformed);
+            continue;
         }
-        let cue = strip_ass_overrides(field("text").ok_or(BrowserCaptionError::Malformed)?)?;
+        let Ok(cue) = strip_ass_overrides(text) else {
+            continue;
+        };
         if cue.trim().is_empty() {
             continue;
         }
@@ -890,13 +975,106 @@ mod tests {
 
     #[test]
     fn caption_conversion_rejects_invalid_text_input() {
+        for input in [
+            &b"not a cue"[..],
+            b"1\n00:00:01,000 --> 00:00:01,000\nZero\n\n2\n00:00:03,000 --> 00:00:02,000\nBack\n",
+            b"1\n00:00:01,000 --> 00:00:02,000\n\n",
+            b"1\nnot --> timing\nText\n",
+        ] {
+            assert_eq!(
+                caption_to_webvtt(CaptionWebVttConversion::SubRipToWebVtt, input),
+                Err(BrowserCaptionError::Malformed),
+                "{input:?}"
+            );
+        }
         assert_eq!(
-            caption_to_webvtt(CaptionWebVttConversion::SubRipToWebVtt, b"not a cue"),
+            caption_to_webvtt(
+                CaptionWebVttConversion::SubStationAlphaToWebVtt,
+                b"[Events]\nFormat: Start, End, Text\nDialogue: 0:00:02.00,0:00:01.00,Back\n"
+            ),
             Err(BrowserCaptionError::Malformed)
         );
+        // An odd UTF-16 length or an unpaired surrogate is not decodable text.
+        for input in [&[0xff, 0xfe, b'W'][..], &[0xff, 0xfe, 0x00, 0xd8, b'W', 0]] {
+            assert_eq!(
+                caption_to_webvtt(CaptionWebVttConversion::SubRipToWebVtt, input),
+                Err(BrowserCaptionError::Encoding)
+            );
+        }
         assert_eq!(
             caption_to_webvtt(CaptionWebVttConversion::ValidateWebVtt, &[0xff, 0xfe]),
-            Err(BrowserCaptionError::Encoding)
+            Err(BrowserCaptionError::Malformed)
+        );
+    }
+
+    #[test]
+    fn srt_omits_unusable_cues_and_joins_split_dialogue() {
+        let input = b"1\n00:00:01,000 --> 00:00:02,000\nFirst\n\n2\n00:00:03,000 --> 00:00:03,000\nZero length\n\n3\n00:00:04,000 --> 00:00:05,000\n\n4\n00:00:06,000 --> 00:00:07,000\nSplit\n\nacross a blank line\n\n5\n00:00:08,000 -> 00:00:09,000\nBad arrow\n\nOrphan after a bad cue\n\nCue 6\n00:00:10,000 --> 00:00:11,000\nIdentifier\n";
+        assert_eq!(
+            converted(CaptionWebVttConversion::SubRipToWebVtt, input),
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nFirst\n\n00:00:06.000 --> 00:00:07.000\nSplit\nacross a blank line\n\n00:00:10.000 --> 00:00:11.000\nIdentifier\n\n"
+        );
+        // Text separated from an otherwise empty cue becomes that cue's payload.
+        assert_eq!(
+            converted(
+                CaptionWebVttConversion::SubRipToWebVtt,
+                b"1\n00:00:01,000 --> 00:00:02,000\n\n\nLate text\nmore\nthen --> here\n"
+            ),
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nLate text\nmore\nthen --&gt; here\n\n"
+        );
+        let output = converted(CaptionWebVttConversion::SubRipToWebVtt, input);
+        assert!(
+            caption_to_webvtt(CaptionWebVttConversion::ValidateWebVtt, output.as_bytes()).is_ok()
+        );
+    }
+
+    #[test]
+    fn ass_omits_unusable_events_but_keeps_valid_dialogue() {
+        let input = "[Events]\nFormat: Start, End, Text\nDialogue: 0:00:02.00,0:00:01.00,Reversed\nDialogue: 0:00:03.00,0:00:03.00,Zero\nDialogue: bad,0:00:04.00,Bad time\nDialogue: 0:00:01.00\nDialogue: 0:00:05.00,0:00:06.00,{\\i1 unclosed\nDialogue: 0:00:07.00,0:00:08.00,Kept";
+        assert_eq!(
+            converted(
+                CaptionWebVttConversion::SubStationAlphaToWebVtt,
+                input.as_bytes()
+            ),
+            "WEBVTT\n\n00:00:07.000 --> 00:00:08.000\nKept\n\n"
+        );
+    }
+
+    #[test]
+    fn legacy_and_utf16_sidecars_decode_deterministically() {
+        // "Café – “Ça va”" in Windows-1252, including bytes 0x80..=0x9F.
+        let cp1252 =
+            b"1\r\n00:00:01,000 --> 00:00:02,000\r\nCaf\xe9 \x96 \x93\xc7a va\x94 \x80\r\n";
+        assert_eq!(
+            converted(CaptionWebVttConversion::SubRipToWebVtt, cp1252),
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nCafé – “Ça va” €\n\n"
+        );
+        assert_eq!(windows_1252(0x81), '\u{81}');
+        assert_eq!(windows_1252(0x9f), '\u{178}');
+        assert_eq!(windows_1252(0xff), 'ÿ');
+        let text = "1\n00:00:01,000 --> 00:00:02,000\nПривет 世界\n";
+        let expected = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nПривет 世界\n\n";
+        let mut little = vec![0xff, 0xfe];
+        let mut big = vec![0xfe, 0xff];
+        for unit in text.encode_utf16() {
+            little.extend(unit.to_le_bytes());
+            big.extend(unit.to_be_bytes());
+        }
+        assert_eq!(
+            converted(CaptionWebVttConversion::SubRipToWebVtt, &little),
+            expected
+        );
+        assert_eq!(
+            converted(CaptionWebVttConversion::SubRipToWebVtt, &big),
+            expected
+        );
+        // NUL bytes stay malformed whatever the decoded encoding.
+        assert_eq!(
+            caption_to_webvtt(
+                CaptionWebVttConversion::SubRipToWebVtt,
+                b"1\n00:00:01,000 --> 00:00:02,000\nA\0\xe9\n"
+            ),
+            Err(BrowserCaptionError::Malformed)
         );
     }
 }

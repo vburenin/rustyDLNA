@@ -253,12 +253,17 @@ export class SourceSelector {
         mediaSourceDelivery = true;
       }
     }
-    const copiedVideoMediaSourceSupport = !nativeHlsDelivery && copiedVideoMediaSourceType(item, streamNegotiation);
+    // Advertised Media Source types declare a video track. Audio-only output
+    // would fail its first append against that SourceBuffer, so compatible
+    // audio keeps the native progressive audio/mp4 loader.
+    const videoItem = item?.kind === "video";
+    const copiedVideoMediaSourceSupport = videoItem && !nativeHlsDelivery
+      && copiedVideoMediaSourceType(item, streamNegotiation);
     if (copiedVideoMediaSourceSupport) {
       mediaSourceType = copiedVideoMediaSourceSupport;
       mediaSourceDelivery = true;
     }
-    const encodedMediaSourceSupport = !nativeHlsDelivery
+    const encodedMediaSourceSupport = videoItem && !nativeHlsDelivery
       && streamNegotiation?.video === "transcode"
       && ["h264_sdr", "hevc_hdr10"].includes(streamNegotiation?.videoOutput)
       ? advertisedMediaSourceType(

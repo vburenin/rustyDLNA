@@ -2,6 +2,8 @@ import { STREAM_MODES, validQualityProfileId, encodingPreset } from "./core.js";
 
 const PREFIX = "rustydlna.";
 const PROGRESS_KEY = `${PREFIX}webProgress.v1`;
+const WATCHED_KEY = `${PREFIX}webWatched.v1`;
+const MAX_WATCHED_ENTRIES = 500;
 
 function read(key, fallback) {
   try {
@@ -111,6 +113,40 @@ export function saveProgress(itemId, position, duration) {
 
 export function clearProgress(itemId) {
   return saveProgress(itemId, 0, 0);
+}
+
+// Completion markers are kept apart from resume positions so they can never
+// surface in Continue watching, offer Resume, or evict a resume entry.
+function readWatchedMap() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(WATCHED_KEY) || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+export function watchedSnapshot() {
+  return new Set(Object.entries(readWatchedMap())
+    .filter(([, updated]) => Number.isFinite(Number(updated)))
+    .map(([itemId]) => itemId));
+}
+
+export function markWatched(itemId) {
+  if (itemId === null || itemId === undefined) return false;
+  const watched = readWatchedMap();
+  watched[String(itemId)] = Date.now();
+  const entries = Object.entries(watched);
+  if (entries.length > MAX_WATCHED_ENTRIES) {
+    entries.sort((left, right) => Number(right[1] || 0) - Number(left[1] || 0));
+    for (const [key] of entries.slice(MAX_WATCHED_ENTRIES)) delete watched[key];
+  }
+  try {
+    localStorage.setItem(WATCHED_KEY, JSON.stringify(watched));
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 export function createProgressWriter(writeNow, interval = 5000) {

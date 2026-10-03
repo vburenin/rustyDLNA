@@ -39,6 +39,11 @@ pub(crate) use cache::{maintain_transcode_cache, CacheCoordinator};
 const FIRST_BYTES: u64 = 16 * 1024;
 const FIRST_WAIT: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(50);
+// A growing copied-video native playlist waits at most this long, from the
+// request, for its startup look-ahead before publishing the ordinary startup
+// buffer. It stays well inside FIRST_WAIT so the look-ahead never becomes a
+// "no complete media segment" failure.
+const NATIVE_COPIED_LOOKAHEAD_WAIT: Duration = Duration::from_secs(5);
 // Chromium commonly pauses range reads while it parses a new fragmented MP4
 // or refills its media pipeline. Keep the producer around long enough for the
 // next request instead of treating that normal gap as abandonment.
@@ -58,6 +63,9 @@ const WEB_PREPARATION_RETENTION: Duration = Duration::from_secs(2 * 60);
 const WEB_SUPERSEDED_JOB_HANDOFF: Duration = Duration::from_secs(2);
 const MAX_WEB_TRANSCODE_PREPARATIONS: usize = 64;
 const WEB_REQUEST_CANCELLED: &str = "web playback request superseded";
+// Every cache quota or free-space failure carries this prefix so admission
+// and producers can classify it apart from contention.
+const CACHE_LIMITS_ERROR_PREFIX: &str = "transcode cache limits: ";
 const REMUX_CANCELLED: &str = "remux cancelled";
 pub(crate) const MAX_MSE_FRAGMENT_CURSOR: usize = hls::MAX_INDEX_FRAGMENTS;
 
@@ -139,6 +147,7 @@ pub(crate) struct RemuxMetrics {
     web_prepared_reuses: AtomicU64,
     web_cancelled: AtomicU64,
     web_failures_busy: AtomicU64,
+    web_failures_storage: AtomicU64,
     web_failures_producer: AtomicU64,
     web_startup_initial_bytes: AtomicDurationMetric,
     web_startup_playlist_ready: AtomicDurationMetric,
@@ -149,6 +158,9 @@ pub(crate) struct RemuxMetrics {
     web_startup_mse_first_fragment_appended: AtomicDurationMetric,
     web_startup_canplay: AtomicDurationMetric,
     web_startup_playing: AtomicDurationMetric,
+    /// Running copied-seek origin probes. They hold helper slots but no
+    /// title-job permit, so shutdown waits for them separately.
+    origin_probes: AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -238,6 +250,7 @@ pub(crate) struct RemuxStatus {
     pub web_prepared_reuses_total: u64,
     pub web_cancelled_total: u64,
     pub web_failures_busy_total: u64,
+    pub web_failures_storage_total: u64,
     pub web_failures_producer_total: u64,
     pub web_startup_initial_bytes: DurationMetric,
     pub web_startup_playlist_ready: DurationMetric,
@@ -277,6 +290,7 @@ impl RemuxMetrics {
             web_prepared_reuses: AtomicU64::new(0),
             web_cancelled: AtomicU64::new(0),
             web_failures_busy: AtomicU64::new(0),
+            web_failures_storage: AtomicU64::new(0),
             web_failures_producer: AtomicU64::new(0),
             web_startup_initial_bytes: AtomicDurationMetric::default(),
             web_startup_playlist_ready: AtomicDurationMetric::default(),
@@ -287,6 +301,7 @@ impl RemuxMetrics {
             web_startup_mse_first_fragment_appended: AtomicDurationMetric::default(),
             web_startup_canplay: AtomicDurationMetric::default(),
             web_startup_playing: AtomicDurationMetric::default(),
+            origin_probes: AtomicUsize::new(0),
         }
     }
 
@@ -353,6 +368,9 @@ pub struct RemuxJob {
     started: Instant,
     hls_index: Mutex<hls::Index>,
     effective_recipe: Mutex<Option<fallback::EffectiveRecipe>>,
+    /// Source time of output zero for a nonzero copied-video seek, once the
+    /// bounded source probe has repeated FFmpeg's keyframe landing.
+    stream_origin: std::sync::OnceLock<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -1334,7 +1352,7 @@ fn spawn_ffmpeg(
                     let _ = std::fs::remove_file(&part);
                 }
                 Err(error) => {
-                    let cache_pressure = error.starts_with("transcode cache limits: ");
+                    let cache_pressure = error.starts_with(CACHE_LIMITS_ERROR_PREFIX);
                     if job.cancelled.load(Ordering::Acquire) || error == "cancelled" {
                         tracing::info!(
                             id,
@@ -1501,7 +1519,7 @@ fn run_ffmpeg_growing(
                 cache_monitor = cache_monitor::Monitor::new();
                 cache_monitor
                     .poll(app, job, cache_monitor::Kind::Ordinary)
-                    .map_err(|error| format!("transcode cache limits: {error}"))?;
+                    .map_err(|error| format!("{CACHE_LIMITS_ERROR_PREFIX}{error}"))?;
                 loop {
                     if job.reconnect_grace_expired() {
                         job.cancel();
@@ -1515,7 +1533,7 @@ fn run_ffmpeg_growing(
                     if let Some(observation) = cache_monitor
                         .take_ready()
                         .transpose()
-                        .map_err(|error| format!("transcode cache limits: {error}"))?
+                        .map_err(|error| format!("{CACHE_LIMITS_ERROR_PREFIX}{error}"))?
                     {
                         if job.cancelled.load(Ordering::Acquire) {
                             return Err("cancelled".into());
@@ -1562,7 +1580,7 @@ fn run_ffmpeg_growing(
                 reason: Stop::Cache(error),
                 ..
             },
-        ) => Err(format!("transcode cache limits: {error}")),
+        ) => Err(format!("{CACHE_LIMITS_ERROR_PREFIX}{error}")),
         Ok(SupervisedOutcome::Deadline { .. }) => {
             Err("transcode runtime exceeded configured deadline".into())
         }
@@ -1718,7 +1736,7 @@ fn finalize_remux(
         } else {
             tracing::error!(id = job.detail_id, %error, "remux output verification/publication failed");
             job.transition(RemuxState::Failed(
-                if error.starts_with("transcode cache limits:") {
+                if error.starts_with(CACHE_LIMITS_ERROR_PREFIX) {
                     error
                 } else {
                     format!("remux output verification failed: {error}")
@@ -1812,13 +1830,13 @@ fn publish_finished_output(
     let _maintenance = cache::lock_maintenance(app, || {
         job.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
     })
-    .map_err(|error| format!("transcode cache limits: {error}"))?;
+    .map_err(|error| format!("{CACHE_LIMITS_ERROR_PREFIX}{error}"))?;
     cache::maintain_locked_measured(app, false)
-        .map_err(|error| format!("transcode cache limits: {error}"))?;
+        .map_err(|error| format!("{CACHE_LIMITS_ERROR_PREFIX}{error}"))?;
     // Cancellation and publication retain one ordering through Complete.
     let _completion = crate::lock_recover(&job.disconnect_deadline);
     cache::check_publication_limits(app, job)
-        .map_err(|error| format!("transcode cache limits: {error}"))?;
+        .map_err(|error| format!("{CACHE_LIMITS_ERROR_PREFIX}{error}"))?;
     let _publication = crate::lock_recover(&job.output);
     let file = output.as_ref();
     if job.cancelled.load(Ordering::Acquire) {
@@ -2227,7 +2245,7 @@ fn attach_job_attempt(
     }
     let requested = HashSet::from([spec.dest.clone()]);
     maintain_app_cache(&app, &requested, false)
-        .map_err(|error| format!("transcode cache limits: {error}"))?;
+        .map_err(|error| format!("{CACHE_LIMITS_ERROR_PREFIX}{error}"))?;
     if fresh {
         app.remux_metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
         if new_web_generation {
@@ -2269,11 +2287,13 @@ fn attach_job_attempt(
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
             effective_recipe: Mutex::new(reused_fallback),
+            stream_origin: std::sync::OnceLock::new(),
         });
         job.open_output()
             .map_err(|error| format!("open completed remux: {error}"))?;
         register_admitted_job(&app, spec, &job, register_client, register_client)?;
         cache::touch_recency(&job.dest);
+        start_stream_origin_probe(&app, spec, &job);
         return Ok(RemuxAttachment::Ready(job));
     }
     app.remux_metrics
@@ -2313,11 +2333,10 @@ fn attach_job_attempt(
     };
     let helper_permit = app
         .helpers
-        .try_acquire_many(if spec.remux_p8 && app.cfg.helper_max_jobs > 1 {
-            2
-        } else {
-            1
-        })
+        .try_acquire_many(producer_helper_slots(
+            app.cfg.helper_max_jobs,
+            spec.remux_p8,
+        ))
         .map_err(|error| format!("media helper busy: {error}"))?;
     let part = cache_part(&spec.dest);
     if part.exists() {
@@ -2355,6 +2374,7 @@ fn attach_job_attempt(
         started: Instant::now(),
         hls_index: Mutex::new(hls::Index::default()),
         effective_recipe: Mutex::new(None),
+        stream_origin: std::sync::OnceLock::new(),
     });
     register_admitted_job(&app, spec, &job, register_client, true)?;
     spawn_ffmpeg(
@@ -2365,6 +2385,7 @@ fn attach_job_attempt(
         job_permit,
         ai_upscale_permit,
     );
+    start_stream_origin_probe(&app, spec, &job);
     Ok(RemuxAttachment::Ready(job))
 }
 
@@ -2395,6 +2416,139 @@ fn register_admitted_job(
         map.insert(spec.job_key.clone(), job.clone());
     }
     Ok(())
+}
+
+/// Helper slots one producer admits together: Dolby Vision Profile 8
+/// conversion runs two cooperating helpers when the gate allows two.
+fn producer_helper_slots(helper_max_jobs: usize, remux_p8: bool) -> usize {
+    if remux_p8 && helper_max_jobs > 1 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Bound on the demux-only probe that repeats FFmpeg's copied-seek landing.
+const STREAM_ORIGIN_PROBE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Admission for the optional origin probe. Producer admission never waits,
+/// so the probe runs only while every title-job permit still free could also
+/// admit its largest producer: it never takes a slot a producer would need.
+/// Queued waiters are never bypassed and a skip is not counted as rejection.
+fn origin_probe_permit(app: &App) -> Option<rusty_dlna_helper::HelperPermit> {
+    let free_jobs = (app.cfg.transcode.max_jobs.max(1) as usize).saturating_sub(app.jobs.in_use());
+    let reserve = free_jobs.saturating_mul(producer_helper_slots(app.cfg.helper_max_jobs, true));
+    let idle = || {
+        let metrics = app.helpers.metrics();
+        metrics.max_active.saturating_sub(metrics.active)
+    };
+    if idle() <= reserve {
+        return None;
+    }
+    // Recheck with the slot held: when a concurrent admission consumed the
+    // headroom in between, the probe steps aside instead.
+    let permit = app.helpers.try_acquire_idle()?;
+    (idle() >= reserve).then_some(permit)
+}
+
+/// Counts one running origin probe for [`wait_for_shutdown`].
+struct OriginProbeGuard(Arc<App>);
+
+impl OriginProbeGuard {
+    /// `None` once shutdown has begun. The count is published before the
+    /// shutdown check, and [`wait_for_shutdown`] reads it after shutdown is
+    /// broadcast, so a probe either sees shutdown or is waited for.
+    fn enter(app: &Arc<App>) -> Option<Self> {
+        app.remux_metrics
+            .origin_probes
+            .fetch_add(1, Ordering::SeqCst);
+        let guard = Self(app.clone());
+        std::sync::atomic::fence(Ordering::SeqCst);
+        (!app.scan_control.cancellation.is_cancelled()).then_some(guard)
+    }
+}
+
+impl Drop for OriginProbeGuard {
+    fn drop(&mut self) {
+        self.0
+            .remux_metrics
+            .origin_probes
+            .fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A nonzero copied-video browser seek starts at the keyframe FFmpeg's demuxer
+/// lands on, which output time zero then represents. Establish that source
+/// time beside the producer so status can report it without delaying
+/// startup. The probe runs only on helper capacity no producer could claim
+/// (see [`origin_probe_permit`]) or does not run; the origin then stays
+/// unknown and clients keep using the requested start. A skip is not a
+/// refused request, so it does not count as helper rejection. The probe stops
+/// when its job is cancelled or shutdown begins, and shutdown waits for it to
+/// reap FFprobe.
+fn start_stream_origin_probe(app: &Arc<App>, spec: &RemuxJobSpec, job: &Arc<RemuxJob>) {
+    let Some(expected) = spec.output_expectation.as_ref() else {
+        return;
+    };
+    let Some(source) = spec.source_file.clone() else {
+        return;
+    };
+    if !job.web
+        || !expected.video_copy
+        || expected.video_codec.is_none()
+        || !expected.seek_seconds.is_finite()
+        || expected.seek_seconds <= 0.0
+        || job.stream_origin.get().is_some()
+    {
+        return;
+    }
+    let Some(tracked) = OriginProbeGuard::enter(app) else {
+        return;
+    };
+    let Some(permit) = origin_probe_permit(app) else {
+        tracing::debug!(
+            id = job.detail_id,
+            "copied seek origin probe skipped: no helper slot beyond producer reserve"
+        );
+        return;
+    };
+    let seek = expected.seek_seconds;
+    let job = job.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("seek-origin-{}", job.detail_id))
+        .spawn(move || {
+            // Released after the permit: shutdown sees the probe until
+            // FFprobe is reaped and its helper slot is free.
+            let tracked = tracked;
+            let _permit = permit;
+            let app = &tracked.0;
+            let deadline = Instant::now() + STREAM_ORIGIN_PROBE_DEADLINE;
+            let cancelled = [&job.cancelled, app.scan_control.cancellation.as_atomic()];
+            match source_evidence::copied_seek_origin(&source, seek, deadline, &cancelled) {
+                Ok(Some(origin)) => {
+                    let _ = job.stream_origin.set(origin);
+                    tracing::debug!(
+                        id = job.detail_id,
+                        requested = seek,
+                        origin,
+                        "copied seek output origin established"
+                    );
+                }
+                Ok(None) => tracing::debug!(
+                    id = job.detail_id,
+                    requested = seek,
+                    "copied seek output origin not established"
+                ),
+                Err(error) => tracing::debug!(
+                    id = job.detail_id,
+                    requested = seek,
+                    "copied seek output origin probe failed: {error}"
+                ),
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::debug!("copied seek origin probe thread: {error}");
+    }
 }
 
 fn browser_preparation_options(mut options: BrowserOutputOptions) -> BrowserOutputOptions {
@@ -2572,6 +2726,51 @@ pub(crate) fn web_job_state(
         ("queued", Some(1))
     } else {
         ("idle", None)
+    }
+}
+
+/// Source time, in seconds from the container start, that output time zero
+/// represents. Encoded video and accurately trimmed seeks start exactly at the
+/// request; a nonzero copied-video seek is known only once its source probe
+/// has finished, unless a portable fallback re-encoded the video.
+/// The origin is specific to one generation, so it is reported only to the
+/// request (and session) that owns it.
+pub(crate) fn web_job_stream_start(
+    app: &App,
+    detail_id: i64,
+    session_id: Option<u64>,
+    request_id: Option<u64>,
+) -> Option<f64> {
+    let request_id = request_id?;
+    let job = {
+        let jobs = crate::lock_recover(&app.remuxes);
+        jobs.values()
+            .find(|job| {
+                job.web
+                    && job.detail_id == detail_id
+                    && job.owns_web_request(session_id, request_id)
+            })
+            .cloned()
+    }?;
+    job.stream_start_seconds()
+}
+
+impl RemuxJob {
+    fn stream_start_seconds(&self) -> Option<f64> {
+        let expected = self.web_spec.as_ref()?.output_expectation.as_ref()?;
+        let seek = expected.seek_seconds;
+        if !seek.is_finite() || seek < 0.0 {
+            return None;
+        }
+        let video_copied = expected.video_copy
+            && expected.video_codec.is_some()
+            && crate::lock_recover(&self.effective_recipe)
+                .as_ref()
+                .is_none_or(|actual| actual.video_encoder == "copy");
+        if !video_copied || seek == 0.0 {
+            return Some(seek);
+        }
+        self.stream_origin.get().copied()
     }
 }
 
@@ -2937,6 +3136,14 @@ pub async fn serve_remux(
             let err = if req.path.starts_with("/web/media/") {
                 if e == WEB_REQUEST_CANCELLED {
                     crate::web_ui::transcode_stream_error(409, "transcode_cancelled")
+                } else if e.starts_with(CACHE_LIMITS_ERROR_PREFIX) {
+                    // Cache limits do not clear when another generation
+                    // finishes, so they keep a retryable 503 class but a
+                    // distinct code, message, and longer Retry-After.
+                    app.remux_metrics
+                        .web_failures_storage
+                        .fetch_add(1, Ordering::Relaxed);
+                    crate::web_ui::transcode_stream_error(503, "transcode_storage")
                 } else {
                     app.remux_metrics
                         .web_failures_busy
@@ -3029,9 +3236,27 @@ pub async fn serve_remux(
     }
     let finished = job.is_complete() && current_len_async(&job).await? > 0;
     if finished {
-        return serve_finished(app, sock, req, &job, spec.mime, head).await;
+        return serve_finished(
+            app,
+            sock,
+            req,
+            &job,
+            spec.mime,
+            spec.caption_info_sec.as_deref(),
+            head,
+        )
+        .await;
     }
-    serve_growing(app, sock, req, &job, spec.mime, head).await
+    serve_growing(
+        app,
+        sock,
+        req,
+        &job,
+        spec.mime,
+        spec.caption_info_sec.as_deref(),
+        head,
+    )
+    .await
 }
 
 /// A bounded range has a truthful wire length even while the output grows.
@@ -3162,7 +3387,7 @@ async fn serve_resumable_download(
         RemuxState::Complete => {
             let pin_job = job.clone();
             tokio::task::spawn_blocking(move || pin_job.pin_ready_output()).await??;
-            return serve_finished(app, sock, req, job, mime, false).await;
+            return serve_finished(app, sock, req, job, mime, None, false).await;
         }
         RemuxState::Failed(_) => crate::web_ui::transcode_stream_error(500, "transcode_failed"),
         RemuxState::Cancelled => crate::web_ui::transcode_stream_error(409, "transcode_cancelled"),
@@ -3278,7 +3503,9 @@ async fn serve_fragment_playlist(
     head: bool,
     media_source: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let deadline = Instant::now() + FIRST_WAIT;
+    let requested = Instant::now();
+    let deadline = requested + FIRST_WAIT;
+    let lookahead_deadline = requested + NATIVE_COPIED_LOOKAHEAD_WAIT.min(FIRST_WAIT);
     let playlist_delivery = if media_source { "mse" } else { "hls" };
     let all_fragments_independent = !media_source
         && job
@@ -3311,6 +3538,7 @@ async fn serve_fragment_playlist(
         let init_uri = init_uri.clone();
         let segment_uri = segment_uri.clone();
         let observe_fragment = !first_fragment_observed;
+        let lookahead = Instant::now() < lookahead_deadline;
         let indexed = tokio::task::spawn_blocking(move || {
             let output = index_job
                 .open_output()
@@ -3335,14 +3563,10 @@ async fn serve_fragment_playlist(
                     })
                     .transpose()
             } else {
+                let generation = timing_key.map(|(_, session, request)| (session, request));
                 index
-                    .has_startup_buffer(complete)
-                    .then(|| {
-                        index.playlist_view_for(
-                            false,
-                            timing_key.map(|(_, session, request)| (session, request)),
-                        )
-                    })
+                    .has_dependent_startup_buffer(complete, generation, lookahead)
+                    .then(|| index.playlist_view_for(false, generation))
                     .transpose()
             };
             drop(index);
@@ -3648,15 +3872,21 @@ pub(crate) fn cancel_all(app: &App) {
     }
 }
 
+/// Wait until title jobs and copied-seek origin probes have reaped their
+/// helpers. Callers broadcast shutdown cancellation first.
 pub(crate) async fn wait_for_shutdown(app: &App, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
+    // Pairs with the fence in `OriginProbeGuard::enter`.
+    std::sync::atomic::fence(Ordering::SeqCst);
     loop {
-        if app.jobs.in_use() == 0 {
+        let origin_probes = app.remux_metrics.origin_probes.load(Ordering::SeqCst);
+        if app.jobs.in_use() == 0 && origin_probes == 0 {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
             tracing::error!(
                 jobs = app.jobs.in_use(),
+                origin_probes,
                 "transcode jobs did not reap before shutdown deadline"
             );
             return;
@@ -3723,6 +3953,10 @@ pub(crate) fn runtime_status(app: &App) -> RemuxStatus {
             .load(Ordering::Relaxed),
         web_cancelled_total: app.remux_metrics.web_cancelled.load(Ordering::Relaxed),
         web_failures_busy_total: app.remux_metrics.web_failures_busy.load(Ordering::Relaxed),
+        web_failures_storage_total: app
+            .remux_metrics
+            .web_failures_storage
+            .load(Ordering::Relaxed),
         web_failures_producer_total: app
             .remux_metrics
             .web_failures_producer
@@ -3754,6 +3988,7 @@ async fn serve_finished(
     req: &HttpRequest,
     job: &Arc<RemuxJob>,
     mime: &str,
+    caption_info_sec: Option<&str>,
     head: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let metadata_job = job.clone();
@@ -3818,6 +4053,9 @@ async fn serve_finished(
     if let Some(etag) = etag.as_deref() {
         resp.set("ETag", etag);
     }
+    if let Some(url) = caption_info_sec {
+        rusty_dlna_http::set_caption_info_sec(&mut resp, url);
+    }
     if head {
         write_remux_response(app, sock, resp, head).await?;
         return Ok(());
@@ -3835,6 +4073,7 @@ async fn serve_growing(
     req: &HttpRequest,
     job: &Arc<RemuxJob>,
     mime: &str,
+    caption_info_sec: Option<&str>,
     head: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let open = match req.header("Range") {
@@ -3850,10 +4089,10 @@ async fn serve_growing(
         },
     };
     let Some((start, requested_end)) = open else {
-        return serve_open_growing(app, sock, job, mime, head).await;
+        return serve_open_growing(app, sock, job, mime, caption_info_sec, head).await;
     };
     if start == 0 && requested_end.is_none() {
-        return serve_open_growing(app, sock, job, mime, head).await;
+        return serve_open_growing(app, sock, job, mime, caption_info_sec, head).await;
     }
 
     // Browsers can reconnect to a growing fMP4 with a nonzero open range after
@@ -3910,6 +4149,9 @@ async fn serve_growing(
         "Content-Length",
         end.saturating_sub(start).saturating_add(1),
     );
+    if let Some(url) = caption_info_sec {
+        rusty_dlna_http::set_caption_info_sec(&mut resp, url);
+    }
     let valid_wire = write_remux_response(app, sock, resp, head).await?;
     if valid_wire && !head {
         stream_growing(app, sock, job, start, Some(end)).await?;
@@ -3922,9 +4164,13 @@ async fn serve_open_growing(
     sock: &mut tokio::net::TcpStream,
     job: &Arc<RemuxJob>,
     mime: &str,
+    caption_info_sec: Option<&str>,
     head: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let resp = live_transcode_response(mime);
+    let mut resp = live_transcode_response(mime);
+    if let Some(url) = caption_info_sec {
+        rusty_dlna_http::set_caption_info_sec(&mut resp, url);
+    }
     let valid_wire = write_remux_response(app, sock, resp, head).await?;
     if head || !valid_wire {
         return Ok(());
@@ -4111,14 +4357,27 @@ pub use hls::fuzzing::FuzzIndex;
 mod tests {
     use super::*;
 
+    /// Captures this thread's INFO events. One process-wide subscriber routes
+    /// output to the capturing thread: a scoped `with_default` subscriber is
+    /// not reliable under the parallel test runner, because a callsite first
+    /// reached on another thread can cache `never` interest for every thread.
     #[derive(Clone, Default)]
     struct TraceCapture(Arc<Mutex<Vec<u8>>>);
 
-    struct TraceCaptureWriter(Arc<Mutex<Vec<u8>>>);
+    thread_local! {
+        static TRACE_CAPTURE: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
-    impl std::io::Write for TraceCaptureWriter {
+    struct ThreadTraceWriter;
+
+    impl std::io::Write for ThreadTraceWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            crate::lock_recover(&self.0).extend_from_slice(bytes);
+            TRACE_CAPTURE.with(|capture| {
+                if let Some(buffer) = capture.borrow().as_ref() {
+                    crate::lock_recover(buffer).extend_from_slice(bytes);
+                }
+            });
             Ok(bytes.len())
         }
 
@@ -4127,15 +4386,30 @@ mod tests {
         }
     }
 
-    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TraceCapture {
-        type Writer = TraceCaptureWriter;
-
-        fn make_writer(&'writer self) -> Self::Writer {
-            TraceCaptureWriter(self.0.clone())
-        }
-    }
-
     impl TraceCapture {
+        fn capture<T>(&self, f: impl FnOnce() -> T) -> T {
+            static GLOBAL: std::sync::Once = std::sync::Once::new();
+            GLOBAL.call_once(|| {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::INFO)
+                    .with_ansi(false)
+                    .without_time()
+                    .with_writer(|| ThreadTraceWriter)
+                    .finish();
+                tracing::subscriber::set_global_default(subscriber)
+                    .expect("no other test installs a global subscriber");
+            });
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    TRACE_CAPTURE.with(|capture| capture.borrow_mut().take());
+                }
+            }
+            TRACE_CAPTURE.with(|capture| *capture.borrow_mut() = Some(self.0.clone()));
+            let _reset = Reset;
+            f()
+        }
+
         fn text(&self) -> String {
             String::from_utf8(crate::lock_recover(&self.0).clone()).unwrap()
         }
@@ -4227,6 +4501,7 @@ mod tests {
             profile8_toolchain: None,
             audio_index: 0,
             audio: RemuxAudio::Copy,
+            caption_info_sec: None,
         }
     }
 
@@ -4323,6 +4598,7 @@ mod tests {
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
             effective_recipe: Mutex::new(None),
+            stream_origin: std::sync::OnceLock::new(),
         });
         crate::lock_recover(&app.remuxes).insert(key.clone(), job.clone());
         (key, job)
@@ -4355,6 +4631,7 @@ mod tests {
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
             effective_recipe: Mutex::new(None),
+            stream_origin: std::sync::OnceLock::new(),
         })
     }
 
@@ -4366,7 +4643,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            serve_growing(&app, &mut socket, &request, &job, "video/mp4", head)
+            serve_growing(&app, &mut socket, &request, &job, "video/mp4", None, head)
                 .await
                 .unwrap();
         });
@@ -4752,13 +5029,7 @@ mod tests {
         assert_eq!(first_metrics.web_cache_reuses_total, 0);
 
         let traces = TraceCapture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .without_time()
-            .with_writer(traces.clone())
-            .finish();
-        let (shared, clients) = tracing::subscriber::with_default(subscriber, || {
+        let (shared, clients) = traces.capture(|| {
             let mut clients = Vec::new();
             // Native HLS can refresh its playlist and fetch fragments while
             // paused. Every resource carries the established generation IDs.
@@ -5112,6 +5383,7 @@ mod tests {
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
             effective_recipe: Mutex::new(None),
+            stream_origin: std::sync::OnceLock::new(),
         });
 
         finalize_remux(
@@ -5413,7 +5685,7 @@ mod tests {
             &"a".repeat(64),
         );
         let protected_part = cache_part(&protected_dest);
-        let protected_bytes = 1_200_000u64;
+        let protected_bytes = 600_000u64;
         std::fs::write(&protected_part, vec![0u8; protected_bytes as usize]).unwrap();
         let job = Arc::new(RemuxJob {
             detail_id: 1,
@@ -5439,6 +5711,7 @@ mod tests {
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
             effective_recipe: Mutex::new(None),
+            stream_origin: std::sync::OnceLock::new(),
         });
         crate::lock_recover(&app.remuxes).insert("protected".into(), job);
         let protected = cache::active_artifacts(crate::lock_recover(&app.remuxes).values());
@@ -5449,12 +5722,20 @@ mod tests {
 
         let victim =
             rusty_dlna_transcode::cache_dest_for_key(&dir, 2, RecodeAction::Hdr10, &"b".repeat(64));
-        let victim_bytes = 600_000u64;
+        let victim_bytes = 300_000u64;
         std::fs::write(&victim, vec![1u8; victim_bytes as usize]).unwrap();
         let victim_stamp = rusty_dlna_transcode::cache_stamp_path(&victim);
         std::fs::write(&victim_stamp, b"stamp").unwrap();
+        // Evicting both completed entries could satisfy the quota, but an
+        // admission owns this one, so the pass reclaims only part of it.
+        let reserved =
+            rusty_dlna_transcode::cache_dest_for_key(&dir, 3, RecodeAction::Hdr10, &"c".repeat(64));
+        let reserved_bytes = 600_000u64;
+        std::fs::write(&reserved, vec![2u8; reserved_bytes as usize]).unwrap();
+        let reservation = app.transcode_cache.reserve(&reserved).unwrap();
 
         let error = enforce_active_cache_limits(&app).unwrap_err();
+        drop(reservation);
 
         assert_eq!(
             error.to_string(),
@@ -5463,8 +5744,9 @@ mod tests {
         assert!(!victim.exists());
         assert!(!victim_stamp.exists());
         assert!(protected_part.exists());
+        assert!(reserved.exists());
         let metrics = runtime_status(&app);
-        assert_eq!(metrics.cache_bytes, protected_bytes);
+        assert_eq!(metrics.cache_bytes, protected_bytes + reserved_bytes);
         assert_eq!(metrics.cache_evicted_files_total, 1);
         assert_eq!(metrics.cache_evicted_bytes_total, victim_bytes);
         assert_eq!(metrics.cache_maintenance_failures_total, 1);
@@ -5552,6 +5834,7 @@ mod tests {
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
             effective_recipe: Mutex::new(None),
+            stream_origin: std::sync::OnceLock::new(),
         });
         crate::lock_recover(&app.remuxes).insert(key.clone(), job.clone());
 
@@ -5616,6 +5899,7 @@ mod tests {
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
             effective_recipe: Mutex::new(None),
+            stream_origin: std::sync::OnceLock::new(),
         });
         crate::lock_recover(&app.remuxes).insert(key.clone(), job.clone());
         assert!(enforce_active_cache_limits(&app).is_err());
@@ -5775,6 +6059,7 @@ mod tests {
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
             effective_recipe: Mutex::new(None),
+            stream_origin: std::sync::OnceLock::new(),
         });
         assert!(!dest.exists());
         let writer = {
@@ -6310,6 +6595,76 @@ mod tests {
         }
     }
 
+    /// Samsung TVs send `getCaptionInfo.sec: 1` on the /Transcode/ URL a remap
+    /// advertises; every successful growing or finished response answers it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn samsung_caption_info_sec_reaches_growing_and_finished_transcode_responses() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = temp_dir("caption-info-sec-wire");
+        let app = test_app(&dir, 1);
+        let caption = "http://192.0.2.10:18200/Captions/45.srt";
+        let body = vec![0x5a; FIRST_BYTES as usize];
+        let finished = growing_test_job(&dir, 46, b"finished-transcode-bytes");
+        std::fs::rename(&finished.part, &finished.dest).unwrap();
+        finished.transition(RemuxState::Complete);
+        let growing = growing_test_job(&dir, 45, &body);
+        for (job, complete, request, head) in [
+            (&growing, false, "HEAD /Transcode/45.mp4 HTTP/1.1", true),
+            (&growing, false, "GET /Transcode/45.mp4 HTTP/1.1", false),
+            (&finished, true, "HEAD /Transcode/46.mp4 HTTP/1.1", true),
+            (&finished, true, "GET /Transcode/46.mp4 HTTP/1.1", false),
+        ] {
+            // Ranged GETs end once their bytes are written, even while growing.
+            let range = if head { "" } else { "Range: bytes=0-7\r\n" };
+            let request = HttpRequest::parse_headers(&format!(
+                "{request}\r\nHost: 127.0.0.1:18200\r\ngetCaptionInfo.sec: 1\r\n{range}\r\n"
+            ))
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (server_app, job) = (app.clone(), Arc::clone(job));
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                if complete {
+                    serve_finished(
+                        &server_app,
+                        &mut socket,
+                        &request,
+                        &job,
+                        "video/mp4",
+                        Some(caption),
+                        head,
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    serve_growing(
+                        &server_app,
+                        &mut socket,
+                        &request,
+                        &job,
+                        "video/mp4",
+                        Some(caption),
+                        head,
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            server.await.unwrap();
+            let headers = String::from_utf8_lossy(&bytes);
+            assert!(
+                headers.contains(&format!("\r\nCaptionInfo.sec: {caption}\r\n")),
+                "complete={complete} head={head}: {headers}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finished_and_growing_transcode_head_emit_headers_only() {
         use tokio::io::AsyncReadExt;
@@ -6334,6 +6689,7 @@ mod tests {
                 &finished_req,
                 &finished_job,
                 "video/mp4",
+                None,
                 true,
             )
             .await
@@ -6602,6 +6958,7 @@ mod tests {
             profile8_toolchain: None,
             audio_index: 0,
             audio: RemuxAudio::Copy,
+            caption_info_sec: None,
         };
         let first_job = attach(app.clone(), first).unwrap();
         wait_for_terminal_cleanup(&app, &first_job);
@@ -6639,6 +6996,7 @@ mod tests {
             profile8_toolchain: None,
             audio_index: 0,
             audio: RemuxAudio::Copy,
+            caption_info_sec: None,
         };
         let second_job = attach(app.clone(), second).unwrap();
         assert!(!Arc::ptr_eq(&first_job, &second_job));
@@ -7564,6 +7922,7 @@ mod tests {
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
             effective_recipe: Mutex::new(None),
+            stream_origin: std::sync::OnceLock::new(),
         });
         idle.attach_client();
         idle.detach_client(
@@ -7884,6 +8243,74 @@ mod tests {
         crate::lock_recover(&app.remuxes).clear();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn cache_limit_admission_is_reported_as_storage_not_busy() {
+        use tokio::io::AsyncReadExt;
+        let dir = temp_dir("storage-admission");
+        let app = Arc::new(App::from_config(
+            crate::Config {
+                cache_dir: Some(dir.display().to_string()),
+                transcode: crate::TranscodeCfg {
+                    enable: true,
+                    cache_max_mb: 1,
+                    max_jobs: 2,
+                    ..crate::TranscodeCfg::default()
+                },
+                rescan_secs: 0,
+                ..crate::Config::default()
+            },
+            18200,
+            11900,
+            &dir,
+        ));
+        // Another producer's growing output already exceeds the whole quota.
+        let mut oversized = growing_test_job(&dir, 41, b"");
+        let dest = rusty_dlna_transcode::cache_dest_for_key(
+            &dir,
+            41,
+            RecodeAction::Hdr10,
+            &"a".repeat(64),
+        );
+        std::fs::remove_file(&oversized.part).unwrap();
+        Arc::get_mut(&mut oversized).unwrap().part = cache_part(&dest);
+        Arc::get_mut(&mut oversized).unwrap().dest = dest;
+        std::fs::write(&oversized.part, vec![0; 2 * 1024 * 1024]).unwrap();
+        crate::lock_recover(&app.remuxes).insert("oversized".into(), oversized.clone());
+        let spec = job_spec(&dir, "storage-admission", vec!["false".into()]);
+        let req =
+            HttpRequest::parse_headers("GET /web/media/42.mp4 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_app = app.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            serve_remux(&server_app, &mut socket, &req, spec)
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 503 "), "{response}");
+        assert!(
+            response.contains("\"code\":\"transcode_storage\""),
+            "{response}"
+        );
+        assert!(response.contains("\"recoverable\":true"), "{response}");
+        assert!(response.contains("Retry-After: 30\r\n"), "{response}");
+        let status = runtime_status(&app);
+        assert_eq!(status.web_failures_storage_total, 1);
+        assert_eq!(status.web_failures_busy_total, 0);
+        assert!(oversized.part.exists());
+        crate::lock_recover(&app.remuxes).clear();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pinned_output_survives_final_replacement_and_parallel_ranges() {
         let dir = temp_dir("pinned-replacement");
@@ -8179,6 +8606,328 @@ mod tests {
             false,
         ));
         assert_eq!(wire_body(&received), b"source bytes");
+    }
+
+    #[test]
+    fn copied_seek_status_reports_the_probed_output_origin() {
+        let dir = temp_dir("copied-seek-status-origin");
+        let source = dir.join("source.mkv");
+        // Ten-second GOPs: a copied seek to 25 s begins at the 20 s keyframe.
+        let generated = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=64x64:rate=24:duration=30")
+            .args(["-c:v", "libx264", "-threads", "1", "-preset", "ultrafast"])
+            .args(["-bf", "0", "-g", "240", "-keyint_min", "240"])
+            .args(["-sc_threshold", "0"])
+            .arg(&source)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(generated.status.success(), "{generated:?}");
+        let app = Arc::new(App::from_config(
+            crate::Config {
+                cache_dir: Some(dir.display().to_string()),
+                helper_max_jobs: 4,
+                transcode: crate::TranscodeCfg {
+                    enable: true,
+                    encoder: "libx264".into(),
+                    max_jobs: 1,
+                    ..crate::TranscodeCfg::default()
+                },
+                rescan_secs: 0,
+                ..crate::Config::default()
+            },
+            18200,
+            11900,
+            &dir,
+        ));
+        let release = dir.join("release-producer");
+        let mut spec = job_spec(&dir, "copied-seek-origin", Vec::new());
+        spec.job_key = "web:42:copied-seek-origin".into();
+        spec.web_request_id = Some(77);
+        spec.cacheable = false;
+        spec.source_file = Some(Arc::new(std::fs::File::open(&source).unwrap()));
+        spec.output_expectation = Some(rusty_dlna_http::RemuxOutputExpectation {
+            video_codec: Some("h264".into()),
+            audio_codecs: Vec::new(),
+            duration_seconds: Some(30.0),
+            seek_seconds: 25.0,
+            video_copy: true,
+        });
+        spec.args = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf partial > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done; exit 1".into(),
+            "producer".into(),
+            cache_part(&spec.dest).into_os_string(),
+            release.as_os_str().to_owned(),
+        ];
+        // Trailing arguments only shape the recipe and descriptor input.
+        spec.args
+            .extend(["-c:v", "copy", "-i", "input"].map(Into::into));
+        let job = attach(app.clone(), spec.clone()).unwrap();
+        wait_until(Duration::from_secs(10), || {
+            web_job_stream_start(&app, 42, None, Some(77)).is_some()
+        });
+        let origin = web_job_stream_start(&app, 42, None, Some(77)).unwrap();
+        assert!((origin - 20.0).abs() < 0.05, "{origin}");
+        assert_eq!(web_job_stream_start(&app, 42, None, Some(78)), None);
+        assert_eq!(
+            web_job_stream_start(&app, 42, None, None),
+            None,
+            "a generation's origin is reported only to its request"
+        );
+        // A portable fallback re-encodes video and trims at the request.
+        *crate::lock_recover(&job.effective_recipe) = Some(fallback::recipe(
+            &spec,
+            &["-c:v".into(), "libx264".into()],
+            fallback::Attempt::Portable,
+        ));
+        assert_eq!(job.stream_start_seconds(), Some(25.0));
+        std::fs::write(&release, b"release").unwrap();
+        wait_until(Duration::from_secs(5), || {
+            job.producer_finished.load(Ordering::Acquire)
+        });
+        wait_until(Duration::from_secs(5), || app.helpers.metrics().active == 0);
+    }
+
+    #[test]
+    fn skipped_seek_origin_probe_is_not_counted_as_helper_rejection() {
+        let dir = temp_dir("skipped-seek-origin-probe");
+        let source = dir.join("source.mkv");
+        std::fs::write(&source, b"not probed").unwrap();
+        let app = Arc::new(App::from_config(
+            crate::Config {
+                cache_dir: Some(dir.display().to_string()),
+                helper_max_jobs: 1,
+                transcode: crate::TranscodeCfg {
+                    enable: true,
+                    encoder: "libx264".into(),
+                    max_jobs: 1,
+                    ..crate::TranscodeCfg::default()
+                },
+                rescan_secs: 0,
+                ..crate::Config::default()
+            },
+            18200,
+            11900,
+            &dir,
+        ));
+        let release = dir.join("release-producer");
+        let mut spec = job_spec(&dir, "skipped-seek-origin", Vec::new());
+        spec.job_key = "web:42:skipped-seek-origin".into();
+        spec.web_request_id = Some(77);
+        spec.cacheable = false;
+        spec.source_file = Some(Arc::new(std::fs::File::open(&source).unwrap()));
+        spec.output_expectation = Some(rusty_dlna_http::RemuxOutputExpectation {
+            video_codec: Some("h264".into()),
+            audio_codecs: Vec::new(),
+            duration_seconds: Some(30.0),
+            seek_seconds: 25.0,
+            video_copy: true,
+        });
+        spec.args = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf partial > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done; exit 1".into(),
+            "producer".into(),
+            cache_part(&spec.dest).into_os_string(),
+            release.as_os_str().to_owned(),
+        ];
+        spec.args
+            .extend(["-c:v", "copy", "-i", "input"].map(Into::into));
+        // The producer holds the only helper slot, so the probe is skipped.
+        let job = attach(app.clone(), spec).unwrap();
+        let metrics = app.helpers.metrics();
+        assert_eq!(metrics.active, 1, "only the producer runs");
+        assert_eq!(metrics.rejected_total, 0);
+        assert_eq!(metrics.saturated_total, 0);
+        assert_eq!(web_job_stream_start(&app, 42, None, Some(77)), None);
+        std::fs::write(&release, b"release").unwrap();
+        wait_until(Duration::from_secs(5), || {
+            job.producer_finished.load(Ordering::Acquire)
+        });
+        wait_until(Duration::from_secs(5), || app.helpers.metrics().active == 0);
+        assert_eq!(app.helpers.metrics().rejected_total, 0);
+    }
+
+    fn origin_probe_app(dir: &Path, helper_max_jobs: usize, max_jobs: u32) -> Arc<App> {
+        Arc::new(App::from_config(
+            crate::Config {
+                cache_dir: Some(dir.display().to_string()),
+                helper_max_jobs,
+                transcode: crate::TranscodeCfg {
+                    enable: true,
+                    encoder: "libx264".into(),
+                    max_jobs,
+                    ..crate::TranscodeCfg::default()
+                },
+                rescan_secs: 0,
+                ..crate::Config::default()
+            },
+            18200,
+            11900,
+            dir,
+        ))
+    }
+
+    /// A browser producer that writes a partial output, waits for `release`,
+    /// then fails. A copied-video seek makes it eligible for an origin probe.
+    fn origin_probe_spec(
+        dir: &Path,
+        key: &str,
+        request_id: u64,
+        source: std::fs::File,
+        release: &Path,
+    ) -> RemuxJobSpec {
+        let mut spec = job_spec(dir, key, Vec::new());
+        spec.job_key = format!("web:42:{key}");
+        spec.web_request_id = Some(request_id);
+        spec.cacheable = false;
+        spec.source_file = Some(Arc::new(source));
+        spec.output_expectation = Some(rusty_dlna_http::RemuxOutputExpectation {
+            video_codec: Some("h264".into()),
+            audio_codecs: Vec::new(),
+            duration_seconds: Some(30.0),
+            seek_seconds: 25.0,
+            video_copy: true,
+        });
+        spec.args = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf partial > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done; exit 1".into(),
+            "producer".into(),
+            cache_part(&spec.dest).into_os_string(),
+            release.as_os_str().to_owned(),
+        ];
+        spec.args
+            .extend(["-c:v", "copy", "-i", "input"].map(Into::into));
+        spec
+    }
+
+    #[test]
+    fn origin_probe_never_takes_a_slot_an_admissible_producer_needs() {
+        let dir = temp_dir("origin-probe-producer-reserve");
+        let source = dir.join("source.mkv");
+        std::fs::write(&source, b"not probed").unwrap();
+        let open = || std::fs::File::open(&source).unwrap();
+        // Two title jobs and two helper slots: the first session's producer
+        // takes one slot, and the second session's producer needs the other.
+        let app = origin_probe_app(&dir, 2, 2);
+        let release = dir.join("release-producers");
+        let first = attach(
+            app.clone(),
+            origin_probe_spec(&dir, "reserve-first", 77, open(), &release),
+        )
+        .unwrap();
+        assert_eq!(app.helpers.metrics().active, 1, "the probe stepped aside");
+        assert_eq!(app.remux_metrics.origin_probes.load(Ordering::SeqCst), 0);
+        let second = attach(
+            app.clone(),
+            origin_probe_spec(&dir, "reserve-second", 78, open(), &release),
+        )
+        .expect("the second producer is admitted, not refused as helper busy");
+        let metrics = app.helpers.metrics();
+        assert_eq!(metrics.active, 2, "both producers run; no probe");
+        assert_eq!(metrics.rejected_total, 0);
+        assert_eq!(metrics.saturated_total, 0);
+        std::fs::write(&release, b"release").unwrap();
+        for job in [&first, &second] {
+            wait_until(Duration::from_secs(5), || {
+                job.producer_finished.load(Ordering::Acquire)
+            });
+        }
+        wait_until(Duration::from_secs(5), || app.helpers.metrics().active == 0);
+
+        // With spare capacity the probe runs only while every free title
+        // permit could still admit a two-slot producer.
+        let app = origin_probe_app(&dir, 4, 2);
+        let job = app.jobs.try_acquire().unwrap();
+        let producer = app.helpers.try_acquire().unwrap();
+        let probe = origin_probe_permit(&app).expect("3 idle, 2 reserved");
+        assert!(origin_probe_permit(&app).is_none(), "2 idle, 2 reserved");
+        drop(probe);
+        let other = app.helpers.try_acquire().unwrap();
+        assert!(origin_probe_permit(&app).is_none(), "2 idle, 2 reserved");
+        let second_job = app.jobs.try_acquire().unwrap();
+        let probe = origin_probe_permit(&app).expect("no title permit is free");
+        assert_eq!(app.helpers.metrics().active, 3);
+        drop((probe, other, producer, job, second_job));
+        assert_eq!(app.helpers.metrics().rejected_total, 0);
+        assert_eq!(app.helpers.metrics().saturated_total, 0);
+    }
+
+    #[test]
+    fn origin_probe_stops_at_shutdown_and_shutdown_waits_for_its_reaping() {
+        let dir = temp_dir("origin-probe-shutdown");
+        // FFprobe blocks on an empty pipe whose writer stays open, so only
+        // cancellation or the probe deadline can end it.
+        let (reader, writer) = std::io::pipe().unwrap();
+        let source = std::fs::File::from(std::os::fd::OwnedFd::from(reader));
+        let app = origin_probe_app(&dir, 4, 1);
+        let release = dir.join("release-producer");
+        let spec = origin_probe_spec(&dir, "shutdown-probe", 77, source, &release);
+        let job = attach(app.clone(), spec.clone()).unwrap();
+        assert_eq!(app.helpers.metrics().active, 2, "producer and probe");
+        assert_eq!(app.remux_metrics.origin_probes.load(Ordering::SeqCst), 1);
+        // The producer ends and releases its title permit; the probe holds
+        // no title permit and its job is never cancelled.
+        std::fs::write(&release, b"release").unwrap();
+        wait_until(Duration::from_secs(5), || {
+            job.producer_finished.load(Ordering::Acquire) && app.jobs.in_use() == 0
+        });
+        wait_until(Duration::from_secs(5), || app.helpers.metrics().active == 1);
+        assert!(!job.cancelled.load(Ordering::Acquire));
+
+        app.scan_control.cancellation.cancel();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        runtime.block_on(wait_for_shutdown(&app, Duration::from_secs(8)));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown cancelled the probe instead of waiting for its deadline"
+        );
+        assert_eq!(app.remux_metrics.origin_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(app.helpers.metrics().active, 0, "FFprobe was reaped");
+        assert!(job.stream_origin.get().is_none());
+
+        // No probe starts once shutdown has begun.
+        start_stream_origin_probe(&app, &spec, &job);
+        assert_eq!(app.helpers.metrics().active, 0);
+        assert_eq!(app.remux_metrics.origin_probes.load(Ordering::SeqCst), 0);
+        drop(writer);
+    }
+
+    #[test]
+    fn stream_start_is_the_request_unless_copied_video_lands_on_a_keyframe() {
+        let dir = temp_dir("stream-start-contract");
+        let job = growing_test_job(&dir, 42, b"");
+        let mut job = Arc::try_unwrap(job).ok().unwrap();
+        assert_eq!(job.stream_start_seconds(), None, "not a browser job");
+        let mut spec = job_spec(&dir, "stream-start-contract", Vec::new());
+        let expectation = |seek_seconds: f64, video_copy: bool| {
+            Some(rusty_dlna_http::RemuxOutputExpectation {
+                video_codec: Some("hevc".into()),
+                audio_codecs: vec!["aac".into()],
+                duration_seconds: Some(60.0),
+                seek_seconds,
+                video_copy,
+            })
+        };
+        spec.output_expectation = expectation(0.0, true);
+        job.web_spec = Some(spec.clone());
+        assert_eq!(job.stream_start_seconds(), Some(0.0));
+        spec.output_expectation = expectation(30.0, false);
+        job.web_spec = Some(spec.clone());
+        assert_eq!(job.stream_start_seconds(), Some(30.0));
+        spec.output_expectation = expectation(30.0, true);
+        job.web_spec = Some(spec);
+        assert_eq!(job.stream_start_seconds(), None, "probe pending or failed");
+        job.stream_origin.set(27.5).unwrap();
+        assert_eq!(job.stream_start_seconds(), Some(27.5));
     }
 
     #[test]

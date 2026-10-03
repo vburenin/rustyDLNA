@@ -312,6 +312,7 @@ fn page_children_matches_children_of_slice() {
                 rotation: None,
                 bookmark_sec: 0,
                 watch_count: 0,
+                stream_probe_failed: false,
             },
         );
         cat.link_child("64$1", &oid);
@@ -405,6 +406,53 @@ fn every_protocol_caption_format_uses_the_same_association_grammar() {
             Some("en".into())
         );
     }
+}
+
+/// The renderer default (`/Captions/{id}.srt`, pv, Samsung CaptionInfo.sec)
+/// is an SRT when one exists, then SMI, then any format; within each tier the
+/// untagged sidecar precedes language variants, then the lowest index wins. Path order alone would pick `Movie.ass` or
+/// `Movie.de.srt` here.
+#[test]
+fn default_caption_prefers_untagged_srt_then_smi_then_lowest_index() {
+    let media = Path::new("/media/Movie.mkv");
+    let caption = |index: u32, name: &str| Caption {
+        index,
+        path: PathBuf::from(format!("/media/{name}")),
+        ext: caption_extension_for_path(Path::new(name)).into(),
+    };
+    let picked =
+        |captions: &[Caption]| default_caption(media, captions).map(|caption| caption.path.clone());
+    let mixed = [
+        caption(0, "Movie.ass"),
+        caption(1, "Movie.de.srt"),
+        caption(2, "Movie.en.srt"),
+        caption(3, "Movie.srt"),
+    ];
+    assert_eq!(picked(&mixed), Some(PathBuf::from("/media/Movie.srt")));
+    assert_eq!(
+        picked(&mixed[..3]),
+        Some(PathBuf::from("/media/Movie.de.srt"))
+    );
+    let no_srt = [
+        caption(0, "Movie.ass"),
+        caption(1, "Movie.en.smi"),
+        caption(2, "Movie.vtt"),
+    ];
+    assert_eq!(picked(&no_srt), Some(PathBuf::from("/media/Movie.en.smi")));
+    assert_eq!(
+        picked(&[caption(0, "Movie.en.ass"), caption(1, "Movie.vtt")]),
+        Some(PathBuf::from("/media/Movie.vtt"))
+    );
+    assert_eq!(
+        picked(&[caption(0, "Movie.en.ass"), caption(1, "Movie.fr.vtt")]),
+        Some(PathBuf::from("/media/Movie.en.ass"))
+    );
+    // An alias path with a different stem still gets a deterministic SRT.
+    assert_eq!(
+        default_caption(Path::new("/other/Alias.mkv"), &mixed).map(|c| c.index),
+        Some(1)
+    );
+    assert!(default_caption(media, &[]).is_none());
 }
 
 #[cfg(unix)]
@@ -647,6 +695,548 @@ fn nfo_title_plot_show_season() {
     assert_eq!(ep.track, Some(2));
     assert!(ep.date.starts_with("2020-05-01"), "date={}", ep.date);
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn startup_backfill_adds_subtitle_discovery_to_legacy_rows_once() {
+    let tmp = TempPath::new("subtitle-marker-backfill");
+    let root = tmp.join("media");
+    std::fs::create_dir_all(&root).unwrap();
+    let legacy = root.join("legacy.mkv");
+    write_fake_mkv(&legacy, 4096);
+    let broken = root.join("broken.mkv");
+    let mut bytes = vec![0_u8; 64];
+    bytes[..4].copy_from_slice(&[0x1a, 0x45, 0xdf, 0xa3]);
+    std::fs::write(&broken, bytes).unwrap();
+    let gate = std::sync::Arc::new(HelperGate::new(1, 8));
+    let db_path = tmp.join("files.db");
+    let cfg = ScanConfig {
+        media_dirs: vec![root.clone()],
+        db_path: Some(db_path.clone()),
+        types: MediaTypes::video_only(),
+        thumbnails: false,
+        helper_gate: Some(gate.clone()),
+        ..Default::default()
+    };
+    let catalog = scan(&cfg).unwrap();
+    let failed = catalog
+        .items
+        .values()
+        .find(|item| item.path == broken)
+        .unwrap();
+    assert!(failed.stream_probe_failed);
+    assert!(
+        !catalog
+            .items
+            .values()
+            .find(|item| item.path == legacy)
+            .unwrap()
+            .stream_probe_failed
+    );
+    let descriptor = || -> Option<String> {
+        LibraryDb::open(&db_path)
+            .unwrap()
+            .connection()
+            .query_row(
+                "SELECT AUDIO_STREAMS FROM DETAILS WHERE PATH = ?1",
+                [path_to_db(&legacy)],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let current = descriptor().unwrap();
+    assert!(current.split(',').any(|record| record == "@s"), "{current}");
+    // A catalog row recorded before subtitle discovery: same revision, no
+    // `@s` record. A subtitle record prefix alone is not the marker.
+    let legacy_descriptor = current
+        .split(',')
+        .filter(|record| *record != "@s")
+        .chain(["@s:9:subrip:::0:0"])
+        .collect::<Vec<_>>()
+        .join(",");
+    LibraryDb::open(&db_path)
+        .unwrap()
+        .connection()
+        .execute(
+            "UPDATE DETAILS SET AUDIO_STREAMS = ?1 WHERE PATH = ?2",
+            rusqlite::params![legacy_descriptor, path_to_db(&legacy)],
+        )
+        .unwrap();
+    let backfill = || {
+        let probes = gate.metrics().admitted_total;
+        let mut session = ScanSession::new(&cfg).unwrap();
+        let prepared = session.prepare_fill_missing_av_meta().unwrap();
+        session.publish(prepared).unwrap();
+        gate.metrics().admitted_total - probes
+    };
+    // Only the legacy row is probed; the cached failure is not retried.
+    assert_eq!(backfill(), 1);
+    let refreshed = descriptor().unwrap();
+    assert!(
+        refreshed.split(',').any(|record| record == "@s"),
+        "{refreshed}"
+    );
+    assert_eq!(backfill(), 0);
+}
+
+#[test]
+fn timed_out_probes_retry_boundedly_and_keep_stored_metadata() {
+    let tmp = TempPath::new("probe-timeout-retry");
+    let root = tmp.join("media");
+    std::fs::create_dir_all(&root).unwrap();
+    let spun_up = root.join("spin-up.mkv");
+    let stuck = root.join("stuck.mkv");
+    write_fake_mkv(&spun_up, 4096);
+    write_fake_mkv(&stuck, 4096);
+    let db_path = tmp.join("files.db");
+    let cfg = ScanConfig {
+        media_dirs: vec![root.clone()],
+        db_path: Some(db_path.clone()),
+        types: MediaTypes::video_only(),
+        thumbnails: false,
+        ..Default::default()
+    };
+    let state = |path: &Path| {
+        let db = LibraryDb::open(&db_path).unwrap();
+        let id = db
+            .find_detail_by_path(&path_to_db(path))
+            .unwrap()
+            .unwrap()
+            .id;
+        let container: Option<String> = db
+            .connection()
+            .query_row("SELECT CONTAINER FROM DETAILS WHERE ID=?1", [id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        (db.detail_probe_state(id).unwrap().1, container)
+    };
+    probe::force_probe_timeouts(&spun_up, 1);
+    probe::force_probe_timeouts(&stuck, usize::MAX);
+    scan(&cfg).unwrap();
+    // A deadline expiry is not cached as a failed probe.
+    assert_eq!(state(&spun_up), (-1, None));
+    assert_eq!(state(&stuck), (-1, None));
+
+    // The next reconciliation retries; the second attempt succeeds.
+    monitor(&cfg).unwrap();
+    let (revision, container) = state(&spun_up);
+    assert_eq!(revision, db::STREAM_PROBE_REVISION);
+    assert!(container.is_some());
+    assert_eq!(state(&stuck), (-2, None));
+    // A file that keeps timing out is eventually cached as failed and no
+    // longer costs a helper deadline on every pass.
+    monitor(&cfg).unwrap();
+    assert_eq!(state(&stuck), (db::STREAM_PROBE_REVISION, None));
+    let gate_probes = state(&stuck);
+    monitor(&cfg).unwrap();
+    assert_eq!(state(&stuck), gate_probes);
+
+    // A timed-out re-probe of an unchanged file whose metadata was stamped at
+    // the current revision (here: its probe-sidecar provenance is unknown)
+    // keeps that metadata and stays a startup backfill candidate.
+    LibraryDb::open(&db_path)
+        .unwrap()
+        .connection()
+        .execute("UPDATE DETAILS SET PROBE_SIDECAR_FINGERPRINT = NULL", [])
+        .unwrap();
+    probe::force_probe_timeouts(&spun_up, 1);
+    probe::force_probe_timeouts(&stuck, 0);
+    let mut session = ScanSession::new(&cfg).unwrap();
+    let prepared = session.prepare_fill_missing_av_meta().unwrap();
+    session.publish(prepared).unwrap();
+    assert_eq!(state(&spun_up), (-1, container.clone()));
+    let mut session = ScanSession::new(&cfg).unwrap();
+    let prepared = session.prepare_fill_missing_av_meta().unwrap();
+    session.publish(prepared).unwrap();
+    assert_eq!(state(&spun_up), (db::STREAM_PROBE_REVISION, container));
+}
+
+#[cfg(unix)]
+#[test]
+fn timed_out_probe_of_a_replaced_file_never_keeps_the_previous_streams() {
+    use std::os::unix::fs::MetadataExt;
+    for pass in ["scan", "monitor", "fill_missing"] {
+        let tmp = TempPath::new(&format!("probe-timeout-replaced-{pass}"));
+        let root = tmp.join("media");
+        std::fs::create_dir_all(root.join("library")).unwrap();
+        let movie = root.join("Movie.mkv");
+        let alias = root.join("library/Movie.mkv");
+        write_fake_mkv(&movie, 4096);
+        std::fs::hard_link(&movie, &alias).unwrap();
+        let db_path = tmp.join("files.db");
+        let cfg = ScanConfig {
+            media_dirs: vec![root.clone()],
+            db_path: Some(db_path.clone()),
+            types: MediaTypes::video_only(),
+            thumbnails: false,
+            ..Default::default()
+        };
+        scan(&cfg).unwrap();
+        let streams = |path: &Path| {
+            let db = LibraryDb::open(&db_path).unwrap();
+            db.connection()
+                .query_row(
+                    "SELECT STREAM_PROBE_REV, CONTAINER, VIDEO, AUDIO, AUDIO_STREAMS, DLNA_PN
+                     FROM DETAILS WHERE PATH = ?1",
+                    [path_to_db(path)],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        for path in [&movie, &alias] {
+            let (revision, container, video, _, audio_streams, _) = streams(path);
+            assert_eq!(revision, db::STREAM_PROBE_REVISION, "{pass}");
+            assert!(container.is_some() && video.is_some(), "{pass}");
+            assert!(audio_streams.is_some(), "{pass}");
+        }
+        // Mark the old content so it cannot be mistaken for a fresh probe.
+        LibraryDb::open(&db_path)
+            .unwrap()
+            .connection()
+            .execute(
+                "UPDATE DETAILS SET VIDEO = 'stale-old-codec', HDR = 'stale-old-hdr'",
+                [],
+            )
+            .unwrap();
+
+        // Replace the movie with different content (new size and inode) and
+        // relink the library alias to it, as an atomic re-encode would.
+        let replacement = tmp.join("replacement.mkv");
+        write_fake_mkv(&replacement, 8192);
+        std::fs::rename(&replacement, &movie).unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::hard_link(&movie, &alias).unwrap();
+        // Every probe of either path expires during this pass, however often
+        // the pass reaches the shared physical file.
+        probe::force_probe_timeouts(&movie, usize::MAX);
+        probe::force_probe_timeouts(&alias, usize::MAX);
+        match pass {
+            "scan" => {
+                scan(&cfg).unwrap();
+            }
+            "monitor" => {
+                monitor(&cfg).unwrap();
+            }
+            _ => {
+                // A stat change recorded before the probe ran (for example
+                // a pass interrupted by shutdown) is finished by the startup
+                // backfill.
+                let db = LibraryDb::open(&db_path).unwrap();
+                for path in [&movie, &alias] {
+                    let id = db
+                        .find_detail_by_path(&path_to_db(path))
+                        .unwrap()
+                        .unwrap()
+                        .id;
+                    let meta = std::fs::metadata(path).unwrap();
+                    db.update_detail_stat(
+                        id,
+                        i64::try_from(meta.len()).unwrap(),
+                        file_mtime_unix(&meta),
+                        sqlite_i64_from_u64_bits(meta.dev()),
+                        sqlite_i64_from_u64_bits(meta.ino()),
+                    )
+                    .unwrap();
+                }
+                drop(db);
+                let mut session = ScanSession::new(&cfg).unwrap();
+                let prepared = session.prepare_fill_missing_av_meta().unwrap();
+                session.publish(prepared).unwrap();
+            }
+        }
+        for path in [&movie, &alias] {
+            let (revision, container, video, audio, audio_streams, pn) = streams(path);
+            assert!(revision < 0, "{pass}: {} rev {revision}", path.display());
+            assert_eq!(
+                (container, video, audio, audio_streams, pn),
+                (None, None, None, None, None),
+                "{pass}: {}",
+                path.display()
+            );
+            let hdr: Option<String> = LibraryDb::open(&db_path)
+                .unwrap()
+                .connection()
+                .query_row(
+                    "SELECT HDR FROM DETAILS WHERE PATH = ?1",
+                    [path_to_db(path)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(hdr, None, "{pass}");
+        }
+
+        // The retry probes the new content.
+        probe::force_probe_timeouts(&movie, 0);
+        probe::force_probe_timeouts(&alias, 0);
+        monitor(&cfg).unwrap();
+        for path in [&movie, &alias] {
+            let (revision, container, video, _, audio_streams, _) = streams(path);
+            assert_eq!(revision, db::STREAM_PROBE_REVISION, "{pass}");
+            assert!(container.is_some() && audio_streams.is_some(), "{pass}");
+            assert!(
+                video.is_some_and(|video| video != "stale-old-codec"),
+                "{pass}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn deleting_the_first_hardlink_rehomes_video_virtual_views() {
+    for removal in ["monitor", "monitor_dirty", "forget_path"] {
+        let tmp = TempPath::new(&format!("hardlink-rehome-{removal}"));
+        let root = tmp.join("media");
+        std::fs::create_dir_all(root.join("a-downloads")).unwrap();
+        std::fs::create_dir_all(root.join("b-library")).unwrap();
+        std::fs::write(
+            root.join("tvshow.nfo"),
+            "<tvshow><title>Show</title><genre>Drama</genre></tvshow>",
+        )
+        .unwrap();
+        let first = root.join("a-downloads/episode.mkv");
+        let survivor = root.join("b-library/episode.mkv");
+        write_fake_mkv(&first, 64);
+        std::fs::hard_link(&first, &survivor).unwrap();
+        let cfg = ScanConfig {
+            media_dirs: vec![root.clone()],
+            db_path: Some(tmp.join("files.db")),
+            types: MediaTypes::video_only(),
+            thumbnails: false,
+            ..Default::default()
+        };
+        let virtuals = |catalog: &Catalog| {
+            let mut entries = Vec::new();
+            for item in catalog.items.values() {
+                for virtual_root in [VIDEO_ALL_ID, VIDEO_SERIES_ID, VIDEO_GENRE_ID] {
+                    let mut parent = item.parent_id.as_str();
+                    while parent != virtual_root {
+                        match catalog.containers.get(parent) {
+                            Some(container) if parent != "0" => parent = &container.parent_id,
+                            _ => break,
+                        }
+                    }
+                    if parent == virtual_root {
+                        entries.push((virtual_root, item.path.clone()));
+                    }
+                }
+            }
+            entries.sort();
+            entries
+        };
+        let initial = scan(&cfg).unwrap();
+        let before = virtuals(&initial);
+        assert_eq!(before.len(), 3, "one entry per view: {before:?}");
+        assert!(before.iter().all(|(_, path)| path == &first), "{before:?}");
+
+        std::fs::remove_file(&first).unwrap();
+        let catalog = match removal {
+            "monitor" => monitor(&cfg).unwrap().0.unwrap(),
+            "monitor_dirty" => monitor_dirty(&cfg, std::slice::from_ref(&first))
+                .unwrap()
+                .0
+                .unwrap(),
+            _ => {
+                assert_eq!(forget_path(&cfg, &first).unwrap(), 1);
+                reload_published_catalog(&cfg).unwrap()
+            }
+        };
+        let after = virtuals(&catalog);
+        assert_eq!(
+            after,
+            [
+                (VIDEO_ALL_ID, survivor.clone()),
+                (VIDEO_GENRE_ID, survivor.clone()),
+                (VIDEO_SERIES_ID, survivor.clone()),
+            ],
+            "{removal}"
+        );
+        // Unchanged afterwards, and a clean scan agrees.
+        // `forget_path` leaves now-empty folders for the next reconcile.
+        let (next, delta) = monitor(&cfg).unwrap();
+        assert_eq!(delta.added + delta.changed, 0, "{removal}: {delta:?}");
+        if let Some(next) = next {
+            assert_eq!(virtuals(&next), after, "{removal}");
+        }
+        assert!(monitor(&cfg).unwrap().0.is_none(), "{removal}");
+        let mut clean = cfg.clone();
+        clean.db_path = Some(tmp.join("clean.db"));
+        assert_eq!(virtuals(&scan(&clean).unwrap()), after, "{removal}");
+    }
+}
+
+#[test]
+fn folder_movie_nfo_applies_only_to_a_folders_sole_video() {
+    let tmp = TempPath::new("nfo-folder-movie");
+    let root = tmp.join("media");
+    let folder = root.join("Heat (1995)");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::create_dir_all(root.join("Own (2001)")).unwrap();
+    write_fake_mkv(&folder.join("Heat.1995.1080p.mkv"), 64);
+    // Samples are not candidate videos.
+    write_fake_mkv(&folder.join("Heat-sample.mkv"), 64);
+    std::fs::write(
+        folder.join("movie.nfo"),
+        "<movie><title>Heat</title><genre>Crime</genre></movie>",
+    )
+    .unwrap();
+    // `{stem}.nfo` fully wins over the folder file.
+    write_fake_mkv(&root.join("Own (2001)/own.mkv"), 64);
+    std::fs::write(
+        root.join("Own (2001)/own.nfo"),
+        "<movie><title>Own Title</title></movie>",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Own (2001)/movie.nfo"),
+        "<movie><title>Folder</title><genre>Drama</genre></movie>",
+    )
+    .unwrap();
+    let cfg = ScanConfig {
+        media_dirs: vec![root.clone()],
+        db_path: Some(tmp.join("files.db")),
+        types: MediaTypes::video_only(),
+        thumbnails: false,
+        ..Default::default()
+    };
+    let item = |catalog: &Catalog, name: &str| {
+        catalog
+            .items
+            .values()
+            .find(|item| item.path.ends_with(name) && item.ref_id.is_none())
+            .map(|item| (item.title.clone(), item.genre.clone()))
+            .unwrap_or_else(|| panic!("{name} was not indexed"))
+    };
+    let catalog = scan(&cfg).unwrap();
+    assert_eq!(
+        item(&catalog, "Heat.1995.1080p.mkv"),
+        ("Heat".into(), Some("Crime".into()))
+    );
+    assert_eq!(item(&catalog, "own.mkv"), ("Own Title".into(), None));
+
+    // A second movie makes the folder file ambiguous for both videos.
+    let extra = folder.join("Heat.Directors.Cut.mkv");
+    write_fake_mkv(&extra, 64);
+    let (catalog, _) = monitor_dirty(&cfg, std::slice::from_ref(&extra)).unwrap();
+    let catalog = catalog.unwrap();
+    assert_eq!(
+        item(&catalog, "Heat.1995.1080p.mkv"),
+        ("Heat.1995.1080p".into(), None)
+    );
+    assert_eq!(
+        item(&catalog, "Heat.Directors.Cut.mkv"),
+        ("Heat.Directors.Cut".into(), None)
+    );
+    let mut clean = cfg.clone();
+    clean.db_path = Some(tmp.join("clean-two.db"));
+    assert_eq!(
+        item(&scan(&clean).unwrap(), "Heat.1995.1080p.mkv"),
+        ("Heat.1995.1080p".into(), None)
+    );
+
+    // Removing it restores the folder metadata through the watcher path,
+    // and a full reconciliation agrees.
+    std::fs::remove_file(&extra).unwrap();
+    let (catalog, _) = monitor_dirty(&cfg, std::slice::from_ref(&extra)).unwrap();
+    assert_eq!(
+        item(&catalog.unwrap(), "Heat.1995.1080p.mkv"),
+        ("Heat".into(), Some("Crime".into()))
+    );
+    let (catalog, delta) = monitor(&cfg).unwrap();
+    assert!(catalog.is_none(), "{delta:?}");
+
+    // Removing the folder file restores the filename defaults.
+    std::fs::remove_file(folder.join("movie.nfo")).unwrap();
+    let (catalog, _) = monitor_dirty(&cfg, &[folder.join("movie.nfo")]).unwrap();
+    assert_eq!(
+        item(&catalog.unwrap(), "Heat.1995.1080p.mkv"),
+        ("Heat.1995.1080p".into(), None)
+    );
+}
+
+#[test]
+fn malformed_nfo_sidecars_never_abort_scan_or_reconciliation() {
+    let tmp = TempPath::new("nfo-malformed");
+    let root = tmp.join("media");
+    std::fs::create_dir_all(root.join("show")).unwrap();
+    std::fs::create_dir_all(root.join("movies")).unwrap();
+    // Scene release text, a half-written stem NFO, and a broken inherited
+    // show file that must not cancel the episode's own overrides.
+    write_fake_mkv(&root.join("movies/Scene.Release-GRP.mkv"), 64);
+    std::fs::write(
+        root.join("movies/Scene.Release-GRP.nfo"),
+        b"\xdb\xdb GRP <proudly> presents & \xb0\xb1\r\n".as_slice(),
+    )
+    .unwrap();
+    write_fake_mkv(&root.join("movies/Half.mkv"), 64);
+    std::fs::write(root.join("movies/Half.nfo"), "<movie><title>Ha").unwrap();
+    std::fs::write(root.join("show/tvshow.nfo"), "<tvshow><title>Show</plot>").unwrap();
+    write_fake_mkv(&root.join("show/S01E01.mkv"), 64);
+    std::fs::write(
+        root.join("show/S01E01.nfo"),
+        "<episodedetails><title>Pilot & Co</title><plot>A<br>B &nbsp;C</plot></episodedetails>",
+    )
+    .unwrap();
+    let cfg = ScanConfig {
+        media_dirs: vec![root.clone()],
+        db_path: Some(tmp.join("files.db")),
+        types: MediaTypes::video_only(),
+        thumbnails: false,
+        ..Default::default()
+    };
+    let title_of = |catalog: &Catalog, name: &str| {
+        catalog
+            .items
+            .values()
+            .find(|item| item.path.ends_with(name) && item.ref_id.is_none())
+            .map(|item| item.title.clone())
+            .unwrap_or_else(|| panic!("{name} was not indexed"))
+    };
+    let initial = scan(&cfg).unwrap();
+    assert_eq!(
+        title_of(&initial, "Scene.Release-GRP.mkv"),
+        "Scene.Release-GRP"
+    );
+    assert_eq!(title_of(&initial, "Half.mkv"), "Half");
+    assert_eq!(title_of(&initial, "S01E01.mkv"), "Pilot & Co");
+    let episode = initial
+        .items
+        .values()
+        .find(|item| item.path.ends_with("S01E01.mkv"))
+        .unwrap();
+    assert_eq!(episode.plot.as_deref(), Some("A\nB  C"));
+
+    // Unchanged malformed sidecars neither fail nor republish anything.
+    let (catalog, delta) = monitor(&cfg).unwrap();
+    assert!(catalog.is_none());
+    assert_eq!(delta.changed, 0);
+    let (_, delta) = monitor_dirty(&cfg, &[root.join("movies/Half.nfo")]).unwrap();
+    assert_eq!(delta.changed, 0);
+
+    // New media still appears while other sidecars stay malformed.
+    write_fake_mkv(&root.join("movies/New.mkv"), 64);
+    let (catalog, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.added, 1);
+    assert_eq!(title_of(&catalog.unwrap(), "New.mkv"), "New");
+
+    // Once the sidecar is complete, its overrides converge.
+    std::fs::write(
+        root.join("movies/Half.nfo"),
+        "<movie><title>Whole</title></movie>",
+    )
+    .unwrap();
+    let (catalog, _) = monitor(&cfg).unwrap();
+    assert_eq!(title_of(&catalog.unwrap(), "Half.mkv"), "Whole");
 }
 
 #[test]
@@ -1375,6 +1965,7 @@ fn walker_streams_preparation_in_bounded_ordered_batches() {
         preparation_batches: 0,
         peak_pending: 0,
         physical_artwork_inventories: HashMap::new(),
+        held: HeldSubtrees::default(),
     };
     walker.walk(&tmp, BROWSEDIR_ID, "media").unwrap();
     walker.index_pending().unwrap();
@@ -1594,6 +2185,103 @@ fn art_sidecar_indexed_and_cloned() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// 1x1 RGBA PNG.
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
+
+#[test]
+fn periodic_reconcile_drops_deleted_png_poster_but_keeps_alias_poster() {
+    let tmp = TempPath::new("png-poster-delete");
+    let root = tmp.join("media");
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::create_dir_all(root.join("b")).unwrap();
+    let media = root.join("a/movie.mkv");
+    write_fake_mkv(&media, 64);
+    // A hardlink in another folder without its own poster.
+    std::fs::hard_link(&media, root.join("b/movie.mkv")).unwrap();
+    let poster = root.join("a/movie-poster.png");
+    std::fs::write(&poster, TINY_PNG).unwrap();
+    let cfg = ScanConfig {
+        media_dirs: vec![root.clone()],
+        db_path: Some(tmp.join("db/files.db")),
+        types: MediaTypes::video_only(),
+        thumbnails: false,
+        ..Default::default()
+    };
+    let arts = |catalog: &Catalog| {
+        let mut arts = catalog
+            .items
+            .values()
+            .filter(|item| item.ref_id.is_none() && item.path.ends_with("movie.mkv"))
+            .map(|item| item.album_art)
+            .collect::<Vec<_>>();
+        arts.sort();
+        arts
+    };
+    let initial = scan(&cfg).unwrap();
+    let art = arts(&initial);
+    assert_eq!(art.len(), 2);
+    assert!(art[0] > 0 && art[0] == art[1], "{art:?}");
+    let converted = initial.album_art_paths[&art[0]].clone();
+    assert!(converted.starts_with(tmp.join("db/art")), "{converted:?}");
+
+    // The poster-less alias never replaces the surviving alias's poster.
+    for _ in 0..2 {
+        let (catalog, delta) = monitor(&cfg).unwrap();
+        assert!(catalog.is_none(), "art must not flip: {delta:?}");
+    }
+
+    // The converted JPEG outlives its deleted source; reconcile clears it.
+    std::fs::remove_file(&poster).unwrap();
+    let (catalog, _) = monitor(&cfg).unwrap();
+    assert_eq!(arts(&catalog.unwrap()), [0, 0]);
+    let (catalog, _) = monitor(&cfg).unwrap();
+    assert!(catalog.is_none());
+}
+
+#[test]
+fn in_place_jpeg_poster_replacement_changes_the_art_id() {
+    let tmp = TempPath::new("jpeg-poster-replace");
+    let root = tmp.join("media");
+    std::fs::create_dir_all(&root).unwrap();
+    write_fake_mkv(&root.join("movie.mkv"), 64);
+    write_fake_mkv(&root.join("other.mkv"), 64);
+    let poster = root.join("poster.jpg");
+    std::fs::write(&poster, TINY_JPEG).unwrap();
+    let cfg = ScanConfig {
+        media_dirs: vec![root.clone()],
+        db_path: Some(tmp.join("files.db")),
+        types: MediaTypes::video_only(),
+        thumbnails: false,
+        ..Default::default()
+    };
+    let arts = |catalog: &Catalog| {
+        let mut arts = catalog
+            .items
+            .values()
+            .filter(|item| item.ref_id.is_none())
+            .map(|item| item.album_art)
+            .collect::<Vec<_>>();
+        arts.sort();
+        arts
+    };
+    let before = arts(&scan(&cfg).unwrap());
+    assert!(before[0] > 0 && before[0] == before[1], "{before:?}");
+    std::fs::write(&poster, TINY_JPEG).unwrap();
+    let (catalog, delta) = monitor_dirty(&cfg, std::slice::from_ref(&poster)).unwrap();
+    assert_eq!(delta.changed, 1);
+    let catalog = catalog.unwrap();
+    let after = arts(&catalog);
+    assert!(after[0] > before[0] && after[0] == after[1], "{after:?}");
+    assert_eq!(catalog.album_art_paths[&after[0]], poster);
+    assert!(!catalog.album_art_paths.contains_key(&before[0]));
+}
+
 #[test]
 fn sidecar_write_replace_and_delete_recompute_one_catalog_generation() {
     let tmp = TempPath::new("sidecar-lifecycle");
@@ -1646,10 +2334,11 @@ fn sidecar_write_replace_and_delete_recompute_one_catalog_generation() {
     let (_, delta) = monitor_dirty(&cfg, std::slice::from_ref(&poster)).unwrap();
     assert_eq!(delta.changed, 1);
 
-    // Malformed sidecar parsing is transactional: the last published DB
-    // generation remains fully readable and unchanged.
+    // A malformed (possibly half-written) sidecar keeps the item's last
+    // published presentation and does not fail the targeted refresh.
     std::fs::write(&nfo, "<movie><title>broken</movie>").unwrap();
-    assert!(monitor_dirty(&cfg, std::slice::from_ref(&nfo)).is_err());
+    let (_, delta) = monitor_dirty(&cfg, std::slice::from_ref(&nfo)).unwrap();
+    assert_eq!(delta.changed, 0);
     let retained = open_library_db(cfg.db_path.as_ref().unwrap())
         .unwrap()
         .load_catalog()
@@ -2072,7 +2761,7 @@ fn sqlite_files_db_roundtrip_and_delete_original_drops_symlinks() {
 
     let db = LibraryDb::open(&dbp).unwrap();
     let n = db
-        .remove_path_and_symlink_aliases(&orig.to_string_lossy())
+        .remove_path_and_symlink_aliases(&orig.to_string_lossy(), &|_| false)
         .unwrap();
     assert!(n >= 1);
     let cat2 = db.load_catalog().unwrap();
@@ -2309,6 +2998,7 @@ fn recent_is_200_unique_inodes_no_time_window() {
                 rotation: None,
                 bookmark_sec: 0,
                 watch_count: 0,
+                stream_probe_failed: false,
             },
         );
         let alias = format!("64$2${i:X}");
@@ -2354,6 +3044,7 @@ fn recent_is_200_unique_inodes_no_time_window() {
                 rotation: None,
                 bookmark_sec: 0,
                 watch_count: 0,
+                stream_probe_failed: false,
             },
         );
     }
@@ -4533,11 +5224,61 @@ fn dlna_pn_mkv_hevc_stays_empty_mp4_is_written() {
     );
     assert_eq!(
         dlna_pn_from_probe("mp4", "h264", "aac", "sdr", 1920, 1080).as_deref(),
-        Some("AVC_MP4_MP_HD_AAC_MULT5")
+        Some("AVC_MP4_HP_HD_AAC")
+    );
+    // No conformant DLNA profile exists for HEVC; an invented Main10/HD1080
+    // name would also mislabel 8-bit and 2160p streams.
+    assert_eq!(
+        dlna_pn_from_probe("mp4", "hevc", "eac3", "dv-p8", 3840, 2160),
+        None
+    );
+}
+
+/// Every PN the scanner newly derives for MP4 must be one ConnectionManager
+/// advertises for `video/mp4`; streams with no conformant profile get none.
+#[test]
+fn mp4_dlna_pn_is_advertised_for_video_mp4_or_absent() {
+    let source = rusty_dlna_protocol::protocol_info_source();
+    let advertised = |pn: &str| {
+        source
+            .split(',')
+            .any(|entry| entry == format!("http-get:*:video/mp4:DLNA.ORG_PN={pn}"))
+    };
+    for (video, audio, width, height) in [
+        ("h264", "aac", 1920, 1080),
+        ("h264", "aac", 1280, 720),
+        ("h264", "", 1920, 800),
+        ("h264", "aac", 720, 576),
+        ("h264", "ac3", 720, 480),
+        ("mpeg4", "aac", 640, 480),
+    ] {
+        let pn = dlna_pn_from_probe("mp4", video, audio, "sdr", width, height)
+            .unwrap_or_else(|| panic!("{video}/{audio} {width}x{height} has a profile"));
+        assert!(advertised(&pn), "{pn} is not advertised for video/mp4");
+    }
+    for (container, video, audio, width, height) in [
+        ("mp4", "hevc", "aac", 1920, 1080),
+        ("mp4", "hevc", "aac", 1280, 720),
+        ("mp4", "mpeg2", "ac3", 720, 576),
+        ("avi", "h264", "aac", 1920, 1080),
+        ("avi", "h264", "mp3", 640, 480),
+        ("ts", "hevc", "aac", 3840, 2160),
+        ("mpeg-ts", "hevc", "ac3", 1920, 1080),
+    ] {
+        assert_eq!(
+            dlna_pn_from_probe(container, video, audio, "sdr", width, height),
+            None,
+            "{container}/{video}"
+        );
+    }
+    // Renderer workarounds key on these TS prefixes; they stay stable.
+    assert_eq!(
+        dlna_pn_from_probe("ts", "h264", "ac3", "sdr", 1920, 1080).as_deref(),
+        Some("AVC_TS_MP_HD_AC3_ISO")
     );
     assert_eq!(
-        dlna_pn_from_probe("mp4", "hevc", "eac3", "dv-p8", 3840, 2160).as_deref(),
-        Some("HEVC_MP4_BL_Main10_L5_HD1080_AC3")
+        dlna_pn_from_probe("mpeg-ts", "mpeg2", "mp2", "sdr", 720, 576).as_deref(),
+        Some("MPEG_TS_SD_NA_ISO")
     );
 }
 
@@ -4593,7 +5334,7 @@ fn apply_probe_writes_dlna_pn_and_multi_audio() {
     assert_eq!(it.probe.audio_streams, "1:0:aac:2,2:1:ac3:6");
     assert_eq!(it.probe.width, 1920);
     assert_eq!(it.probe.height, 800);
-    assert_eq!(it.dlna_pn.as_deref(), Some("AVC_MP4_MP_HD_AAC_MULT5"));
+    assert_eq!(it.dlna_pn.as_deref(), Some("AVC_MP4_HP_HD_AAC"));
 }
 
 #[test]
@@ -4916,6 +5657,75 @@ fn backfill_rewrites_avi_other_and_pn() {
     assert_eq!(it.dlna_pn.as_deref(), Some("MPEG4_P2_AVI_ASP_L5_SO"));
 }
 
+/// Catalogs written with the former invented MP4 names converge from stored
+/// stream columns, without reprobing: HD H.264 gets the advertised profile
+/// and HEVC loses its PN.
+#[test]
+fn backfill_replaces_stored_nonconformant_mp4_pn() {
+    let db = LibraryDb::open_memory().unwrap();
+    let mut ids = Vec::new();
+    for (inode, (path, video, legacy)) in [
+        ("/media/hd.mp4", "h264", "AVC_MP4_MP_HD_AAC_MULT5"),
+        (
+            "/media/hevc.mp4",
+            "hevc",
+            "HEVC_MP4_BL_Main10_L5_HD1080_AAC",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = db
+            .insert_detail(NewDetail {
+                path,
+                size: 10,
+                timestamp: 1,
+                title: "clip",
+                date: "2024-01-01",
+                mime: "video/mp4",
+                device: 1,
+                inode: i64::try_from(inode).unwrap() + 10,
+                dlna_pn: Some(legacy),
+            })
+            .unwrap();
+        db.update_detail_stream(
+            id,
+            DetailStreamUpdate {
+                resolution: Some("1920x1080"),
+                container: Some("mp4"),
+                video: Some(video),
+                audio: Some("aac"),
+                hdr: Some("sdr"),
+                ..DetailStreamUpdate::default()
+            },
+        )
+        .unwrap();
+        db.update_detail_dlna_pn(id, Some(legacy)).unwrap();
+        db.upsert_object(
+            &format!("64$1${inode}"),
+            "64$1",
+            "item.videoItem",
+            Some(id),
+            "clip",
+            None,
+        )
+        .unwrap();
+        ids.push(id);
+    }
+    assert!(db.backfill_derived_stream_fields().unwrap() >= 2);
+    let cat = db.load_catalog().unwrap();
+    let pn = |id: i64| {
+        cat.items
+            .values()
+            .find(|item| item.detail_id == id)
+            .unwrap()
+            .dlna_pn
+            .clone()
+    };
+    assert_eq!(pn(ids[0]).as_deref(), Some("AVC_MP4_HP_HD_AAC"));
+    assert_eq!(pn(ids[1]), None);
+}
+
 #[test]
 fn stream_probe_fill_keyset_uses_the_inode_index_without_a_temp_sort() {
     let db = LibraryDb::open_memory().unwrap();
@@ -5090,6 +5900,41 @@ fn corrupt_database_is_backed_up_before_fresh_recovery() {
     assert_eq!(backups.len(), 1, "backup files: {backups:?}");
     assert_eq!(std::fs::read(&backups[0]).unwrap(), corrupt);
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn runtime_scanner_opens_never_move_the_live_database() {
+    let tmp = TempPath::new("runtime-no-corrupt-rename");
+    let root = tmp.join("video");
+    std::fs::create_dir_all(&root).unwrap();
+    write_fake_mkv(&root.join("a.mkv"), 64);
+    let path = tmp.join("files.db");
+    let cfg = ScanConfig {
+        media_dirs: vec![root],
+        db_path: Some(path.clone()),
+        types: MediaTypes::video_only(),
+        thumbnails: false,
+        ..Default::default()
+    };
+    scan(&cfg).unwrap();
+    // A damaged live file seen after startup is reported, not replaced:
+    // pooled connections may still reference it.
+    std::fs::write(&path, b"this is deliberately not a sqlite database").unwrap();
+    let _ = std::fs::remove_file(tmp.join("files.db-wal"));
+    let _ = std::fs::remove_file(tmp.join("files.db-shm"));
+    assert!(monitor(&cfg).is_err());
+    assert!(ScanSession::new(&cfg).is_err());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"this is deliberately not a sqlite database"
+    );
+    assert!(!std::fs::read_dir(&tmp).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains(".corrupt-")));
+    // Only the startup open preserves and replaces it.
+    assert_eq!(open_library_db(&path).unwrap().detail_count().unwrap(), 0);
 }
 
 #[test]
@@ -6509,11 +7354,34 @@ fn periodic_nfo_removal_converges_with_targeted_and_clean_scan() {
         let probes = gate.metrics().admitted_total;
         assert!(monitor(&periodic).unwrap().0.is_none());
         assert_eq!(gate.metrics().admitted_total, probes);
-        // Invalid XML cannot replace either presentation or recorded provenance.
+        // Invalid XML cannot replace either presentation or recorded
+        // provenance, and it does not fail or re-probe the reconciliation.
         let before = snapshot(&periodic);
+        let fingerprints = {
+            let db = open_library_db(periodic.db_path.as_ref().unwrap()).unwrap();
+            db.all_detail_stats()
+                .unwrap()
+                .iter()
+                .map(|row| db.detail_nfo_fingerprint(row.id).unwrap())
+                .collect::<Vec<_>>()
+        };
         std::fs::write(&sidecar, "<movie><title>broken</movie>").unwrap();
-        assert!(monitor(&periodic).is_err());
+        let probes = gate.metrics().admitted_total;
+        let (catalog, delta) = monitor(&periodic).unwrap();
+        assert!(catalog.is_none());
+        assert_eq!(delta.changed, 0);
+        let (_, delta) = monitor_dirty(&targeted, std::slice::from_ref(&sidecar)).unwrap();
+        assert_eq!(delta.changed, 0);
+        assert_eq!(gate.metrics().admitted_total, probes);
         assert_eq!(snapshot(&periodic), before);
+        let db = open_library_db(periodic.db_path.as_ref().unwrap()).unwrap();
+        let retained = db
+            .all_detail_stats()
+            .unwrap()
+            .iter()
+            .map(|row| db.detail_nfo_fingerprint(row.id).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(retained, fingerprints);
     }
 }
 
@@ -7991,4 +8859,732 @@ fn basename_glob_matching_has_polynomial_worst_case() {
         pattern, &matching, &mut steps
     ));
     assert!(steps <= bound + pattern.len() as u64 + 1);
+}
+
+fn detail_id_ending_with(db_path: &Path, suffix: &str) -> Option<i64> {
+    LibraryDb::open(db_path)
+        .unwrap()
+        .all_detail_stats()
+        .unwrap()
+        .into_iter()
+        .find(|row| path_from_db(&row.path).ends_with(suffix))
+        .map(|row| row.id)
+}
+
+fn separate_db_cfg(tmp: &Path, root: &Path, types: MediaTypes) -> ScanConfig {
+    std::fs::create_dir_all(tmp.join("state")).unwrap();
+    ScanConfig {
+        media_roots: Vec::new(),
+        media_dirs: vec![root.to_path_buf()],
+        db_path: Some(tmp.join("state/files.db")),
+        types,
+        ..Default::default()
+    }
+}
+
+fn two_root_cfg(tmp: &Path, first: &Path, second: &Path) -> ScanConfig {
+    std::fs::create_dir_all(tmp.join("state")).unwrap();
+    std::fs::create_dir_all(first).unwrap();
+    std::fs::create_dir_all(second).unwrap();
+    ScanConfig {
+        media_roots: Vec::new(),
+        media_dirs: vec![first.to_path_buf(), second.to_path_buf()],
+        db_path: Some(tmp.join("state/files.db")),
+        types: MediaTypes::video_only(),
+        ..Default::default()
+    }
+}
+
+/// Overwrite the device recorded for `root` by the last successful pass.
+/// `None` simulates a catalog written before devices were recorded; another
+/// device simulates a mount (NFS, SMB, USB, or a bind mount) that is gone and
+/// left its empty mount point behind.
+fn set_recorded_root_device(cfg: &ScanConfig, root: &Path, device: Option<u64>) {
+    let (identity, _) = crate::root_relative_path(root, cfg).unwrap();
+    let key = format!("{}{identity}", crate::MEDIA_ROOT_DEVICE_SETTING_PREFIX);
+    let db = LibraryDb::open(cfg.db_path.as_ref().unwrap()).unwrap();
+    assert!(
+        db.setting(&key).unwrap().is_some(),
+        "a successful pass records each root's device"
+    );
+    db.set_setting(&key, &device.map(|dev| dev.to_string()).unwrap_or_default())
+        .unwrap();
+}
+
+fn root_device(root: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(root).unwrap().dev()
+}
+
+fn playlist_ids(db_path: &Path) -> Vec<i64> {
+    LibraryDb::open(db_path)
+        .unwrap()
+        .playlists()
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect()
+}
+
+fn bookmark_seconds(db_path: &Path, id: i64) -> Option<i64> {
+    LibraryDb::open(db_path)
+        .unwrap()
+        .get_bookmark(id)
+        .unwrap()
+        .map(|(seconds, _)| seconds)
+}
+
+#[test]
+fn unavailable_root_keeps_items_bookmarks_and_ids_until_it_returns() {
+    let tmp = TempPath::new("root-unavailable");
+    let root = tmp.join("media");
+    let other = tmp.join("other");
+    let offline = tmp.join("media.offline");
+    let cfg = two_root_cfg(&tmp, &root, &other);
+    let db_path = cfg.db_path.clone().unwrap();
+    write_fake_mkv(&root.join("movies/keep.mkv"), 64);
+    std::fs::write(root.join("movies/favorites.m3u"), "keep.mkv\n").unwrap();
+    write_fake_mkv(&other.join("present.mkv"), 64);
+    scan(&cfg).unwrap();
+    let id = detail_id_ending_with(&db_path, "movies/keep.mkv").expect("indexed");
+    let playlists = playlist_ids(&db_path);
+    assert_eq!(playlists.len(), 1);
+    LibraryDb::open(&db_path)
+        .unwrap()
+        .set_bookmark(id, 600)
+        .unwrap();
+
+    // A dropped mount whose mount point vanished. The root is held; every
+    // other root keeps being reconciled.
+    std::fs::rename(&root, &offline).unwrap();
+    write_fake_mkv(&other.join("during-missing.mkv"), 64);
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    assert_eq!(delta.added, 1, "{delta:?}");
+    scan_refresh(&cfg).unwrap();
+    rebuild_objects(&cfg).unwrap();
+    assert_eq!(detail_id_ending_with(&db_path, "movies/keep.mkv"), Some(id));
+    assert_eq!(playlist_ids(&db_path), playlists);
+
+    // An unmounted mount point: empty, on a different device than the one the
+    // last successful pass recorded (or none recorded by an older catalog).
+    std::fs::create_dir(&root).unwrap();
+    set_recorded_root_device(&cfg, &root, Some(root_device(&root).wrapping_add(1)));
+    write_fake_mkv(&other.join("during-unmount.mkv"), 64);
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    assert_eq!(delta.added, 1, "{delta:?}");
+    scan_refresh(&cfg).unwrap();
+    set_recorded_root_device(&cfg, &root, None);
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    scan(&cfg).unwrap();
+    assert_eq!(detail_id_ending_with(&db_path, "movies/keep.mkv"), Some(id));
+    assert_eq!(playlist_ids(&db_path), playlists);
+
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::rename(&offline, &root).unwrap();
+    let (catalog, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    assert_eq!(delta.added, 0, "{delta:?}");
+    assert_eq!(
+        detail_id_ending_with(&db_path, "movies/keep.mkv"),
+        Some(id),
+        "a returning root must keep its stable item IDs"
+    );
+    let catalog =
+        catalog.unwrap_or_else(|| LibraryDb::open(&db_path).unwrap().load_catalog().unwrap());
+    assert!(
+        catalog.items.values().any(|item| item.detail_id == id),
+        "the returning item is browseable again"
+    );
+    assert_eq!(bookmark_seconds(&db_path, id), Some(600));
+    assert_eq!(playlist_ids(&db_path), playlists);
+}
+
+#[test]
+fn emptied_root_converges_and_never_blocks_other_roots() {
+    let tmp = TempPath::new("root-emptied");
+    let first = tmp.join("incoming");
+    let second = tmp.join("movies");
+    let cfg = two_root_cfg(&tmp, &first, &second);
+    let db_path = cfg.db_path.clone().unwrap();
+    write_fake_mkv(&first.join("show/episode.mkv"), 64);
+    write_fake_mkv(&second.join("film.mkv"), 64);
+    scan(&cfg).unwrap();
+
+    // Deleting a root's last directory reaches the scanner as a nameless
+    // IGNORED/DELETE_SELF, which forces a full reconcile. On the device the
+    // last pass recorded, the emptied root is simply empty.
+    std::fs::remove_dir_all(first.join("show")).unwrap();
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert!(delta.removed >= 1, "{delta:?}");
+    assert_eq!(detail_id_ending_with(&db_path, "show/episode.mkv"), None);
+    write_fake_mkv(&second.join("new-movie/new.mkv"), 64);
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.added, 1, "{delta:?}");
+    scan_refresh(&cfg).unwrap();
+    rebuild_objects(&cfg).unwrap();
+    assert!(detail_id_ending_with(&db_path, "new-movie/new.mkv").is_some());
+
+    // The last file of a root, removed by a full pass, converges too.
+    write_fake_mkv(&first.join("single.mkv"), 64);
+    monitor(&cfg).unwrap();
+    std::fs::remove_file(first.join("single.mkv")).unwrap();
+    scan_refresh(&cfg).unwrap();
+    assert_eq!(detail_id_ending_with(&db_path, "single.mkv"), None);
+
+    // A catalog written before devices were recorded cannot tell an emptied
+    // root from an unmounted one. That root alone is held; the others keep
+    // indexing, and any entry in the held root releases it.
+    write_fake_mkv(&first.join("legacy.mkv"), 64);
+    monitor(&cfg).unwrap();
+    set_recorded_root_device(&cfg, &first, None);
+    std::fs::remove_file(first.join("legacy.mkv")).unwrap();
+    write_fake_mkv(&second.join("other.mkv"), 64);
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.added, 1, "{delta:?}");
+    assert!(detail_id_ending_with(&db_path, "legacy.mkv").is_some());
+    std::fs::write(first.join(".keep"), b"").unwrap();
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert!(delta.removed >= 1, "{delta:?}");
+    assert_eq!(detail_id_ending_with(&db_path, "legacy.mkv"), None);
+}
+
+#[test]
+fn startup_maintenance_sequence_completes_with_an_emptied_or_offline_root() {
+    fn startup_sequence(cfg: &ScanConfig) {
+        // The server's ordered startup pass for a non-empty catalog.
+        let mut session = ScanSession::new(cfg).unwrap();
+        let prepared = session.prepare_video_title_repair().unwrap();
+        session.publish(prepared).unwrap();
+        let prepared = session.prepare_object_repair().unwrap();
+        session.publish(prepared).unwrap();
+        let prepared = session.prepare_monitor(&[], false).unwrap();
+        session.publish(prepared).unwrap();
+        let prepared = session.prepare_fill_missing_av_meta().unwrap();
+        session.publish(prepared).unwrap();
+    }
+    fn drop_objects(db_path: &Path, id: i64) {
+        LibraryDb::open(db_path)
+            .unwrap()
+            .connection()
+            .execute("DELETE FROM OBJECTS WHERE DETAIL_ID = ?1", [id])
+            .unwrap();
+    }
+
+    let tmp = TempPath::new("root-startup");
+    let first = tmp.join("recordings");
+    let second = tmp.join("library");
+    let offline = tmp.join("recordings.offline");
+    let cfg = two_root_cfg(&tmp, &first, &second);
+    let db_path = cfg.db_path.clone().unwrap();
+    write_fake_mkv(&first.join("recorded.mkv"), 64);
+    write_fake_mkv(&second.join("kept.mkv"), 64);
+    scan(&cfg).unwrap();
+    let kept = detail_id_ending_with(&db_path, "kept.mkv").unwrap();
+
+    // Emptied while the server was down, with object repair also pending.
+    std::fs::remove_file(first.join("recorded.mkv")).unwrap();
+    drop_objects(&db_path, kept);
+    startup_sequence(&cfg);
+    assert_eq!(detail_id_ending_with(&db_path, "recorded.mkv"), None);
+    let catalog = LibraryDb::open(&db_path).unwrap().load_catalog().unwrap();
+    assert!(catalog.items.values().any(|item| item.detail_id == kept));
+
+    // Offline at startup: the other root is still reconciled and repaired.
+    write_fake_mkv(&first.join("again.mkv"), 64);
+    monitor(&cfg).unwrap();
+    let again = detail_id_ending_with(&db_path, "again.mkv").unwrap();
+    std::fs::rename(&first, &offline).unwrap();
+    write_fake_mkv(&second.join("arrived.mkv"), 64);
+    drop_objects(&db_path, kept);
+    startup_sequence(&cfg);
+    assert_eq!(detail_id_ending_with(&db_path, "again.mkv"), Some(again));
+    assert!(detail_id_ending_with(&db_path, "arrived.mkv").is_some());
+    let catalog = LibraryDb::open(&db_path).unwrap().load_catalog().unwrap();
+    assert!(catalog.items.values().any(|item| item.detail_id == kept));
+    assert!(catalog.items.values().any(|item| item.detail_id == again));
+}
+
+/// Mode 000 on a directory, restored on drop so the temp tree can be removed.
+struct LockedDirectory(PathBuf);
+
+impl LockedDirectory {
+    /// `None` when this process reads the directory anyway (root or
+    /// CAP_DAC_OVERRIDE), so permission tests cannot observe EACCES.
+    fn lock(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let guard = Self(path.to_path_buf());
+        if std::fs::read_dir(path).is_ok() {
+            return None;
+        }
+        Some(guard)
+    }
+}
+
+impl Drop for LockedDirectory {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[test]
+fn unreadable_subdirectory_is_skipped_and_keeps_its_items() {
+    let tmp = TempPath::new("unreadable-subdir");
+    let root = tmp.join("media");
+    std::fs::create_dir_all(root.join("movies")).unwrap();
+    std::fs::create_dir_all(root.join("locked")).unwrap();
+    write_fake_mkv(&root.join("movies/open.mkv"), 64);
+    write_fake_mkv(&root.join("locked/hidden.mkv"), 64);
+    std::fs::write(
+        root.join("locked/hidden.nfo"),
+        "<movie><title>Kept Title</title></movie>",
+    )
+    .unwrap();
+    std::fs::write(root.join("locked/hidden.m3u"), "hidden.mkv\n").unwrap();
+    let cfg = separate_db_cfg(&tmp, &root, MediaTypes::video_only());
+    let db_path = cfg.db_path.clone().unwrap();
+    let catalog = scan(&cfg).unwrap();
+    let playlists = playlist_ids(&db_path);
+    assert_eq!(playlists.len(), 1);
+    assert!(catalog
+        .items
+        .values()
+        .any(|item| item.title == "Kept Title"));
+    let hidden = detail_id_ending_with(&db_path, "locked/hidden.mkv").expect("indexed");
+    LibraryDb::open(&db_path)
+        .unwrap()
+        .set_bookmark(hidden, 300)
+        .unwrap();
+
+    let Some(lock) = LockedDirectory::lock(&root.join("locked")) else {
+        eprintln!("skipping: this process bypasses directory permissions");
+        return;
+    };
+    write_fake_mkv(&root.join("movies/new.mkv"), 64);
+    let (catalog, delta) = monitor(&cfg).unwrap();
+    let catalog = catalog.expect("the new file is published");
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    assert!(catalog.items.values().any(|item| item.title == "new"));
+    assert!(
+        catalog
+            .items
+            .values()
+            .any(|item| item.title == "Kept Title"),
+        "an unreadable directory's items and NFO metadata are kept"
+    );
+    scan_refresh(&cfg).unwrap();
+    assert_eq!(
+        detail_id_ending_with(&db_path, "locked/hidden.mkv"),
+        Some(hidden)
+    );
+    assert_eq!(
+        playlist_ids(&db_path),
+        playlists,
+        "a playlist in an unreadable directory keeps its ID"
+    );
+
+    // A first scan with the directory already unreadable still succeeds and
+    // does not publish an empty container for it.
+    let fresh = ScanConfig {
+        db_path: Some(tmp.join("state/fresh.db")),
+        ..cfg.clone()
+    };
+    let catalog = scan(&fresh).unwrap();
+    assert!(catalog.items.values().any(|item| item.title == "open"));
+    assert!(!catalog
+        .items
+        .values()
+        .any(|item| item.title == "Kept Title"));
+    assert!(!catalog
+        .containers
+        .values()
+        .any(|container| container.title == "locked"));
+
+    drop(lock);
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    assert_eq!(
+        detail_id_ending_with(&db_path, "locked/hidden.mkv"),
+        Some(hidden)
+    );
+    assert_eq!(
+        LibraryDb::open(&db_path)
+            .unwrap()
+            .get_bookmark(hidden)
+            .unwrap()
+            .map(|(seconds, _)| seconds),
+        Some(300)
+    );
+    let (catalog, _) = monitor(&fresh).unwrap();
+    let catalog = catalog.expect("the readable directory is indexed");
+    assert!(catalog
+        .items
+        .values()
+        .any(|item| item.title == "Kept Title"));
+}
+
+#[test]
+fn unreadable_root_is_held_instead_of_reading_as_empty() {
+    let tmp = TempPath::new("unreadable-root");
+    let root = tmp.join("media");
+    let other = tmp.join("other");
+    let cfg = two_root_cfg(&tmp, &root, &other);
+    write_fake_mkv(&root.join("only.mkv"), 64);
+    let db_path = cfg.db_path.clone().unwrap();
+    scan(&cfg).unwrap();
+    let id = detail_id_ending_with(&db_path, "only.mkv").expect("indexed");
+    let Some(lock) = LockedDirectory::lock(&root) else {
+        eprintln!("skipping: this process bypasses directory permissions");
+        return;
+    };
+    write_fake_mkv(&other.join("arrived.mkv"), 64);
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    assert_eq!(delta.added, 1, "{delta:?}");
+    scan_refresh(&cfg).unwrap();
+    assert_eq!(detail_id_ending_with(&db_path, "only.mkv"), Some(id));
+    drop(lock);
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    assert_eq!(detail_id_ending_with(&db_path, "only.mkv"), Some(id));
+}
+
+#[test]
+fn dangling_alias_removal_keeps_its_target_under_an_unavailable_root() {
+    #[derive(Clone, Copy, Debug)]
+    enum Vanish {
+        Missing,
+        EmptyMountPoint,
+    }
+    #[derive(Clone, Copy, Debug)]
+    enum Pass {
+        Targeted,
+        Monitor,
+        Scan,
+        Rebuild,
+    }
+
+    let tmp = TempPath::new("held-alias-cascade");
+    let views = tmp.join("views");
+    let nas = tmp.join("nas");
+    let offline = tmp.join("nas.offline");
+    let cfg = two_root_cfg(&tmp, &views, &nas);
+    let db_path = cfg.db_path.clone().unwrap();
+    write_fake_mkv(&nas.join("film.mkv"), 64);
+    std::os::unix::fs::symlink(nas.join("film.mkv"), views.join("film.mkv")).unwrap();
+    scan(&cfg).unwrap();
+    let target = detail_id_ending_with(&db_path, "nas/film.mkv").expect("indexed");
+    LibraryDb::open(&db_path)
+        .unwrap()
+        .set_bookmark(target, 900)
+        .unwrap();
+
+    for (vanish, pass) in [
+        (Vanish::Missing, Pass::Targeted),
+        (Vanish::EmptyMountPoint, Pass::Targeted),
+        (Vanish::Missing, Pass::Monitor),
+        (Vanish::Missing, Pass::Scan),
+        (Vanish::Missing, Pass::Rebuild),
+        (Vanish::EmptyMountPoint, Pass::Monitor),
+    ] {
+        // Root B goes offline. The symlink in root A dangles and is removed,
+        // but the cascade must not reach B's own row: B is unknown, not gone.
+        assert!(
+            detail_id_ending_with(&db_path, "views/film.mkv").is_some(),
+            "{vanish:?} {pass:?}: the alias is indexed while its target is online"
+        );
+        std::fs::rename(&nas, &offline).unwrap();
+        if let Vanish::EmptyMountPoint = vanish {
+            std::fs::create_dir(&nas).unwrap();
+            if !matches!(pass, Pass::Targeted) {
+                set_recorded_root_device(&cfg, &nas, Some(root_device(&nas).wrapping_add(1)));
+            }
+        }
+        match pass {
+            Pass::Targeted => {
+                monitor_dirty(&cfg, &[views.join("film.mkv")]).unwrap();
+            }
+            Pass::Monitor => {
+                monitor(&cfg).unwrap();
+            }
+            Pass::Scan => {
+                scan_refresh(&cfg).unwrap();
+            }
+            Pass::Rebuild => {
+                rebuild_objects(&cfg).unwrap();
+            }
+        }
+        assert_eq!(
+            detail_id_ending_with(&db_path, "nas/film.mkv"),
+            Some(target),
+            "{vanish:?} {pass:?}: the held root's item keeps its ID"
+        );
+        assert_eq!(
+            bookmark_seconds(&db_path, target),
+            Some(900),
+            "{vanish:?} {pass:?}: the held root's item keeps its bookmark"
+        );
+
+        if let Vanish::EmptyMountPoint = vanish {
+            std::fs::remove_dir(&nas).unwrap();
+        }
+        std::fs::rename(&offline, &nas).unwrap();
+        let (_, delta) = monitor(&cfg).unwrap();
+        assert_eq!(delta.removed, 0, "{vanish:?} {pass:?}: {delta:?}");
+        assert_eq!(
+            detail_id_ending_with(&db_path, "nas/film.mkv"),
+            Some(target)
+        );
+    }
+}
+
+#[test]
+fn root_that_vanishes_during_a_pass_is_held_not_pruned() {
+    let tmp = TempPath::new("root-vanishes-mid-pass");
+    let first = tmp.join("first");
+    let second = tmp.join("second");
+    let cfg = two_root_cfg(&tmp, &first, &second);
+    let db_path = cfg.db_path.clone().unwrap();
+    write_fake_mkv(&first.join("a.mkv"), 64);
+    write_fake_mkv(&second.join("b.mkv"), 64);
+    scan(&cfg).unwrap();
+    let ids = [
+        detail_id_ending_with(&db_path, "first/a.mkv").expect("indexed"),
+        detail_id_ending_with(&db_path, "second/b.mkv").expect("indexed"),
+    ];
+    for id in ids {
+        LibraryDb::open(&db_path)
+            .unwrap()
+            .set_bookmark(id, 120)
+            .unwrap();
+    }
+
+    type Pass = fn(&ScanConfig);
+    let passes: [(&str, Pass); 2] = [
+        ("monitor", |cfg| {
+            monitor(cfg).unwrap();
+        }),
+        ("scan", |cfg| {
+            scan_refresh(cfg).unwrap();
+        }),
+    ];
+    for (name, pass) in passes {
+        // Each root disappears right after the other one was walked: the
+        // second root before its own walk, the first after it was listed.
+        for (vanishing, walked) in [(&second, &first), (&first, &second)] {
+            let offline = vanishing.with_extension("offline");
+            let walked_name = walked.file_name().unwrap().to_owned();
+            let (from, to) = (vanishing.clone(), offline.clone());
+            set_after_root_walk(Some(Box::new(move |root: &Path| {
+                if root.file_name() == Some(walked_name.as_os_str()) && from.exists() {
+                    std::fs::rename(&from, &to).unwrap();
+                }
+            })));
+            pass(&cfg);
+            set_after_root_walk(None);
+            assert!(!vanishing.exists(), "{name}: the hook ran");
+            for id in ids {
+                assert_eq!(
+                    bookmark_seconds(&db_path, id),
+                    Some(120),
+                    "{name}: {} vanished mid-pass; item {id} must be held",
+                    vanishing.display()
+                );
+            }
+            assert_eq!(detail_id_ending_with(&db_path, "first/a.mkv"), Some(ids[0]));
+            assert_eq!(
+                detail_id_ending_with(&db_path, "second/b.mkv"),
+                Some(ids[1])
+            );
+
+            std::fs::rename(&offline, vanishing).unwrap();
+            let (_, delta) = monitor(&cfg).unwrap();
+            assert_eq!(delta.removed, 0, "{name}: {delta:?}");
+        }
+    }
+}
+
+/// Mode 000 on a file, restored on drop.
+struct LockedFile(PathBuf);
+
+impl LockedFile {
+    /// `None` when this process opens the file anyway (root or
+    /// CAP_DAC_OVERRIDE), so permission tests cannot observe EACCES.
+    fn lock(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let guard = Self(path.to_path_buf());
+        if std::fs::File::open(path).is_ok() {
+            return None;
+        }
+        Some(guard)
+    }
+}
+
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+    }
+}
+
+#[test]
+fn unopenable_file_and_symlink_keep_their_rows_on_targeted_and_full_passes() {
+    let tmp = TempPath::new("unopenable-file");
+    let root = tmp.join("media");
+    let movie = root.join("movies/movie.mkv");
+    let link = root.join("views/movie.mkv");
+    write_fake_mkv(&movie, 64);
+    std::fs::create_dir_all(root.join("views")).unwrap();
+    std::os::unix::fs::symlink(&movie, &link).unwrap();
+    let cfg = separate_db_cfg(&tmp, &root, MediaTypes::video_only());
+    let db_path = cfg.db_path.clone().unwrap();
+    scan(&cfg).unwrap();
+    let movie_id = detail_id_ending_with(&db_path, "movies/movie.mkv").expect("indexed");
+    let link_id = detail_id_ending_with(&db_path, "views/movie.mkv").expect("indexed");
+    for id in [movie_id, link_id] {
+        LibraryDb::open(&db_path)
+            .unwrap()
+            .set_bookmark(id, 45)
+            .unwrap();
+    }
+    let assert_kept = |context: &str| {
+        assert_eq!(
+            detail_id_ending_with(&db_path, "movies/movie.mkv"),
+            Some(movie_id),
+            "{context}"
+        );
+        assert_eq!(
+            detail_id_ending_with(&db_path, "views/movie.mkv"),
+            Some(link_id),
+            "{context}"
+        );
+        assert_eq!(bookmark_seconds(&db_path, movie_id), Some(45), "{context}");
+        assert_eq!(bookmark_seconds(&db_path, link_id), Some(45), "{context}");
+    };
+
+    // A replacement that briefly cannot be opened (EACCES) is unknown, not
+    // deleted, for an inotify-targeted pass on either path and for the full
+    // reconcile, which lists a symlink only after opening its target.
+    let Some(lock) = LockedFile::lock(&movie) else {
+        eprintln!("skipping: this process bypasses file permissions");
+        return;
+    };
+    let (_, delta) = monitor_dirty(&cfg, std::slice::from_ref(&movie)).unwrap();
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    assert_kept("targeted event on the unopenable file");
+    let (_, delta) = monitor_dirty(&cfg, std::slice::from_ref(&link)).unwrap();
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    assert_kept("targeted event on its symlink");
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    assert_kept("full reconcile");
+    scan_refresh(&cfg).unwrap();
+    assert_kept("full scan");
+
+    drop(lock);
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    assert_kept("after the file can be opened again");
+
+    // Affirmative absence still removes the rows.
+    std::fs::remove_file(&movie).unwrap();
+    let (_, delta) = monitor_dirty(&cfg, std::slice::from_ref(&movie)).unwrap();
+    assert!(delta.removed >= 1, "{delta:?}");
+    assert_eq!(detail_id_ending_with(&db_path, "movies/movie.mkv"), None);
+    assert_eq!(detail_id_ending_with(&db_path, "views/movie.mkv"), None);
+}
+
+fn write_bdav_m2ts(path: &Path) -> bool {
+    let mut command = std::process::Command::new("ffmpeg");
+    command
+        .args([
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=0.5:size=32x32:rate=2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "mpegts",
+            "-mpegts_m2ts_mode",
+            "1",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+        ])
+        .arg(path)
+        .stdin(std::process::Stdio::null());
+    probe::command_status_with_timeout(&mut command, std::time::Duration::from_secs(30))
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn late_added_bdav_dsd_and_realmedia_files_are_admitted_and_kept_when_changed() {
+    let tmp = TempPath::new("late-formats");
+    let root = tmp.join("media");
+    std::fs::create_dir_all(root.join("movies")).unwrap();
+    std::fs::create_dir_all(root.join("music")).unwrap();
+    write_fake_mkv(&root.join("movies/existing.mkv"), 64);
+    let cfg = separate_db_cfg(&tmp, &root, MediaTypes::all());
+    let db_path = cfg.db_path.clone().unwrap();
+    scan(&cfg).unwrap();
+
+    // Reconciliation (not the first full scan) sees these files, so admission
+    // depends on the header sniff rather than a prepared probe.
+    let mut dsf = b"DSD \x1c\0\0\0\0\0\0\0".to_vec();
+    dsf.resize(256, 0x69);
+    std::fs::write(root.join("music/dsf-track.dsf"), &dsf).unwrap();
+    let mut dff = b"FRM8\0\0\0\0\0\0\x01\0DSD ".to_vec();
+    dff.resize(256, 0x69);
+    std::fs::write(root.join("music/dff-track.dff"), &dff).unwrap();
+    let mut rm = b".RMF\0\0\0\x12\0\x01".to_vec();
+    rm.resize(256, 0);
+    std::fs::write(root.join("movies/real.rm"), &rm).unwrap();
+    let mut files = vec![
+        "music/dsf-track.dsf",
+        "music/dff-track.dff",
+        "movies/real.rm",
+    ];
+    if write_bdav_m2ts(&root.join("movies/camcorder.m2ts")) {
+        let header = std::fs::read(root.join("movies/camcorder.m2ts")).unwrap();
+        assert_ne!(header[0], 0x47, "BDAV packets start with a TP_extra_header");
+        assert_eq!((header[4], header[196], header[388]), (0x47, 0x47, 0x47));
+        files.push("movies/camcorder.m2ts");
+    } else {
+        eprintln!("ffmpeg unavailable: skipping the BDAV transport-stream case");
+    }
+
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.added, files.len(), "{delta:?}");
+    let ids = files
+        .iter()
+        .map(|file| detail_id_ending_with(&db_path, file).unwrap_or_else(|| panic!("{file}")))
+        .collect::<Vec<_>>();
+
+    // A changed timestamp re-runs admission on the existing row; it must
+    // not remove the item or change its ID.
+    let later = std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+    for file in &files {
+        std::fs::File::options()
+            .write(true)
+            .open(root.join(file))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+    }
+    let (_, delta) = monitor(&cfg).unwrap();
+    assert_eq!(delta.removed, 0, "{delta:?}");
+    for (file, id) in files.iter().zip(ids) {
+        assert_eq!(detail_id_ending_with(&db_path, file), Some(id), "{file}");
+    }
 }

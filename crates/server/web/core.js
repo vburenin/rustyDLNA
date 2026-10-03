@@ -153,6 +153,21 @@ export function seekTarget(value, duration) {
   return duration > 0 ? Math.min(numeric, duration) : numeric;
 }
 
+// A focused position slider moves by the same step as the player's Left/Right
+// shortcuts instead of the native 0.1-second range step. Up/Down mirror
+// Right/Left as the ARIA slider pattern expects. Returns null for other keys.
+export function timelineKeySeekTarget(key, current, duration) {
+  const position = Number.isFinite(current) ? current : 0;
+  const delta = {
+    ArrowLeft: -10, ArrowDown: -10, ArrowRight: 10, ArrowUp: 10,
+    PageDown: -60, PageUp: 60,
+  }[key];
+  if (delta !== undefined) return seekTarget(position + delta, duration);
+  if (key === "Home") return 0;
+  if (key === "End") return duration > 0 ? duration : null;
+  return null;
+}
+
 export function doubleTapSeekDelta({
   firstX,
   firstY,
@@ -971,11 +986,50 @@ export function mediaDetails(item) {
   return parts.join(" · ");
 }
 
+// Browser-local progress for one library card. A saved resumable position wins
+// over an earlier completion so a rewatch shows where it stopped.
+export function cardProgress({ position = 0, duration = 0, watched = false } = {}) {
+  const resume = resumePosition(position, duration);
+  if (resume > 0) {
+    const percent = clamp(Math.floor((resume / duration) * 100), 1, 99);
+    return {
+      state: "partial",
+      percent,
+      label: `${percent}% watched, ${clockLabel(duration - resume)} left`,
+    };
+  }
+  return watched ? { state: "watched", percent: 100, label: "Watched" } : null;
+}
+
+export const LIBRARY_RETRY_DELAYS_MS = Object.freeze([250, 1000]);
+
+// A catalog publication or a momentarily busy query budget is transient: retry
+// the whole snapshot a bounded number of times before showing manual Retry.
+export function libraryRetryDelay(error, attempt, random = Math.random) {
+  if (!Number.isInteger(attempt) || attempt < 0 || attempt >= LIBRARY_RETRY_DELAYS_MS.length) return null;
+  if (error?.recoverable === false || !["catalog_changed", "catalog_busy"].includes(error?.code)) return null;
+  const jitter = clamp(Number(random()) || 0, 0, 1);
+  return Math.round(LIBRARY_RETRY_DELAYS_MS[attempt] * (0.75 + jitter * 0.5));
+}
+
+export function libraryErrorMessage(error, online = true) {
+  if (error?.code === "catalog_changed") return "The library changed while loading. Retry to refresh it.";
+  if (error?.code === "catalog_busy") return "The server is busy updating the library. Retry in a moment.";
+  if (!online) return "You appear to be offline. Reconnect, then retry.";
+  return "Check the server connection, then retry.";
+}
+
+// Mirrors the server's browser search: every whitespace-separated term (up to
+// 16 distinct terms) must occur in some field; terms may match different fields.
+export const SEARCH_MAX_TERMS = 16;
+
 export function mediaMatchesQuery(item, query) {
-  const normalized = String(query || "").trim().toLowerCase();
-  if (!normalized) return true;
-  return [item?.file_name, item?.title, item?.artist, item?.album_artist, item?.album]
-    .some((value) => String(value || "").toLowerCase().includes(normalized));
+  const terms = [...new Set(String(query || "").toLowerCase().split(/\s+/).filter(Boolean))]
+    .slice(0, SEARCH_MAX_TERMS);
+  if (!terms.length) return true;
+  const fields = [item?.file_name, item?.title, item?.artist, item?.album_artist, item?.album]
+    .map((value) => String(value || "").toLowerCase());
+  return terms.every((term) => fields.some((field) => field.includes(term)));
 }
 
 export function navigationFromUrl(href) {
@@ -1002,6 +1056,15 @@ export function navigationFromUrl(href) {
   };
 }
 
+// Back/Forward to an entry for the title that is already playing changes only
+// the library. Reselecting would stop playback, replace its queue, and ask to
+// resume again. A failed session may still be retried from history.
+export function navigationKeepsPlayback(navigation, playback) {
+  const itemId = navigation?.itemId;
+  return Boolean(playback?.item && itemId !== null && itemId !== undefined
+    && String(playback.item.id) === String(itemId) && playback.status !== "error");
+}
+
 export function navigationUrl(href, navigation, rootFolderId) {
   const url = new URL(href);
   url.search = "";
@@ -1013,6 +1076,9 @@ export function navigationUrl(href, navigation, rootFolderId) {
     url.searchParams.set("view", "continue");
   }
   if (navigation.query) url.searchParams.set("q", navigation.query);
+  // Continue watching is always ordered by most recent progress and ignores
+  // `sort`; its entries still carry the other views' sort so a reload or
+  // Back/Forward onto Continue watching does not reset that choice to Title.
   if (navigation.sort !== "title") url.searchParams.set("sort", navigation.sort);
   if (navigation.itemId !== null && navigation.itemId !== undefined) {
     url.searchParams.set("item", String(navigation.itemId));
@@ -1042,6 +1108,15 @@ const ERROR_MAP = Object.freeze({
 export function playbackError(code, technical = "") {
   const [message, actions] = ERROR_MAP[code] || ERROR_MAP.unknown;
   return { code, message, actions: [...actions], technical };
+}
+
+// The recovery actions an error can actually offer, in presentation order.
+// Play while an error is shown performs the first of them.
+export function availableErrorActions(error, { sourceMode, transcoding }) {
+  const actions = Array.isArray(error?.actions) ? error.actions : [];
+  return ["retry", "try_compatible", "play_original"].filter((action) => actions.includes(action)
+    && (action !== "retry" || sourceMode !== SOURCE_MODES.COMPATIBLE || transcoding)
+    && (action !== "try_compatible" || transcoding));
 }
 
 export function playbackEndedEarly(currentTime, duration) {
@@ -1085,7 +1160,8 @@ export function compatibleDecodeRecovery({
   }
   const portableVideo = negotiation?.video === "transcode"
     || (negotiation?.video === "repair" && ["libx264", "h264_nvenc"].includes(repairEncoder));
-  const saferQuality = portableVideo && negotiation?.audio === "transcode"
+  // Quality profiles bound video. Lowering one cannot repair audio-only output.
+  const saferQuality = item?.kind === "video" && portableVideo && negotiation?.audio === "transcode"
     ? automaticCompatibleRecoveryProfile(profiles, quality, preferredQuality) : null;
   return saferQuality
     ? fallback(negotiation, "Lowering streaming quality for this device…", { quality: saferQuality })
@@ -1103,6 +1179,36 @@ export function mediaSourceStallReason({ now, startedAt, preparationAt, playback
   if (firstFragmentAt !== null && !seeking && now - firstFragmentAt >= 20_000) return "first frame";
   if (now - preparationAt >= 120_000 || now - startedAt >= 300_000) return "preparation progress";
   return null;
+}
+
+// Whether native HLS kept decoding while the page was hidden. Safari keeps
+// playing a backgrounded tab (and Picture in Picture), but device sleep can
+// drain about a second of buffer and then suspend the decoder without a pause
+// event. Only a media clock that tracked at least half of the hidden wall-clock
+// time (at the element's rate) shows the attachment is still live. A wrong
+// "live" verdict stalls the next resume, while a wrong "suspended" verdict
+// costs one extra generation, so the threshold deliberately favors suspended.
+export function nativeHlsPlaybackContinued({ paused, hiddenTime, visibleTime, hiddenMs, playbackRate = 1 }) {
+  if (paused || !Number.isFinite(hiddenTime) || !Number.isFinite(visibleTime)) return false;
+  const advanced = visibleTime - hiddenTime;
+  const elapsed = Math.max(0, Number(hiddenMs) || 0) / 1_000;
+  const rate = Number(playbackRate);
+  const expected = elapsed * (Number.isFinite(rate) && rate > 0 ? rate : 1);
+  return advanced > 0.05 && advanced >= expected * 0.5;
+}
+
+// Media Session previous/next availability mirrors playChapterRelative():
+// Previous restarts the current chapter after its first three seconds or moves
+// to an earlier chapter, and Next moves to a later chapter; otherwise both
+// fall back to the queue neighbor.
+export function mediaSessionTrackActions({ chapters = [], currentTime = 0, hasPrevious = false, hasNext = false }) {
+  const list = Array.isArray(chapters) ? chapters : [];
+  if (!list.length) return { previous: Boolean(hasPrevious), next: Boolean(hasNext) };
+  const index = Math.max(0, list.findLastIndex((chapter) => chapter.start_seconds <= currentTime));
+  return {
+    previous: index > 0 || currentTime > list[index].start_seconds + 3 || Boolean(hasPrevious),
+    next: index < list.length - 1 || Boolean(hasNext),
+  };
 }
 
 export function apiErrorCategory(error) {

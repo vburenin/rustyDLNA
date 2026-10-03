@@ -80,6 +80,36 @@ pub fn path_is_live_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// True only when the filesystem affirmatively reports that no regular file
+/// lives at `path`. `PermissionDenied`, stale handles, and I/O errors are
+/// unknown rather than gone, so an unreadable directory or a failing mount
+/// cannot delete catalog rows, bookmarks, or stable IDs.
+pub fn path_is_definitely_gone(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(metadata) => !metadata.is_file(),
+        Err(error) => error_means_absent(&error),
+    }
+}
+
+/// `ENOENT`, `ENOTDIR`, and `ELOOP` affirmatively say nothing usable lives at
+/// a path. Every other OS error (`EACCES`, `EPERM`, `ESTALE`, `EIO`,
+/// `ENOTCONN`, ...) leaves the path's state unknown.
+fn error_means_absent(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    ) || error.raw_os_error() == Some(libc::ELOOP)
+}
+
+/// Classify an [`open_allowed_file`] failure for catalog pruning. Errors the
+/// root policy constructs itself (outside every root, not a regular file,
+/// non-normal components) carry no OS code and mean the path is unwanted, as
+/// does affirmative absence. Any other OS error is unknown, and the caller
+/// keeps the row.
+pub(crate) fn open_refusal_means_unwanted(error: &std::io::Error) -> bool {
+    error.raw_os_error().is_none() || error_means_absent(error)
+}
+
 /// A regular file opened through the configured root policy. The descriptor,
 /// not the original pathname, is the security boundary for subsequent I/O.
 #[derive(Debug)]

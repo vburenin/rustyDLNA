@@ -10,7 +10,7 @@ use crate::db::LibraryDb;
 use crate::{
     display_os_name, file_mtime_unix, inode_key, is_skipped_dir_os_name, open_allowed_file,
     path_excluded, path_from_db, path_is_allowed_dir, path_is_allowed_file, path_to_db, scan_io,
-    ScanConfig, ScanResult,
+    HeldSubtrees, ScanConfig, ScanResult,
 };
 
 #[cfg(test)]
@@ -64,20 +64,44 @@ pub(crate) fn is_playlist(path: &Path) -> bool {
 fn collect_playlist_paths(
     cfg: &ScanConfig,
     directory: &Path,
+    is_root: bool,
     seen: &mut HashSet<(u64, u64)>,
+    held: &mut HeldSubtrees,
     output: &mut Vec<PathBuf>,
 ) -> ScanResult<()> {
     checkpoint(cfg)?;
     if !path_is_allowed_dir(directory, cfg) {
         return Ok(());
     }
-    let metadata = std::fs::metadata(directory).map_err(|error| scan_io(directory, error))?;
+    // Same rule as the media walkers: an unreadable subdirectory is held (its
+    // existing playlists are kept), an unreadable configured root fails.
+    let skip = |error: &std::io::Error, held: &mut HeldSubtrees| {
+        let unreadable = crate::unreadable_subdirectory(error, is_root);
+        if unreadable {
+            held.hold_unreadable(directory, cfg, error);
+        }
+        unreadable
+    };
+    let metadata = match std::fs::metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if skip(&error, held) => return Ok(()),
+        Err(error) => return Err(scan_io(directory, error)),
+    };
     if !seen.insert(inode_key(&metadata)) {
         return Ok(());
     }
-    for entry in std::fs::read_dir(directory).map_err(|error| scan_io(directory, error))? {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if skip(&error, held) => return Ok(()),
+        Err(error) => return Err(scan_io(directory, error)),
+    };
+    for entry in entries {
         checkpoint(cfg)?;
-        let entry = entry.map_err(|error| scan_io(directory, error))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if skip(&error, held) => break,
+            Err(error) => return Err(scan_io(directory, error)),
+        };
         let path = entry.path();
         let raw_name = entry.file_name();
         let name = raw_name.to_string_lossy().into_owned();
@@ -87,7 +111,7 @@ fn collect_playlist_paths(
         let file_type = entry.file_type().map_err(|error| scan_io(&path, error))?;
         if file_type.is_dir() || (file_type.is_symlink() && path.is_dir()) {
             if !is_skipped_dir_os_name(&raw_name) {
-                collect_playlist_paths(cfg, &path, seen, output)?;
+                collect_playlist_paths(cfg, &path, false, seen, held, output)?;
             }
         } else if is_playlist(&path) && path_is_allowed_file(&path, cfg) {
             output.push(path);
@@ -172,17 +196,45 @@ fn percent_decode_path(value: &str) -> Option<PathBuf> {
     }
 }
 
-fn entry_path(playlist: &Path, raw: &str) -> Option<PathBuf> {
+/// `C:\...`, `C:/...`, `C:...`, or a `file:///C:/...` path after decoding.
+fn has_windows_drive_prefix(value: &[u8]) -> bool {
+    let value = value.strip_prefix(b"/").unwrap_or(value);
+    value.len() >= 2 && value[0].is_ascii_alphabetic() && value[1] == b':'
+}
+
+/// Candidate paths for one entry in resolution order. The literal path always
+/// comes first because a Linux filename may legally contain `\`. A relative
+/// entry written by a Windows player (`Music\Artist\01.mp3`, no `/`) is then
+/// retried with `/` separators. Drive-letter, root-relative (`\Music`), and
+/// UNC paths name another machine's filesystem and get no translated candidate.
+fn entry_paths(playlist: &Path, raw: &str) -> Vec<PathBuf> {
     let raw = raw.trim().trim_matches('"');
-    let path = raw
-        .strip_prefix("file://")
-        .and_then(percent_decode_path)
-        .unwrap_or_else(|| PathBuf::from(raw));
-    if path.is_absolute() {
-        Some(path)
-    } else {
-        Some(playlist.parent()?.join(path))
+    let Some(parent) = playlist.parent() else {
+        return Vec::new();
+    };
+    if let Some(path) = raw.strip_prefix("file://").and_then(percent_decode_path) {
+        if has_windows_drive_prefix(path.as_os_str().as_encoded_bytes()) {
+            return Vec::new();
+        }
+        return vec![if path.is_absolute() {
+            path
+        } else {
+            parent.join(path)
+        }];
     }
+    let literal = PathBuf::from(raw);
+    if literal.is_absolute() {
+        return vec![literal];
+    }
+    let mut candidates = vec![parent.join(literal)];
+    if raw.contains('\\')
+        && !raw.contains('/')
+        && !raw.starts_with('\\')
+        && !has_windows_drive_prefix(raw.as_bytes())
+    {
+        candidates.push(parent.join(raw.replace('\\', "/")));
+    }
+    candidates
 }
 
 fn desired_playlists(
@@ -234,12 +286,17 @@ fn desired_playlists(
             }
         };
         let mut detail_ids = Vec::new();
+        let mut unresolved = 0_usize;
         for raw in parse_entries(&path, &text) {
             checkpoint(cfg)?;
-            let Some(candidate) = entry_path(&path, &raw) else {
-                continue;
-            };
-            let Ok(candidate_file) = open_allowed_file(&candidate, cfg) else {
+            let Some((candidate, candidate_file)) =
+                entry_paths(&path, &raw).into_iter().find_map(|candidate| {
+                    open_allowed_file(&candidate, cfg)
+                        .ok()
+                        .map(|opened| (candidate, opened))
+                })
+            else {
+                unresolved = unresolved.saturating_add(1);
                 continue;
             };
             let resolved = &candidate_file.resolved_path;
@@ -284,7 +341,19 @@ fn desired_playlists(
             };
             if let Some(detail_id) = detail_id {
                 detail_ids.push(detail_id);
+            } else {
+                unresolved = unresolved.saturating_add(1);
             }
+        }
+        if unresolved > 0 {
+            // One bounded summary per playlist, never one line per entry.
+            tracing::debug!(
+                target: "rusty_dlna",
+                path = %path.display(),
+                unresolved,
+                resolved = detail_ids.len(),
+                "playlist entries did not resolve to library media"
+            );
         }
         let (device, inode) = inode_key(&metadata);
         output.push(DesiredPlaylist {
@@ -302,19 +371,30 @@ fn desired_playlists(
     Ok(output)
 }
 
-pub(crate) fn sync_playlists(db: &LibraryDb, cfg: &ScanConfig) -> ScanResult<bool> {
+/// Rebuild every playlist from a full walk. Playlists below `held` subtrees
+/// (unavailable roots, unreadable directories) cannot be read; they keep
+/// their rows, IDs, and containers until the subtree returns.
+pub(crate) fn sync_playlists(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    held: &mut HeldSubtrees,
+) -> ScanResult<bool> {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
     for root in &cfg.media_dirs {
-        collect_playlist_paths(cfg, root, &mut seen, &mut paths)?;
+        if held.contains(root, cfg) {
+            continue;
+        }
+        collect_playlist_paths(cfg, root, true, &mut seen, held, &mut paths)?;
     }
-    sync_playlist_paths(db, cfg, paths)
+    sync_playlist_paths(db, cfg, paths, &|path| held.contains(path, cfg))
 }
 
 pub(crate) fn sync_targeted_playlists(
     db: &LibraryDb,
     cfg: &ScanConfig,
     dirty: &[PathBuf],
+    held: &HeldSubtrees,
 ) -> ScanResult<bool> {
     checkpoint(cfg)?;
     let mut paths: Vec<_> = db
@@ -341,13 +421,15 @@ pub(crate) fn sync_targeted_playlists(
                 })
             })
     });
-    sync_playlist_paths(db, cfg, paths)
+    paths.retain(|path| !held.contains(path, cfg));
+    sync_playlist_paths(db, cfg, paths, &|path| held.contains(path, cfg))
 }
 
 fn sync_playlist_paths(
     db: &LibraryDb,
     cfg: &ScanConfig,
     mut paths: Vec<PathBuf>,
+    held: &dyn Fn(&Path) -> bool,
 ) -> ScanResult<bool> {
     checkpoint(cfg)?;
     paths.sort();
@@ -365,6 +447,7 @@ fn sync_playlist_paths(
         .collect();
     let mut changed = false;
     let mut desired_objects = HashSet::new();
+    let mut matched = HashSet::new();
     db.reset_playlist_found()?;
     for playlist in desired {
         checkpoint(cfg)?;
@@ -372,6 +455,9 @@ fn sync_playlist_paths(
         let old = by_inode
             .remove(&(playlist.device, playlist.inode))
             .or_else(|| by_path.get(path.as_str()).copied());
+        if let Some(row) = old {
+            matched.insert(row.id);
+        }
         if match old {
             None => true,
             Some(row) => {
@@ -436,6 +522,19 @@ fn sync_playlist_paths(
                     Some(source),
                 )?;
             }
+        }
+    }
+    // A playlist that could not be read because its subtree is held keeps
+    // its row and containers unchanged instead of being dropped and later
+    // recreated under a new ID.
+    for row in &existing {
+        checkpoint(cfg)?;
+        if matched.contains(&row.id) || !held(&path_from_db(&row.path)) {
+            continue;
+        }
+        db.retain_playlist(row.id)?;
+        for root in [MUSIC_PLIST_ID, VIDEO_PLIST_ID, IMAGE_PLIST_ID] {
+            desired_objects.extend(db.object_subtree_ids(&format!("{root}${:X}", row.id))?);
         }
     }
     checkpoint(cfg)?;
@@ -517,6 +616,7 @@ mod tests {
             &db,
             &ScanConfig::default(),
             &[PathBuf::from("/generated/arrival.mkv")],
+            &HeldSubtrees::default(),
         )
         .unwrap());
     }
@@ -614,5 +714,50 @@ mod tests {
             .unwrap();
         let desired = desired_playlists(&db, &cfg, vec![playlist]).unwrap();
         assert_eq!(desired[0].detail_ids, [alias_id, hardlink_id, raw_id]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_playlist_entries_resolve_relative_backslash_paths_only() {
+        let tmp = TempPath::new("playlist-windows-separators");
+        std::fs::create_dir_all(tmp.join("Music/Artist")).unwrap();
+        let nested = tmp.join("Music/Artist/01 Song.mp3");
+        // A Linux filename may contain a backslash; the literal path wins.
+        let literal = tmp.join("AC\\DC.mp3");
+        let decoy = tmp.join("AC/DC.mp3");
+        std::fs::create_dir_all(tmp.join("AC")).unwrap();
+        for path in [&nested, &literal, &decoy] {
+            std::fs::write(path, b"member").unwrap();
+        }
+        let db = LibraryDb::open_memory().unwrap();
+        let nested_id = insert(&db, &nested, 1, 1);
+        let literal_id = insert(&db, &literal, 1, 2);
+        let decoy_id = insert(&db, &decoy, 1, 3);
+        let cfg = ScanConfig {
+            media_dirs: vec![tmp.to_path_buf()],
+            ..Default::default()
+        };
+        let m3u = tmp.join("Windows.m3u");
+        std::fs::write(
+            &m3u,
+            "#EXTM3U\r\n\
+             Music\\Artist\\01 Song.mp3\r\n\
+             AC\\DC.mp3\r\n\
+             C:\\Music\\Artist\\01 Song.mp3\r\n\
+             \\\\nas\\share\\Music\\Artist\\01 Song.mp3\r\n\
+             \\Music\\Artist\\01 Song.mp3\r\n\
+             file:///C:/Music/Artist/01%20Song.mp3\r\n",
+        )
+        .unwrap();
+        let pls = tmp.join("Windows.pls");
+        std::fs::write(
+            &pls,
+            "[playlist]\nFile1=Music\\Artist\\01 Song.mp3\nNumberOfEntries=1\n",
+        )
+        .unwrap();
+        let desired = desired_playlists(&db, &cfg, vec![m3u, pls]).unwrap();
+        assert_eq!(desired[0].detail_ids, [nested_id, literal_id]);
+        assert_ne!(desired[0].detail_ids[1], decoy_id);
+        assert_eq!(desired[1].detail_ids, [nested_id]);
     }
 }

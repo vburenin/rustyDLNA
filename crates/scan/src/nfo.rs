@@ -177,8 +177,33 @@ pub fn parse_nfo_text(text: &str) -> NfoMeta {
         .unwrap_or_default()
 }
 
+/// Kodi accepts a plain-text NFO that only names a scraper URL, and scene
+/// releases ship ASCII-art `.nfo` files beside media. Neither is an XML
+/// document, so neither carries metadata overrides. A document whose first
+/// significant byte is `<` is parsed; a trailing URL after the XML root is
+/// ignored by the parser.
+fn is_xml_document(bytes: &[u8]) -> bool {
+    if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) {
+        return true;
+    }
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    bytes
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| *byte == b'<')
+}
+
+/// HTML line breaks are common in scraped `<plot>` text and are never closed.
+fn is_html_line_break(name: &str) -> bool {
+    name == "br"
+}
+
 fn parse_nfo_parts_bytes(bytes: &[u8]) -> Result<NfoParts, String> {
     use quick_xml::events::Event;
+
+    if !is_xml_document(bytes) {
+        return Ok(NfoParts::default());
+    }
 
     // quick-xml's event scanner requires ASCII-compatible markup even when
     // its decoder feature is enabled. Normalize UTF-16 documents first so
@@ -198,6 +223,11 @@ fn parse_nfo_parts_bytes(bytes: &[u8]) -> Result<NfoParts, String> {
     // spaces around them, then trim the completed element value.
     reader.config_mut().trim_text(false);
     reader.config_mut().expand_empty_elements = true;
+    // A bare `&` in scraped text (`Tom & Jerry`) is kept literally rather
+    // than rejecting an otherwise well-formed document.
+    reader.config_mut().allow_dangling_amp = true;
+    // `<br>` is matched below, so end-name checks happen here instead.
+    reader.config_mut().check_end_names = false;
     let mut stack: Vec<(String, String)> = Vec::new();
     let mut parts = NfoParts::default();
     let mut premiered = None;
@@ -207,14 +237,19 @@ fn parse_nfo_parts_bytes(bytes: &[u8]) -> Result<NfoParts, String> {
         match reader.read_event() {
             Ok(Event::Start(start)) => {
                 let name = start.local_name().as_ref().to_ascii_lowercase();
+                if is_html_line_break(&name) {
+                    if let Some((_, value)) = stack.last_mut() {
+                        value.push('\n');
+                    }
+                    continue;
+                }
                 stack.push((name, String::new()));
             }
             Ok(Event::Text(text)) => {
                 if let Some((_, value)) = stack.last_mut() {
-                    let decoded = text.into_inner();
-                    let unescaped =
-                        quick_xml::escape::unescape(&decoded).map_err(|error| error.to_string())?;
-                    value.push_str(&unescaped);
+                    // References arrive as separate events, so text only
+                    // contains `&` when it is a tolerated dangling ampersand.
+                    value.push_str(&text.into_inner());
                 }
             }
             Ok(Event::GeneralRef(reference)) => {
@@ -226,9 +261,17 @@ fn parse_nfo_parts_bytes(bytes: &[u8]) -> Result<NfoParts, String> {
                         value.push(character);
                     } else {
                         let name = reference.into_inner();
-                        let entity = quick_xml::escape::resolve_xml_entity(&name)
-                            .ok_or_else(|| format!("unrecognized XML entity '&{name};'"))?;
-                        value.push_str(entity);
+                        match quick_xml::escape::resolve_xml_entity(&name) {
+                            Some(entity) => value.push_str(entity),
+                            // HTML entities are common in scraped text; keep
+                            // a readable space or the literal reference.
+                            None if name.as_ref() == "nbsp" => value.push(' '),
+                            None => {
+                                value.push('&');
+                                value.push_str(&name);
+                                value.push(';');
+                            }
+                        }
                     }
                 }
             }
@@ -239,6 +282,9 @@ fn parse_nfo_parts_bytes(bytes: &[u8]) -> Result<NfoParts, String> {
             }
             Ok(Event::End(end)) => {
                 let end_name = end.local_name().as_ref().to_ascii_lowercase();
+                if is_html_line_break(&end_name) {
+                    continue;
+                }
                 let Some((name, value)) = stack.pop() else {
                     return Err("unexpected closing element".into());
                 };
@@ -310,7 +356,9 @@ fn decode_utf16_xml(bytes: &[u8], little_endian: bool) -> Result<String, String>
     }
 }
 
-/// `{stem}.nfo` then parent `tvshow.nfo` files up to (and including) a media root.
+/// `{stem}.nfo` then parent `tvshow.nfo` files up to (and including) a media
+/// root. Folder-level `movie.nfo` needs the scanner's admission context and is
+/// only applied by [`nfo_lookup_with_policy`].
 pub fn nfo_for_file(file: &Path, media_roots: &[PathBuf]) -> NfoMeta {
     nfo_for_file_with_policy(file, media_roots, false)
 }
@@ -321,18 +369,91 @@ pub fn nfo_for_file_with_policy(file: &Path, media_roots: &[PathBuf], wide_links
     nfo_for_file_with_policy_result(file, media_roots, wide_links).unwrap_or_default()
 }
 
-/// Fallible scanner entry point. Missing, oversized, or jailed NFOs are
-/// intentionally ignored; an NFO that is selected but cannot be read is an
-/// observable scan error so its database mutation can be rolled back.
+/// Strict lookup. Missing, oversized, or jailed NFOs are intentionally
+/// ignored; an NFO that is selected but cannot be read or parsed is an error.
 pub fn nfo_for_file_with_policy_result(
     file: &Path,
     media_roots: &[PathBuf],
     wide_links: bool,
 ) -> Result<NfoMeta, NfoError> {
+    let lookup = nfo_lookup_with_policy(file, media_roots, wide_links, || false)?;
+    match lookup.invalid {
+        Some(invalid) => Err(invalid_nfo(&invalid.path, invalid.message)),
+        None => Ok(lookup.meta),
+    }
+}
+
+/// A selected sidecar that was read successfully but is not usable XML.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidNfo {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+/// Effective NFO metadata for one media path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NfoLookup {
+    /// Metadata from every selected sidecar that parsed.
+    pub meta: NfoMeta,
+    /// The first selected sidecar that could not be parsed. Scanner callers
+    /// keep an existing item's stored presentation and provenance in that
+    /// case, because the file may be mid-write; a new item indexes with the
+    /// metadata that did parse.
+    pub invalid: Option<InvalidNfo>,
+}
+
+/// Kodi's folder-level sidecar for the "movies in separate folders" layout.
+pub const FOLDER_MOVIE_NFO: &str = "movie.nfo";
+
+/// Scanner entry point. Real I/O failures stay errors so the surrounding
+/// staged mutation rolls back; malformed XML is reported in the result and
+/// logged once per path and message, so it can never abort a whole scan.
+///
+/// Precedence: `{stem}.nfo`, otherwise the same directory's `movie.nfo` when
+/// `folder_movie_nfo_applies` confirms that the folder holds this one movie,
+/// then inherited `tvshow.nfo` for fields the local sidecar leaves empty.
+pub fn nfo_lookup_with_policy(
+    file: &Path,
+    media_roots: &[PathBuf],
+    wide_links: bool,
+    folder_movie_nfo_applies: impl FnOnce() -> bool,
+) -> Result<NfoLookup, NfoError> {
+    let mut invalid = None;
+    let mut parse = |path: &Path, bytes: &[u8]| match parse_nfo_parts_bytes(bytes) {
+        Ok(parts) => Some(parts),
+        Err(message) => {
+            warn_invalid_nfo(path, &message);
+            invalid.get_or_insert_with(|| InvalidNfo {
+                path: path.to_path_buf(),
+                message,
+            });
+            None
+        }
+    };
     let mut parts = NfoParts::default();
     let file_nfo = file.with_extension("nfo");
-    if let Some(bytes) = read_nfo_bytes(&file_nfo, media_roots, wide_links)? {
-        parts = parse_nfo_parts_bytes(&bytes).map_err(|message| invalid_nfo(&file_nfo, message))?;
+    let local = match read_nfo_bytes(&file_nfo, media_roots, wide_links)? {
+        Some(bytes) => Some((file_nfo, bytes)),
+        None => match file.parent().map(|dir| dir.join(FOLDER_MOVIE_NFO)) {
+            // A folder `movie.nfo` that would not apply to this file (several
+            // videos share the folder) cannot fail its indexing either.
+            Some(folder_nfo) => match read_nfo_bytes(&folder_nfo, media_roots, wide_links) {
+                Ok(Some(bytes)) => folder_movie_nfo_applies().then_some((folder_nfo, bytes)),
+                Ok(None) => None,
+                Err(error) => {
+                    if folder_movie_nfo_applies() {
+                        return Err(error);
+                    }
+                    None
+                }
+            },
+            None => None,
+        },
+    };
+    if let Some((path, bytes)) = local {
+        if let Some(parsed) = parse(&path, &bytes) {
+            parts = parsed;
+        }
     }
     // Scanner paths normally retain their lexical root even when a component
     // is a directory symlink. Walk those lexical parents cheaply; any NFO that
@@ -350,9 +471,9 @@ pub fn nfo_for_file_with_policy_result(
         }
         let tvshow = cur.join("tvshow.nfo");
         if let Some(bytes) = read_nfo_bytes(&tvshow, media_roots, wide_links)? {
-            let show =
-                parse_nfo_parts_bytes(&bytes).map_err(|message| invalid_nfo(&tvshow, message))?;
-            parts.inherit_tvshow(&show);
+            if let Some(show) = parse(&tvshow, &bytes) {
+                parts.inherit_tvshow(&show);
+            }
         }
         if lexical_root.is_some_and(|root| cur.as_path() == root.as_path())
             || (lexical_root.is_none() && is_media_root_dir(&cur, media_roots))
@@ -361,7 +482,36 @@ pub fn nfo_for_file_with_policy_result(
         }
         dir = cur.parent().map(Path::to_path_buf);
     }
-    Ok(parts.into_meta())
+    Ok(NfoLookup {
+        meta: parts.into_meta(),
+        invalid,
+    })
+}
+
+/// Periodic reconciliation revisits a permanently malformed sidecar on every
+/// pass. Warn once per path and parser message; bound the remembered set so
+/// a pathological library cannot grow it without limit.
+fn warn_invalid_nfo(path: &Path, message: &str) {
+    const REMEMBERED_LIMIT: usize = 4096;
+    type Warned = std::collections::HashSet<(PathBuf, String)>;
+    static WARNED: std::sync::Mutex<Option<Warned>> = std::sync::Mutex::new(None);
+    let key = (path.to_path_buf(), message.to_string());
+    let first = {
+        let mut warned = WARNED.lock().unwrap_or_else(|error| error.into_inner());
+        let warned = warned.get_or_insert_with(Default::default);
+        if warned.len() >= REMEMBERED_LIMIT && !warned.contains(&key) {
+            warned.clear();
+        }
+        warned.insert(key)
+    };
+    if first {
+        tracing::warn!(
+            target: "rusty_dlna",
+            path = %path.display(),
+            error = message,
+            "ignoring NFO that is not well-formed XML"
+        );
+    }
 }
 
 fn invalid_nfo(path: &Path, message: String) -> NfoError {
@@ -487,5 +637,41 @@ mod tests {
         let parsed = parse_nfo_parts_bytes(&utf16le).unwrap().into_meta();
         assert_eq!(parsed.title.as_deref(), Some("Crème ☃"));
         assert!(parse_nfo_parts_bytes(b"<movie><title>broken</movie>").is_err());
+    }
+
+    #[test]
+    fn nfo_parser_tolerates_scene_text_html_breaks_and_entities() {
+        // Scene ASCII art (CP437 bytes, `<`, `&`) and URL-only scraper NFOs
+        // are not XML documents and carry no overrides.
+        let art = b"  \xdb\xdb\xb2 GRP <presents> Movie & more \xb0\xb1\r\n";
+        assert!(parse_nfo_parts_bytes(art).unwrap().into_meta().is_empty());
+        let url = b"https://www.themoviedb.org/movie/603?a=1&b=2\n";
+        assert!(parse_nfo_parts_bytes(url).unwrap().into_meta().is_empty());
+        let bom_xml = b"\xef\xbb\xbf\n<movie><title>Bom</title></movie>";
+        assert_eq!(
+            parse_nfo_parts_bytes(bom_xml).unwrap().into_meta().title,
+            Some("Bom".into())
+        );
+        // Kodi's XML-plus-trailing-URL form keeps the XML overrides.
+        let trailing = b"<movie><title>Kodi</title></movie>\nhttps://x.test/?a=1&b=2";
+        assert_eq!(
+            parse_nfo_parts_bytes(trailing).unwrap().into_meta().title,
+            Some("Kodi".into())
+        );
+
+        let parsed = parse_nfo_text(
+            "<movie><title>Tom & Jerry</title>\
+             <plot>First line<br>second&nbsp;line<br/>third &eacute; &amp; done</plot></movie>",
+        );
+        assert_eq!(parsed.title.as_deref(), Some("Tom & Jerry"));
+        assert_eq!(
+            parsed.plot.as_deref(),
+            Some("First line\nsecond line\nthird &eacute; & done")
+        );
+
+        // Structurally broken XML is still reported, so the scanner can keep
+        // an item's previous presentation while a sidecar is mid-write.
+        assert!(parse_nfo_parts_bytes(b"<movie><title>half").is_err());
+        assert!(parse_nfo_parts_bytes(b"<movie><title>x</plot></movie>").is_err());
     }
 }

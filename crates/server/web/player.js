@@ -14,7 +14,10 @@ import {
   apiErrorCategory,
   compatibleDecodeRecovery,
   mediaSourceStallReason,
+  mediaSessionTrackActions,
+  nativeHlsPlaybackContinued,
   audioTrackLabel,
+  availableErrorActions,
   bufferedSeekTarget,
   bufferedRangeSecondsAhead,
   clockLabel,
@@ -48,6 +51,7 @@ import {
   sourceBoundedQualityProfile,
   SOURCE_MODES,
   STREAM_MODES,
+  timelineKeySeekTarget,
   timelineValueText,
   trickplayFrame,
   trickplayPreloadUrls,
@@ -56,6 +60,7 @@ import {
 import {
   clearProgress,
   createProgressWriter,
+  markWatched,
   progressFor,
   savePreference,
   saveProgress,
@@ -219,7 +224,8 @@ export class PlaybackController {
   #streamInfoRenderInputs = [];
   #sourceSelector = new SourceSelector();
   #compatibleRecovery = initialCompatibleRecovery();
-  #nativeHlsSuspendedSession = null;
+  #nativeHlsSuspension = null;
+  #mediaSessionTrackHandlers = { previoustrack: false, nexttrack: false };
   #progressWriter;
   #onReturnLibrary;
   #onClosePlayback;
@@ -245,7 +251,10 @@ export class PlaybackController {
     this.#store.subscribe((state, action) => {
       if (action.type === "PLAYBACK_TIME" || action.type === "PLAYBACK_PREVIEW") {
         this.#renderTimeline(state.playback);
-        if (action.type === "PLAYBACK_TIME") this.#renderChapters();
+        if (action.type === "PLAYBACK_TIME") {
+          this.#renderChapters();
+          this.#syncMediaSessionTrackHandlers();
+        }
         return;
       }
       this.render();
@@ -254,8 +263,11 @@ export class PlaybackController {
     this.render();
   }
 
-  async select(item, { preserveQueue = false, startAt = 0, signal = null, timingStart = performance.now() } = {}) {
+  async select(item, {
+    preserveQueue = false, startAt = 0, signal = null, timingStart = performance.now(), focusPrompt = false,
+  } = {}) {
     if (signal?.aborted) return;
+    const focusOrigin = document.activeElement;
     const timing = new PlaybackTiming("selection", timingStart);
     timing.mark("selection");
     let preparationError = null;
@@ -285,7 +297,7 @@ export class PlaybackController {
     this.#fullscreenRequestToken += 1;
     this.#playbackSession = playbackSessionSeed();
     const sessionId = ++this.#session;
-    this.#dom.resumePrompt.hidden = true;
+    this.#hideResumePrompt();
     this.#store.dispatch({ type: "PLAYBACK_SELECT", sessionId, item, duration: itemDuration(item) });
     this.#adoptActiveFullscreen(sessionId);
     this.#loadTrickplay(item);
@@ -315,17 +327,44 @@ export class PlaybackController {
       this.#dom.resumePrompt.hidden = false;
       this.render();
       this.#dom.resumeButton.onclick = () => {
-        this.#dom.resumePrompt.hidden = true;
+        this.#hideResumePrompt();
         this.#loadSource(item, { start: resumeAt, intent: "playing", messageKind: "resume" });
       };
       this.#dom.startOverButton.onclick = () => {
         clearProgress(item.id);
-        this.#dom.resumePrompt.hidden = true;
+        this.#hideResumePrompt();
         this.#loadSource(item, { start: 0, intent: "playing" });
       };
+      this.#focusResumePrompt(sessionId, focusOrigin, focusPrompt);
     } else {
       this.#loadSource(item, { start: 0, intent: "playing" });
     }
+  }
+
+  #hideResumePrompt() {
+    const prompt = this.#dom.resumePrompt;
+    // Never hide the focused choice: keep keyboard focus on the player.
+    if (!prompt.hidden && prompt.contains(document.activeElement)) {
+      this.#dom.playerStage.focus({ preventScroll: true });
+    }
+    prompt.hidden = true;
+  }
+
+  // The resume choice blocks playback and hides the controls. Move keyboard
+  // focus to it when the user started this selection or focus is unclaimed,
+  // but never take focus from a dialog, an editable control, or another part
+  // of the page the user moved to while metadata loaded.
+  #focusResumePrompt(sessionId, origin, userActivated) {
+    window.requestAnimationFrame(() => {
+      if (sessionId !== this.#store.getState().playback.sessionId || this.#dom.resumePrompt.hidden) return;
+      const active = document.activeElement;
+      const inPlayer = Boolean(active && this.#dom.playerPanel.contains(active));
+      if (active?.closest?.("dialog[open]")) return;
+      if (!inPlayer && active?.closest?.("input, select, textarea, [contenteditable]:not([contenteditable='false'])")) return;
+      const unclaimed = !active || active === document.body || active === document.documentElement;
+      if (!unclaimed && !inPlayer && !(userActivated && active === origin)) return;
+      this.#dom.resumeButton.focus({ preventScroll: true });
+    });
   }
 
   activePlayer() {
@@ -368,16 +407,21 @@ export class PlaybackController {
       });
       return;
     }
+    if (playback.status === "error") {
+      this.#performErrorAction();
+      return;
+    }
     const player = this.activePlayer();
     if (playbackControlLabel(playback.status, playback.intent) === "Pause") {
-      if (["loading", "waiting", "seeking"].includes(playback.status)) {
-        this.#store.dispatch({
-          type: "PLAYBACK_STATUS",
-          sessionId: playback.sessionId,
-          status: playback.status,
-          intent: "paused",
-        });
-      }
+      // An explicit pause (button, keyboard, or Media Session) is user intent
+      // even while the page is hidden; only an unrequested element pause
+      // there preserves the previous intent.
+      this.#store.dispatch({
+        type: "PLAYBACK_STATUS",
+        sessionId: playback.sessionId,
+        status: playback.status,
+        intent: "paused",
+      });
       player.pause();
       return;
     }
@@ -641,7 +685,7 @@ export class PlaybackController {
     this.#releaseHeldVideoFrame();
     this.#api.abortItem();
     this.#cancelSource({ keepElement: false });
-    this.#nativeHlsSuspendedSession = null;
+    this.#nativeHlsSuspension = null;
     this.#pipRequestSession = null;
     this.#pipRequestToken += 1;
     this.#pipRequestPending = false;
@@ -849,6 +893,7 @@ export class PlaybackController {
     const { playback, preferences, queue, server } = state;
     const item = playback.item;
     this.#syncPlaybackAnnouncement(playback);
+    this.#syncMediaSessionTrackHandlers();
     this.#dom.playerStage.classList.toggle("has-media", Boolean(item));
     this.#dom.playerStage.classList.toggle("has-video", item?.kind === "video");
     this.#dom.playerStage.classList.toggle("is-playing", playback.status === "playing");
@@ -992,7 +1037,7 @@ export class PlaybackController {
     const { start = 0, intent = "paused", preservePreviousTranscode = false, message, messageKind, mediaSourceRetry = false } = options;
     this.#holdVideoFrame();
     this.#cancelSource({ cancelTranscode: !preservePreviousTranscode });
-    this.#nativeHlsSuspendedSession = null;
+    this.#nativeHlsSuspension = null;
     const state = this.#store.getState();
     const player = item.kind === "audio" ? this.#dom.audio : this.#dom.video;
     const plan = this.#sourceSelector.prepare(item, state, player, options);
@@ -1215,9 +1260,10 @@ export class PlaybackController {
         return;
       }
       this.#reportStartup(source, "playing");
+      source.platformPaused = false;
       if (document.visibilityState === "visible"
-        && this.#nativeHlsSuspendedSession === sessionId) {
-        this.#nativeHlsSuspendedSession = null;
+        && this.#nativeHlsSuspension?.sessionId === sessionId) {
+        this.#nativeHlsSuspension = null;
       }
       this.#clearStartupTimer();
       this.#releaseHeldVideoFrame();
@@ -1233,6 +1279,7 @@ export class PlaybackController {
         // Locking a device or backgrounding a browser pauses its media element
         // without changing what the user asked rustyDLNA to do. Preserve that
         // intent so a seek or suspended-source restart continues playback.
+        source.platformPaused = document.visibilityState === "hidden";
         status("paused", {
           autoplayBlocked: playback.autoplayBlocked,
           intent: document.visibilityState === "hidden" ? playback.intent : "paused",
@@ -1281,6 +1328,11 @@ export class PlaybackController {
         });
         return;
       }
+      // Only a genuine end of the title marks it watched. An early Compatible
+      // end above recovers instead; an early direct end (for example a
+      // truncated file) still finishes playback but is not completion, and an
+      // explicit seek to the end finishes without an ended event.
+      if (!playbackEndedEarly(currentTime, duration)) markWatched(item.id);
       this.#finishPlayback();
       if (this.#store.getState().preferences.autoplay) this.playRelative(1);
     });
@@ -1421,6 +1473,14 @@ export class PlaybackController {
         progress.preparationAt = now;
         progress.playbackAt = now;
         if (progress.firstFragmentAt !== null) progress.firstFragmentAt = now;
+      } else if (progress.hasFrame && !seeking && player.paused && playback.status === "paused"
+        && source.platformPaused) {
+        // The platform paused decoded playback while the page was hidden,
+        // without a user pause. Playing intent is kept for the
+        // next Play or seek, but a stopped clock is not a stall. Startup and
+        // preparation budgets are untouched: a paused element that has not
+        // presented a frame is still governed by them.
+        progress.playbackAt = now;
       } else {
         if (Math.abs(player.currentTime - progress.currentTime) > 0.001) {
           progress.currentTime = player.currentTime;
@@ -1765,17 +1825,39 @@ export class PlaybackController {
   #markNativeHlsSuspended() {
     const { playback } = this.#store.getState();
     if (playback.nativeHlsDelivery && playback.item?.kind === "video") {
-      this.#nativeHlsSuspendedSession = playback.sessionId;
+      const source = this.#source?.sessionId === playback.sessionId ? this.#source : null;
+      this.#nativeHlsSuspension = {
+        sessionId: playback.sessionId,
+        currentTime: source ? source.player.currentTime : Number.NaN,
+        at: performance.now(),
+      };
     }
+  }
+
+  // Safari keeps a backgrounded tab (or Picture in Picture) playing. When the
+  // page returns with that attachment still advancing, it was never suspended
+  // and the next pause/play must not discard its buffer for a new generation.
+  #confirmNativeHlsSuspension() {
+    const suspension = this.#nativeHlsSuspension;
+    const source = this.#source;
+    if (!suspension || !source?.active || source.sessionId !== suspension.sessionId
+      || this.#store.getState().playback.sessionId !== suspension.sessionId) return;
+    if (nativeHlsPlaybackContinued({
+      paused: source.player.paused,
+      hiddenTime: suspension.currentTime,
+      visibleTime: source.player.currentTime,
+      hiddenMs: performance.now() - suspension.at,
+      playbackRate: source.player.playbackRate,
+    })) this.#nativeHlsSuspension = null;
   }
 
   #restartSuspendedNativeHls(playback) {
     if (document.visibilityState !== "visible"
-      || this.#nativeHlsSuspendedSession !== playback.sessionId
+      || this.#nativeHlsSuspension?.sessionId !== playback.sessionId
       || !playback.nativeHlsDelivery
       || playback.sourceMode !== SOURCE_MODES.COMPATIBLE
       || !playback.item) return false;
-    this.#nativeHlsSuspendedSession = null;
+    this.#nativeHlsSuspension = null;
     this.#loadSource(playback.item, {
       start: playback.currentTime,
       intent: "playing",
@@ -2463,12 +2545,14 @@ export class PlaybackController {
     this.#dom.playerMessageText.textContent = text;
     const actions = error?.actions || [];
     const compatibleAvailable = server.capabilities.transcoding;
-    const retryNeedsCompatible = playback.sourceMode === SOURCE_MODES.COMPATIBLE;
+    const offered = availableErrorActions(error, {
+      sourceMode: playback.sourceMode,
+      transcoding: compatibleAvailable,
+    });
     const unavailableCompatibleRecovery = actions.includes("try_compatible") && !compatibleAvailable;
-    this.#dom.playerRetry.hidden = !actions.includes("retry")
-      || (retryNeedsCompatible && !compatibleAvailable);
-    this.#dom.tryCompatible.hidden = !actions.includes("try_compatible") || !compatibleAvailable;
-    this.#dom.playOriginal.hidden = !actions.includes("play_original");
+    this.#dom.playerRetry.hidden = !offered.includes("retry");
+    this.#dom.tryCompatible.hidden = !offered.includes("try_compatible");
+    this.#dom.playOriginal.hidden = !offered.includes("play_original");
     this.#dom.returnLibrary.hidden = !actions.includes("return_to_library")
       && !unavailableCompatibleRecovery;
     this.#dom.technicalDetails.hidden = !error?.technical;
@@ -2510,6 +2594,25 @@ export class PlaybackController {
       if (this.#trickplayTarget && !this.#trickplayTarget.committed) {
         this.#releaseHeldVideoFrame();
       }
+    });
+    this.#dom.timeline.addEventListener("keydown", (event) => {
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
+      const playback = this.#store.getState().playback;
+      if (!playback.item) return;
+      // globalTime() follows a pending seek target, so repeated presses
+      // accumulate; compatible restarts share seekTo()'s debounce. Before the
+      // duration is known the keys are still consumed (seekTo() ignores them)
+      // so the native 0.1-second step never applies.
+      const target = timelineKeySeekTarget(event.key, playback.previewTime ?? this.globalTime(), playback.duration);
+      if (target === null) return;
+      // Replace the range's native 0.1-second step (and its per-step change
+      // event) with the player's seek step.
+      event.preventDefault();
+      event.stopPropagation();
+      if (playback.previewTime !== null) {
+        this.#store.dispatch({ type: "PLAYBACK_PREVIEW", sessionId: playback.sessionId, value: null });
+      }
+      this.seekTo(target);
     });
     this.#dom.muteButton.addEventListener("click", () => {
       const muted = !this.#store.getState().preferences.muted;
@@ -2627,6 +2730,8 @@ export class PlaybackController {
       const enriched = await this.#enrichAudioTracks();
       const { playback, preferences } = this.#store.getState();
       if (!enriched || this.#playbackSession !== playbackSessionId || playback.audioTracksStatus !== "ready") return;
+      // Enrichment can supply the title or artwork shown by platform controls.
+      this.#updateMediaSessionMetadata(enriched);
       if (playback.sourceMode === SOURCE_MODES.COMPATIBLE || preferences.streamMode !== STREAM_MODES.ORIGINAL) {
         this.#loadSource(enriched, {
           start: this.globalTime(),
@@ -2685,29 +2790,9 @@ export class PlaybackController {
     this.#dom.captionBackgroundControl.addEventListener("change", () => this.#setPreference("captionBackground", this.#dom.captionBackgroundControl.value));
     this.#dom.autoplayControl.addEventListener("change", () => this.#setPreference("autoplay", this.#dom.autoplayControl.checked));
     this.#dom.shortcutHelpButton.addEventListener("click", () => this.#dom.shortcutDialog.showModal());
-    this.#dom.playerRetry.addEventListener("click", () => {
-      const playback = this.#store.getState().playback;
-      if (playback.item) {
-        this.#resetAutomaticTranscodeRecovery();
-        this.#loadSource(playback.item, {
-          start: playback.currentTime,
-          intent: playback.intent,
-          forceSourceMode: playback.sourceMode,
-          forceQuality: playback.outputQuality,
-        });
-      }
-    });
-    this.#dom.tryCompatible.addEventListener("click", () => {
-      const playback = this.#store.getState().playback;
-      if (playback.item) {
-        this.#resetAutomaticTranscodeRecovery();
-        this.#loadSource(playback.item, { start: playback.currentTime, intent: "playing", forceSourceMode: SOURCE_MODES.COMPATIBLE, message: "Preparing stream…" });
-      }
-    });
-    this.#dom.playOriginal.addEventListener("click", () => {
-      const playback = this.#store.getState().playback;
-      if (playback.item) this.#loadSource(playback.item, { start: playback.currentTime, intent: "playing", forceSourceMode: SOURCE_MODES.ORIGINAL });
-    });
+    this.#dom.playerRetry.addEventListener("click", () => this.#retryPlayback());
+    this.#dom.tryCompatible.addEventListener("click", () => this.#tryCompatiblePlayback());
+    this.#dom.playOriginal.addEventListener("click", () => this.#playOriginalPlayback());
     this.#dom.returnLibrary.addEventListener("click", () => this.#onReturnLibrary());
     this.#dom.closePlayerButton.addEventListener("click", (event) => {
       this.closePlayback();
@@ -2741,6 +2826,7 @@ export class PlaybackController {
     document.addEventListener("keydown", (event) => this.#handleShortcut(event));
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") this.#markNativeHlsSuspended();
+      else this.#confirmNativeHlsSuspension();
       this.#updateWakeLock();
     });
     window.addEventListener("resize", () => this.#scheduleDisplayViewport(), { passive: true });
@@ -2751,6 +2837,55 @@ export class PlaybackController {
       this.#progressWriter.flush();
     });
     this.#installMediaSessionHandlers();
+  }
+
+  #retryPlayback(intent = null) {
+    const playback = this.#store.getState().playback;
+    if (!playback.item) return;
+    this.#resetAutomaticTranscodeRecovery();
+    this.#loadSource(playback.item, {
+      start: playback.currentTime,
+      intent: intent || playback.intent,
+      forceSourceMode: playback.sourceMode,
+      forceQuality: playback.outputQuality,
+    });
+  }
+
+  #tryCompatiblePlayback() {
+    const playback = this.#store.getState().playback;
+    if (!playback.item) return;
+    this.#resetAutomaticTranscodeRecovery();
+    this.#loadSource(playback.item, { start: playback.currentTime, intent: "playing", forceSourceMode: SOURCE_MODES.COMPATIBLE, message: "Preparing stream…" });
+  }
+
+  #playOriginalPlayback() {
+    const playback = this.#store.getState().playback;
+    if (playback.item) this.#loadSource(playback.item, { start: playback.currentTime, intent: "playing", forceSourceMode: SOURCE_MODES.ORIGINAL });
+  }
+
+  // Play on a failed source performs the first recovery the error banner
+  // offers. An error with none (for example Return to library only) repeats
+  // its message for assistive technology instead of silently doing nothing.
+  #performErrorAction() {
+    const { playback, server } = this.#store.getState();
+    const [action] = availableErrorActions(playback.error, {
+      sourceMode: playback.sourceMode,
+      transcoding: server.capabilities.transcoding,
+    });
+    if (action === "retry") this.#retryPlayback("playing");
+    else if (action === "try_compatible") this.#tryCompatiblePlayback();
+    else if (action === "play_original") this.#playOriginalPlayback();
+    else if (playback.error?.message) {
+      const { sessionId } = playback;
+      const message = playback.error.message;
+      if (this.#announceTimer !== null) window.clearTimeout(this.#announceTimer);
+      this.#dom.playbackLive.textContent = "";
+      this.#announceTimer = window.setTimeout(() => {
+        this.#announceTimer = null;
+        const latest = this.#store.getState().playback;
+        if (latest.sessionId === sessionId && latest.status === "error") this.#dom.playbackLive.textContent = message;
+      }, 0);
+    }
   }
 
   #handleShortcut(event) {
@@ -3106,7 +3241,9 @@ export class PlaybackController {
   #syncPlaybackAnnouncement(playback) {
     let message = "";
     if (playback.item) {
-      if (playback.status === "idle" && playback.audioTracksStatus === "loading") {
+      if (playback.status === "idle" && !this.#dom.resumePrompt.hidden) {
+        message = `Continue watching? ${this.#dom.resumeTime.textContent}, or start over.`;
+      } else if (playback.status === "idle" && playback.audioTracksStatus === "loading") {
         message = "Loading media details.";
       } else if (playback.status === "loading") {
         message = playback.sourceMode === SOURCE_MODES.COMPATIBLE
@@ -3168,20 +3305,49 @@ export class PlaybackController {
   #installMediaSessionHandlers() {
     if (!("mediaSession" in navigator)) return;
     const setPlaying = (playing) => {
-      const { status, intent } = this.#store.getState().playback;
+      const { status, intent, sessionId } = this.#store.getState().playback;
       if ((playbackControlLabel(status, intent) === "Pause") !== playing) this.togglePlay();
+      else if (!playing && status === "paused" && intent === "playing") {
+        // The platform already paused the element (for example while the page
+        // was hidden). An explicit pause command still records user intent.
+        this.#store.dispatch({ type: "PLAYBACK_STATUS", sessionId, status, intent: "paused" });
+      }
     };
+    // Previous/next track are registered by render() only while they can act.
     const handlers = {
       play: () => setPlaying(true),
       pause: () => setPlaying(false),
       seekbackward: (details) => this.seekTo(this.globalTime() - (details.seekOffset || 10)),
       seekforward: (details) => this.seekTo(this.globalTime() + (details.seekOffset || 10)),
       seekto: (details) => this.seekTo(details.seekTime || 0),
-      previoustrack: () => this.playChapterRelative(-1),
-      nexttrack: () => this.playChapterRelative(1),
     };
     for (const [action, handler] of Object.entries(handlers)) {
       try { navigator.mediaSession.setActionHandler(action, handler); } catch (_) { /* Optional action. */ }
+    }
+  }
+
+  // Platform controls (lock screen, notification, browser media hub) show
+  // Previous/Next only for registered handlers. Register them only while
+  // they can act, and touch the platform only when availability changes.
+  #syncMediaSessionTrackHandlers() {
+    if (!("mediaSession" in navigator)) return;
+    const { playback, queue } = this.#store.getState();
+    const item = playback.item;
+    const available = item ? mediaSessionTrackActions({
+      chapters: playback.chapters,
+      currentTime: playback.currentTime,
+      hasPrevious: Boolean(queueNeighbor(queue.entries, item.id, -1)),
+      hasNext: Boolean(queueNeighbor(queue.entries, item.id, 1)),
+    }) : { previous: false, next: false };
+    for (const [action, enabled, delta] of [
+      ["previoustrack", available.previous, -1],
+      ["nexttrack", available.next, 1],
+    ]) {
+      if (this.#mediaSessionTrackHandlers[action] === enabled) continue;
+      this.#mediaSessionTrackHandlers[action] = enabled;
+      try {
+        navigator.mediaSession.setActionHandler(action, enabled ? () => this.playChapterRelative(delta) : null);
+      } catch (_) { /* Optional action. */ }
     }
   }
 

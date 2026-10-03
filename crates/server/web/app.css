@@ -224,6 +224,15 @@ dialog dd { margin: 0; color: var(--muted); }
 .card-play::after { content: ""; position: absolute; left: 19px; top: 13px; border-block: 10px solid transparent; border-left: 14px solid #fff; }
 .card-button:is(:hover, :focus-visible) .card-play, .media-card.playing .card-play { opacity: 1; }
 .media-card.playing .art { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+/* Browser-local progress overlays the artwork so card geometry never changes. */
+.card-progress { position: absolute; inset: auto 0 0; height: 5px; background: rgba(3,4,5,.78); pointer-events: none; }
+.card-progress-fill { display: block; width: var(--card-progress, 0%); height: 100%; background: var(--accent); }
+.card-watched { position: absolute; top: .4rem; left: .4rem; padding: .12rem .45rem; border-radius: 1rem; color: #04130a; background: var(--green); font-size: .72rem; font-weight: 750; pointer-events: none; }
+@media (forced-colors: active) {
+  .card-progress { border-top: 1px solid CanvasText; }
+  .card-progress-fill { forced-color-adjust: none; background: Highlight; }
+  .card-watched { border: 1px solid CanvasText; }
+}
 .folder-icon { width: 42%; aspect-ratio: 2 / 1; position: relative; border-radius: .35rem; background: #c77b27; }
 .folder-icon::before { content: ""; position: absolute; width: 42%; height: 25%; left: 0; top: -20%; border-radius: .25rem .25rem 0 0; background: #df9a4c; }
 .folder-count { position: absolute; right: -.45rem; bottom: -.55rem; padding: .15rem .35rem; border-radius: 1rem; color: var(--accent-text); background: var(--accent); font-size: .72rem; font-weight: 750; }

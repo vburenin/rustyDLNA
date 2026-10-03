@@ -15,6 +15,8 @@ export class PlaybackSource {
   constructor(context) {
     Object.assign(this, context);
     this.reloads = 0;
+    // Set when the platform paused this element while the page was hidden.
+    this.platformPaused = false;
   }
 
   get signal() { return this.#controller.signal; }

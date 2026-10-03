@@ -18,8 +18,8 @@ use rusty_dlna_protocol::object_id::{
 };
 
 use crate::{
-    path_from_db, path_is_live_file, path_is_unwanted, Caption, Catalog, CatalogPatch, Container,
-    EmbeddedTags, MediaItem, NfoMeta, ScanConfig,
+    path_from_db, path_is_definitely_gone, path_is_excluded_by_config, path_is_unwanted, Caption,
+    Catalog, CatalogPatch, Container, EmbeddedTags, MediaItem, NfoMeta, ScanConfig,
 };
 
 // Both SQLite paging and the in-memory web fallback use the same title key.
@@ -27,19 +27,43 @@ fn register_web_order(conn: &Connection) -> rusqlite::Result<()> {
     use rusqlite::functions::FunctionFlags;
     conn.create_scalar_function(
         "web_metadata_matches",
-        5,
+        6,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |context| {
             let path = path_from_db(context.get_raw(0).as_str()?);
             Ok(crate::web_order::web_media_fields_match(
                 &path,
-                "",
-                Some(context.get_raw(1).as_str()?),
+                context.get_raw(1).as_str()?,
                 Some(context.get_raw(2).as_str()?),
                 Some(context.get_raw(3).as_str()?),
-                context.get_raw(4).as_str()?,
+                Some(context.get_raw(4).as_str()?),
+                context.get_raw(5).as_str()?,
             ))
         },
+    )?;
+    // SOAP Search free-text folding; must equal the in-memory search path.
+    // NULL/number/blob values fold to their text form instead of failing.
+    conn.create_scalar_function(
+        "soap_search_fold",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            use rusqlite::types::ValueRef;
+            Ok(match context.get_raw(0) {
+                ValueRef::Null => String::new(),
+                ValueRef::Integer(value) => value.to_string(),
+                ValueRef::Real(value) => value.to_string(),
+                ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+                    rusty_dlna_protocol::soap::search_text_fold(&String::from_utf8_lossy(bytes))
+                }
+            })
+        },
+    )?;
+    conn.create_scalar_function(
+        "web_added_seconds",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| Ok(crate::web_recently_added_key(context.get::<i64>(0)?).0),
     )?;
     conn.create_scalar_function(
         "web_search_normalize",
@@ -171,20 +195,20 @@ fn web_media_query_sql(kind: WebMediaKind, sort: WebMediaSort) -> (String, Strin
     let title = format!("CASE WHEN o.PARENT_ID IN ('{VIDEO_SERIES_ID}', '{VIDEO_GENRE_ID}') OR o.PARENT_ID GLOB '{VIDEO_SERIES_ID}$*' OR o.PARENT_ID GLOB '{VIDEO_GENRE_ID}$*' THEN web_media_display_title(COALESCE(d.PATH, ''), d.TITLE, o.NAME, o.PARENT_ID) ELSE COALESCE(NULLIF(d.TITLE, ''), NULLIF(o.NAME, ''), web_media_display_title(COALESCE(d.PATH, ''), d.TITLE, o.NAME, o.PARENT_ID)) END");
     let order = match sort {
             WebMediaSort::Title => format!("web_media_title_key(COALESCE(d.COLLECTION_PATH, d.PATH, ''), COALESCE(d.MIME, ''), {title}), d.ID"),
-            WebMediaSort::DateDescending => format!("COALESCE(d.DATE, '') DESC, web_search_normalize({title}), d.ID"),
+            WebMediaSort::RecentlyAdded => format!("web_added_seconds(COALESCE(d.TIMESTAMP, 0)) DESC, COALESCE(d.TIMESTAMP, 0) DESC, web_search_normalize({title}), d.ID"),
             WebMediaSort::EpisodeTrack => format!("web_search_normalize(COALESCE(d.ALBUM, '')), COALESCE(d.DISC, 0), COALESCE(d.TRACK, 0), web_search_normalize({title}), d.ID"),
         };
     // Effective titles can have object-local overlays. A correlated lookup
-    // uses the existing detail index only when that field is searched;
-    // empty searches avoid whole-catalog representative materialization.
+    // uses the existing detail index only for nonempty searches, so empty
+    // searches avoid whole-catalog representative materialization. All
+    // fields go to one matcher: search terms may match different fields.
     let search_title = format!("(SELECT {title} FROM OBJECTS o WHERE o.DETAIL_ID = d.ID ORDER BY o.REF_ID IS NOT NULL, o.OBJECT_ID LIMIT 1)");
     let cte = format!(
             "WITH matching AS (\
                SELECT MIN(d.ID) AS detail_id FROM DETAILS d \
-               WHERE {mime} AND EXISTS (SELECT 1 FROM OBJECTS present WHERE present.DETAIL_ID = d.ID) AND (?1 = '' OR (\
-                 web_metadata_matches(COALESCE(d.PATH, ''), COALESCE(d.ARTIST, ''), COALESCE(d.ALBUM_ARTIST, ''), COALESCE(d.ALBUM, ''), ?1) OR \
-                 INSTR(web_search_normalize(COALESCE({search_title}, '')), ?1) > 0\
-               )) GROUP BY CASE WHEN COALESCE(d.INODE, 0) = 0 \
+               WHERE {mime} AND EXISTS (SELECT 1 FROM OBJECTS present WHERE present.DETAIL_ID = d.ID) AND (?1 = '' OR \
+                 web_metadata_matches(COALESCE(d.PATH, ''), COALESCE({search_title}, ''), COALESCE(d.ARTIST, ''), COALESCE(d.ALBUM_ARTIST, ''), COALESCE(d.ALBUM, ''), ?1)\
+               ) GROUP BY CASE WHEN COALESCE(d.INODE, 0) = 0 \
                  THEN 'id:' || d.ID ELSE d.DEVICE || ':' || d.INODE END\
              ), representatives AS (\
                SELECT m.detail_id, COALESCE(\
@@ -337,6 +361,8 @@ fn media_item_from_catalog_row(
     let video: Option<String> = row.get(20)?;
     let audio: Option<String> = row.get(21)?;
     let audio_streams: Option<String> = row.get(22)?;
+    let stream_probe_failed = audio_streams.is_none()
+        && row.get::<_, Option<i64>>(41)?.unwrap_or(0) >= STREAM_PROBE_REVISION;
     let hdr: Option<String> = row.get(23)?;
     let resolution: Option<String> = row.get(16)?;
     let stored_size = row.get::<_, Option<i64>>(7)?.unwrap_or(0);
@@ -419,6 +445,7 @@ fn media_item_from_catalog_row(
         rotation: row.get(37)?,
         bookmark_sec: 0,
         watch_count: 0,
+        stream_probe_failed,
     })
 }
 
@@ -579,18 +606,26 @@ CREATE INDEX IF NOT EXISTS IDX_DETAILS_ALBUM ON DETAILS(ALBUM, ID);
 CREATE INDEX IF NOT EXISTS IDX_DETAILS_TRACK ON DETAILS(TRACK, ID);
 "#;
 
+/// Stream-probe candidates: never probed at the current revision, unknown
+/// probe-sidecar provenance, or stored stream metadata recorded before
+/// embedded-subtitle discovery (no exact `@s` record). Records are
+/// comma-separated and field values percent-encode `,`, so `,@s,` can only
+/// match a whole record. A NULL descriptor (a cached failed probe) never
+/// matches, so unprobeable files are not retried on every startup.
 pub(crate) const STREAM_PROBE_NULLABLE_BATCH_SQL: &str =
     "SELECT ID, PATH, COALESCE(DEVICE, 0), COALESCE(INODE, 0)
      FROM DETAILS
      WHERE MIME IS NOT NULL AND PATH IS NOT NULL
-       AND (STREAM_PROBE_REV < ?1 OR PROBE_SIDECAR_FINGERPRINT IS NULL)
+       AND (STREAM_PROBE_REV < ?1 OR PROBE_SIDECAR_FINGERPRINT IS NULL
+         OR ',' || AUDIO_STREAMS || ',' NOT LIKE '%,@s,%')
        AND (DEVICE IS NULL OR INODE IS NULL) AND ID > ?4
      ORDER BY ID LIMIT ?5";
 
 pub(crate) const STREAM_PROBE_NONNULL_BATCH_SQL: &str = "SELECT ID, PATH, DEVICE, INODE
      FROM DETAILS INDEXED BY IDX_DETAILS_INODE
      WHERE MIME IS NOT NULL AND PATH IS NOT NULL
-       AND (STREAM_PROBE_REV < ?1 OR PROBE_SIDECAR_FINGERPRINT IS NULL)
+       AND (STREAM_PROBE_REV < ?1 OR PROBE_SIDECAR_FINGERPRINT IS NULL
+         OR ',' || AUDIO_STREAMS || ',' NOT LIKE '%,@s,%')
        AND DEVICE IS NOT NULL AND INODE IS NOT NULL
        AND (DEVICE > ?2 OR (DEVICE = ?2 AND INODE > ?3)
          OR (DEVICE = ?2 AND INODE = ?3 AND ID > ?4))
@@ -686,8 +721,10 @@ pub enum WebMediaKind {
 pub enum WebMediaSort {
     /// Metadata title, then detail identity.
     Title,
-    /// Metadata date newest first, then title and identity.
-    DateDescending,
+    /// Recently added: file modification time (`DETAILS.TIMESTAMP`) newest
+    /// first, then title and identity. This matches the DLNA Recently Added
+    /// views; NFO, embedded, or container dates never reorder it.
+    RecentlyAdded,
     /// Album/show, disc/season, track/episode, then title and identity.
     EpisodeTrack,
 }
@@ -706,7 +743,8 @@ const CATALOG_ITEM_SELECT: &str =
             d.AUDIO_STREAMS, d.HDR,
             d.ALBUM_ART, d.TITLE, d.CREATOR, d.ARTIST, d.ALBUM, d.GENRE,
             d.COMMENT, d.DISC, d.TRACK, d.ALBUM_ARTIST, d.COMPOSER,
-            d.CONTRIBUTOR, d.RATING, d.ROTATION, d.OUTLINE, d.PLOT, d.COLLECTION_PATH
+            d.CONTRIBUTOR, d.RATING, d.ROTATION, d.OUTLINE, d.PLOT, d.COLLECTION_PATH,
+            d.STREAM_PROBE_REV
      FROM OBJECTS o JOIN DETAILS d ON o.DETAIL_ID = d.ID";
 
 fn catalog_field_sql(field: CatalogQueryField) -> &'static str {
@@ -745,36 +783,50 @@ fn catalog_clause_sql(clause: &CatalogQueryClause, values: &mut Vec<Value>) -> S
             value.to_string()
         }
     };
+    // Free text folds Unicode case (identical to the in-memory search path);
+    // identifiers, classes, dates and numbers keep SQLite's ASCII folding.
+    let free_text = matches!(
+        clause.field,
+        CatalogQueryField::Title
+            | CatalogQueryField::Creator
+            | CatalogQueryField::Artist
+            | CatalogQueryField::Genre
+            | CatalogQueryField::Album
+            | CatalogQueryField::Actor
+    );
+    let compare = |values: &mut Vec<Value>, value: &str, operator: &str| {
+        if free_text {
+            values.push(Value::Text(rusty_dlna_protocol::soap::search_text_fold(
+                value,
+            )));
+            format!("soap_search_fold({field}) {operator} ?")
+        } else {
+            values.push(Value::Text(comparison_value(value)));
+            format!("{field} {operator} ? COLLATE NOCASE")
+        }
+    };
+    let contains = |values: &mut Vec<Value>, value: &str, found: bool| {
+        let test = if found { "> 0" } else { "= 0" };
+        if free_text {
+            values.push(Value::Text(rusty_dlna_protocol::soap::search_text_fold(
+                value,
+            )));
+            format!("instr(soap_search_fold({field}), ?) {test}")
+        } else {
+            values.push(Value::Text(value.to_ascii_lowercase()));
+            format!("instr(lower({field}), ?) {test}")
+        }
+    };
     match &clause.op {
-        CatalogQueryOp::Contains(value) => {
-            values.push(Value::Text(value.to_ascii_lowercase()));
-            format!("instr(lower({field}), ?) > 0")
-        }
-        CatalogQueryOp::DoesNotContain(value) => {
-            values.push(Value::Text(value.to_ascii_lowercase()));
-            format!("instr(lower({field}), ?) = 0")
-        }
-        CatalogQueryOp::Equals(value) => {
-            values.push(Value::Text(comparison_value(value)));
-            format!("{field} = ? COLLATE NOCASE")
-        }
-        CatalogQueryOp::NotEquals(value) => {
-            values.push(Value::Text(comparison_value(value)));
-            format!("{field} <> ? COLLATE NOCASE")
-        }
+        CatalogQueryOp::Contains(value) => contains(values, value, true),
+        CatalogQueryOp::DoesNotContain(value) => contains(values, value, false),
+        CatalogQueryOp::Equals(value) => compare(values, value, "="),
+        CatalogQueryOp::NotEquals(value) => compare(values, value, "<>"),
         CatalogQueryOp::LessThan { value, inclusive } => {
-            values.push(Value::Text(comparison_value(value)));
-            format!(
-                "{field} {} ? COLLATE NOCASE",
-                if *inclusive { "<=" } else { "<" }
-            )
+            compare(values, value, if *inclusive { "<=" } else { "<" })
         }
         CatalogQueryOp::GreaterThan { value, inclusive } => {
-            values.push(Value::Text(comparison_value(value)));
-            format!(
-                "{field} {} ? COLLATE NOCASE",
-                if *inclusive { ">=" } else { ">" }
-            )
+            compare(values, value, if *inclusive { ">=" } else { ">" })
         }
         CatalogQueryOp::DerivedFrom(value) => {
             let value = rusty_dlna_protocol::class::full_object_class(value).into_owned();
@@ -831,6 +883,11 @@ fn catalog_order_sql(sort: &[CatalogQuerySort], default_order: CatalogDefaultOrd
 pub struct LibraryDb {
     conn: Connection,
     pub path: PathBuf,
+    /// Physical files `(device, inode)` that lost a browseable path through
+    /// this connection. Video virtual views list one entry per inode, owned
+    /// by the path that attached it first, so the scanner re-homes those
+    /// entries to a surviving alias before it commits.
+    removed_inodes: std::cell::Cell<std::collections::BTreeSet<(i64, i64)>>,
 }
 
 struct BackupProgressDeadline {
@@ -1347,6 +1404,16 @@ impl LibraryDb {
                  WHERE staged.ID = DETAILS.ID
                );
 
+             -- Remove retired rows before inserting staged ones: an in-place
+             -- replaced sidecar keeps its PATH under a renewed ID. Every detail
+             -- that referenced a retired row changed in the stage too, so the
+             -- DETAILS upsert below restores its reference.
+             DELETE FROM ALBUM_ART
+             WHERE ID IN (SELECT ID FROM scan_stage._scan_album_art_changes)
+               AND NOT EXISTS (
+                 SELECT 1 FROM scan_stage.ALBUM_ART staged
+                 WHERE staged.ID = ALBUM_ART.ID
+               );
              INSERT INTO ALBUM_ART (ID, PATH)
              SELECT staged.ID, staged.PATH
              FROM scan_stage.ALBUM_ART staged
@@ -1538,14 +1605,7 @@ impl LibraryDb {
              JOIN scan_stage._scan_setting_changes changed ON changed.KEY = staged.KEY
              WHERE staged.KEY NOT IN ('updateID', 'scan_catalog_epoch')
              ON CONFLICT(KEY) DO UPDATE SET VALUE=excluded.VALUE
-             WHERE SETTINGS.VALUE COLLATE BINARY IS NOT excluded.VALUE COLLATE BINARY;
-
-             DELETE FROM ALBUM_ART
-             WHERE ID IN (SELECT ID FROM scan_stage._scan_album_art_changes)
-               AND NOT EXISTS (
-                 SELECT 1 FROM scan_stage.ALBUM_ART staged
-                 WHERE staged.ID = ALBUM_ART.ID
-               );",
+             WHERE SETTINGS.VALUE COLLATE BINARY IS NOT excluded.VALUE COLLATE BINARY;",
         )?;
         if let Some(cutoff) = bookmark_expiry_cutoff {
             self.conn.execute(
@@ -1576,14 +1636,43 @@ impl LibraryDb {
         self.conn
             .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
     }
+    /// Startup and maintenance open: migrate, then run a full
+    /// `PRAGMA integrity_check` (a scan of every page and index). Run it once
+    /// per process before long-lived connections exist; later opens use
+    /// [`LibraryDb::open_runtime`] or [`LibraryDb::open_with_cancellation`].
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
+        Self::create_parent(path)?;
+        Self::open_with_control(
+            path,
+            std::time::Duration::from_secs(15),
+            None,
+            IntegrityCheck::Full,
+        )
+    }
+
+    /// Open a catalog that this process already verified with
+    /// [`LibraryDb::open`]. It migrates but skips the full integrity scan.
+    pub fn open_runtime(path: &Path) -> rusqlite::Result<Self> {
+        Self::create_parent(path)?;
+        Self::open_with_control(
+            path,
+            std::time::Duration::from_secs(15),
+            None,
+            IntegrityCheck::Skip,
+        )
+    }
+
+    fn create_parent(path: &Path) -> rusqlite::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         }
-        Self::open_with_control(path, std::time::Duration::from_secs(15), None)
+        Ok(())
     }
 
+    /// Cancellable runtime open (scanner passes, stage rebackup, writer
+    /// reopen). Like [`LibraryDb::open_runtime`], it skips the full integrity
+    /// scan that startup already performed.
     pub fn open_with_cancellation(
         path: &Path,
         cancellation: crate::CancellationToken,
@@ -1602,6 +1691,7 @@ impl LibraryDb {
             path,
             std::time::Duration::from_millis(250),
             Some(cancellation),
+            IntegrityCheck::Skip,
         )
     }
 
@@ -1610,13 +1700,14 @@ impl LibraryDb {
         path: &Path,
         busy_timeout: std::time::Duration,
     ) -> rusqlite::Result<Self> {
-        Self::open_with_control(path, busy_timeout, None)
+        Self::open_with_control(path, busy_timeout, None, IntegrityCheck::Full)
     }
 
     fn open_with_control(
         path: &Path,
         busy_timeout: std::time::Duration,
         cancellation: Option<crate::CancellationToken>,
+        integrity: IntegrityCheck,
     ) -> rusqlite::Result<Self> {
         let mut conn = Connection::open(path)?;
         register_web_order(&conn)?;
@@ -1624,16 +1715,20 @@ impl LibraryDb {
         if let Some(cancellation) = cancellation {
             conn.progress_handler(1_000, Some(move || cancellation.is_cancelled()))?;
         }
+        reject_newer_schema(&conn)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
         conn.execute_batch(SCHEMA)?;
         migrate_schema(&mut conn)?;
-        verify_integrity(&conn)?;
+        if integrity == IntegrityCheck::Full {
+            verify_integrity(&conn)?;
+        }
         install_child_suffix_cache(&conn)?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
+            removed_inodes: Default::default(),
         })
     }
 
@@ -1647,6 +1742,7 @@ impl LibraryDb {
         Ok(Self {
             conn,
             path: PathBuf::from(":memory:"),
+            removed_inodes: Default::default(),
         })
     }
 
@@ -1662,6 +1758,7 @@ impl LibraryDb {
         Ok(Self {
             conn,
             path: path.to_path_buf(),
+            removed_inodes: Default::default(),
         })
     }
 
@@ -1982,6 +2079,17 @@ impl LibraryDb {
     }
 
     pub fn remove_detail_id(&self, id: i64) -> rusqlite::Result<()> {
+        if let Some((device, inode)) = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(DEVICE, 0), COALESCE(INODE, 0) FROM DETAILS WHERE ID = ?1",
+                [id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        {
+            self.note_removed_inode(device, inode);
+        }
         self.conn
             .execute("DELETE FROM OBJECTS WHERE DETAIL_ID = ?1", [id])?;
         self.conn
@@ -2395,6 +2503,44 @@ impl LibraryDb {
             [id],
             |r| r.get(0),
         )
+    }
+
+    /// Give a sidecar that was replaced in place a new ALBUM_ART ID. Art URLs
+    /// embed the ID, so renderers and clients that cache by URL fetch the new
+    /// image. IDs are AUTOINCREMENT, so the new ID is never reused.
+    pub(crate) fn renew_album_art_id(&self, path: &str) -> rusqlite::Result<bool> {
+        let Some(old) = self
+            .conn
+            .query_row("SELECT ID FROM ALBUM_ART WHERE PATH = ?1", [path], |row| {
+                row.get::<_, i64>(0)
+            })
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        let details = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT ID FROM DETAILS WHERE ALBUM_ART = ?1 ORDER BY ID")?;
+            let rows = statement.query_map([old], |row| row.get::<_, i64>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if details.is_empty() {
+            return Ok(false);
+        }
+        self.conn.execute(
+            "UPDATE DETAILS SET ALBUM_ART = NULL WHERE ALBUM_ART = ?1",
+            [old],
+        )?;
+        self.conn
+            .execute("DELETE FROM ALBUM_ART WHERE ID = ?1", [old])?;
+        self.conn
+            .execute("INSERT INTO ALBUM_ART (PATH) VALUES (?1)", [path])?;
+        let renewed = self.conn.last_insert_rowid();
+        for id in details {
+            self.set_detail_album_art(id, renewed)?;
+        }
+        Ok(true)
     }
 
     pub fn album_art_path(&self, id: i64) -> rusqlite::Result<Option<String>> {
@@ -2847,7 +2993,8 @@ impl LibraryDb {
              WHERE ID IN (
                SELECT MIN(ID) FROM DETAILS
                WHERE MIME IS NOT NULL AND PATH IS NOT NULL
-                 AND (STREAM_PROBE_REV < ?1 OR PROBE_SIDECAR_FINGERPRINT IS NULL)
+                 AND (STREAM_PROBE_REV < ?1 OR PROBE_SIDECAR_FINGERPRINT IS NULL
+                   OR ',' || AUDIO_STREAMS || ',' NOT LIKE '%,@s,%')
                GROUP BY DEVICE, INODE,
                         CASE WHEN COALESCE(INODE, 0) = 0 THEN ID ELSE 0 END
              )
@@ -2895,14 +3042,16 @@ impl LibraryDb {
         rows.collect()
     }
 
-    /// Inodes whose current revision has never been attempted. Empty optional
-    /// metadata is not a retry signal: failed and unusual streams are marked
-    /// attempted and retried only after their file stat changes.
+    /// Inodes whose current revision has never been attempted, or whose
+    /// stored descriptor predates subtitle discovery. Empty optional metadata
+    /// is not a retry signal: failed and unusual streams are marked attempted
+    /// and retried only after their file stat changes.
     pub fn inodes_needing_stream_probe(&self) -> rusqlite::Result<Vec<(i64, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT DEVICE, INODE FROM DETAILS
              WHERE MIME IS NOT NULL AND INODE != 0
-               AND (STREAM_PROBE_REV < ?1 OR PROBE_SIDECAR_FINGERPRINT IS NULL)
+               AND (STREAM_PROBE_REV < ?1 OR PROBE_SIDECAR_FINGERPRINT IS NULL
+                 OR ',' || AUDIO_STREAMS || ',' NOT LIKE '%,@s,%')
              ORDER BY DEVICE, INODE",
         )?;
         let rows = stmt.query_map([STREAM_PROBE_REVISION], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -2948,6 +3097,71 @@ impl LibraryDb {
 
     pub fn details_missing_av_meta(&self) -> rusqlite::Result<Vec<(i64, String)>> {
         self.details_missing_stream_meta()
+    }
+
+    /// Record a probe whose deadline expired. `STREAM_PROBE_REV` keeps the
+    /// row a probe candidate: a negative value counts consecutive timeouts
+    /// (0 is "never attempted at this stat"). Stored stream metadata stays
+    /// only when it was stamped at the current revision for this physical
+    /// file (or an earlier expiry already decided that). A stat change, a new
+    /// row, or an older-revision stamp means the stored columns may describe
+    /// other content, so they are cleared, as a failed probe would. Aliases
+    /// are left alone: each alias is probed and deferred on its own.
+    /// Returns false, changing nothing, once this expiry would reach
+    /// `max_timeouts`; the caller then caches a failed probe.
+    pub(crate) fn defer_detail_stream_probe(
+        &self,
+        id: i64,
+        max_timeouts: i64,
+    ) -> rusqlite::Result<bool> {
+        let Some(revision) = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(STREAM_PROBE_REV, 0) FROM DETAILS WHERE ID = ?1",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        let timeouts = if revision < 0 {
+            revision.saturating_neg()
+        } else {
+            0
+        };
+        let timeouts = timeouts.saturating_add(1);
+        if timeouts >= max_timeouts {
+            return Ok(false);
+        }
+        if (0..STREAM_PROBE_REVISION).contains(&revision) {
+            self.conn.execute(
+                "UPDATE DETAILS SET DURATION = NULL, BITRATE = NULL, RESOLUTION = NULL,
+                     CHANNELS = NULL, SAMPLERATE = NULL,
+                     CONTAINER = NULL, VIDEO = NULL, AUDIO = NULL, AUDIO_STREAMS = NULL,
+                     HDR = NULL, DLNA_PN = NULL, STREAM_PROBE_REV = ?2
+                 WHERE ID = ?1",
+                params![id, timeouts.saturating_neg()],
+            )?;
+            return Ok(true);
+        }
+        self.conn.execute(
+            "UPDATE DETAILS SET STREAM_PROBE_REV = ?2 WHERE ID = ?1",
+            params![id, timeouts.saturating_neg()],
+        )?;
+        Ok(true)
+    }
+
+    /// Details whose last probe attempts timed out (see
+    /// [`LibraryDb::defer_detail_stream_probe`]).
+    pub(crate) fn details_with_deferred_stream_probe(
+        &self,
+    ) -> rusqlite::Result<std::collections::HashSet<i64>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT ID FROM DETAILS WHERE STREAM_PROBE_REV < 0")?;
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.collect()
     }
 
     pub fn mark_detail_stream_probed(&self, id: i64) -> rusqlite::Result<()> {
@@ -3386,8 +3600,16 @@ impl LibraryDb {
     /// Delete this path. Also drop other DETAILS rows for the same inode
     /// whose files are gone (dangling symlink aliases). Live hardlinks and
     /// live symlinks that still resolve — e.g. a genre tree retargeted at
-    /// the file's new location — are kept.
-    pub fn remove_path_and_symlink_aliases(&self, path: &str) -> rusqlite::Result<usize> {
+    /// the file's new location — are kept, and so is every alias for which
+    /// `keep` is true. Callers pass the pass's held (unavailable) subtrees as
+    /// `keep`: an alias under an unmounted root reads as gone too, but it is
+    /// unknown, so its row, IDs, and bookmarks must survive the cascade.
+    /// `keep` is consulted only for aliases that read as gone.
+    pub fn remove_path_and_symlink_aliases(
+        &self,
+        path: &str,
+        keep: &dyn Fn(&Path) -> bool,
+    ) -> rusqlite::Result<usize> {
         let row = self
             .conn
             .query_row(
@@ -3419,7 +3641,10 @@ impl LibraryDb {
         }
         let mut n = 0usize;
         for (id, p) in victims {
-            let gone = p == path || !path_is_live_file(&path_from_db(&p));
+            let gone = p == path || {
+                let alias = path_from_db(&p);
+                path_is_definitely_gone(&alias) && !keep(&alias)
+            };
             if !gone {
                 continue;
             }
@@ -3433,10 +3658,41 @@ impl LibraryDb {
                 .execute("DELETE FROM DETAILS WHERE ID = ?1", [id])?;
             n += 1;
         }
+        if n > 0 {
+            self.note_removed_inode(device, inode);
+        }
         Ok(n)
     }
 
-    pub fn prune_missing_files(&self) -> rusqlite::Result<usize> {
+    fn note_removed_inode(&self, device: i64, inode: i64) {
+        if inode != 0 {
+            let mut removed = self.removed_inodes.take();
+            removed.insert((device, inode));
+            self.removed_inodes.set(removed);
+        }
+    }
+
+    /// Drain the physical files that lost a path since the last call.
+    pub(crate) fn take_removed_inodes(&self) -> std::collections::BTreeSet<(i64, i64)> {
+        self.removed_inodes.take()
+    }
+
+    pub(crate) fn object_class_and_name(
+        &self,
+        object_id: &str,
+    ) -> rusqlite::Result<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(CLASS, ''), COALESCE(NAME, '') FROM OBJECTS WHERE OBJECT_ID = ?1",
+                [object_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+    }
+
+    /// Remove rows whose files are affirmatively gone. `held` names paths in
+    /// a subtree that is unavailable this pass; they are never pruned here.
+    pub fn prune_missing_files(&self, held: &dyn Fn(&Path) -> bool) -> rusqlite::Result<usize> {
         let mut paths: Vec<String> = Vec::new();
         {
             let mut stmt = self
@@ -3449,14 +3705,24 @@ impl LibraryDb {
         }
         let mut n = 0;
         for p in paths {
-            if !path_is_live_file(&path_from_db(&p)) {
-                n += self.remove_path_and_symlink_aliases(&p)?;
+            // Permission, stale-handle, and I/O failures are not proof that
+            // the file was deleted; only an affirmative absence prunes a row.
+            let path = path_from_db(&p);
+            if !held(&path) && path_is_definitely_gone(&path) {
+                n += self.remove_path_and_symlink_aliases(&p, held)?;
             }
         }
         Ok(n)
     }
 
-    pub fn prune_excluded_paths(&self, cfg: &ScanConfig) -> rusqlite::Result<usize> {
+    /// Remove rows the configuration no longer admits. Rows under a `held`
+    /// (unavailable) subtree are judged by configuration alone, never by the
+    /// failing filesystem.
+    pub fn prune_excluded_paths(
+        &self,
+        cfg: &ScanConfig,
+        held: &dyn Fn(&Path) -> bool,
+    ) -> rusqlite::Result<usize> {
         let mut paths: Vec<String> = Vec::new();
         {
             let mut stmt = self
@@ -3469,8 +3735,14 @@ impl LibraryDb {
         }
         let mut n = 0;
         for p in paths {
-            if path_is_unwanted(&path_from_db(&p), cfg) {
-                n += self.remove_path_and_symlink_aliases(&p)?;
+            let path = path_from_db(&p);
+            let unwanted = if held(&path) {
+                path_is_excluded_by_config(&path, cfg)
+            } else {
+                path_is_unwanted(&path, cfg)
+            };
+            if unwanted {
+                n += self.remove_path_and_symlink_aliases(&p, held)?;
             }
         }
         Ok(n)
@@ -3761,6 +4033,28 @@ impl LibraryDb {
         self.conn
             .execute("UPDATE PLAYLISTS SET FOUND=0 WHERE FOUND IS NOT 0", [])?;
         Ok(())
+    }
+
+    /// Keep a playlist whose file cannot be read during this pass.
+    pub fn retain_playlist(&self, playlist_id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE PLAYLISTS SET FOUND=1 WHERE ID=?1 AND FOUND IS NOT 1",
+            [playlist_id],
+        )?;
+        Ok(())
+    }
+
+    /// `object_id` and every object below it in the `$`-separated ID space.
+    pub fn object_subtree_ids(&self, object_id: &str) -> rusqlite::Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT OBJECT_ID FROM OBJECTS
+             WHERE OBJECT_ID = ?1
+                OR substr(OBJECT_ID, 1, length(?1) + 1) = ?1 || '$'",
+        )?;
+        let rows = statement
+            .query_map([object_id], |row| row.get::<_, String>(0))?
+            .collect();
+        rows
     }
 
     pub fn delete_missing_playlists(&self) -> rusqlite::Result<usize> {
@@ -4517,6 +4811,33 @@ fn is_virtual_container(id: &str) -> bool {
 
 const SCHEMA_VERSION: i64 = 14;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IntegrityCheck {
+    Full,
+    Skip,
+}
+
+/// Refuse a catalog written by a newer rustyDLNA before any pragma or schema
+/// statement can modify it, so rolling back an upgrade leaves it intact.
+fn reject_newer_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(newer_schema_error(version));
+    }
+    Ok(())
+}
+
+fn newer_schema_error(version: i64) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+        Some(format!(
+            "library database schema v{version} is newer than this build supports \
+             (v{SCHEMA_VERSION}); run a newer rustyDLNA or restore a database backup \
+             made by this version"
+        )),
+    )
+}
+
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
     let sql = format!("PRAGMA table_info({table})");
     let mut stmt = conn.prepare(&sql)?;
@@ -4549,7 +4870,7 @@ fn migrate_schema_inner(
 ) -> rusqlite::Result<()> {
     let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > SCHEMA_VERSION {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(newer_schema_error(version));
     }
     let tx = conn.transaction()?;
     if version < 1 {
@@ -6097,6 +6418,40 @@ mod query_tests {
             db.setting("stream_probe_rev").unwrap().as_deref(),
             Some(STREAM_PROBE_REVISION.to_string().as_str())
         );
+    }
+
+    #[test]
+    fn newer_schema_is_refused_descriptively_without_modifying_the_file() {
+        let temp = crate::tests::TempPath::new("db-newer-schema");
+        std::fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("files.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE FUTURE(ID INTEGER);")
+                .unwrap();
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        let error = LibraryDb::open(&path).err().unwrap();
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!(
+                "schema v{} is newer than this build supports (v{SCHEMA_VERSION})",
+                SCHEMA_VERSION + 1
+            )),
+            "{message}"
+        );
+        assert!(!matches!(error, rusqlite::Error::InvalidQuery));
+        // The refusal happens before WAL or schema statements run, and the
+        // recovering scanner open does not mistake it for corruption.
+        assert!(crate::open_library_db(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let names = std::fs::read_dir(&temp)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [std::ffi::OsString::from("files.db")]);
     }
 
     #[test]

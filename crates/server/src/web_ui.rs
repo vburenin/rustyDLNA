@@ -116,10 +116,14 @@ const MAX_PAGE_SIZE: usize = 200;
 const MAX_CONTINUE_IDS: usize = 100;
 const MAX_HLS_RESOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const WEB_SCHEMA_VERSION: u8 = 2;
+// One-item enrichment waits at most this long for helper admission. With the
+// probe's own ten-second ceiling, a busy server answers within twenty seconds,
+// below the thirty-second request timeout common to HTTP clients.
+const WEB_ENRICHMENT_ADMISSION_MAX_SECS: u64 = 10;
 // Change when a browser API representation can differ without a catalog
 // generation change. This keeps conditional requests from reusing capability
 // or media metadata cached from an older rustyDLNA build.
-const WEB_API_CACHE_REVISION: u8 = 10;
+const WEB_API_CACHE_REVISION: u8 = 11;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WebItemId(i64);
@@ -324,6 +328,8 @@ struct WebTranscodeStatus {
     state: &'static str,
     retry_after_seconds: Option<u64>,
     produced_seconds: Option<f64>,
+    /// Source time represented by output time zero, when established.
+    stream_start_seconds: Option<f64>,
     effective_recipe: Option<crate::remux::fallback::EffectiveRecipe>,
 }
 
@@ -395,6 +401,10 @@ struct WebMediaItem {
     audio_layout: Option<String>,
     codec_string: Option<String>,
     video_content_type: Option<String>,
+    /// Whether `video_mode=copy` at Auto quality copies this source's video.
+    /// It also covers timestamp and legacy-metadata cases that
+    /// `video_content_type` cannot express.
+    video_copy_available: bool,
     hdr: String,
     audio_tracks: Vec<WebAudioTrack>,
     default_audio_index: usize,
@@ -598,6 +608,17 @@ pub(crate) fn transcode_stream_error(status_code: u16, code: &'static str) -> Ht
             response.set("Retry-After", "1");
             response
         }
+        "transcode_storage" => {
+            let mut response = api_error(
+                status_code,
+                code,
+                "The server's transcode cache is full. Try again later.",
+                true,
+                Some("retry_media"),
+            );
+            response.set("Retry-After", "30");
+            response
+        }
         "transcode_cancelled" => api_error(
             status_code,
             code,
@@ -625,13 +646,49 @@ pub(super) fn query_budget_error() -> HttpResponse {
     )
 }
 
-fn generation_etag(generation: u32) -> String {
-    format!("W/\"web-v{WEB_SCHEMA_VERSION}-r{WEB_API_CACHE_REVISION}-{generation}\"")
+/// Whether the published catalog holds any browser-playable media.
+///
+/// `library_state` describes the whole library, never the current view, folder,
+/// kind, or search: an empty search or folder on a populated server is still
+/// `ready`. The canonical virtual containers own every browser-playable audio
+/// and video detail, so their child lists provide an O(1) check without
+/// walking a large catalog.
+pub(super) fn catalog_has_web_media(catalog: &Catalog) -> bool {
+    [
+        rusty_dlna_protocol::object_id::VIDEO_ALL_ID,
+        rusty_dlna_protocol::object_id::MUSIC_ALL_ID,
+    ]
+    .iter()
+    .any(|id| {
+        catalog
+            .containers
+            .get(*id)
+            .is_some_and(|container| !container.children.is_empty())
+    })
 }
 
-fn generation_not_modified(req: &HttpRequest, generation: u32) -> Option<HttpResponse> {
-    let etag = generation_etag(generation);
-    if req.header("If-None-Match") != Some(etag.as_str()) {
+pub(super) fn library_state(has_media: bool) -> &'static str {
+    if has_media {
+        "ready"
+    } else {
+        "empty"
+    }
+}
+
+/// Weak validator for generation-scoped web API bodies. Bodies also depend on
+/// configuration (transcoding, encoder outputs, captions, server name), which
+/// can change across a restart without a catalog generation change, so the
+/// running instance's opaque tag ends every validator.
+fn generation_etag(app: &App, generation: u32, suffix: &str) -> String {
+    format!(
+        "W/\"web-v{WEB_SCHEMA_VERSION}-r{WEB_API_CACHE_REVISION}-{generation}{suffix}-i{}\"",
+        app.web_etag_instance
+    )
+}
+
+fn generation_not_modified(req: &HttpRequest, app: &App, generation: u32) -> Option<HttpResponse> {
+    let etag = generation_etag(app, generation, "");
+    if !rusty_dlna_http::range::if_none_match_matches(req.header("If-None-Match"), &etag) {
         return None;
     }
     let mut response = HttpResponse::new(304, "Not Modified");
@@ -642,13 +699,14 @@ fn generation_not_modified(req: &HttpRequest, generation: u32) -> Option<HttpRes
 
 fn generation_json_response<T: Serialize>(
     req: &HttpRequest,
+    app: &App,
     generation: u32,
     value: &T,
 ) -> HttpResponse {
-    if let Some(response) = generation_not_modified(req, generation) {
+    if let Some(response) = generation_not_modified(req, app, generation) {
         return response;
     }
-    let etag = generation_etag(generation);
+    let etag = generation_etag(app, generation, "");
     let mut response = json_response_with_status_and_cache_control(
         200,
         value,
@@ -658,11 +716,78 @@ fn generation_json_response<T: Serialize>(
     response
 }
 
-pub(crate) fn presentation(app: &App) -> HttpResponse {
+const INDEX_HTML_PATH: &str = "/";
+const JS_MIME: &str = "text/javascript; charset=utf-8";
+const WEB_ASSETS: &[(&str, &str, &str)] = &[
+    ("/web/app.css", "text/css; charset=utf-8", APP_CSS),
+    ("/web/app.js", JS_MIME, APP_JS),
+    ("/web/api.js", JS_MIME, API_JS),
+    ("/web/playback-timing.js", JS_MIME, PLAYBACK_TIMING_JS),
+    ("/web/preview-cache.js", JS_MIME, PREVIEW_CACHE_JS),
+    ("/web/media-source.js", JS_MIME, MEDIA_SOURCE_JS),
+    ("/web/playback-source.js", JS_MIME, PLAYBACK_SOURCE_JS),
+    ("/web/source-selection.js", JS_MIME, SOURCE_SELECTION_JS),
+    ("/web/captions.js", JS_MIME, CAPTIONS_JS),
+    ("/web/core.js", JS_MIME, CORE_JS),
+    ("/web/library.js", JS_MIME, LIBRARY_JS),
+    ("/web/artwork.js", JS_MIME, ARTWORK_JS),
+    ("/web/player.js", JS_MIME, PLAYER_JS),
+    ("/web/preferences.js", JS_MIME, PREFERENCES_JS),
+    ("/web/store.js", JS_MIME, STORE_JS),
+];
+
+/// Strong validators for the embedded browser application.
+///
+/// Each hash covers the exact embedded bytes, so any build that changes an
+/// asset changes its validator, including same-length edits and development
+/// rebuilds with an unchanged crate version. Assets stay `no-cache`: browsers
+/// revalidate every load, and an unchanged asset costs a 304 instead of its body.
+static EMBEDDED_ASSET_ETAGS: std::sync::LazyLock<HashMap<&'static str, String>> =
+    std::sync::LazyLock::new(|| {
+        std::iter::once((INDEX_HTML_PATH, INDEX_HTML))
+            .chain(WEB_ASSETS.iter().map(|(path, _, body)| (*path, *body)))
+            .map(|(path, body)| (path, embedded_content_etag(body.as_bytes())))
+            .collect()
+    });
+
+fn embedded_content_etag(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(body);
+    let mut etag = String::with_capacity(39);
+    etag.push_str("\"web-");
+    for byte in &digest[..16] {
+        let _ = write!(etag, "{byte:02x}");
+    }
+    etag.push('"');
+    etag
+}
+
+/// Serve one embedded document or module, answering a current validator with
+/// 304. Callers add representation headers to either response.
+fn embedded_response(req: &HttpRequest, path: &str, mime: &str, body: &str) -> HttpResponse {
+    let Some(etag) = EMBEDDED_ASSET_ETAGS.get(path) else {
+        return bytes_response(mime, body.as_bytes(), "no-cache");
+    };
+    let mut response =
+        if rusty_dlna_http::range::if_none_match_matches(req.header("If-None-Match"), etag) {
+            HttpResponse::new(304, "Not Modified")
+        } else {
+            bytes_response(mime, body.as_bytes(), "no-cache")
+        };
+    response.set("Cache-Control", "no-cache");
+    response.set("ETag", etag.as_str());
+    response
+}
+
+pub(crate) fn presentation(app: &App, req: &HttpRequest) -> HttpResponse {
     if !app.cfg.web.enable {
+        // Status HTML is generated per request and never gets a stable validator.
         return html_response(status::status_html(app));
     }
-    let mut response = html_response(INDEX_HTML.to_owned());
+    let mut response =
+        embedded_response(req, INDEX_HTML_PATH, "text/html; charset=utf-8", INDEX_HTML);
+    response.set("X-Content-Type-Options", "nosniff");
     response.set(
         "Content-Security-Policy",
         "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
@@ -671,32 +796,18 @@ pub(crate) fn presentation(app: &App) -> HttpResponse {
     response
 }
 
-pub(crate) fn asset(app: &App, path: &str) -> HttpResponse {
+pub(crate) fn asset(app: &App, req: &HttpRequest) -> HttpResponse {
     if !app.cfg.web.enable {
         return not_found();
     }
+    let path = req.path.as_str();
     if path == "/favicon.ico" {
         return bytes_response("image/png", FAVICON_PNG, "public, max-age=86400");
     }
-    let (mime, body) = match path {
-        "/web/app.css" => ("text/css; charset=utf-8", APP_CSS),
-        "/web/app.js" => ("text/javascript; charset=utf-8", APP_JS),
-        "/web/api.js" => ("text/javascript; charset=utf-8", API_JS),
-        "/web/playback-timing.js" => ("text/javascript; charset=utf-8", PLAYBACK_TIMING_JS),
-        "/web/preview-cache.js" => ("text/javascript; charset=utf-8", PREVIEW_CACHE_JS),
-        "/web/media-source.js" => ("text/javascript; charset=utf-8", MEDIA_SOURCE_JS),
-        "/web/playback-source.js" => ("text/javascript; charset=utf-8", PLAYBACK_SOURCE_JS),
-        "/web/source-selection.js" => ("text/javascript; charset=utf-8", SOURCE_SELECTION_JS),
-        "/web/captions.js" => ("text/javascript; charset=utf-8", CAPTIONS_JS),
-        "/web/core.js" => ("text/javascript; charset=utf-8", CORE_JS),
-        "/web/library.js" => ("text/javascript; charset=utf-8", LIBRARY_JS),
-        "/web/artwork.js" => ("text/javascript; charset=utf-8", ARTWORK_JS),
-        "/web/player.js" => ("text/javascript; charset=utf-8", PLAYER_JS),
-        "/web/preferences.js" => ("text/javascript; charset=utf-8", PREFERENCES_JS),
-        "/web/store.js" => ("text/javascript; charset=utf-8", STORE_JS),
-        _ => return not_found(),
+    let Some((path, mime, body)) = WEB_ASSETS.iter().find(|(asset, _, _)| *asset == path) else {
+        return not_found();
     };
-    bytes_response(mime, body.as_bytes(), "no-cache")
+    embedded_response(req, path, mime, body)
 }
 
 pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
@@ -879,7 +990,7 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
                 Some("retry_library"),
             );
         }
-        if let Some(response) = generation_not_modified(req, generation) {
+        if let Some(response) = generation_not_modified(req, app, generation) {
             return response;
         }
     }
@@ -889,7 +1000,7 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
         _ => rusty_dlna_scan::WebMediaKind::All,
     };
     let db_sort = match sort {
-        "date_desc" => rusty_dlna_scan::WebMediaSort::DateDescending,
+        "date_desc" => rusty_dlna_scan::WebMediaSort::RecentlyAdded,
         "episode" => rusty_dlna_scan::WebMediaSort::EpisodeTrack,
         _ => rusty_dlna_scan::WebMediaSort::Title,
     };
@@ -1043,9 +1154,11 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
         .into_iter()
         .map(|item| WebEntryDto::Media(Box::new(media_dto(app, item))))
         .collect::<Vec<_>>();
+    let library_has_media = catalog_has_web_media(&catalog);
     drop(catalog);
     generation_json_response(
         req,
+        app,
         generation,
         &WebLibraryPage {
             schema_version: WEB_SCHEMA_VERSION,
@@ -1053,7 +1166,7 @@ pub(crate) fn library(app: &App, req: &HttpRequest) -> HttpResponse {
             server_name: app.cfg.friendly_name.clone(),
             root_folder_id,
             capabilities,
-            library_state: if total == 0 { "empty" } else { "ready" },
+            library_state: library_state(library_has_media),
             view: "library",
             folder: None,
             breadcrumbs: Vec::new(),
@@ -1120,20 +1233,7 @@ fn continue_library(app: &App, req: &HttpRequest, params: &QueryParams) -> HttpR
             Some("retry_library"),
         );
     }
-    // These canonical virtual containers own every browser-playable audio and
-    // video detail, so their child lists provide an O(1) state check for each
-    // batch without walking a large catalog.
-    let library_has_media = [
-        rusty_dlna_protocol::object_id::VIDEO_ALL_ID,
-        rusty_dlna_protocol::object_id::MUSIC_ALL_ID,
-    ]
-    .iter()
-    .any(|id| {
-        catalog
-            .containers
-            .get(*id)
-            .is_some_and(|container| !container.children.is_empty())
-    });
+    let library_has_media = catalog_has_web_media(&catalog);
     let mut entries = Vec::with_capacity(ids.len());
     for id in &ids {
         if control.check().is_err() {
@@ -1154,6 +1254,7 @@ fn continue_library(app: &App, req: &HttpRequest, params: &QueryParams) -> HttpR
     }
     generation_json_response(
         req,
+        app,
         generation,
         &WebLibraryPage {
             schema_version: WEB_SCHEMA_VERSION,
@@ -1161,7 +1262,7 @@ fn continue_library(app: &App, req: &HttpRequest, params: &QueryParams) -> HttpR
             server_name: app.cfg.friendly_name.clone(),
             root_folder_id: rusty_dlna_protocol::object_id::BROWSEDIR_ID.to_owned(),
             capabilities: web_capabilities(app),
-            library_state: if library_has_media { "ready" } else { "empty" },
+            library_state: library_state(library_has_media),
             view: "continue",
             folder: None,
             breadcrumbs: Vec::new(),
@@ -1355,7 +1456,8 @@ fn memory_web_page<'a>(
         let a = representatives[*left];
         let b = representatives[*right];
         let ordering = match sort {
-            "date_desc" => b.date.cmp(&a.date),
+            "date_desc" => rusty_dlna_scan::web_recently_added_key(b.mtime)
+                .cmp(&rusty_dlna_scan::web_recently_added_key(a.mtime)),
             "episode" => keys[*left]
                 .1
                 .cmp(&keys[*right].1)
@@ -1408,7 +1510,10 @@ impl WebEntry<'_> {
 
     fn matches(&self, query: &str) -> bool {
         match self {
-            Self::Folder(folder) => folder.title.to_lowercase().contains(query),
+            Self::Folder(folder) => rusty_dlna_scan::web_search_fields_match(
+                &[rusty_dlna_scan::web_search_normalize(&folder.title).as_str()],
+                query,
+            ),
             Self::Media(item) => media_matches(item, query),
         }
     }
@@ -1721,16 +1826,11 @@ fn media_dto(app: &App, item: &MediaItem) -> WebMediaItem {
     } else {
         "audio"
     };
-    let art_url = if item.album_art > 0 {
-        Some(format!(
-            "/AlbumArt/{}-{}.jpg",
-            item.album_art, item.detail_id
-        ))
-    } else if media_kind == "video" && app.cfg.thumbnails {
-        Some(format!("/Thumbnails/{}.jpg", item.detail_id))
-    } else {
-        None
-    };
+    // Generated video thumbnails are persisted as album art, and /Thumbnails
+    // serves only that art. Without it no artwork URL can succeed, so clients
+    // get null and show their neutral placeholder instead of a failed image.
+    let art_url = (item.album_art > 0)
+        .then(|| format!("/AlbumArt/{}-{}.jpg", item.album_art, item.detail_id));
     let source = probe_to_source(
         &item.probe.container,
         &item.probe.video,
@@ -1823,6 +1923,9 @@ fn media_dto(app: &App, item: &MediaItem) -> WebMediaItem {
             .then(|| item.probe.audio_layout.clone()),
         codec_string: direct_codec_string,
         video_content_type,
+        video_copy_available: media_kind == "video"
+            && app.cfg.transcode.enable
+            && browser_can_remux_video(item, &source),
         hdr: item.probe.hdr.clone(),
         audio_tracks,
         default_audio_index,
@@ -1831,7 +1934,10 @@ fn media_dto(app: &App, item: &MediaItem) -> WebMediaItem {
         } else {
             vec![]
         },
+        // A cached failed probe is complete too: a live re-probe would fail
+        // the same way, so clients must not keep requesting enrichment.
         embedded_captions_complete: !app.scan_cfg.subtitles
+            || item.stream_probe_failed
             || stream_metadata.is_some_and(CompactStreamMetadata::has_subtitle_marker),
         chapters: stored_chapters(stream_metadata),
         stream_metadata_complete: stream_metadata_complete(
@@ -1931,11 +2037,12 @@ pub(crate) fn item(app: &App, req: &HttpRequest) -> HttpResponse {
     #[cfg(test)]
     pause_item_snapshot_if_requested(app, id);
     drop(catalog);
-    let etag = format!(
-        "W/\"web-v{WEB_SCHEMA_VERSION}-r{WEB_API_CACHE_REVISION}-{generation}-item-{id}{}\"",
-        if enrich { "-enriched" } else { "" }
+    let etag = generation_etag(
+        app,
+        generation,
+        &format!("-item-{id}{}", if enrich { "-enriched" } else { "" }),
     );
-    if req.header("If-None-Match") == Some(etag.as_str()) {
+    if rusty_dlna_http::range::if_none_match_matches(req.header("If-None-Match"), &etag) {
         let mut response = HttpResponse::new(304, "Not Modified");
         response.set("ETag", etag);
         response.set("Cache-Control", "private, max-age=0, must-revalidate");
@@ -1956,9 +2063,11 @@ pub(crate) fn item(app: &App, req: &HttpRequest) -> HttpResponse {
     let source_path = rusty_dlna_scan::rebase_media_path_for_config(&item.path, &app.scan_cfg);
     let opened = match rusty_dlna_scan::open_allowed_file(&source_path, &app.scan_cfg) {
         Ok(opened) => opened,
+        // Unreadable or confinement-rejected files are missing media, not an
+        // authorization failure; status-only clients must not ask for sign-in.
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             return api_error(
-                403,
+                404,
                 "media_missing",
                 "The media file is not available.",
                 false,
@@ -1979,8 +2088,10 @@ pub(crate) fn item(app: &App, req: &HttpRequest) -> HttpResponse {
     let mut audio_tracks = item_dto.audio_tracks.clone();
     let mut chapters = item_dto.chapters.clone();
     if enrich {
+        // Admission plus the probe stays well below common client request
+        // timeouts, so a saturated helper pool yields a definite 503 to retry.
         let _helper_permit = match app.helpers.acquire_timeout_cancelled(
-            Duration::from_secs(app.cfg.helper_queue_timeout_secs),
+            web_enrichment_admission_timeout(app.cfg.helper_queue_timeout_secs),
             &app.scan_cfg.cancellation,
         ) {
             Ok(permit) => permit,
@@ -1997,7 +2108,7 @@ pub(crate) fn item(app: &App, req: &HttpRequest) -> HttpResponse {
                 return response;
             }
         };
-        let Some(probe) = rusty_dlna_scan::probe::probe_media_with_cancellation(
+        let Some(mut probe) = rusty_dlna_scan::probe::probe_media_with_cancellation(
             &opened.proc_path(),
             Duration::from_secs(app.cfg.scan_command_timeout_secs.min(10)),
             &app.scan_cfg.cancellation,
@@ -2010,6 +2121,15 @@ pub(crate) fn item(app: &App, req: &HttpRequest) -> HttpResponse {
                 Some("retry_item"),
             );
         };
+        // Operator `.probe.toml` overrides win over libav exactly as they do
+        // in the catalog, so delivery selection matches server policy.
+        if let Err(error) = rusty_dlna_scan::apply_probe_sidecar_overrides(
+            &app.scan_cfg,
+            &source_path,
+            &mut probe.probe,
+        ) {
+            tracing::warn!(%error, detail_id = id, "probe sidecar could not be applied");
+        }
         let mut enriched = item.clone();
         enriched.probe = probe.probe;
         enriched.duration = probe.av.duration.or(enriched.duration);
@@ -2036,6 +2156,10 @@ pub(crate) fn item(app: &App, req: &HttpRequest) -> HttpResponse {
     );
     response.set("ETag", etag);
     response
+}
+
+fn web_enrichment_admission_timeout(helper_queue_timeout_secs: u64) -> Duration {
+    Duration::from_secs(helper_queue_timeout_secs.min(WEB_ENRICHMENT_ADMISSION_MAX_SECS))
 }
 
 enum TrickplayRequest<'a> {
@@ -2353,7 +2477,7 @@ pub(crate) fn preview(app: &App, req: &HttpRequest) -> HttpResponse {
                 "\"trickplay-api-v{WEB_SCHEMA_VERSION}-{}\"",
                 manifest.asset_revision
             );
-            if req.header("If-None-Match") == Some(etag.as_str()) {
+            if rusty_dlna_http::range::if_none_match_matches(req.header("If-None-Match"), &etag) {
                 let mut response = HttpResponse::new(304, "Not Modified");
                 response.set("ETag", etag);
                 response.set("Cache-Control", "private, max-age=0, must-revalidate");
@@ -2413,7 +2537,7 @@ pub(crate) fn preview(app: &App, req: &HttpRequest) -> HttpResponse {
                 return preview_unavailable(item_id, false);
             }
             let etag = format!("\"trickplay-v1-{revision}-{index}\"");
-            if req.header("If-None-Match") == Some(etag.as_str()) {
+            if rusty_dlna_http::range::if_none_match_matches(req.header("If-None-Match"), &etag) {
                 let mut response = HttpResponse::new(304, "Not Modified");
                 response.set("ETag", etag);
                 response.set("Cache-Control", "private, max-age=31536000, immutable");
@@ -2621,6 +2745,9 @@ pub(crate) fn transcode_status(app: &App, req: &HttpRequest) -> HttpResponse {
         state,
         retry_after_seconds,
         produced_seconds,
+        stream_start_seconds: (!cancelled)
+            .then(|| crate::remux::web_job_stream_start(app, id, session_id, request_id))
+            .flatten(),
         effective_recipe: (!cancelled)
             .then(|| crate::remux::web_job_effective_recipe(app, id, session_id, request_id))
             .flatten(),
@@ -2766,7 +2893,7 @@ pub(crate) fn browser_caption_response(app: &App, ext: &str, body: &[u8]) -> Htt
         Err(BrowserCaptionError::Encoding) => api_error(
             422,
             "caption_encoding",
-            "The caption file is not valid UTF-8.",
+            "The caption file's text encoding cannot be read.",
             false,
             None,
         ),
@@ -3276,11 +3403,22 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             Some("play_compatible"),
         );
     }
+    let mut video_output = requested_video_output;
     let copy_video = if copy_video_requested {
-        if !is_video
-            || quality != rusty_dlna_transcode::BrowserQuality::Auto
-            || !browser_can_remux_video(&item, &source)
+        let auto_video = is_video && quality == rusty_dlna_transcode::BrowserQuality::Auto;
+        if auto_video && browser_can_remux_video(&item, &source) {
+            true
+        } else if let Some(output) = (auto_video && fallback_reason == "native_ios")
+            .then(|| native_copy_fallback_output(source.hdr, hevc_hdr10_available))
+            .flatten()
         {
+            // Native clients request copy for every H.264/HEVC source and
+            // cannot retry a rejected download. The fallback is derived only
+            // from the request and stored probe facts, so every generation,
+            // seek, and cache identity for this URL resolves to one encode.
+            video_output = output;
+            false
+        } else {
             return api_error(
                 400,
                 "video_copy_unavailable",
@@ -3289,10 +3427,10 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
                 None,
             );
         }
-        true
     } else {
         false
     };
+    let copy_video_fallback = copy_video_requested && !copy_video;
     if repair_video_requested
         && (!is_video
             || quality != rusty_dlna_transcode::BrowserQuality::Auto
@@ -3374,17 +3512,17 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             item.probe.bit_depth,
         )
     });
-    let preserve_hevc_hdr = repair_video_encoder == Some("hevc_nvenc")
-        || requested_video_output == BrowserVideoOutput::HevcHdr10;
+    let preserve_hevc_hdr =
+        repair_video_encoder == Some("hevc_nvenc") || video_output == BrowserVideoOutput::HevcHdr10;
     let video_encoder = if !is_video || copy_video {
         "copy"
-    } else if requested_video_output == BrowserVideoOutput::HevcHdr10 {
+    } else if video_output == BrowserVideoOutput::HevcHdr10 {
         "hevc_nvenc"
     } else {
         repair_video_encoder
             .unwrap_or_else(|| rusty_dlna_transcode::browser_video_encoder(&app.cfg.web.encoder))
     };
-    let hardware_decode = if requested_video_output == BrowserVideoOutput::HevcHdr10 {
+    let hardware_decode = if video_output == BrowserVideoOutput::HevcHdr10 {
         rusty_dlna_transcode::browser_hdr_hardware_decode(
             video_encoder,
             source.video_codec,
@@ -3510,24 +3648,13 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             rusty_dlna_scan::rebase_media_path_for_config(&item.path, &app.scan_cfg);
         let opened = match rusty_dlna_scan::open_allowed_file(&configured_path, &app.scan_cfg) {
             Ok(opened) => opened,
+            // Not 403: this is unavailable media, not an authorization failure.
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                return api_error(
-                    403,
-                    "media_missing",
-                    "The media file is not available.",
-                    false,
-                    Some("return_to_library"),
-                );
+                return original_media_unavailable(false);
             }
             Err(error) => {
                 tracing::warn!(path = %configured_path.display(), %error, "web media missing");
-                return api_error(
-                    404,
-                    "media_missing",
-                    "The media file is not available.",
-                    true,
-                    Some("retry_media"),
-                );
+                return original_media_unavailable(true);
             }
         };
         drop(source_open);
@@ -3641,6 +3768,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         source_hdr = ?source.hdr,
         tone_map_to_sdr,
         copy_video,
+        copy_video_fallback,
         repair_video = repair_video_requested,
         copy_audio,
         audio_index = plan.audio_index,
@@ -3725,6 +3853,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         profile8_toolchain: None,
         audio_index: plan.audio_index,
         audio: remux_audio,
+        caption_info_sec: None,
     });
     response
 }
@@ -3855,12 +3984,40 @@ fn browser_video_codec_compatible(
                 && !rusty_dlna_transcode::browser_requires_sdr_tonemap(source.hdr)
         }
         rusty_dlna_transcode::VideoCodec::Hevc => {
-            matches!(
-                source.hdr,
-                HdrKind::Sdr | HdrKind::Hdr10 | HdrKind::DolbyVisionProfile8
-            )
+            // Empty or zero facts come from catalogs that item enrichment
+            // has not probed yet; keep their existing copy behavior.
+            let profile = item.probe.video_profile.trim().to_ascii_lowercase();
+            let profile_safe = profile.is_empty()
+                || matches!(profile.as_str(), "main" | "main 10" | "main still picture");
+            let pixel_format_safe = matches!(
+                item.probe.pixel_format.as_str(),
+                "" | "yuv420p" | "yuvj420p" | "yuv420p10le"
+            );
+            let bit_depth_safe = item.probe.bit_depth <= 10;
+            profile_safe
+                && pixel_format_safe
+                && bit_depth_safe
+                && matches!(
+                    source.hdr,
+                    HdrKind::Sdr | HdrKind::Hdr10 | HdrKind::DolbyVisionProfile8
+                )
         }
         _ => false,
+    }
+}
+
+/// Output for a native client's copy request that cannot be copied. The
+/// encode must keep the source's dynamic range: an HDR source becomes HEVC
+/// HDR10 only where that output exists, and is otherwise rejected rather than
+/// silently delivered as SDR to a client that asked for the source video.
+fn native_copy_fallback_output(
+    hdr: HdrKind,
+    hevc_hdr10_available: bool,
+) -> Option<BrowserVideoOutput> {
+    if hdr == HdrKind::Sdr {
+        Some(BrowserVideoOutput::H264Sdr)
+    } else {
+        hevc_hdr10_available.then_some(BrowserVideoOutput::HevcHdr10)
     }
 }
 
@@ -3910,7 +4067,35 @@ fn serve_original(
     // leak into the original media route when transcoding is disabled.
     original.query.clear();
     original.target = original.path.clone();
-    app.media(&original, false, peer)
+    app.media_with_open_errors(
+        &original,
+        false,
+        peer,
+        crate::http_app::OriginalOpenErrors::WebJson,
+    )
+}
+
+/// JSON `404 media_missing` for a catalog item whose file cannot be opened.
+/// A refused open (unreadable or outside the configured roots) is not
+/// retryable; a vanished file may reappear after the next scan.
+pub(crate) fn original_media_unavailable(recoverable: bool) -> HttpResponse {
+    if recoverable {
+        api_error(
+            404,
+            "media_missing",
+            "The media file is not available.",
+            true,
+            Some("retry_media"),
+        )
+    } else {
+        api_error(
+            404,
+            "media_missing",
+            "The media file is not available.",
+            false,
+            Some("return_to_library"),
+        )
+    }
 }
 
 fn download_content_disposition(file_name: &str, detail_id: i64, extension: &str) -> String {
@@ -4199,6 +4384,19 @@ fn hex(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn item_enrichment_admission_stays_below_client_request_timeouts() {
+        assert_eq!(web_enrichment_admission_timeout(1), Duration::from_secs(1));
+        assert_eq!(
+            web_enrichment_admission_timeout(30),
+            Duration::from_secs(WEB_ENRICHMENT_ADMISSION_MAX_SECS)
+        );
+        assert_eq!(
+            web_enrichment_admission_timeout(u64::MAX),
+            Duration::from_secs(10)
+        );
+    }
 
     #[test]
     fn web_item_ids_serialize_as_exact_decimal_strings() {

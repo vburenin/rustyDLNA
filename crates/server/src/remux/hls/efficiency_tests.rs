@@ -76,6 +76,23 @@ fn long_title_views_retain_history_timing_and_bound_mse_pages() {
     }
 }
 
+fn push_gops(index: &mut Index, offset: &mut u64, gops: &[(f64, bool)]) {
+    for &(seconds, random_access) in gops {
+        index
+            .push_fragment(
+                Fragment {
+                    offset: *offset,
+                    duration: seconds,
+                    random_access,
+                    continuation: false,
+                },
+                *offset + 16,
+            )
+            .unwrap();
+        *offset += 16;
+    }
+}
+
 #[test]
 fn native_target_is_frozen_and_later_larger_copied_gop_requires_restart() {
     let mut index = Index {
@@ -83,70 +100,23 @@ fn native_target_is_frozen_and_later_larger_copied_gop_requires_restart() {
         ..Index::default()
     };
     let mut offset = 32;
-    for (seconds, random_access) in [(2.1, true), (0.2, false), (1.0, true)] {
-        index
-            .push_fragment(
-                Fragment {
-                    offset,
-                    duration: seconds,
-                    random_access,
-                    continuation: false,
-                },
-                offset + 16,
-            )
-            .unwrap();
-        offset += 16;
-    }
+    push_gops(
+        &mut index,
+        &mut offset,
+        &[(2.1, true), (0.2, false), (1.0, true)],
+    );
     let first = index.playlist_view(false).unwrap();
     assert!(first
         .render("init", "segment")
         .unwrap()
-        .contains("#EXT-X-TARGETDURATION:2\n"));
-    index
-        .push_fragment(
-            Fragment {
-                offset,
-                duration: 2.49,
-                random_access: true,
-                continuation: false,
-            },
-            offset + 16,
-        )
-        .unwrap();
-    offset += 16;
-    assert!(index
-        .playlist_view(false)
-        .unwrap()
-        .render("init", "segment")
-        .unwrap()
-        .contains("#EXT-X-TARGETDURATION:2\n"));
-    index
-        .push_fragment(
-            Fragment {
-                offset,
-                duration: 3.0,
-                random_access: true,
-                continuation: false,
-            },
-            offset + 16,
-        )
-        .unwrap();
-    offset += 16;
+        .contains("#EXT-X-TARGETDURATION:10\n"));
+    // Ordinary later GOPs up to the copied floor keep the frozen target.
+    push_gops(&mut index, &mut offset, &[(10.49, true), (1.0, true)]);
     assert!(
         index.playlist_view(false).is_ok(),
-        "2.49 rounds within the original target"
+        "10.49 rounds within the copied floor"
     );
-    index
-        .push_fragment(
-            Fragment {
-                offset,
-                duration: 1.0,
-                random_access: true,
-                continuation: false,
-            },
-            offset + 16,
-        )
-        .unwrap();
+    push_gops(&mut index, &mut offset, &[(12.0, true), (1.0, true)]);
     assert!(index
         .playlist_view(false)
         .unwrap_err()
@@ -154,14 +124,125 @@ fn native_target_is_frozen_and_later_larger_copied_gop_requires_restart() {
     assert!(first
         .render("init", "segment")
         .unwrap()
-        .contains("#EXT-X-TARGETDURATION:2\n"));
-    // A fresh generation with a complete index knows the entire GOP maximum.
+        .contains("#EXT-X-TARGETDURATION:10\n"));
+    // A fresh generation chooses the known larger maximum.
     assert!(index
         .playlist_view_for(false, Some((2, 2)))
         .unwrap()
         .render("init", "segment")
         .unwrap()
-        .contains("#EXT-X-TARGETDURATION:3\n"));
+        .contains("#EXT-X-TARGETDURATION:12\n"));
+}
+
+#[test]
+fn growing_copied_target_reserves_headroom_for_later_longer_gops() {
+    let mut index = Index {
+        init_end: Some(32),
+        ..Index::default()
+    };
+    let mut offset = 32;
+    // Scene-cut keyframes give short early GOPs; a later GOP reaches the
+    // encoder's maximum keyframe interval.
+    push_gops(
+        &mut index,
+        &mut offset,
+        &[(1.0, true), (1.0, true), (1.0, true)],
+    );
+    let first = index
+        .playlist_view_for(false, Some((1, 1)))
+        .unwrap()
+        .render("init", "segment")
+        .unwrap();
+    assert!(first.contains("#EXT-X-TARGETDURATION:10\n"), "{first}");
+    assert_eq!(first.matches("#EXTINF:").count(), 2);
+    push_gops(&mut index, &mut offset, &[(8.0, false), (1.0, true)]);
+    let refreshed = index
+        .playlist_view_for(false, Some((1, 1)))
+        .unwrap()
+        .render("init", "segment")
+        .unwrap();
+    assert!(refreshed.contains("#EXT-X-TARGETDURATION:10\n"));
+    assert!(refreshed.contains("#EXTINF:9.000000,\n"));
+    // No tag is added: the copied playlist keeps its exact tag set.
+    let tags = refreshed
+        .lines()
+        .filter(|line| line.starts_with("#EXT"))
+        .map(|line| line.split(':').next().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        tags.into_iter().collect::<Vec<_>>(),
+        [
+            "#EXT-X-INDEPENDENT-SEGMENTS",
+            "#EXT-X-MAP",
+            "#EXT-X-MEDIA-SEQUENCE",
+            "#EXT-X-PLAYLIST-TYPE",
+            "#EXT-X-START",
+            "#EXT-X-TARGETDURATION",
+            "#EXT-X-VERSION",
+            "#EXTINF",
+            "#EXTM3U",
+        ]
+    );
+    // Independent encoded fragments and Media Source keep their proven
+    // one-second targets.
+    let mut encoded = Index {
+        init_end: Some(32),
+        ..Index::default()
+    };
+    let mut offset = 32;
+    push_gops(&mut encoded, &mut offset, &[(1.0, true), (1.0, true)]);
+    assert!(encoded
+        .playlist_view_for(true, Some((1, 1)))
+        .unwrap()
+        .render("init", "segment")
+        .unwrap()
+        .contains("#EXT-X-TARGETDURATION:1\n"));
+    assert!(encoded
+        .mse_playlist_after("init", "segment", 0)
+        .unwrap()
+        .contains("#EXT-X-TARGETDURATION:1\n"));
+    // A finalized copied index knows its whole maximum.
+    encoded.finalized = true;
+    assert!(encoded
+        .playlist_view_for(false, Some((1, 2)))
+        .unwrap()
+        .render("init", "segment")
+        .unwrap()
+        .contains("#EXT-X-TARGETDURATION:1\n"));
+}
+
+#[test]
+fn copied_startup_lookahead_is_bounded_and_only_gates_first_publication() {
+    let mut index = Index {
+        init_end: Some(32),
+        ..Index::default()
+    };
+    let mut offset = 32;
+    push_gops(&mut index, &mut offset, &[(2.0, true), (2.0, true)]);
+    let generation = Some((1, 1));
+    assert!(index.has_startup_buffer(false));
+    assert!(!index.has_dependent_startup_buffer(false, generation, true));
+    // An expired bounded wait, complete output, or an already published
+    // generation never waits for the look-ahead.
+    assert!(index.has_dependent_startup_buffer(false, generation, false));
+    assert!(index.has_dependent_startup_buffer(true, generation, true));
+    index.playlist_view_for(false, generation).unwrap();
+    assert!(index.has_dependent_startup_buffer(false, generation, true));
+    assert!(!index.has_dependent_startup_buffer(false, Some((1, 2)), true));
+    // An early GOP longer than the floor is seen before the target freezes.
+    push_gops(
+        &mut index,
+        &mut offset,
+        &[(12.0, true), (3.0, true), (3.0, true), (1.0, true)],
+    );
+    assert!(index.segment_time >= NATIVE_COPIED_STARTUP_LOOKAHEAD_SECONDS);
+    assert!(index.has_dependent_startup_buffer(false, Some((1, 2)), true));
+    assert!(index
+        .playlist_view_for(false, Some((1, 2)))
+        .unwrap()
+        .render("init", "segment")
+        .unwrap()
+        .contains("#EXT-X-TARGETDURATION:12\n"));
 }
 
 #[test]
@@ -179,7 +260,7 @@ fn native_generation_targets_are_bounded_and_scoped_to_request_owners() {
     index.push_segment(Segment {
         offset: 48,
         length: 16,
-        duration: 3.0,
+        duration: 12.0,
     });
     assert!(index.playlist_view_for(false, Some((1, 10))).is_err());
     index.finalized = true;
@@ -187,7 +268,7 @@ fn native_generation_targets_are_bounded_and_scoped_to_request_owners() {
     assert!(new
         .render("init", "segment")
         .unwrap()
-        .contains("#EXT-X-TARGETDURATION:3\n"));
+        .contains("#EXT-X-TARGETDURATION:12\n"));
     assert!(index.playlist_view_for(false, Some((1, 10))).is_err());
     index.forget_generation(1, 10);
     assert_eq!(index.native_targets.len(), 1);
@@ -219,7 +300,7 @@ fn removing_one_session_preserves_another_sessions_same_numbered_generation() {
     index.push_segment(Segment {
         offset: 48,
         length: 16,
-        duration: 3.0,
+        duration: 12.0,
     });
     index.forget_generation(1, 10);
     assert!(index
@@ -231,65 +312,75 @@ fn removing_one_session_preserves_another_sessions_same_numbered_generation() {
         .unwrap()
         .render("init", "segment")
         .unwrap()
-        .contains("#EXT-X-TARGETDURATION:3\n"));
+        .contains("#EXT-X-TARGETDURATION:12\n"));
 }
 
-#[tokio::test]
-async fn same_completed_job_accepts_new_hls_generation_after_longer_copied_gop() {
-    use super::super::tests::{growing_test_job, test_app};
-    use super::super::{serve_fragment_playlist, RemuxJob, RemuxState};
+async fn serve_native_playlist(
+    app: Arc<crate::App>,
+    job: Arc<super::super::RemuxJob>,
+    request_id: u64,
+) -> (Result<(), String>, String) {
     use tokio::io::AsyncReadExt;
-
-    async fn serve(
-        app: Arc<crate::App>,
-        job: Arc<RemuxJob>,
-        request_id: u64,
-    ) -> (Result<(), String>, String) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let request = rusty_dlna_http::HttpRequest::parse_headers(&format!(
-            "GET /web/media/42.m3u8?delivery=hls&session=1&request={request_id} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
-        )).unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            serve_fragment_playlist(&app, &mut socket, &request, &job, false, false)
-                .await
-                .map_err(|error| error.to_string())
-        });
-        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
-        let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let request = rusty_dlna_http::HttpRequest::parse_headers(&format!(
+        "GET /web/media/42.m3u8?delivery=hls&session=1&request={request_id} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+    )).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        super::super::serve_fragment_playlist(&app, &mut socket, &request, &job, false, false)
             .await
-            .unwrap()
-            .unwrap();
-        (server.await.unwrap(), String::from_utf8(response).unwrap())
-    }
+            .map_err(|error| error.to_string())
+    });
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    (server.await.unwrap(), String::from_utf8(response).unwrap())
+}
 
-    let dir = tests::TempDir::new("native-generation-wire");
-    let app = test_app(dir.path(), 1);
-    let mut bytes = synthetic(6);
+/// Marks the given one-second synthetic movie fragments as dependent, so
+/// each random-access group becomes one copied GOP.
+fn make_dependent(bytes: &mut [u8], fragments: impl IntoIterator<Item = usize>) {
     let runs = bytes
         .windows(4)
         .enumerate()
         .filter_map(|(offset, name)| (name == b"trun").then_some(offset))
         .collect::<Vec<_>>();
-    // Random-access groups have durations2,3,1seconds, while movie fragments
-    // retain one-second timings and the copied stream's decoder dependencies.
-    for index in [1, 3, 4] {
+    for index in fragments {
         bytes[runs[index] + 12..runs[index] + 16].copy_from_slice(&0x0001_0000_u32.to_be_bytes());
     }
-    let split = bytes
+}
+
+fn moof_offset(bytes: &[u8], fragment: usize) -> usize {
+    bytes
         .windows(4)
         .enumerate()
         .filter(|(_, name)| *name == b"moof")
-        .nth(3)
+        .nth(fragment)
         .unwrap()
         .0
-        - 4;
+        - 4
+}
+
+#[tokio::test]
+async fn same_completed_job_accepts_new_hls_generation_after_longer_copied_gop() {
+    use super::super::tests::{growing_test_job, test_app};
+    use super::super::RemuxState;
+
+    let dir = tests::TempDir::new("native-generation-wire");
+    let app = test_app(dir.path(), 1);
+    // Twenty one-second GOPs satisfy the startup look-ahead, then an
+    // eleven-second GOP exceeds the copied floor, then one short GOP.
+    let mut bytes = synthetic(33);
+    make_dependent(&mut bytes, 21..=30);
+    let split = moof_offset(&bytes, 21);
     let job = growing_test_job(dir.path(), 42, &bytes[..split]);
-    let (result, text) = serve(app.clone(), job.clone(), 10).await;
+    let (result, text) = serve_native_playlist(app.clone(), job.clone(), 10).await;
     result.unwrap();
-    assert!(text.contains("#EXT-X-TARGETDURATION:2\n"));
+    assert!(text.contains("#EXT-X-TARGETDURATION:10\n"), "{text}");
     std::fs::OpenOptions::new()
         .append(true)
         .open(&job.part)
@@ -300,20 +391,70 @@ async fn same_completed_job_accepts_new_hls_generation_after_longer_copied_gop()
     job.transition(RemuxState::Complete);
     // The old generation's published target cannot grow, so its playlist is
     // refused with an HTTP error (not a dropped connection) and no playlist.
-    let (result, text) = serve(app.clone(), job.clone(), 10).await;
+    let (result, text) = serve_native_playlist(app.clone(), job.clone(), 10).await;
     result.unwrap();
     assert!(text.starts_with("HTTP/1.1 500 "), "{text}");
     assert!(text.contains("\"code\":\"transcode_failed\""), "{text}");
     assert!(!text.contains("#EXTM3U"), "{text}");
-    let (result, text) = serve(app.clone(), job.clone(), 11).await;
+    let (result, text) = serve_native_playlist(app.clone(), job.clone(), 11).await;
     result.unwrap();
-    assert!(text.contains("#EXT-X-TARGETDURATION:3\n"));
-    assert_eq!(text.matches("#EXTINF:").count(), 3);
+    assert!(text.contains("#EXT-X-TARGETDURATION:11\n"), "{text}");
+    assert_eq!(text.matches("#EXTINF:").count(), 23);
     assert!(text.ends_with("#EXT-X-ENDLIST\n"));
-    let (_, text) = serve(app, job, 10).await;
+    let (_, text) = serve_native_playlist(app, job, 10).await;
     assert!(
         text.starts_with("HTTP/1.1 500 ") && !text.contains("#EXTM3U"),
         "the old generation remains frozen: {text}"
+    );
+}
+
+#[tokio::test]
+async fn growing_copied_playlist_waits_for_lookahead_and_publishes_early_long_gop() {
+    use super::super::tests::{growing_test_job, test_app};
+
+    let dir = tests::TempDir::new("native-lookahead-wire");
+    let app = test_app(dir.path(), 1);
+    // GOPs of 1, 1 and 12 seconds, then one-second GOPs. Only the first two
+    // short GOPs are complete when the playlist is requested.
+    let mut bytes = synthetic(24);
+    make_dependent(&mut bytes, 3..=13);
+    let split = moof_offset(&bytes, 3);
+    let job = growing_test_job(dir.path(), 42, &bytes[..split]);
+    let started = Instant::now();
+    let served = tokio::spawn(serve_native_playlist(app.clone(), job.clone(), 10));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !served.is_finished(),
+        "first publication waits for look-ahead"
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&job.part)
+        .unwrap()
+        .write_all(&bytes[split..])
+        .unwrap();
+    let (result, text) = served.await.unwrap();
+    result.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "look-ahead published as soon as it was satisfied"
+    );
+    assert!(text.contains("#EXT-X-TARGETDURATION:12\n"), "{text}");
+    assert!(!text.contains("#EXT-X-ENDLIST"));
+
+    // A producer that never reaches the look-ahead still publishes its
+    // ordinary startup buffer after the bounded wait, never a failure.
+    let job = growing_test_job(dir.path(), 43, &synthetic(4));
+    let started = Instant::now();
+    let (result, text) = serve_native_playlist(app, job, 10).await;
+    result.unwrap();
+    let elapsed = started.elapsed();
+    assert!(text.starts_with("HTTP/1.1 200 "), "{text}");
+    assert!(text.contains("#EXT-X-TARGETDURATION:10\n"), "{text}");
+    assert!(
+        elapsed >= super::super::NATIVE_COPIED_LOOKAHEAD_WAIT
+            && elapsed < super::super::NATIVE_COPIED_LOOKAHEAD_WAIT + Duration::from_secs(3),
+        "{elapsed:?}"
     );
 }
 

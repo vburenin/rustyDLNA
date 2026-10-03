@@ -301,7 +301,19 @@ impl MSearchHeader {
     }
 }
 
+/// Parse an M-SEARCH sent to the SSDP multicast group. MX is required.
 pub fn parse_msearch(packet: &str) -> Result<MSearch, MSearchReject> {
+    parse_msearch_delivered(packet, false)
+}
+
+/// Parse an M-SEARCH sent directly to one of the server's unicast addresses.
+/// UPnP 1.1 unicast searches omit MX and expect an immediate answer, so a
+/// missing MX is accepted as 0; a present MX must still be a valid integer.
+pub fn parse_unicast_msearch(packet: &str) -> Result<MSearch, MSearchReject> {
+    parse_msearch_delivered(packet, true)
+}
+
+fn parse_msearch_delivered(packet: &str, unicast: bool) -> Result<MSearch, MSearchReject> {
     if has_lone_carriage_return(packet) {
         return Err(MSearchReject::NotHttp11);
     }
@@ -347,6 +359,7 @@ pub fn parse_msearch(packet: &str) -> Result<MSearch, MSearchReject> {
         _ => return Err(MSearchReject::BadMan),
     }
     let mx = match mx {
+        None if unicast => return Ok(MSearch { st, mx: 0 }),
         None => return Err(MSearchReject::BadMx),
         Some(s) => s.parse::<u32>().map_err(|_| MSearchReject::BadMx)?,
     };
@@ -794,6 +807,32 @@ mod tests {
         let huge_mx =
             "M-SEARCH * HTTP/1.1\r\nMAN: \"ssdp:discover\"\r\nMX: 999999\r\nST: ssdp:all\r\n\r\n";
         assert_eq!(parse_msearch(huge_mx).unwrap().mx, 5);
+    }
+
+    #[test]
+    fn unicast_msearch_allows_missing_mx_but_not_a_malformed_one() {
+        let missing_mx = "M-SEARCH * HTTP/1.1\r\nHOST: 192.0.2.10:1900\r\nMAN: \"ssdp:discover\"\r\nST: upnp:rootdevice\r\n\r\n";
+        assert_eq!(parse_msearch(missing_mx), Err(MSearchReject::BadMx));
+        assert_eq!(
+            parse_unicast_msearch(missing_mx),
+            Ok(MSearch {
+                st: "upnp:rootdevice".into(),
+                mx: 0
+            })
+        );
+        let bad_mx =
+            "M-SEARCH * HTTP/1.1\r\nMAN: \"ssdp:discover\"\r\nMX: soon\r\nST: ssdp:all\r\n\r\n";
+        assert_eq!(parse_unicast_msearch(bad_mx), Err(MSearchReject::BadMx));
+        let with_mx =
+            "M-SEARCH * HTTP/1.1\r\nMAN: \"ssdp:discover\"\r\nMX: 9\r\nST: ssdp:all\r\n\r\n";
+        assert_eq!(parse_unicast_msearch(with_mx).unwrap().mx, 5);
+        let bad_man = "M-SEARCH * HTTP/1.1\r\nMAN: ssdp:discover\r\nST: ssdp:all\r\n\r\n";
+        assert_eq!(parse_unicast_msearch(bad_man), Err(MSearchReject::BadMan));
+        let notify = "NOTIFY * HTTP/1.1\r\nNT: upnp:rootdevice\r\nNTS: ssdp:alive\r\n\r\n";
+        assert_eq!(
+            parse_unicast_msearch(notify),
+            Err(MSearchReject::NotMsearch)
+        );
     }
 
     #[test]

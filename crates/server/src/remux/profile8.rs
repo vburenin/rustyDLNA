@@ -153,7 +153,7 @@ pub(super) fn observe_final_mux(
     }
     let Some(observation) = monitor
         .poll(app, job, kind)
-        .map_err(|error| format!("transcode cache limits: {error}"))?
+        .map_err(|error| format!("{}{error}", super::CACHE_LIMITS_ERROR_PREFIX))?
     else {
         return Ok(false);
     };
@@ -254,6 +254,7 @@ mod tests {
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
             effective_recipe: Mutex::new(None),
+            stream_origin: std::sync::OnceLock::new(),
         }
     }
 

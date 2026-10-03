@@ -1,4 +1,5 @@
-//! Bounded source facts for completed-output coverage decisions.
+//! Bounded source facts for completed-output coverage decisions and for the
+//! output origin of a copied-video seek.
 //!
 //! The catalog records only a container duration. A container can run past
 //! the streams a job selected (another audio or subtitle stream, or a trailing
@@ -50,6 +51,7 @@ pub(super) fn gather(
     deadline: Instant,
     cancelled: &AtomicBool,
 ) -> Result<SourceEvidence, String> {
+    let cancelled = &[cancelled];
     let (start_time, streams) = streams(source, deadline, cancelled)?;
     // Ordinals follow FFmpeg's `0:v:0` / `0:a:N` stream specifiers.
     let of_type = |kind: &str| {
@@ -123,11 +125,109 @@ pub(super) fn gather(
     })
 }
 
+/// A keyframe landing found this far past the requested seek is not the
+/// backward seek FFmpeg performs; the origin is then left unknown.
+const LANDING_LEAD_TOLERANCE_SECONDS: f64 = 1.0;
+/// FFmpeg's input seek moves this much earlier when a video stream has
+/// decoder delay and the demuxer does not seek by presentation time.
+const DTS_SEEK_HEURISTIC_SECONDS: f64 = 3.0 / 23.0;
+
+/// Source time, relative to the container start, of the keyframe a copied
+/// video `-ss <seek>` input seek begins at. `-avoid_negative_ts make_zero`
+/// moves that keyframe to output time zero, so it is the output's origin.
+///
+/// This repeats FFmpeg's own demuxer seek with demux-only FFprobe reads of the
+/// rooted descriptor: one stream-information read, then one video packet.
+/// Index-seeking demuxers (Matroska, MP4) land on a keyframe. A generic
+/// timestamp seek (MPEG-TS, M2TS and similar) can land between keyframes;
+/// FFmpeg then still emits every other selected stream, such as copied or
+/// encoded audio, from the landing while copied video waits for its next
+/// keyframe, so output zero depends on which streams are mapped. Such a
+/// landing returns `None`, as does any landing that cannot be established.
+///
+/// The origin is the keyframe's presentation time. Output zero is the
+/// earliest timestamp across the muxed streams, so B-frame decode lead and
+/// audio interleaved around the keyframe can place it a fraction of a second
+/// earlier; the origin is accurate to well under one second, not one frame.
+///
+/// Any one of the `cancelled` flags stops the probe and reaps FFprobe.
+pub(super) fn copied_seek_origin(
+    source: &File,
+    seek: f64,
+    deadline: Instant,
+    cancelled: &[&AtomicBool],
+) -> Result<Option<f64>, String> {
+    if !seek.is_finite() || seek <= 0.0 {
+        return Ok(Some(0.0));
+    }
+    let output = ffprobe(
+        source,
+        &[
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "format=format_name,start_time:stream=has_b_frames",
+            "-of",
+            "compact=p=0",
+        ],
+        deadline,
+        cancelled,
+    )?;
+    let mut start_time = 0.0;
+    let mut seeks_to_pts = false;
+    let mut video_delay = false;
+    for line in output.lines() {
+        if let Some(value) = field(line, "start_time") {
+            start_time = value;
+        }
+        if let Some(name) = line
+            .split('|')
+            .find_map(|pair| pair.strip_prefix("format_name="))
+        {
+            seeks_to_pts = demuxer_seeks_to_pts(name);
+        }
+        video_delay |= field(line, "has_b_frames").is_some_and(|delay| delay > 0.0);
+    }
+    let target = copied_seek_target(start_time, seek, seeks_to_pts, video_delay);
+    let first = packets(
+        source,
+        Some("v:0"),
+        &format!("{target:.6}%+#1"),
+        deadline,
+        cancelled,
+    )?;
+    Ok(first
+        .first()
+        .filter(|packet| packet.keyframe)
+        .map(|keyframe| (keyframe.start - start_time).max(0.0))
+        .filter(|origin| {
+            origin.is_finite()
+                && *origin >= seek - KEYFRAME_SEARCH_SECONDS
+                && *origin <= seek + LANDING_LEAD_TOLERANCE_SECONDS
+        }))
+}
+
+/// FFmpeg's MOV/MP4 demuxer is the admitted container family that declares
+/// `AVFMT_SEEK_TO_PTS`; Matroska, MPEG-TS and others seek by decode time.
+fn demuxer_seeks_to_pts(format_name: &str) -> bool {
+    format_name.split(',').any(|name| name == "mov")
+}
+
+/// The absolute timestamp FFmpeg passes to its demuxer for `-ss <seek>`.
+fn copied_seek_target(start_time: f64, seek: f64, seeks_to_pts: bool, video_delay: bool) -> f64 {
+    let heuristic = if video_delay && !seeks_to_pts {
+        DTS_SEEK_HEURISTIC_SECONDS
+    } else {
+        0.0
+    };
+    start_time + seek - heuristic
+}
+
 /// The source's start time and its `(index, codec_type)` streams in order.
 fn streams(
     source: &File,
     deadline: Instant,
-    cancelled: &AtomicBool,
+    cancelled: &[&AtomicBool],
 ) -> Result<(f64, Vec<(usize, String)>), String> {
     let output = ffprobe(
         source,
@@ -165,7 +265,7 @@ fn packets(
     selector: Option<&str>,
     interval: &str,
     deadline: Instant,
-    cancelled: &AtomicBool,
+    cancelled: &[&AtomicBool],
 ) -> Result<Vec<Packet>, String> {
     let mut arguments = vec!["-read_intervals", interval];
     if let Some(selector) = selector {
@@ -216,7 +316,7 @@ fn ffprobe(
     source: &File,
     arguments: &[&str],
     deadline: Instant,
-    cancelled: &AtomicBool,
+    cancelled: &[&AtomicBool],
 ) -> Result<String, String> {
     let deadline = deadline.min(Instant::now() + MAX_PROBE_DURATION);
     let mut command = std::process::Command::new("ffprobe");
@@ -234,7 +334,7 @@ fn ffprobe(
         .inherit_file_at(source, 3)
         .map_err(|error| format!("source evidence descriptor: {error}"))?
         .run_until(deadline, POLL, || {
-            if cancelled.load(Ordering::Acquire) {
+            if cancelled.iter().any(|flag| flag.load(Ordering::Acquire)) {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())
@@ -277,5 +377,16 @@ mod tests {
         assert_eq!((audio.start, audio.end, audio.keyframe), (3.0, 3.0, false));
         assert_eq!(parse_packet("start_time=0.000000"), None);
         assert_eq!(field("start_time=1.400000", "start_time"), Some(1.4));
+    }
+
+    #[test]
+    fn copied_seek_target_mirrors_ffmpeg_demuxer_seek() {
+        assert!(demuxer_seeks_to_pts("mov,mp4,m4a,3gp,3g2,mj2"));
+        assert!(!demuxer_seeks_to_pts("matroska,webm"));
+        assert!(!demuxer_seeks_to_pts("mpegts"));
+        assert_eq!(copied_seek_target(0.0, 30.0, true, true), 30.0);
+        assert_eq!(copied_seek_target(1.4, 30.0, false, false), 31.4);
+        let delayed = copied_seek_target(-0.005, 30.0, false, true);
+        assert!((delayed - (30.0 - 0.005 - 3.0 / 23.0)).abs() < 1e-9);
     }
 }

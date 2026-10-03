@@ -47,8 +47,8 @@ pub use media_format::{
     MediaKind, ResolvedMediaFormat, MEDIA_FORMATS,
 };
 pub use paths::{
-    album_art_id_from_path, caption_from_path, media_item_id_from_path, strtoll_prefix,
-    transcode_id_from_path,
+    album_art_id_from_path, caption_from_path, caption_route_from_path, media_item_id_from_path,
+    strtoll_prefix, transcode_id_from_path, CaptionSelector,
 };
 pub use persist::http_should_persist;
 pub use protocol_info::{protocol_info_source, PROTOCOL_INFO_SOURCE};

@@ -25,6 +25,16 @@ use std::path::Path;
 const MAX_INDEX_BOX_BYTES: u64 = 4 * 1024 * 1024;
 const MIN_HLS_TARGET_DURATION_SECONDS: u64 = 1;
 const HLS_STARTUP_BUFFER_SECONDS: f64 = 1.0;
+/// A growing EVENT playlist without builder-proven independent fragments
+/// (normally copied video; also audio-only output or a re-encoding fallback
+/// of such a plan) cannot know its longest GOP when it freezes the target. x264/x265 default to a 250-frame maximum keyframe
+/// interval, which rounds to at most ten seconds at 23.976 fps or faster; a
+/// target above every EXTINF is valid and only lengthens client reloads.
+const NATIVE_COPIED_TARGET_FLOOR_SECONDS: u64 = 10;
+/// First publication of a growing copied-video generation waits briefly for
+/// this much complete media, so early long GOPs set the frozen target and the
+/// client starts with two floor-sized target durations of history.
+const NATIVE_COPIED_STARTUP_LOOKAHEAD_SECONDS: f64 = 20.0;
 const MAX_MSE_PLAYLIST_FRAGMENTS: usize = 256;
 const MAX_INDEX_BOXES: usize = 200_000;
 pub(super) const MAX_INDEX_FRAGMENTS: usize = 100_000;
@@ -279,6 +289,25 @@ impl Index {
         self.has_playable_segment() && (complete || self.segment_time >= HLS_STARTUP_BUFFER_SECONDS)
     }
 
+    /// Copied-video (GOP-coalesced) native playlists: a generation that has
+    /// not yet frozen its target additionally waits for the startup
+    /// look-ahead while `lookahead` is still within its bounded wait.
+    /// Published generations, complete output and expired waits use the
+    /// ordinary startup buffer.
+    pub(super) fn has_dependent_startup_buffer(
+        &self,
+        complete: bool,
+        generation: PlaylistGeneration,
+        lookahead: bool,
+    ) -> bool {
+        self.has_startup_buffer(complete)
+            && (complete
+                || self.finalized
+                || !lookahead
+                || self.native_targets.contains_key(&(false, generation))
+                || self.segment_time >= NATIVE_COPIED_STARTUP_LOOKAHEAD_SECONDS)
+    }
+
     pub(super) fn has_mse_startup_buffer(&self, complete: bool) -> bool {
         self.init_end.is_some()
             && !self.fragments.is_empty()
@@ -336,7 +365,16 @@ impl Index {
         if segments.is_empty() {
             return Err("fragmented MP4 has no complete media segments".into());
         }
-        let target = target.max(MIN_HLS_TARGET_DURATION_SECONDS);
+        let observed = target.max(MIN_HLS_TARGET_DURATION_SECONDS);
+        // Encoded independent fragments have a builder-proven duration and a
+        // finalized index knows its whole maximum. Any other growing
+        // generation (normally copied video) reserves headroom for a later,
+        // longer source GOP.
+        let target = if independent_fragments || self.finalized {
+            observed
+        } else {
+            observed.max(NATIVE_COPIED_TARGET_FLOOR_SECONDS)
+        };
         let key = (independent_fragments, generation);
         if !self.native_targets.contains_key(&key)
             && self.native_targets.len() >= 2 * (super::MAX_WEB_PLAYBACK_SESSIONS + 1)

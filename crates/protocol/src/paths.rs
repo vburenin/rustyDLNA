@@ -78,16 +78,33 @@ fn caption_index_prefix(value: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// `/Captions/{id}/{index}.{ext}` or `/Captions/{id}.srt`.
-pub fn caption_from_path(path: &str) -> Option<(i64, u32)> {
+/// Which sidecar of an item a caption URL names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptionSelector {
+    /// `/Captions/{id}.srt`: the item's default renderer caption.
+    Default,
+    /// `/Captions/{id}/{index}.{ext}`: one stable caption index.
+    Index(u32),
+}
+
+/// `/Captions/{id}/{index}.{ext}` or the non-indexed `/Captions/{id}.srt`.
+pub fn caption_route_from_path(path: &str) -> Option<(i64, CaptionSelector)> {
     let rest = strip_query(path).strip_prefix(CAPTIONS_PREFIX)?;
     let id = strtoll_prefix(rest)?;
     let after_id = rest.trim_start_matches(|c: char| c == '+' || c == '-' || c.is_ascii_digit());
     if let Some(indexed) = after_id.strip_prefix('/') {
-        Some((id, caption_index_prefix(indexed)?))
+        Some((id, CaptionSelector::Index(caption_index_prefix(indexed)?)))
     } else {
-        Some((id, 0))
+        Some((id, CaptionSelector::Default))
     }
+}
+
+/// `/Captions/{id}/{index}.{ext}` or `/Captions/{id}.srt` (index 0).
+pub fn caption_from_path(path: &str) -> Option<(i64, u32)> {
+    caption_route_from_path(path).map(|(id, selector)| match selector {
+        CaptionSelector::Default => (id, 0),
+        CaptionSelector::Index(index) => (id, index),
+    })
 }
 
 pub fn transcode_item_url(host: &str, port: u16, detail_id: i64) -> String {
@@ -171,6 +188,23 @@ mod tests {
         );
         assert_eq!(caption_from_path("/Captions/9/-0.srt"), Some((9, 0)));
         assert_eq!(caption_from_path("/Captions/9/legacy.srt"), Some((9, 0)));
+        assert_eq!(
+            caption_route_from_path("/Captions/9.srt"),
+            Some((9, CaptionSelector::Default))
+        );
+        assert_eq!(
+            caption_route_from_path("/Captions/9.srt?x=1"),
+            Some((9, CaptionSelector::Default))
+        );
+        assert_eq!(
+            caption_route_from_path("/Captions/9/0.srt"),
+            Some((9, CaptionSelector::Index(0)))
+        );
+        assert_eq!(
+            caption_route_from_path("/Captions/9/legacy.srt"),
+            Some((9, CaptionSelector::Index(0)))
+        );
+        assert_eq!(caption_from_path("/Captions/9.srt"), Some((9, 0)));
         assert_eq!(
             caption_from_path("/Captions/9/7.decorative.srt"),
             Some((9, 7))

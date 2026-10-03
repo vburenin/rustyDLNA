@@ -515,7 +515,12 @@ impl ScanSession {
         let reset = self
             .stage
             .as_ref()
-            .ok_or(rusqlite::Error::InvalidQuery)
+            .ok_or_else(|| {
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+                    Some("scan stage is not open".into()),
+                )
+            })
             .and_then(|stage| {
                 stage
                     .set_scan_catalog_epoch(epoch)

@@ -138,13 +138,17 @@ pub struct Config {
     /// Database directory. Default: `cache_dir`. File is `files.db`.
     #[serde(default)]
     pub db_dir: Option<String>,
-    /// Seconds between library rescans (new/changed/deleted files). 0 = off.
+    /// Minimum seconds between full library reconciliations
+    /// (new/changed/deleted files). 0 = off.
     #[serde(default = "default_rescan")]
     pub rescan_secs: u64,
-    /// Optional upper bound for adaptive full reconciliation. Zero keeps the
-    /// legacy fixed cadence. When set, it must be at least `rescan_secs`.
+    /// Upper bound for adaptive full reconciliation. Omitted selects
+    /// [`DEFAULT_RESCAN_MAX_SECS`] (or `rescan_secs` when that is larger);
+    /// an explicit zero keeps a fixed `rescan_secs` cadence. When non-zero,
+    /// it must be at least `rescan_secs`. Use [`Config::reconcile_max_secs`]
+    /// for the resolved value.
     #[serde(default)]
-    pub rescan_max_secs: u64,
+    pub rescan_max_secs: Option<u64>,
     /// Keep Kodi resume positions and play counts for this many 24-hour days
     /// since their last update. 0 preserves them indefinitely.
     #[serde(default)]
@@ -209,7 +213,7 @@ impl Default for Config {
             root_container: None,
             db_dir: None,
             rescan_secs: default_rescan(),
-            rescan_max_secs: 0,
+            rescan_max_secs: None,
             bookmark_retention_days: 0,
             max_request_body_bytes: default_request_body_bytes(),
             max_connections: default_connections(),
@@ -221,8 +225,28 @@ impl Default for Config {
     }
 }
 
+/// Default minimum full-reconciliation interval. Inotify publishes ordinary
+/// local changes; the periodic walk is the safety net and the only change
+/// detection for network filesystems whose remote writes raise no events.
+pub const DEFAULT_RESCAN_SECS: u64 = 300;
+/// Default adaptive upper bound when `rescan_max_secs` is omitted.
+pub const DEFAULT_RESCAN_MAX_SECS: u64 = 3_600;
+
 fn default_rescan() -> u64 {
-    30
+    DEFAULT_RESCAN_SECS
+}
+
+impl Config {
+    /// Resolved upper bound for periodic reconciliation. Zero only when the
+    /// periodic worker is disabled; equal to `rescan_secs` for a fixed cadence.
+    pub fn reconcile_max_secs(&self) -> u64 {
+        match self.rescan_max_secs {
+            Some(0) => self.rescan_secs,
+            Some(maximum) => maximum,
+            None if self.rescan_secs == 0 => 0,
+            None => DEFAULT_RESCAN_MAX_SECS.max(self.rescan_secs),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -542,9 +566,9 @@ pub(crate) fn validate_http_config(cfg: &Config) -> Result<(), ConfigValidationE
     if cfg.rescan_secs > 31_536_000 {
         return Err("rescan_secs must be 0 or at most 31536000".into());
     }
-    if cfg.rescan_max_secs > 31_536_000
-        || (cfg.rescan_max_secs > 0 && cfg.rescan_secs > 0 && cfg.rescan_max_secs < cfg.rescan_secs)
-    {
+    if cfg.rescan_max_secs.is_some_and(|maximum| {
+        maximum > 31_536_000 || (maximum > 0 && cfg.rescan_secs > 0 && maximum < cfg.rescan_secs)
+    }) {
         return Err("rescan_max_secs must be 0 or between rescan_secs and 31536000".into());
     }
     if cfg.bookmark_retention_days > 36_500 {

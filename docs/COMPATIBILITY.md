@@ -28,7 +28,7 @@ outside the current product contract.
 | `friendly_name`, `network_interface`, `media_dir`, `exclude_dir`, `root_container`, `max_connections` | Supported with strict startup validation. `media_dir` type prefixes are per root. |
 | HTTP and SSDP ports | The HTTP port is selected with `--port` or `RUSTY_DLNA_HTTP_PORT`; the SSDP port uses `RUSTY_DLNA_SSDP_PORT`. Environment values take precedence and invalid values fail startup. Ports are not TOML keys. |
 | `exclude_file` | Supported with documented ASCII case-insensitive basename `*`/`?` semantics. |
-| `presentation_url` | Generated from the selected advertised interface; not user-overridable, preventing an inconsistent address. |
+| `presentation_url` | Generated from the announced interface the request arrived on (the primary advertised address otherwise), like every absolute DLNA URL; not user-overridable, preventing an inconsistent address. |
 | model name/number | Fixed compatibility identity, with client-specific Xbox behavior; not user-overridable. |
 | `strict_dlna` | Not a global switch. Strict checks and client exceptions are applied by identified renderer profile. |
 | `force_sort_criteria` | Not a global switch. Required forced ordering is selected by renderer profile; explicit valid SOAP sort criteria still work. |

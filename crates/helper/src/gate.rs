@@ -133,6 +133,16 @@ impl HelperGate {
         Err(HelperAdmissionError::Rejected)
     }
 
+    /// Opportunistic admission for optional work that is skipped, not
+    /// refused, when no slot is idle. Unlike [`Self::try_acquire`], a skip
+    /// is not contention: it leaves the saturation and rejection counters
+    /// that operators alert on unchanged. Queued waiters are never bypassed.
+    pub fn try_acquire_idle(self: &Arc<Self>) -> Option<HelperPermit> {
+        let mut state = self.lock_state();
+        (state.active < self.max_active && state.queue.is_empty())
+            .then(|| self.admit(&mut state, 1))
+    }
+
     pub fn acquire_timeout(
         self: &Arc<Self>,
         timeout: Duration,
@@ -413,6 +423,38 @@ mod tests {
         assert_eq!(metrics.max_active, 1);
         assert_eq!(metrics.queue_capacity, 1);
         assert_eq!(metrics.rejected_total, 1);
+    }
+
+    #[test]
+    fn opportunistic_admission_skips_without_counting_contention() {
+        let gate = Arc::new(HelperGate::new(1, 1));
+        let permit = gate.try_acquire_idle().expect("idle slot");
+        assert_eq!(gate.metrics().active, 1);
+        assert!(gate.try_acquire_idle().is_none());
+        let metrics = gate.metrics();
+        assert_eq!(metrics.rejected_total, 0);
+        assert_eq!(metrics.saturated_total, 0);
+        assert_eq!(metrics.admitted_total, 1);
+        drop(permit);
+        assert_eq!(gate.metrics().active, 0);
+
+        // A queued waiter keeps its FIFO turn over opportunistic work.
+        let held = gate.try_acquire().expect("hold helper");
+        let waiter_gate = Arc::clone(&gate);
+        let waiter =
+            std::thread::spawn(move || waiter_gate.acquire_timeout(Duration::from_secs(5)));
+        let queued_deadline = Instant::now() + Duration::from_secs(1);
+        while gate.metrics().queued == 0 {
+            assert!(
+                Instant::now() < queued_deadline,
+                "waiter did not enter queue"
+            );
+            std::thread::yield_now();
+        }
+        drop(held);
+        assert!(gate.try_acquire_idle().is_none(), "waiter keeps its turn");
+        assert!(waiter.join().expect("join waiter").is_ok());
+        assert_eq!(gate.metrics().rejected_total, 0);
     }
 
     #[test]

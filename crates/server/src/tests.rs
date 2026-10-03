@@ -218,6 +218,80 @@ fn embedded_text_captions_are_discovered_extracted_and_confined() {
     );
 }
 
+#[test]
+fn failed_probes_need_no_enrichment_and_enrichment_keeps_probe_sidecars() {
+    let tree = TestTree::new("enrichment-contract");
+    let root = tree.path().join("media");
+    std::fs::create_dir_all(&root).unwrap();
+    // A viable Matroska signature that libav cannot read.
+    let broken = root.join("Unreadable.mkv");
+    let mut bytes = vec![0_u8; 64];
+    bytes[..4].copy_from_slice(&[0x1a, 0x45, 0xdf, 0xa3]);
+    std::fs::write(&broken, bytes).unwrap();
+    let movie = root.join("Movie.mkv");
+    rusty_dlna_scan::write_fake_mkv(&movie, 4096);
+    std::fs::write(root.join("Movie.probe.toml"), "hdr = \"dv\"\n").unwrap();
+    let app = App::from_config(
+        Config {
+            friendly_name: "enrichment-test".into(),
+            media_dir: vec![root.display().to_string()],
+            cache_dir: Some(tree.path().join("cache").display().to_string()),
+            db_dir: Some(tree.path().join("database").display().to_string()),
+            thumbnails: false,
+            rescan_secs: 0,
+            ..Config::default()
+        },
+        18200,
+        11900,
+        tree.path(),
+    );
+    *write_recover(&app.catalog) = scan(&app.scan_cfg).unwrap();
+    let id_of = |path: &Path| {
+        read_recover(&app.catalog)
+            .items
+            .values()
+            .find(|item| item.path == path)
+            .unwrap()
+            .detail_id
+    };
+    let item = |path: String| {
+        let response = app.handle(&req(&get(&path, "Browser/1.0")));
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+    };
+
+    // A cached failed probe is complete: native clients that enrich only
+    // incomplete items must not be sent to a re-probe that fails again.
+    let failed = item(format!("/api/web/item/{}", id_of(&broken)));
+    assert_eq!(failed["item"]["embedded_captions_complete"], true);
+    assert_eq!(failed["item"]["stream_metadata_complete"], false);
+    assert_eq!(failed["schema_version"], 2);
+
+    // Live enrichment applies the operator's `.probe.toml` like the catalog.
+    let id = id_of(&movie);
+    let stored = item(format!("/api/web/item/{id}"));
+    assert_eq!(stored["item"]["hdr"], "dv");
+    {
+        let mut catalog = write_recover(&app.catalog);
+        let key = catalog.by_detail[&id].clone();
+        catalog
+            .items
+            .get_mut(&key)
+            .unwrap()
+            .probe
+            .audio_streams
+            .clear();
+    }
+    let enriched = item(format!("/api/web/item/{id}?enrich=1"));
+    assert_eq!(enriched["item"]["hdr"], "dv");
+    assert_eq!(enriched["item"]["embedded_captions_complete"], true);
+}
+
 #[path = "large_library_tests.rs"]
 mod large_library;
 
@@ -753,7 +827,8 @@ album_art_names = ["AlbumArt.jpg", "{stem}-cover.png"]
     assert_eq!(parsed.helper_queue_timeout_secs, 7);
     assert_eq!(parsed.shutdown_timeout_secs, 12);
     assert_eq!(parsed.rescan_secs, 30);
-    assert_eq!(parsed.rescan_max_secs, 900);
+    assert_eq!(parsed.rescan_max_secs, Some(900));
+    assert_eq!(parsed.reconcile_max_secs(), 900);
     assert_eq!(parsed.bookmark_retention_days, 90);
     assert!(validate_http_config(&parsed).is_ok());
 
@@ -813,7 +888,7 @@ album_art_names = ["AlbumArt.jpg", "{stem}-cover.png"]
         .to_string()
         .contains("shutdown_timeout_secs"));
     invalid = Config::default();
-    invalid.rescan_max_secs = invalid.rescan_secs - 1;
+    invalid.rescan_max_secs = Some(invalid.rescan_secs - 1);
     assert!(validate_http_config(&invalid)
         .unwrap_err()
         .to_string()
@@ -974,6 +1049,101 @@ fn adaptive_reconcile_cadence_backs_off_and_resets() {
         next_reconcile_interval_secs(30, 30, 30, unchanged, Duration::from_secs(100)),
         30,
         "rescan_max_secs=0 is resolved to the fixed minimum before selection"
+    );
+}
+
+#[test]
+fn default_reconcile_cadence_is_adaptive_and_explicit_settings_resolve() {
+    let resolved = |text: &str| {
+        let parsed: Config = toml::from_str(text).unwrap();
+        validate_http_config(&parsed).map(|()| (parsed.rescan_secs, parsed.reconcile_max_secs()))
+    };
+    let shipped = Config::default();
+    assert_eq!(
+        (shipped.rescan_secs, shipped.reconcile_max_secs()),
+        (300, 3_600),
+        "an unchanged library must back off instead of walking every few seconds"
+    );
+    assert_eq!(resolved("").unwrap(), (300, 3_600));
+    assert_eq!(resolved("rescan_secs = 30").unwrap(), (30, 3_600));
+    assert_eq!(
+        resolved("rescan_secs = 86400").unwrap(),
+        (86_400, 86_400),
+        "an omitted maximum never makes a large explicit minimum invalid"
+    );
+    assert_eq!(
+        resolved("rescan_max_secs = 0").unwrap(),
+        (300, 300),
+        "an explicit zero keeps the fixed cadence"
+    );
+    assert_eq!(resolved("rescan_secs = 0").unwrap(), (0, 0));
+    assert_eq!(
+        resolved("rescan_secs = 86400\nrescan_max_secs = 604800").unwrap(),
+        (86_400, 604_800)
+    );
+    assert!(resolved("rescan_secs = 600\nrescan_max_secs = 300")
+        .unwrap_err()
+        .to_string()
+        .contains("rescan_max_secs"));
+    assert!(resolved("rescan_max_secs = 31536001")
+        .unwrap_err()
+        .to_string()
+        .contains("rescan_max_secs"));
+}
+
+#[test]
+fn scanner_freshness_applies_only_to_scheduled_reconciliation() {
+    let now = 10_000_000;
+    assert!(
+        !status::scanner_success_stale(0, 0, Some(now - 100_000), now),
+        "rescan_secs = 0 relies on inotify; a quiet library is not stale"
+    );
+    assert!(status::scanner_success_stale(
+        300,
+        3_600,
+        Some(now - 3 * 3_600 - 1),
+        now
+    ));
+    assert!(!status::scanner_success_stale(
+        300,
+        3_600,
+        Some(now - 3 * 3_600),
+        now
+    ));
+    assert!(
+        status::scanner_success_stale(30, 30, Some(now - 901), now),
+        "short cadences keep the five-minute floor"
+    );
+    assert!(!status::scanner_success_stale(30, 30, None, now));
+
+    // The status document uses the same rule: an old success only marks a
+    // scheduled reconciliation stale.
+    let test_tree = TestTree::new("scanner-freshness-status");
+    let tmp = test_tree.path();
+    std::fs::create_dir_all(tmp.join("video")).unwrap();
+    let stale_reason = |rescan_secs: u64| {
+        let app = App::from_config(
+            Config {
+                friendly_name: "scanner-freshness-status".into(),
+                media_dir: vec![tmp.join("video").display().to_string()],
+                cache_dir: Some(tmp.join("cache").display().to_string()),
+                rescan_secs,
+                rescan_max_secs: Some(0),
+                ..Config::default()
+            },
+            18200,
+            11900,
+            tmp,
+        );
+        app.scan_control.state.lock().unwrap().last_success_unix =
+            Some(lifecycle::unix_now().saturating_sub(100_000));
+        let (_, body) = status::status_json(&app, true);
+        body.contains("scanner success is stale")
+    };
+    assert!(!stale_reason(0), "disabled reconciliation is never stale");
+    assert!(
+        stale_reason(60),
+        "scheduled reconciliation reports staleness"
     );
 }
 
@@ -1175,7 +1345,13 @@ fn web_item_samples_item_and_generation_under_one_catalog_snapshot() {
     assert_eq!(json["generation"], old_generation);
     assert_eq!(
         resp_header(&response, "ETag"),
-        Some(format!("W/\"web-v2-r10-{old_generation}-item-{detail_id}\"").as_str())
+        Some(
+            format!(
+                "W/\"web-v2-r11-{old_generation}-item-{detail_id}-i{}\"",
+                app.web_etag_instance
+            )
+            .as_str()
+        )
     );
     done_rx.recv().unwrap().unwrap();
     publisher.join().unwrap();
@@ -1190,6 +1366,164 @@ fn web_item_samples_item_and_generation_under_one_catalog_snapshot() {
             .title,
         new_title
     );
+}
+
+#[test]
+fn folder_view_honors_each_sort_and_keeps_folders_first() {
+    let app = testdata_app();
+    // The physical "video" folder holds a subfolder and several media files.
+    let (folder_id, mut media) = {
+        let catalog = read_recover(&app.catalog);
+        let folder = catalog
+            .containers
+            .values()
+            .find(|container| {
+                container.title == "video"
+                    && container.object_id.starts_with("64$")
+                    && container
+                        .children
+                        .iter()
+                        .any(|id| catalog.containers.contains_key(id))
+                    && container
+                        .children
+                        .iter()
+                        .any(|id| catalog.items.contains_key(id))
+            })
+            .expect("physical video folder");
+        let media = folder
+            .children
+            .iter()
+            .filter_map(|id| catalog.items.get(id))
+            .filter(|item| item.mime.starts_with("video/") || item.mime.starts_with("audio/"))
+            .map(|item| {
+                (
+                    item.object_id.clone(),
+                    item.detail_id.to_string(),
+                    item.path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_lowercase(),
+                )
+            })
+            .collect::<Vec<_>>();
+        (folder.object_id.clone(), media)
+    };
+    assert!(media.len() >= 3, "{media:?}");
+    media.sort_by(|left, right| left.2.cmp(&right.2).then(left.0.cmp(&right.0)));
+    let count = media.len() as i64;
+    {
+        // Newest-first is the reverse of name order (a legacy-seconds stamp
+        // mixed with nanoseconds), and episode order interleaves two albums.
+        let mut catalog = write_recover(&app.catalog);
+        for (index, (object_id, _, _)) in media.iter().enumerate() {
+            let item = catalog.items.get_mut(object_id).unwrap();
+            let index = index as i64;
+            let seconds = 1_700_000_000 + index * 10;
+            item.mtime = if index == 0 {
+                seconds
+            } else {
+                seconds * 1_000_000_000
+            };
+            item.album = Some(if index % 2 == 0 { "B" } else { "a" }.into());
+            item.disc = Some(1);
+            item.track = Some(count - index);
+        }
+    }
+    let ids_for = |sort: &str| {
+        let response = app.handle(&req(&get(
+            &format!("/api/web/library?view=folders&folder={folder_id}&sort={sort}&limit=200"),
+            "Browser/1.0",
+        )));
+        assert_eq!(response.status, 200, "{sort}");
+        let page: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(page["sort"], sort);
+        let entries = page["entries"].as_array().unwrap();
+        let first_media = entries
+            .iter()
+            .position(|entry| entry["entry_type"] == "media")
+            .unwrap();
+        assert!(first_media > 0, "a subfolder precedes media for {sort}");
+        assert!(entries[first_media..]
+            .iter()
+            .all(|entry| entry["entry_type"] == "media"));
+        entries[first_media..]
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let by_name: Vec<_> = media.iter().map(|entry| entry.1.clone()).collect();
+    let newest: Vec<_> = by_name.iter().rev().cloned().collect();
+    let mut episode: Vec<_> = media
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let album = if index % 2 == 0 { "b" } else { "a" };
+            (album, count - index as i64, entry.1.clone())
+        })
+        .collect();
+    episode.sort();
+    let episode: Vec<_> = episode.into_iter().map(|entry| entry.2).collect();
+    assert_ne!(newest, by_name);
+    assert_ne!(episode, by_name);
+    // Alternate sorts at one generation: cached projections never mix orders.
+    for _ in 0..2 {
+        assert_eq!(ids_for("title"), by_name);
+        assert_eq!(ids_for("date_desc"), newest);
+        assert_eq!(ids_for("episode"), episode);
+    }
+    // Folder search uses the same any-order term rule as the flat view.
+    let searched = app.handle(&req(&get(
+        &format!("/api/web/library?view=folders&folder={folder_id}&q=show%20the"),
+        "Browser/1.0",
+    )));
+    let searched: serde_json::Value = serde_json::from_slice(&searched.body).unwrap();
+    assert!(searched["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["entry_type"] == "folder" && entry["title"] == "The Show"));
+}
+
+#[test]
+fn web_validators_do_not_survive_an_instance_with_the_same_generation() {
+    // A restart can change transcoding, encoder outputs, or captions without
+    // advancing the catalog generation; a validator from the old instance
+    // must not turn the new capabilities into a 304.
+    let first = testdata_app();
+    let mut second = testdata_app();
+    second.cfg.transcode.enable = false;
+    let generation = first.update_id.load(Ordering::Acquire);
+    second.update_id.store(generation, Ordering::Release);
+    let detail_id = movie_fixture(&first).detail_id;
+    assert!(read_recover(&second.catalog)
+        .get_item_by_detail(detail_id)
+        .is_some());
+    for path in [
+        "/api/web/library?view=library&kind=video&offset=0&limit=10".to_owned(),
+        format!("/api/web/item/{detail_id}"),
+    ] {
+        let original = first.handle(&req(&get(&path, "Browser/1.0")));
+        assert_eq!(original.status, 200, "{path}");
+        let etag = resp_header(&original, "ETag").unwrap().to_owned();
+        assert!(
+            etag.starts_with(&format!("W/\"web-v2-r11-{generation}")),
+            "{etag}"
+        );
+        let conditional = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\nIf-None-Match: {etag}\r\n\r\n"
+        );
+        assert_eq!(first.handle(&req(&conditional)).status, 304, "{path}");
+        let restarted = second.handle(&req(&conditional));
+        assert_eq!(restarted.status, 200, "{path}");
+        assert_ne!(resp_header(&restarted, "ETag"), Some(etag.as_str()));
+    }
+    let capabilities = second.handle(&req(&get(
+        "/api/web/library?view=library&kind=video&offset=0&limit=10",
+        "Browser/1.0",
+    )));
+    let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.body).unwrap();
+    assert_eq!(capabilities["capabilities"]["transcoding"], false);
 }
 
 #[test]
@@ -2752,6 +3086,23 @@ fn http_uses_the_same_wide_links_policy_as_the_scanner() {
         item.detail_id
     ));
     assert_eq!(app.handle(&request).status, 403);
+    // The browser/app JSON routes report confinement rejections as missing
+    // media, never as an authorization status that clients map to sign-in.
+    for web_path in [
+        format!("/api/web/item/{}", item.detail_id),
+        format!("/web/media/{}.mp4", item.detail_id),
+        format!(
+            "/web/media/{}.mp4?mode=direct&reason=native_ios",
+            item.detail_id
+        ),
+        format!("/web/download/{}", item.detail_id),
+    ] {
+        let response = app.handle(&req(&get(&web_path, "Browser/1.0")));
+        assert_eq!(response.status, 404, "{web_path}");
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"]["code"], "media_missing", "{web_path}");
+        assert_eq!(body["error"]["recoverable"], false, "{web_path}");
+    }
 
     app.cfg.wide_links = true;
     app.scan_cfg.wide_links = true;
@@ -2760,6 +3111,95 @@ fn http_uses_the_same_wide_links_policy_as_the_scanner() {
     assert_eq!(allowed.body, b"outside media bytes");
 
     let _ = std::fs::remove_file(&link);
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_original_is_json_media_missing_on_web_routes_but_403_for_dlna() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut app = testdata_app();
+    let tree = TestTree::new("unreadable-original");
+    let root = tree.path().join("media");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("unreadable.mkv");
+    std::fs::write(&path, b"unreadable media bytes").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&path).is_ok() {
+        // Privileged test runners bypass file modes; nothing to observe.
+        return;
+    }
+    app.scan_cfg.media_dirs = vec![root];
+
+    let mut item = movie_fixture(&app);
+    item.detail_id = 9_100_003;
+    item.object_id = "unreadable-object".into();
+    item.path = path.clone();
+    item.size = 22;
+    {
+        let mut cat = app.catalog.write().unwrap();
+        cat.by_detail.insert(item.detail_id, item.object_id.clone());
+        cat.items.insert(item.object_id.clone(), item.clone());
+    }
+    let dlna = app.handle(&req(&format!(
+        "GET /MediaItems/{}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n\r\n",
+        item.detail_id
+    )));
+    assert_eq!(
+        dlna.status, 403,
+        "DLNA renderers keep the historical status"
+    );
+    // rustyView stores these download and direct-playback URLs; a 403 there
+    // is reported to the user as a sign-in failure.
+    for web_path in [
+        format!(
+            "/web/media/{}.mp4?mode=direct&reason=native_ios",
+            item.detail_id
+        ),
+        format!("/web/download/{}", item.detail_id),
+    ] {
+        for method in ["GET", "HEAD"] {
+            let response = app.handle(&req(&format!(
+                "{method} {web_path} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\n\r\n"
+            )));
+            assert_eq!(response.status, 404, "{method} {web_path}");
+            assert_eq!(
+                resp_header(&response, "Content-Type"),
+                Some("application/json; charset=utf-8"),
+                "{method} {web_path}"
+            );
+            assert!(
+                resp_header(&response, "Content-Disposition").is_none(),
+                "{method} {web_path}"
+            );
+            if method == "GET" {
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(body["schema_version"], 2, "{web_path}");
+                assert_eq!(body["error"]["code"], "media_missing", "{web_path}");
+                assert_eq!(body["error"]["recoverable"], false, "{web_path}");
+                assert_eq!(body["error"]["action"], "return_to_library", "{web_path}");
+            }
+        }
+    }
+
+    // A file that vanished after the scan is retryable missing media.
+    let vanished = tree.path().join("media").join("vanished.mkv");
+    {
+        let mut cat = app.catalog.write().unwrap();
+        let mut gone = item.clone();
+        gone.path = vanished;
+        cat.items.insert(item.object_id.clone(), gone);
+    }
+    for web_path in [
+        format!("/web/media/{}.mp4?mode=direct", item.detail_id),
+        format!("/web/download/{}", item.detail_id),
+    ] {
+        let response = app.handle(&req(&get(&web_path, "Browser/1.0")));
+        assert_eq!(response.status, 404, "{web_path}");
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"]["code"], "media_missing", "{web_path}");
+        assert_eq!(body["error"]["recoverable"], true, "{web_path}");
+    }
 }
 
 #[cfg(unix)]
@@ -3187,6 +3627,54 @@ fn album_art_get_and_didl() {
 
     let missing = app.handle(&req(&get("/AlbumArt/999999-1.jpg", "Kodi/21.0")));
     assert_eq!(missing.status, 404);
+
+    // Artwork carries a descriptor-derived validator; revalidation of an
+    // unchanged poster is a bodyless 304 with the same caching headers.
+    let etag = resp_header(&r, "ETag").expect("album art ETag").to_owned();
+    assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+    let revalidate = |path: &str, etag: &str| {
+        app.handle(&req(&format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nIf-None-Match: {etag}\r\n\r\n"
+        )))
+    };
+    for path in [
+        format!("/AlbumArt/{art_id}-{detail_id}.jpg"),
+        format!("/Thumbnails/{detail_id}.jpg"),
+    ] {
+        let unchanged = revalidate(&path, &etag);
+        assert_eq!(unchanged.status, 304, "{path}");
+        assert!(unchanged.body.is_empty());
+        assert_eq!(resp_header(&unchanged, "ETag"), Some(etag.as_str()));
+        assert_eq!(
+            resp_header(&unchanged, "Cache-Control"),
+            Some("private, max-age=86400")
+        );
+        assert_eq!(
+            resp_header(&unchanged, "transferMode.dlna.org"),
+            Some("Interactive")
+        );
+        assert_eq!(revalidate(&path, "\"stale\"").status, 200, "{path}");
+        assert_eq!(revalidate(&path, "*").status, 304, "{path}");
+        assert_eq!(revalidate(&path, "\"stale\", *").status, 200, "{path}");
+    }
+    // A rewrite served under an unchanged art ID (one the watcher did not
+    // observe, so no ID renewal) still changes its validator.
+    let rewritten = app.cache_dir.join("in-place-poster.jpg");
+    std::fs::write(&rewritten, [0xff, 0xd8, 0xff, 0xd9]).unwrap();
+    write_recover(&app.catalog)
+        .album_art_paths
+        .insert(987_654, rewritten.clone());
+    let path = format!("/AlbumArt/987654-{detail_id}.jpg");
+    let first = app.handle(&req(&get(&path, "Kodi/21.0")));
+    assert_eq!(first.status, 200);
+    let first_etag = resp_header(&first, "ETag").unwrap().to_owned();
+    assert_eq!(revalidate(&path, &first_etag).status, 304);
+    std::fs::write(&rewritten, [0xff, 0xd8, 0x00, 0x00, 0xff, 0xd9]).unwrap();
+    let replaced = revalidate(&path, &first_etag);
+    assert_eq!(replaced.status, 200);
+    assert_eq!(replaced.body, [0xff, 0xd8, 0x00, 0x00, 0xff, 0xd9]);
+    assert_ne!(resp_header(&replaced, "ETag"), Some(first_etag.as_str()));
+    write_recover(&app.catalog).album_art_paths.remove(&987_654);
 
     let streaming = format!(
             "GET /AlbumArt/{art_id}-{detail_id}.jpg HTTP/1.1\r\nHost: 127.0.0.1:18200\r\ntransferMode.dlna.org: Streaming\r\n\r\n"
@@ -4138,6 +4626,44 @@ async fn soap_successes_and_faults_follow_http_keepalive() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_connections_close_silently_without_an_unsolicited_408() {
+    let mut configured = testdata_app();
+    configured.cfg.header_read_timeout_secs = 1;
+    configured.cfg.keep_alive_timeout_secs = 1;
+    let app = Arc::new(configured);
+
+    // A pooled HTTP/1.1 connection idles past keep_alive_timeout_secs after
+    // one complete exchange. The only bytes on the wire are that response.
+    let started = std::time::Instant::now();
+    let pooled = raw_connection(
+        app.clone(),
+        b"GET /rootDesc.xml HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        false,
+    )
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let wire = String::from_utf8_lossy(&pooled);
+    assert!(wire.starts_with("HTTP/1.1 200 OK"), "{wire}");
+    assert_eq!(wire.matches("HTTP/1.1 ").count(), 1, "{wire}");
+    assert!(!wire.contains("408"), "{wire}");
+
+    // A preconnect that never sends a byte is closed without any response.
+    let preconnect = raw_connection(app.clone(), b"", false).await;
+    assert!(preconnect.is_empty(), "{preconnect:?}");
+
+    let metrics = app.runtime_metrics.json();
+    let deliveries = metrics["http"]["deliveries"].as_object().unwrap();
+    assert_eq!(
+        deliveries
+            .values()
+            .map(|route| route["statuses"]["408"].as_u64().unwrap_or(0))
+            .sum::<u64>(),
+        0,
+        "idle closes are not request timeouts: {metrics}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connection_body_caps_incomplete_bodies_and_slow_headers_are_bounded() {
     let mut configured = testdata_app();
     configured.cfg.max_request_body_bytes = 8;
@@ -4220,6 +4746,64 @@ async fn connection_body_caps_incomplete_bodies_and_slow_headers_are_bounded() {
             .map(|route| route["requests_total"].as_u64().unwrap())
             .sum::<u64>(),
         0
+    );
+}
+
+#[test]
+fn runtime_teardown_abandons_blocking_work_after_a_bounded_grace() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    // Stands in for a read stuck on a hung media mount after `serve` returns.
+    let _stuck = runtime.spawn_blocking(move || {
+        entered_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(30));
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let started = Instant::now();
+    shutdown_runtime_bounded(runtime);
+    let elapsed = started.elapsed();
+    drop(release_tx);
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "runtime drop must not wait for stuck blocking work: {elapsed:?}"
+    );
+}
+
+#[test]
+fn accept_errors_back_off_only_for_resource_exhaustion() {
+    let exhausted = |code| std::io::Error::from_raw_os_error(code);
+    let mut delay = None;
+    let mut schedule = Vec::new();
+    for _ in 0..10 {
+        delay = next_accept_backoff(delay, &exhausted(libc::EMFILE));
+        schedule.push(delay.unwrap().as_millis());
+    }
+    assert_eq!(
+        schedule,
+        [10, 20, 40, 80, 160, 320, 640, 1000, 1000, 1000],
+        "descriptor exhaustion must not hot-spin and stays bounded at one second"
+    );
+    for code in [libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+        assert_eq!(
+            next_accept_backoff(None, &exhausted(code)),
+            Some(Duration::from_millis(10))
+        );
+    }
+    for code in [libc::ECONNABORTED, libc::EPROTO, libc::EPERM] {
+        assert_eq!(
+            next_accept_backoff(Some(Duration::from_secs(1)), &exhausted(code)),
+            None,
+            "a per-connection failure must not delay the next client"
+        );
+    }
+    assert_eq!(
+        next_accept_backoff(None, &std::io::Error::other("synthetic")),
+        None
     );
 }
 
@@ -5668,6 +6252,7 @@ fn remux_finished_range_and_stale_rebuild() {
         profile8_toolchain: None,
         audio_index: 0,
         audio: RemuxAudio::Copy,
+        caption_info_sec: None,
     };
     let req = HttpRequest::parse_headers(
         "GET /Transcode/1.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nRange: bytes=0-15\r\n\r\n",
@@ -6117,6 +6702,70 @@ fn status_html_uses_the_shared_complete_markup_escape() {
 }
 
 #[test]
+fn embedded_web_assets_revalidate_with_content_validators() {
+    let mut app = testdata_app();
+    let conditional = |path: &str, validator: &str| {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\nIf-None-Match: {validator}\r\n\r\n"
+        )
+    };
+    let mut validators = std::collections::HashSet::new();
+    for path in ["/", "/web/app.css", "/web/app.js", "/web/player.js"] {
+        let full = app.handle(&req(&get(path, "Browser/1.0")));
+        assert_eq!(full.status, 200, "{path}");
+        assert!(!full.body.is_empty(), "{path}");
+        assert_eq!(resp_header(&full, "Cache-Control"), Some("no-cache"));
+        let etag = resp_header(&full, "ETag")
+            .unwrap_or_else(|| panic!("{path} has no validator"))
+            .to_owned();
+        assert!(etag.starts_with("\"web-") && etag.ends_with('"'), "{etag}");
+        assert!(validators.insert(etag.clone()), "{path} shares {etag}");
+        // The validator is stable for the embedded bytes.
+        let again = app.handle(&req(&get(path, "Browser/1.0")));
+        assert_eq!(resp_header(&again, "ETag"), Some(etag.as_str()));
+
+        for validator in [
+            etag.clone(),
+            format!("W/{etag}"),
+            format!("\"stale\", {etag}"),
+            "*".to_owned(),
+        ] {
+            let revalidated = app.handle(&req(&conditional(path, &validator)));
+            assert_eq!(revalidated.status, 304, "{path} {validator}");
+            assert!(revalidated.body.is_empty(), "{path}");
+            assert_eq!(resp_header(&revalidated, "ETag"), Some(etag.as_str()));
+            assert_eq!(resp_header(&revalidated, "Cache-Control"), Some("no-cache"));
+        }
+        let stale = app.handle(&req(&conditional(path, "\"web-stale\"")));
+        assert_eq!(stale.status, 200, "{path}");
+        assert_eq!(stale.body, full.body, "{path}");
+        // One shared evaluator for every route: `*` matches only on its own,
+        // never as a member of a tag list (the same answer as /AlbumArt).
+        let mixed = app.handle(&req(&conditional(path, "\"web-stale\", *")));
+        assert_eq!(mixed.status, 200, "{path}");
+    }
+
+    // The document keeps its security headers on revalidation.
+    let index_etag = resp_header(&app.handle(&req(&get("/", "Browser/1.0"))), "ETag")
+        .unwrap()
+        .to_owned();
+    let index = app.handle(&req(&conditional("/", &index_etag)));
+    assert_eq!(index.status, 304);
+    assert!(resp_header(&index, "Content-Security-Policy").is_some());
+    assert_eq!(resp_header(&index, "Referrer-Policy"), Some("no-referrer"));
+    assert_eq!(
+        resp_header(&index, "X-Content-Type-Options"),
+        Some("nosniff")
+    );
+
+    // Per-request status HTML never claims a stable embedded validator.
+    app.cfg.web.enable = false;
+    let status = app.handle(&req(&conditional("/", &index_etag)));
+    assert_eq!(status.status, 200);
+    assert!(resp_header(&status, "ETag").is_none());
+}
+
+#[test]
 fn web_player_is_embedded_searchable_and_independently_disabled() {
     let mut app = testdata_app();
 
@@ -6208,10 +6857,10 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     assert_eq!(folders.status, 200);
     let folders_etag = resp_header(&folders, "ETag").unwrap().to_owned();
     assert!(
-        folders_etag.starts_with("W/\"web-v2-r10-"),
+        folders_etag.starts_with("W/\"web-v2-r11-"),
         "{folders_etag}"
     );
-    let stale_capability_etag = folders_etag.replacen("-r10-", "-r9-", 1);
+    let stale_capability_etag = folders_etag.replacen("-r11-", "-r10-", 1);
     let stale_conditional = req(&format!(
         "GET /api/web/library?view=folders&folder=64&offset=0&limit=200 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Browser/1.0\r\nIf-None-Match: {stale_capability_etag}\r\n\r\n"
     ));
@@ -6478,6 +7127,49 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
     let artwork_url = artwork_item["art_url"].as_str().unwrap();
     assert!(artwork_url.starts_with("/AlbumArt/"), "{artwork_url}");
     assert!(artwork_url.ends_with(".jpg"), "{artwork_url}");
+    // Every advertised artwork URL must be fetchable; items without stored
+    // art advertise null rather than a guaranteed-404 thumbnail URL.
+    assert!(app.cfg.thumbnails);
+    let all_videos = app.handle(&req(&get(
+        "/api/web/library?view=library&kind=video&limit=200",
+        "Browser/1.0",
+    )));
+    let all_videos: serde_json::Value = serde_json::from_slice(&all_videos.body).unwrap();
+    for entry in all_videos["entries"].as_array().unwrap() {
+        if let Some(url) = entry["art_url"].as_str() {
+            let response = app.handle(&req(&get(url, "Browser/1.0")));
+            assert_eq!(response.status, 200, "{url}");
+        } else {
+            assert!(entry["art_url"].is_null(), "{entry}");
+        }
+    }
+    let mut artless = movie_fixture(&app);
+    artless.detail_id = 9_100_010;
+    artless.object_id = "artless-video-object".into();
+    artless.album_art = 0;
+    {
+        let mut catalog = app.catalog.write().unwrap();
+        catalog
+            .by_detail
+            .insert(artless.detail_id, artless.object_id.clone());
+        catalog
+            .items
+            .insert(artless.object_id.clone(), artless.clone());
+    }
+    let artless_response = app.handle(&req(&get(
+        &format!("/api/web/item/{}", artless.detail_id),
+        "Browser/1.0",
+    )));
+    {
+        let mut catalog = app.catalog.write().unwrap();
+        catalog.by_detail.remove(&artless.detail_id);
+        catalog.items.remove(&artless.object_id);
+    }
+    let artless = artless_response;
+    assert_eq!(artless.status, 200);
+    let artless: serde_json::Value = serde_json::from_slice(&artless.body).unwrap();
+    assert_eq!(artless["item"]["kind"], "video");
+    assert!(artless["item"]["art_url"].is_null(), "{artless}");
     let caption_item = caption_page["entries"]
         .as_array()
         .unwrap()
@@ -6802,7 +7494,10 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         repair_page["entries"][0]["repair_video_encoder"],
         "hevc_nvenc"
     );
+    // The codec probe input stays published; copy eligibility is decided by
+    // `video_copy_available`, which excludes frame-order repair.
     assert!(repair_page["entries"][0]["video_content_type"].is_string());
+    assert_eq!(repair_page["entries"][0]["video_copy_available"], false);
     let unsafe_copy = app.handle(&req(&get(
         &format!(
             "/web/media/{}.mp4?quality=auto&video_mode=copy&audio_mode=copy",
@@ -7230,6 +7925,11 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
         serde_json::from_slice(&transcode_status.body).unwrap();
     assert_eq!(transcode_status["state"], "idle");
     assert!(transcode_status["produced_seconds"].is_null());
+    assert!(transcode_status
+        .as_object()
+        .unwrap()
+        .get("stream_start_seconds")
+        .is_some_and(serde_json::Value::is_null));
     let scoped_status = app.handle(&req(&get(
         &format!("/api/web/transcode/{}?request=77", dvp7.detail_id),
         "Browser/1.0",
@@ -7623,6 +8323,184 @@ fn web_player_is_embedded_searchable_and_independently_disabled() {
 }
 
 #[test]
+fn native_copy_requests_encode_ineligible_sdr_video_and_keep_hdr_or_reject() {
+    let mut app = testdata_app();
+    let detail_id = read_recover(&app.catalog)
+        .items
+        .values()
+        .find(|item| item.path.ends_with("tagged.mp4"))
+        .unwrap()
+        .detail_id;
+    let set_probe = |app: &App,
+                     video: &str,
+                     profile: &str,
+                     level: u32,
+                     pixel_format: &str,
+                     bit_depth: u32,
+                     codec: &str,
+                     hdr: &str| {
+        let mut catalog = write_recover(&app.catalog);
+        let object_id = catalog.by_detail[&detail_id].clone();
+        let item = catalog.items.get_mut(&object_id).unwrap();
+        item.probe.video = video.into();
+        item.probe.video_profile = profile.into();
+        item.probe.video_level = level;
+        item.probe.pixel_format = pixel_format.into();
+        item.probe.bit_depth = bit_depth;
+        item.probe.codec_string = format!("{codec},mp4a.40.2");
+        item.probe.hdr = hdr.into();
+        item.probe.video_timestamp_mode = "valid".into();
+        item.probe.audio = "aac".into();
+        item.probe.audio_streams = "1:0:aac:2".into();
+        item.duration = Some("00:01:00.000".into());
+    };
+    let item_dto = |app: &App| {
+        let response = app.handle(&req(&get(
+            &format!("/api/web/item/{detail_id}"),
+            "Native/1.0",
+        )));
+        assert_eq!(response.status, 200);
+        serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["item"].clone()
+    };
+    // rustyView's exact query shape for playback, HLS, and downloads.
+    let native = |app: &App, extension: &str, video: &str, extra: &str| {
+        app.handle(&req(&get(
+            &format!(
+                "/web/media/{detail_id}.{extension}?mode=compatible&start=0&quality=auto&video_mode={video}&audio_mode=transcode&reason=native_ios&request=7&session=7{extra}"
+            ),
+            "Native/1.0",
+        )))
+    };
+    let browser_copy = |app: &App| {
+        app.handle(&req(&get(
+            &format!(
+                "/web/media/{detail_id}.mp4?quality=auto&video_mode=copy&audio_mode=transcode"
+            ),
+            "Browser/1.0",
+        )))
+    };
+    let assert_rejected = |response: &HttpResponse| {
+        assert_eq!(
+            response.status,
+            400,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["schema_version"], 2);
+        assert_eq!(body["error"]["code"], "video_copy_unavailable");
+    };
+    let has = |spec: &RemuxJobSpec, pair: [&str; 2]| spec.args.windows(2).any(|args| args == pair);
+
+    // Hi10P, a level above 5.1, HEVC Rext 4:2:2, and 12-bit HEVC are SDR
+    // sources the browser cannot receive as copies. Native copy requests get
+    // the same encode as an explicit H.264 SDR transcode request.
+    for (video, profile, level, pixel_format, bit_depth, codec) in [
+        ("h264", "High 10", 51, "yuv420p10le", 10, "avc1.6e0033"),
+        ("h264", "High", 52, "yuv420p", 8, "avc1.640034"),
+        // Each HEVC row fails on one stored fact while the others are absent.
+        ("hevc", "Rext", 153, "", 0, "hvc1.4.10.L153.B0"),
+        ("hevc", "", 153, "yuv422p10le", 0, "hvc1.4.10.L153.B0"),
+        ("hevc", "", 153, "", 12, "hvc1.4.10.L153.B0"),
+    ] {
+        set_probe(
+            &app,
+            video,
+            profile,
+            level,
+            pixel_format,
+            bit_depth,
+            codec,
+            "sdr",
+        );
+        let dto = item_dto(&app);
+        assert_eq!(
+            dto["video_copy_available"], false,
+            "{profile} {pixel_format}"
+        );
+        assert_eq!(dto["video_content_type"], serde_json::Value::Null);
+        assert_rejected(&browser_copy(&app));
+        let explicit = native(&app, "mp4", "transcode", "&video_output=h264_sdr")
+            .remux_job
+            .expect("explicit native SDR encode");
+        for extra in ["", "&download_audio=selected"] {
+            let response = native(&app, "mp4", "copy", extra);
+            assert_eq!(
+                response.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&response.body)
+            );
+            let spec = response.remux_job.expect("native copy fallback encode");
+            assert!(has(&spec, ["-c:v", "libx264"]), "{:?}", spec.args);
+            assert!(!has(&spec, ["-c:v", "copy"]));
+            if extra.is_empty() {
+                assert_eq!(spec.cache_key, explicit.cache_key);
+                assert_eq!(spec.args, explicit.args);
+            }
+        }
+        let hls = native(&app, "m3u8", "copy", "&delivery=hls");
+        assert_eq!(hls.status, 200, "{}", String::from_utf8_lossy(&hls.body));
+        assert!(has(&hls.remux_job.unwrap(), ["-c:v", "libx264"]));
+    }
+
+    // Copyable HEVC keeps copying, including legacy rows without stored facts.
+    for (profile, pixel_format, bit_depth, hdr) in [
+        ("Main 10", "yuv420p10le", 10, "hdr10"),
+        ("Main", "yuv420p", 8, "sdr"),
+        ("", "", 0, "sdr"),
+    ] {
+        set_probe(
+            &app,
+            "hevc",
+            profile,
+            153,
+            pixel_format,
+            bit_depth,
+            "hvc1.2.4.L153.B0",
+            hdr,
+        );
+        assert_eq!(item_dto(&app)["video_copy_available"], true, "{profile}");
+        let spec = native(&app, "mp4", "copy", "")
+            .remux_job
+            .expect("native copy");
+        assert!(has(&spec, ["-c:v", "copy"]));
+    }
+
+    // Dolby Vision Profile 7 cannot be copied. Without HDR10 output the native
+    // request is still rejected rather than silently delivered as SDR.
+    set_probe(
+        &app,
+        "hevc",
+        "Main 10",
+        153,
+        "yuv420p10le",
+        10,
+        "dvhe.07.06",
+        "dv-p7",
+    );
+    assert_eq!(item_dto(&app)["video_copy_available"], false);
+    assert_rejected(&native(&app, "mp4", "copy", "&download_audio=selected"));
+    app.cfg.web.encoder = "h264_nvenc".into();
+    assert_eq!(item_dto(&app)["prepared_video_outputs"][1], "hevc_hdr10");
+    let explicit = native(&app, "mp4", "transcode", "&video_output=hevc_hdr10")
+        .remux_job
+        .expect("explicit native HDR10 encode");
+    let fallback = native(&app, "mp4", "copy", "")
+        .remux_job
+        .expect("native DV7 copy fallback keeps HDR10");
+    assert!(
+        has(&fallback, ["-c:v", "hevc_nvenc"]),
+        "{:?}",
+        fallback.args
+    );
+    assert_eq!(fallback.cache_key, explicit.cache_key);
+    assert_eq!(fallback.args, explicit.args);
+    // The browser negotiates its own output and keeps the strict rejection.
+    assert_rejected(&browser_copy(&app));
+}
+
+#[test]
 fn web_item_does_not_advertise_aac_as_mpeg4_part_2_video_support() {
     let app = testdata_app();
     let detail_id = {
@@ -7915,6 +8793,41 @@ fn web_continue_watching_hydrates_only_bounded_requested_ids() {
     assert_eq!(pinned_empty.status, 200);
     let pinned_empty: serde_json::Value = serde_json::from_slice(&pinned_empty.body).unwrap();
     assert_eq!(pinned_empty["library_state"], "empty");
+}
+
+#[test]
+fn web_library_state_describes_the_whole_catalog_not_the_current_view() {
+    let app = testdata_app();
+    let state = |path: &str| {
+        let response = app.handle(&req(&get(path, "Browser/1.0")));
+        assert_eq!(response.status, 200, "{path}");
+        let payload: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        (
+            payload["library_state"].as_str().unwrap().to_owned(),
+            payload["total"].as_u64().unwrap(),
+        )
+    };
+    // An unmatched search, an empty filtered folder, and a kind with no
+    // matching titles are empty views of a populated server, not an empty server.
+    for path in [
+        "/api/web/library?view=library&kind=all&q=definitely-absent-title",
+        "/api/web/library?view=library&kind=audio&q=tagged",
+        "/api/web/library?view=folders&q=definitely-absent-title",
+        "/api/web/library?view=folders&folder=64&q=definitely-absent-title",
+    ] {
+        assert_eq!(state(path), ("ready".to_owned(), 0), "{path}");
+    }
+    let (populated, total) = state("/api/web/library?view=library&kind=video");
+    assert_eq!(populated, "ready");
+    assert!(total > 0);
+
+    *app.catalog.write().unwrap() = Catalog::new();
+    for path in [
+        "/api/web/library?view=library&kind=all",
+        "/api/web/library?view=folders&folder=64",
+    ] {
+        assert_eq!(state(path).0, "empty", "{path}");
+    }
 }
 
 #[test]
@@ -9580,4 +10493,574 @@ fn web_collection_metadata_and_memory_pages_keep_numbered_movies_together() {
         assert_eq!(item["collection"]["id"], entries[1]["collection"]["id"]);
         assert!(!item["collection"].to_string().contains("/movies"));
     }
+}
+
+/// Browse children with an explicit Filter and return the unescaped DIDL-Lite.
+fn browse_didl_with_filter(app: &App, oid: &str, filter: &str, ua: &str) -> String {
+    let (status, xml) = soap_action(
+        app,
+        "Browse",
+        &format!(
+            "<ObjectID>{oid}</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>{filter}</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>"
+        ),
+        ua,
+    );
+    assert_eq!(status, 200, "{xml}");
+    let envelope = roxmltree::Document::parse(&xml).unwrap();
+    envelope
+        .descendants()
+        .find(|node| node.tag_name().name() == "Result")
+        .and_then(|node| node.text())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The `<item>` whose original `<res>` is `/MediaItems/{detail_id}.*`.
+fn didl_item_for_detail<'a, 'input>(
+    didl: &'a roxmltree::Document<'input>,
+    detail_id: i64,
+) -> roxmltree::Node<'a, 'input> {
+    let original = format!("/MediaItems/{detail_id}.");
+    didl.descendants()
+        .find(|node| {
+            node.tag_name().name() == "item"
+                && node.children().any(|child| {
+                    child.tag_name().name() == "res"
+                        && child.text().is_some_and(|url| url.contains(&original))
+                })
+        })
+        .unwrap_or_else(|| panic!("no item for detail {detail_id}"))
+}
+
+fn set_item_captions(app: &App, detail_id: i64, captions: Vec<rusty_dlna_scan::Caption>) {
+    let mut cat = write_recover(&app.catalog);
+    for item in cat
+        .items
+        .values_mut()
+        .filter(|item| item.detail_id == detail_id)
+    {
+        item.captions = captions.clone();
+    }
+}
+
+/// Kodi (CAPTION_RES) and Samsung Q/CDE TVs lost sidecar subtitles whenever a
+/// remap rule advertised /Transcode/: caption <res> rows were only built for
+/// the original-only branch and the remux response never answered
+/// `getCaptionInfo.sec`.
+#[test]
+fn kodi_and_samsung_remapped_items_keep_sidecar_captions() {
+    let mut app = testdata_app();
+    app.remaps = rusty_dlna_transcode::parse_remaps_toml(
+        r#"
+[[remap]]
+name = "kodi-dvp7"
+client = "Kodi"
+hdr = "dv-p7"
+action = "remux-p8"
+encoder = "copy"
+audio_out = "to-aac"
+
+[[remap]]
+name = "samsung-dvp7"
+client = "Samsung"
+hdr = "dv-p7"
+action = "remux-p8"
+encoder = "copy"
+audio_out = "to-aac"
+"#,
+    )
+    .unwrap();
+    let movie = movie_fixture(&app);
+    assert!(movie.captions.len() >= 2, "fixture has two sidecars");
+    let dvp7 = dvp7_fixture(&app);
+    let id = dvp7.detail_id;
+    set_item_captions(&app, id, movie.captions.clone());
+
+    let samsung = "DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0";
+    for ua in ["Kodi/21.0", samsung] {
+        let (status, xml) = soap_browse(&app, "2$8", "BrowseDirectChildren", ua);
+        assert_eq!(status, 200, "{xml}");
+        assert_transcode_before_original(&xml, id);
+        let original = xml.find(&format!("/MediaItems/{id}.mkv")).unwrap();
+        for caption in &movie.captions {
+            let url = format!("/Captions/{id}/{}.{}", caption.index, caption.ext);
+            let position = xml
+                .find(&url)
+                .unwrap_or_else(|| panic!("{ua}: remapped item lost caption {url}: {xml}"));
+            assert!(
+                position > original,
+                "{ua}: caption rows follow [remap, original]: {xml}"
+            );
+        }
+    }
+
+    let expected = format!("http://{}:18200/Captions/{id}.srt", app.advertise_ip);
+    for method in ["GET", "HEAD"] {
+        let response = app.handle(&req(&format!(
+            "{method} /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: {samsung}\r\ngetCaptionInfo.sec: 1\r\n\r\n"
+        )));
+        let spec = response
+            .remux_job
+            .unwrap_or_else(|| panic!("{method}: Samsung remap must serve the remux"));
+        assert_eq!(spec.caption_info_sec.as_deref(), Some(expected.as_str()));
+    }
+    let without_header = app.handle(&req(&format!(
+        "GET /Transcode/{id}.mp4 HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: {samsung}\r\n\r\n"
+    )));
+    assert_eq!(
+        without_header.remux_job.expect("remux").caption_info_sec,
+        None
+    );
+}
+
+/// Unremapped DIDL keeps its exact Kodi resource order: original, captions,
+/// then video artwork.
+#[test]
+fn kodi_unremapped_resource_order_is_unchanged() {
+    let app = testdata_app();
+    let movie = movie_fixture(&app);
+    let didl = browse_didl_with_filter(&app, "2$8", "*", "Kodi/21.0");
+    let doc = roxmltree::Document::parse(&didl).unwrap();
+    let item = didl_item_for_detail(&doc, movie.detail_id);
+    let resources = item
+        .children()
+        .filter(|node| node.tag_name().name() == "res")
+        .map(|node| node.text().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    let id = movie.detail_id;
+    let mut expected = vec![format!(
+        "http://{}:18200/MediaItems/{id}.mkv",
+        app.advertise_ip
+    )];
+    for caption in &movie.captions {
+        expected.push(format!(
+            "http://{}:18200/Captions/{id}/{}.{}",
+            app.advertise_ip, caption.index, caption.ext
+        ));
+    }
+    expected.push(format!(
+        "http://{}:18200/AlbumArt/{}-{id}.jpg",
+        app.advertise_ip, movie.album_art
+    ));
+    assert_eq!(resources, expected);
+}
+
+/// VLC's UPnP module, Kodi/Platinum and BubbleUPnP read posters only from
+/// upnp:albumArtURI. Video items now carry it for every client (including
+/// Xbox, which never gets the JPEG_TN <res> row), and the Samsung-only
+/// `dlna:profileID` attribute stays well-formed.
+#[test]
+fn video_items_advertise_album_art_uri_for_kodi_vlc_samsung_and_xbox() {
+    let app = testdata_app();
+    let movie = movie_fixture(&app);
+    assert!(movie.album_art > 0, "movie fixture has a poster");
+    let art = format!("/AlbumArt/{}-{}.jpg", movie.album_art, movie.detail_id);
+    for (ua, profile_id, thumbnail_res) in [
+        ("Kodi/21.0", false, true),
+        ("VLC/3.0.21 LibVLC/3.0.21", false, true),
+        ("DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0", true, true),
+        ("Xbox/2.0.58767.0 UPnP/1.0 Xbox/2.0.58767.0", false, false),
+    ] {
+        let didl = browse_didl_with_filter(&app, "2$8", "*", ua);
+        // Strict parsing rejects an undeclared dlna: prefix.
+        let doc = roxmltree::Document::parse(&didl).unwrap_or_else(|e| panic!("{ua}: {e}"));
+        let item = didl_item_for_detail(&doc, movie.detail_id);
+        let uri = item
+            .children()
+            .find(|node| node.tag_name().name() == "albumArtURI")
+            .unwrap_or_else(|| panic!("{ua}: video item lacks upnp:albumArtURI: {didl}"));
+        assert!(uri.text().unwrap_or_default().ends_with(&art), "{ua}");
+        assert_eq!(
+            uri.attribute(("urn:schemas-dlna-org:metadata-1-0/", "profileID")),
+            profile_id.then_some("JPEG_TN"),
+            "{ua}"
+        );
+        let has_thumbnail_res = item.children().any(|node| {
+            node.tag_name().name() == "res"
+                && node
+                    .attribute("protocolInfo")
+                    .is_some_and(|info| info.contains("image/jpeg:DLNA.ORG_PN=JPEG_TN"))
+        });
+        assert_eq!(has_thumbnail_res, thumbnail_res, "{ua}");
+    }
+    let narrow = browse_didl_with_filter(&app, "2$8", "dc:title,res", "Kodi/21.0");
+    assert!(!narrow.contains("albumArtURI"), "{narrow}");
+    // A Samsung Filter without dlna: still declares the namespace by profile.
+    let samsung_narrow = browse_didl_with_filter(
+        &app,
+        "2$8",
+        "dc:title,res,upnp:albumArtURI",
+        "DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0",
+    );
+    roxmltree::Document::parse(&samsung_narrow).unwrap();
+    assert!(samsung_narrow.contains("albumArtURI"), "{samsung_narrow}");
+}
+
+/// Samsung CaptionInfo.sec and pv-aware players received the alphabetically
+/// first sidecar (here `movie.en.srt`) as the default, always labelled SRT.
+/// The default is now the untagged SRT; a non-SRT default uses its indexed
+/// URL and real type instead of a `.srt` URL.
+#[test]
+fn samsung_and_pv_default_caption_is_the_untagged_srt_with_its_real_type() {
+    let app = testdata_app();
+    let movie = movie_fixture(&app);
+    let id = movie.detail_id;
+    let untagged = movie
+        .captions
+        .iter()
+        .find(|caption| caption.path.ends_with("movie.srt"))
+        .expect("untagged sidecar");
+    let first = movie
+        .captions
+        .iter()
+        .find(|caption| caption.index == 0)
+        .unwrap();
+    assert_ne!(untagged.index, 0, "path order puts movie.en.srt first");
+
+    let default = app.handle(&req(&get(&format!("/Captions/{id}.srt"), "Kodi/21.0")));
+    assert_eq!(default.status, 200);
+    assert_eq!(default.body, std::fs::read(&untagged.path).unwrap());
+    let indexed = app.handle(&req(&get(&format!("/Captions/{id}/0.srt"), "Kodi/21.0")));
+    assert_eq!(indexed.body, std::fs::read(&first.path).unwrap());
+
+    let pv_filter = "res,pv:subtitleFileUri,pv:subtitleFileType";
+    let didl = browse_didl_with_filter(&app, "2$8", pv_filter, "Kodi/21.0");
+    let doc = roxmltree::Document::parse(&didl).unwrap();
+    let item = didl_item_for_detail(&doc, movie.detail_id);
+    let primary = item
+        .children()
+        .find(|node| node.tag_name().name() == "res")
+        .unwrap();
+    let pv = "http://www.pv.com/pvns/";
+    assert_eq!(primary.attribute((pv, "subtitleFileType")), Some("SRT"));
+    let default_url = format!("http://{}:18200/Captions/{id}.srt", app.advertise_ip);
+    assert_eq!(
+        primary.attribute((pv, "subtitleFileUri")),
+        Some(default_url.as_str())
+    );
+
+    let directory = untagged.path.parent().unwrap();
+    set_item_captions(
+        &app,
+        id,
+        vec![
+            rusty_dlna_scan::Caption {
+                index: 0,
+                path: directory.join("movie.ass"),
+                ext: "ass".into(),
+            },
+            rusty_dlna_scan::Caption {
+                index: 1,
+                path: directory.join("movie.ko.smi"),
+                ext: "smi".into(),
+            },
+        ],
+    );
+    let didl = browse_didl_with_filter(&app, "2$8", pv_filter, "Kodi/21.0");
+    let doc = roxmltree::Document::parse(&didl).unwrap();
+    let item = didl_item_for_detail(&doc, movie.detail_id);
+    let primary = item
+        .children()
+        .find(|node| node.tag_name().name() == "res")
+        .unwrap();
+    let smi_url = format!("http://{}:18200/Captions/{id}/1.smi", app.advertise_ip);
+    assert_eq!(primary.attribute((pv, "subtitleFileType")), Some("SMI"));
+    assert_eq!(
+        primary.attribute((pv, "subtitleFileUri")),
+        Some(smi_url.as_str())
+    );
+    let media = app.handle(&req(&format!(
+        "HEAD /MediaItems/{id}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0\r\ngetCaptionInfo.sec: 1\r\n\r\n"
+    )));
+    assert_eq!(
+        resp_header(&media, "CaptionInfo.sec"),
+        Some(smi_url.as_str())
+    );
+}
+
+/// BubbleUPnP / TV search boxes: `contains` and `=` on free text fold Unicode
+/// case on both the SQLite and the in-memory paths, with identical results.
+#[test]
+fn soap_search_folds_unicode_case_identically_in_sqlite_and_memory() {
+    use std::collections::BTreeSet;
+    let app = testdata_app();
+    let movie = movie_fixture(&app);
+    let connection =
+        rusqlite::Connection::open(app.scan_cfg.db_path.as_deref().expect("database")).unwrap();
+    connection
+        .execute(
+            "UPDATE DETAILS SET TITLE = ?1, ARTIST = ?2 WHERE ID = ?3",
+            rusqlite::params!["Матриця", "ÉLAN Quartet", movie.detail_id],
+        )
+        .unwrap();
+    // Collection/series views title aliases by object name.
+    connection
+        .execute(
+            "UPDATE OBJECTS SET NAME = ?1 WHERE DETAIL_ID = ?2",
+            rusqlite::params!["Матриця", movie.detail_id],
+        )
+        .unwrap();
+    drop(connection);
+    {
+        let mut cat = write_recover(&app.catalog);
+        for item in cat
+            .items
+            .values_mut()
+            .filter(|item| item.detail_id == movie.detail_id)
+        {
+            item.title = "Матриця".into();
+            item.artist = Some("ÉLAN Quartet".into());
+        }
+    }
+    let cat = read_recover(&app.catalog);
+    let client = identify_user_agent("DLNADOC/1.50").unwrap();
+    let matches = |criteria: &str| {
+        let clauses = try_parse_search_criteria(Some(criteria)).unwrap();
+        let query = catalog_query(&clauses, &[], DefaultOrder::FoldersFirst);
+        let db = query_db_search(
+            app.db_pool.as_deref(),
+            app.scan_cfg.db_path.as_deref(),
+            "0",
+            &query,
+            0,
+            MAX_SOAP_PAGE_OBJECTS,
+        )
+        .unwrap();
+        let (memory, _) = search_memory_page(
+            &app,
+            &cat,
+            "0",
+            &clauses,
+            &[],
+            DefaultOrder::FoldersFirst,
+            0,
+            MAX_SOAP_PAGE_OBJECTS,
+            client,
+            Some("DLNADOC/1.50"),
+            &FilterBits::default(),
+        );
+        let memory: BTreeSet<_> = memory.iter().map(|object| object.id.clone()).collect();
+        let db: BTreeSet<_> = db.page.object_ids.into_iter().collect();
+        assert_eq!(db, memory, "SQLite and memory diverged for {criteria}");
+        db
+    };
+    let renamed: BTreeSet<_> = cat
+        .items
+        .values()
+        .filter(|item| item.detail_id == movie.detail_id)
+        .map(|item| item.object_id.clone())
+        .collect();
+    for criteria in [
+        "dc:title contains \"матриця\"",
+        "dc:title contains \"МАТР\"",
+        "dc:title = \"МАТРИЦЯ\"",
+        "upnp:artist contains \"élan\"",
+        "upnp:artist = \"élan quartet\"",
+    ] {
+        assert_eq!(matches(criteria), renamed, "{criteria}");
+    }
+    // Case only: accents are not folded away.
+    assert!(matches("upnp:artist contains \"elan\"").is_disjoint(&renamed));
+    let all = matches("*");
+    let excluded = matches("dc:title doesNotContain \"матриця\"");
+    assert!(excluded.is_disjoint(&renamed));
+    assert_eq!(
+        excluded.union(&renamed).cloned().collect::<BTreeSet<_>>(),
+        all
+    );
+}
+
+/// With two announced interfaces, a renderer on the second subnet receives
+/// presentationURL, DIDL, album-art, caption and CaptionInfo.sec URLs on the
+/// address its connection arrived on. Unannounced ingress (Docker bridge,
+/// VPN) and requests without a local address keep the primary address.
+#[test]
+fn dlna_urls_follow_the_announced_ingress_interface() {
+    let mut app = testdata_app();
+    let primary = Ipv4Addr::new(192, 0, 2, 10);
+    let second = Ipv4Addr::new(198, 51, 100, 10);
+    let mask = Ipv4Addr::new(255, 255, 255, 0);
+    app.advertise_ip = primary.to_string();
+    app.ssdp_interfaces = vec![(primary, mask), (second, mask)];
+    let movie = movie_fixture(&app);
+    let id = movie.detail_id;
+    let peer = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 77), 50_000));
+    let browse = |local: Option<Ipv4Addr>| {
+        let body = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>2$8</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"#;
+        let mut request = req(&format!(
+            "POST /ctl/ContentDir HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: Kodi/21.0\r\nSOAPAction: \"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        ));
+        request.body = body.as_bytes().to_vec();
+        let response = match local {
+            Some(local) => app.handle_from_local(&request, peer, SocketAddr::from((local, 18200))),
+            None => app.handle_from(&request, peer),
+        };
+        String::from_utf8_lossy(&response.body).into_owned()
+    };
+    for (local, host) in [
+        (Some(second), second),
+        (Some(primary), primary),
+        (Some(Ipv4Addr::new(172, 17, 0, 2)), primary),
+        (None, primary),
+    ] {
+        let xml = browse(local);
+        let other = if host == primary { second } else { primary };
+        assert!(
+            xml.contains(&format!("http://{host}:18200/MediaItems/{id}.mkv")),
+            "{local:?}: {xml}"
+        );
+        assert!(
+            xml.contains(&format!("http://{host}:18200/AlbumArt/")),
+            "{local:?}"
+        );
+        assert!(
+            xml.contains(&format!("http://{host}:18200/Captions/{id}/")),
+            "{local:?}"
+        );
+        assert!(!xml.contains(&format!("http://{other}:")), "{local:?}");
+    }
+
+    let root = req("GET /rootDesc.xml HTTP/1.1\r\nHost: 127.0.0.1:18200\r\n\r\n");
+    let description = app.handle_from_local(&root, peer, SocketAddr::from((second, 18200)));
+    assert!(
+        String::from_utf8_lossy(&description.body).contains(&format!(
+            "<presentationURL>http://{second}:18200/</presentationURL>"
+        ))
+    );
+
+    let media = req(&format!(
+        "HEAD /MediaItems/{id}.mkv HTTP/1.1\r\nHost: 127.0.0.1:18200\r\nUser-Agent: DLNADOC/1.50 SEC_HHP_[TV]UE40D7000/1.0\r\ngetCaptionInfo.sec: 1\r\n\r\n"
+    ));
+    let response = app.handle_from_local(&media, peer, SocketAddr::from((second, 18200)));
+    let expected = format!("http://{second}:18200/Captions/{id}.srt");
+    assert_eq!(
+        resp_header(&response, "CaptionInfo.sec"),
+        Some(expected.as_str())
+    );
+    // The scope ends with the request; later requests use the primary again.
+    assert_eq!(app.url_host(), primary.to_string());
+}
+
+/// UPnP 1.1 control points revalidate a known server with a unicast M-SEARCH
+/// (often without MX) to `<interface>:1900`. That datagram lands on the
+/// interface's egress socket, which is now read: the reply comes from that
+/// socket at once and names that interface in LOCATION. The test socket is on
+/// loopback, so it drives the reader and reply path directly; the on-link
+/// admission gate is covered by
+/// `unicast_msearch_from_an_off_link_sender_is_dropped`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unicast_msearch_on_an_interface_socket_is_answered_from_that_socket() {
+    let app = Arc::new(testdata_app());
+    let server = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let server_address = server.local_addr().unwrap();
+    let ingress = Ipv4Addr::LOCALHOST;
+    let (_readers, mut datagrams) =
+        crate::lifecycle::spawn_unicast_ssdp_readers(&[(ingress, Arc::clone(&server))]);
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .send_to(
+            b"M-SEARCH * HTTP/1.1\r\nHOST: 127.0.0.1:1900\r\nMAN: \"ssdp:discover\"\r\nST: upnp:rootdevice\r\n\r\n",
+            server_address,
+        )
+        .await
+        .unwrap();
+    let datagram = tokio::time::timeout(Duration::from_secs(5), datagrams.recv())
+        .await
+        .expect("reader forwards the unicast datagram")
+        .unwrap();
+    assert_eq!(datagram.ingress, ingress);
+    let ms = parse_unicast_msearch(&String::from_utf8_lossy(&datagram.bytes)).unwrap();
+    let SocketAddr::V4(sender) = datagram.from else {
+        panic!("IPv4 sender");
+    };
+    let mut limiter = SsdpReplyLimiter::default();
+    let workers = Arc::new(tokio::sync::Semaphore::new(1));
+    crate::lifecycle::schedule_msearch_reply(
+        &app,
+        &mut limiter,
+        &workers,
+        ms,
+        sender,
+        (datagram.ingress, datagram.socket),
+        true,
+    );
+    let mut buffer = vec![0u8; 2048];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buffer))
+        .await
+        .expect("unicast reply without MX delay")
+        .unwrap();
+    assert_eq!(from, server_address, "reply leaves the ingress socket");
+    let reply = String::from_utf8_lossy(&buffer[..n]);
+    assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+    assert!(
+        reply.contains(&format!(
+            "LOCATION: http://{ingress}:{}/rootDesc.xml",
+            app.http_port
+        )) || reply.contains(&format!(
+            "Location: http://{ingress}:{}/rootDesc.xml",
+            app.http_port
+        )),
+        "{reply}"
+    );
+}
+
+/// A unicast M-SEARCH is routable, unlike the link-scoped multicast group, so
+/// answering any source would make a public, DMZ or routed-VPN address an
+/// SSDP reflector for spoofed requests. Only senders on the ingress
+/// interface's own subnet are answered; everything else is dropped before
+/// the reply limiter, so spoofed off-link sources cannot grow its map.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unicast_msearch_from_an_off_link_sender_is_dropped() {
+    let ingress = Ipv4Addr::new(192, 168, 50, 10);
+    let mask = Ipv4Addr::new(255, 255, 255, 0);
+    let interfaces = [(ingress, mask)];
+    let on_link = |sender, ingress| {
+        crate::lifecycle::unicast_msearch_sender_is_on_link(sender, ingress, &interfaces)
+    };
+    assert!(on_link(Ipv4Addr::new(192, 168, 50, 20), ingress));
+    assert!(!on_link(Ipv4Addr::new(192, 168, 51, 20), ingress));
+    assert!(!on_link(Ipv4Addr::new(203, 0, 113, 7), ingress));
+    assert!(!on_link(Ipv4Addr::LOCALHOST, ingress));
+    assert!(!on_link(Ipv4Addr::new(169, 254, 1, 2), ingress));
+    // Subnet broadcast and network addresses are never reply destinations.
+    assert!(!on_link(Ipv4Addr::new(192, 168, 50, 255), ingress));
+    assert!(!on_link(Ipv4Addr::new(192, 168, 50, 0), ingress));
+    // A datagram on an address that is not announced is never answered.
+    assert!(!on_link(
+        Ipv4Addr::new(10, 0, 0, 2),
+        Ipv4Addr::new(10, 0, 0, 1)
+    ));
+    // An unspecified netmask must not make every sender "on link".
+    assert!(!crate::lifecycle::unicast_msearch_sender_is_on_link(
+        Ipv4Addr::new(203, 0, 113, 7),
+        ingress,
+        &[(ingress, Ipv4Addr::UNSPECIFIED)],
+    ));
+
+    let mut app = testdata_app();
+    app.ssdp_interfaces = interfaces.to_vec();
+    let app = Arc::new(app);
+    let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let mut limiter = SsdpReplyLimiter::default();
+    let workers = Arc::new(tokio::sync::Semaphore::new(1));
+    let search = b"M-SEARCH * HTTP/1.1\r\nHOST: 192.168.50.10:1900\r\nMAN: \"ssdp:discover\"\r\nST: ssdp:all\r\n\r\n";
+    for from in [
+        SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 1900)),
+        SocketAddr::from((Ipv4Addr::new(192, 168, 51, 20), 1900)),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 1900)),
+    ] {
+        let datagram = crate::lifecycle::UnicastSsdpDatagram {
+            bytes: search.to_vec(),
+            from,
+            ingress,
+            socket: Arc::clone(&socket),
+        };
+        assert!(
+            !crate::lifecycle::handle_unicast_ssdp_datagram(&app, &mut limiter, &workers, datagram),
+            "{from} must not be answered"
+        );
+    }
+    assert_eq!(limiter.tracked_senders(), 0, "dropped before the limiter");
+    assert_eq!(workers.available_permits(), 1, "no reply task scheduled");
 }

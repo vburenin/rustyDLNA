@@ -178,6 +178,10 @@ fn valid_port_environment_override_keeps_precedence_over_cli_port() {
     let stdout = String::from_utf8(output.stdout).expect("effective config is UTF-8");
     assert!(stdout.contains("http_port = 18200"), "{stdout}");
     assert!(stdout.contains("ssdp_port = 11900"), "{stdout}");
+    assert!(
+        stdout.contains("reconcile_secs = 300..3600"),
+        "the default cadence is adaptive: {stdout}"
+    );
 }
 
 #[test]

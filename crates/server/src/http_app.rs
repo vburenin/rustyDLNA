@@ -586,6 +586,7 @@ impl AppPreflight {
             cache_dir,
             ai_upscale_profiles,
             update_id: AtomicU32::new(update_id),
+            web_etag_instance: web_etag_instance(),
             jobs: JobGate::new(max_jobs),
             ai_upscale_jobs: JobGate::new(ai_upscale_max_jobs),
             helpers,
@@ -618,6 +619,16 @@ impl AppPreflight {
             test_tree: None,
         })
     }
+}
+
+/// An unpredictable 64-bit tag, unique per App instance, from the standard
+/// library's randomly keyed hasher; no new dependency or clock is needed.
+fn web_etag_instance() -> String {
+    use std::hash::BuildHasher;
+    format!(
+        "{:016x}",
+        std::collections::hash_map::RandomState::new().hash_one(std::process::id())
+    )
 }
 
 impl App {
@@ -677,8 +688,24 @@ impl App {
         self.handle_from(req, SocketAddr::from((host, 9)))
     }
 
-    /// Shipped request handler. The accept loop passes the real peer.
-    /// Route one parsed HTTP request from a known peer.
+    /// Shipped request handler. The accept loop passes the real peer and the
+    /// connection's local address. When that local address is one of the
+    /// announced SSDP interfaces, absolute DLNA URLs (presentationURL, DIDL
+    /// resources, album art, captions and `CaptionInfo.sec`) use it, so a
+    /// renderer on each announced subnet receives URLs on its own subnet.
+    /// Any other local address keeps the primary advertise address.
+    pub fn handle_from_local(
+        &self,
+        req: &HttpRequest,
+        peer: SocketAddr,
+        local: SocketAddr,
+    ) -> HttpResponse {
+        let _ingress = self.enter_ingress_scope(local);
+        self.handle_from(req, peer)
+    }
+
+    /// Route one parsed HTTP request from a known peer. Absolute DLNA URLs
+    /// use the current ingress scope, or the primary advertise address.
     pub fn handle_from(&self, req: &HttpRequest, peer: SocketAddr) -> HttpResponse {
         let _query_scope = ensure_query_scope(self.runtime_metrics.queries.clone());
         let started = Instant::now();
@@ -828,12 +855,12 @@ impl App {
                 if req.path.starts_with("/web/preview/") {
                     web_ui::preview(self, req)
                 } else {
-                    web_ui::asset(self, &req.path)
+                    web_ui::asset(self, req)
                 }
             }
             HttpRoute::Thumbnail => self.thumbnail(req),
             HttpRoute::Resized => self.resized(req),
-            HttpRoute::Presentation => web_ui::presentation(self),
+            HttpRoute::Presentation => web_ui::presentation(self, req),
             HttpRoute::NotFound => HttpResponse::html(404, "Not Found", "not found"),
         };
         if matches!(
@@ -884,7 +911,7 @@ impl App {
             model_name: "Windows Media Connect compatible (rustyDLNA)".into(),
             model_description: "rustyDLNA on Linux".into(),
             serial: self.cfg.serial.clone().unwrap_or_else(|| "1".into()),
-            presentation_url: Some(format!("http://{}:{}/", self.advertise_ip, self.http_port)),
+            presentation_url: Some(format!("http://{}:{}/", self.url_host(), self.http_port)),
             xbox: client.kind == ClientKind::Xbox,
             samsung_dcm10: client.flags.contains(ClientFlags::SAMSUNG_DCM10),
         };
@@ -1505,14 +1532,9 @@ impl App {
             }
             CatalogChildRef::Item(it) => {
                 let date = w3c_normalize_date(&it.date);
-                let art_url = (it.album_art > 0).then(|| {
-                    album_art_url(
-                        &self.advertise_ip,
-                        self.http_port,
-                        it.album_art,
-                        it.detail_id,
-                    )
-                });
+                let host = self.url_host();
+                let art_url = (it.album_art > 0)
+                    .then(|| album_art_url(&host, self.http_port, it.album_art, it.detail_id));
                 let audio = it.class.contains("audio");
                 let video = it.class.contains("video");
                 let captions = it
@@ -1521,7 +1543,7 @@ impl App {
                     .map(|c| DidlCaption {
                         ext: c.ext.clone(),
                         url: caption_indexed_url(
-                            &self.advertise_ip,
+                            &host,
                             self.http_port,
                             it.detail_id,
                             c.index,
@@ -1551,9 +1573,12 @@ impl App {
                     child_count: None,
                     child_container_count: None,
                     is_container: false,
-                    resources: self.item_resources(it, client, ua, bits),
-                    album_art_uri: if audio { art_url } else { None },
-                    album_art_profile: audio && client_wants_art_profile(client),
+                    resources: self.item_resources(&host, it, client, ua, bits),
+                    // Movie and episode posters reach control points that read
+                    // only upnp:albumArtURI (VLC, Kodi/Platinum, BubbleUPnP);
+                    // the video JPEG_TN <res> row stays for Samsung and others.
+                    album_art_uri: if audio || video { art_url } else { None },
+                    album_art_profile: (audio || video) && client_wants_art_profile(client),
                     creator: it.creator.clone(),
                     // DLNA renderers can display this field without an
                     // interactive spoiler guard. Advertise only the safe
@@ -1875,6 +1900,7 @@ impl App {
 
     fn item_resources(
         &self,
+        host: &str,
         it: &MediaItem,
         client: &ClientProfile,
         ua: Option<&str>,
@@ -1886,7 +1912,7 @@ impl App {
             it.creator.as_deref(),
             it.dlna_pn.as_deref(),
         );
-        let orig_url = media_item_url(&self.advertise_ip, self.http_port, it.detail_id, &it.ext);
+        let orig_url = media_item_url(host, self.http_port, it.detail_id, &it.ext);
         let dlna = client.flags.contains(ClientFlags::DLNA);
         let skip = client.flags.contains(ClientFlags::SKIP_DLNA_PN);
         let mut bitrate = it.bitrate;
@@ -1927,7 +1953,7 @@ impl App {
         // Any matching remap: advertise the remux first so the client
         // (Kodi included) plays /Transcode/ instead of the original P7.
         let mut res = if plan.decision == Decision::Recode {
-            let remap_url = transcode_item_url(&self.advertise_ip, self.http_port, it.detail_id);
+            let remap_url = transcode_item_url(host, self.http_port, it.detail_id);
             // Live fMP4 pipe (OP=00). Do not stat the remux cache on Browse.
             let remap = DidlRes {
                 url: remap_url,
@@ -1953,22 +1979,22 @@ impl App {
                 let resize_thumbs = client.flags.contains(ClientFlags::RESIZE_THUMBS);
                 if !no_resize {
                     if srcw > 4096 || srch > 4096 {
-                        res.push(resized_didl(self, it, 4096, 4096, "JPEG_LRG"));
+                        res.push(resized_didl(self, host, it, 4096, 4096, "JPEG_LRG"));
                     }
                     if srcw > 1024 || srch > 768 {
-                        res.push(resized_didl(self, it, 1024, 768, "JPEG_MED"));
+                        res.push(resized_didl(self, host, it, 1024, 768, "JPEG_MED"));
                     }
                     if srcw > 640 || srch > 480 {
-                        res.push(resized_didl(self, it, 640, 480, "JPEG_SM"));
+                        res.push(resized_didl(self, host, it, 640, 480, "JPEG_SM"));
                     }
                 }
                 if resize_thumbs {
-                    res.push(resized_didl(self, it, 160, 160, "JPEG_TN"));
+                    res.push(resized_didl(self, host, it, 160, 160, "JPEG_TN"));
                 } else {
                     res.push(DidlRes {
                         url: format!(
-                            "http://{}:{}/Thumbnails/{}.jpg",
-                            self.advertise_ip, self.http_port, it.detail_id
+                            "http://{host}:{}/Thumbnails/{}.jpg",
+                            self.http_port, it.detail_id
                         ),
                         protocol_info: "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_TN;DLNA.ORG_CI=1"
                             .into(),
@@ -1983,39 +2009,34 @@ impl App {
                     });
                 }
             }
-            if client.flags.contains(ClientFlags::CAPTION_RES) {
-                for cap in &it.captions {
-                    let url = caption_indexed_url(
-                        &self.advertise_ip,
-                        self.http_port,
-                        it.detail_id,
-                        cap.index,
-                        &cap.ext,
-                    );
-                    res.push(DidlRes {
-                        url,
-                        protocol_info: format!("http-get:*:{}:*", caption_http_mime(&cap.ext)),
-                        size: None,
-                        duration: None,
-                        bitrate: None,
-                        resolution: None,
-                        sample_frequency: None,
-                        nr_audio_channels: None,
-                        pv_subtitle_type: None,
-                        pv_subtitle_uri: None,
-                    });
-                }
-            }
             res
         };
-        if bits.pv && !it.captions.is_empty() {
-            if let Some(first) = res.first_mut() {
-                first.pv_subtitle_type = Some("SRT".into());
-                first.pv_subtitle_uri = Some(caption_default_url(
-                    &self.advertise_ip,
-                    self.http_port,
-                    it.detail_id,
-                ));
+        // Sidecar captions follow the source timeline, which a remap preserves,
+        // so remapped items advertise them after [remap, original] as well.
+        if client.flags.contains(ClientFlags::CAPTION_RES) {
+            for cap in &it.captions {
+                let url =
+                    caption_indexed_url(host, self.http_port, it.detail_id, cap.index, &cap.ext);
+                res.push(DidlRes {
+                    url,
+                    protocol_info: format!("http-get:*:{}:*", caption_http_mime(&cap.ext)),
+                    size: None,
+                    duration: None,
+                    bitrate: None,
+                    resolution: None,
+                    sample_frequency: None,
+                    nr_audio_channels: None,
+                    pv_subtitle_type: None,
+                    pv_subtitle_uri: None,
+                });
+            }
+        }
+        if bits.pv {
+            if let Some(default) = default_caption_advertisement(host, self.http_port, it) {
+                if let Some(first) = res.first_mut() {
+                    first.pv_subtitle_type = Some(default.type_label);
+                    first.pv_subtitle_uri = Some(default.url);
+                }
             }
         }
         if plan.decision != Decision::Recode {
@@ -2025,7 +2046,7 @@ impl App {
                 extra_ci1_protocol_infos(client.kind, &it.mime, it.dlna_pn.as_deref())
             {
                 res.push(DidlRes {
-                    url: media_item_url(&self.advertise_ip, self.http_port, it.detail_id, &it.ext),
+                    url: media_item_url(host, self.http_port, it.detail_id, &it.ext),
                     protocol_info: format!("http-get:*:{emime}:{info}"),
                     size: Some(it.size),
                     duration: it.duration.clone(),
@@ -2038,23 +2059,24 @@ impl App {
                 });
             }
         }
-        self.push_video_album_art(&mut res, it, client);
+        self.push_video_album_art(host, &mut res, it, client);
         res
     }
 
-    fn push_video_album_art(&self, res: &mut Vec<DidlRes>, it: &MediaItem, client: &ClientProfile) {
+    fn push_video_album_art(
+        &self,
+        host: &str,
+        res: &mut Vec<DidlRes>,
+        it: &MediaItem,
+        client: &ClientProfile,
+    ) {
         if it.album_art <= 0 || !it.class.contains("video") {
             return;
         }
         if client.flags.contains(ClientFlags::MS_PFS) {
             return;
         }
-        let url = album_art_url(
-            &self.advertise_ip,
-            self.http_port,
-            it.album_art,
-            it.detail_id,
-        );
+        let url = album_art_url(host, self.http_port, it.album_art, it.detail_id);
         res.push(DidlRes {
             url: url.clone(),
             protocol_info: "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_TN".into(),
@@ -2092,6 +2114,16 @@ impl App {
         transcode: bool,
         peer: SocketAddr,
     ) -> HttpResponse {
+        self.media_with_open_errors(req, transcode, peer, OriginalOpenErrors::Dlna)
+    }
+
+    pub(crate) fn media_with_open_errors(
+        &self,
+        req: &HttpRequest,
+        transcode: bool,
+        peer: SocketAddr,
+        open_errors: OriginalOpenErrors,
+    ) -> HttpResponse {
         let id = if transcode {
             transcode_id_from_path(&req.path)
         } else {
@@ -2113,6 +2145,14 @@ impl App {
             }
             return HttpResponse::html(404, "Not Found", "no album art");
         }
+        // Samsung asks for the subtitle URL on whichever media URL it plays,
+        // including a remapped /Transcode/ resource.
+        let caption_sec = if wants_caption_info_sec(req) {
+            default_caption_advertisement(&self.url_host(), self.http_port, &item)
+                .map(|caption| caption.url)
+        } else {
+            None
+        };
         if transcode {
             let probe = self.browse_probe(&item);
             let src = probe_to_source(
@@ -2299,6 +2339,7 @@ impl App {
                         AudioAction::ToAc3 => RemuxAudio::Ac3,
                         AudioAction::ToAac => RemuxAudio::Aac,
                     },
+                    caption_info_sec: caption_sec,
                 });
                 return r;
             }
@@ -2324,18 +2365,33 @@ impl App {
         let mut opened = match rusty_dlna_scan::open_allowed_file(&path, &self.scan_cfg) {
             Ok(opened) => opened,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                return HttpResponse::html(403, "Forbidden", "path escaped media dir");
+                return match open_errors {
+                    OriginalOpenErrors::Dlna => {
+                        HttpResponse::html(403, "Forbidden", "path escaped media dir")
+                    }
+                    OriginalOpenErrors::WebJson => web_ui::original_media_unavailable(false),
+                };
             }
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "media missing");
-                return HttpResponse::html(404, "Not Found", "missing file");
+                return match open_errors {
+                    OriginalOpenErrors::Dlna => {
+                        HttpResponse::html(404, "Not Found", "missing file")
+                    }
+                    OriginalOpenErrors::WebJson => web_ui::original_media_unavailable(true),
+                };
             }
         };
         let metadata = match opened.file.metadata() {
             Ok(metadata) => metadata,
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "media metadata failed");
-                return HttpResponse::html(404, "Not Found", "missing file");
+                return match open_errors {
+                    OriginalOpenErrors::Dlna => {
+                        HttpResponse::html(404, "Not Found", "missing file")
+                    }
+                    OriginalOpenErrors::WebJson => web_ui::original_media_unavailable(true),
+                };
             }
         };
         let size = metadata.len();
@@ -2367,15 +2423,6 @@ impl App {
         };
         const RAM_CAP: u64 = 8 * 1024 * 1024;
         let span = end.saturating_sub(start).saturating_add(1);
-        let caption_sec = if wants_caption_info_sec(req) && !item.captions.is_empty() {
-            Some(caption_info_sec_url(
-                &self.advertise_ip,
-                self.http_port,
-                item.detail_id,
-            ))
-        } else {
-            None
-        };
         if req.method.eq_ignore_ascii_case("HEAD") {
             let mut r = media_response(MediaResponseOptions {
                 server: &self.server,
@@ -2490,17 +2537,37 @@ impl App {
             return HttpResponse::html(404, "Not Found", "no such art");
         };
         let path = rusty_dlna_scan::rebase_media_path_for_config(&path, &self.scan_cfg);
-        let body = match self.read_sidecar(&path) {
-            Ok(b) => b,
+        // The watcher renews the art ID (and URL) of a JPEG sidecar replaced in
+        // place; a rewrite it never observes keeps the same ID. The descriptor's
+        // file identity lets clients revalidate either way instead of
+        // re-downloading.
+        let (file, metadata) = match self.open_bounded_sidecar(&path) {
+            Ok(opened) => opened,
             Err(r) => return *r,
         };
-        let mut r = HttpResponse::new(200, "OK");
-        r.set("Content-Type", "image/jpeg");
+        let etag = rusty_dlna_http::range::original_file_etag(&metadata);
+        let not_modified = etag.as_deref().is_some_and(|etag| {
+            rusty_dlna_http::range::if_none_match_matches(req.header("If-None-Match"), etag)
+        });
+        let mut r = if not_modified {
+            HttpResponse::new(304, "Not Modified")
+        } else {
+            let body = match read_opened_sidecar(file) {
+                Ok(body) => body,
+                Err(r) => return *r,
+            };
+            let mut r = HttpResponse::new(200, "OK");
+            r.set("Content-Type", "image/jpeg");
+            r.set("Content-Length", body.len());
+            r.body = body;
+            r
+        };
         r.set("transferMode.dlna.org", "Interactive");
         r.set("contentFeatures.dlna.org", "DLNA.ORG_PN=JPEG_TN");
         r.set("Cache-Control", "private, max-age=86400");
-        r.set("Content-Length", body.len());
-        r.body = body;
+        if let Some(etag) = etag {
+            r.set("ETag", etag);
+        }
         r
     }
 
@@ -2701,13 +2768,22 @@ impl App {
         if req.path.contains("/embedded/") {
             return web_ui::embedded_caption(self, req);
         }
-        let Some((id, idx)) = caption_from_path(&req.path) else {
+        let Some((id, selector)) = caption_route_from_path(&req.path) else {
             return HttpResponse::html(404, "Not Found", "bad caption");
         };
         let Some(item) = read_recover(&self.catalog).get_item_by_detail(id).cloned() else {
             return HttpResponse::html(404, "Not Found", "no item");
         };
-        let Some(cap) = item.captions.iter().find(|c| c.index == idx) else {
+        let cap = match selector {
+            // The same choice advertised by pv:subtitleFileUri / CaptionInfo.sec.
+            rusty_dlna_protocol::CaptionSelector::Default => {
+                rusty_dlna_scan::default_caption(&item.path, &item.captions)
+            }
+            rusty_dlna_protocol::CaptionSelector::Index(idx) => {
+                item.captions.iter().find(|c| c.index == idx)
+            }
+        };
+        let Some(cap) = cap else {
             return HttpResponse::html(404, "Not Found", "no caption");
         };
         let cap_path = rusty_dlna_scan::rebase_media_path_for_config(&cap.path, &self.scan_cfg);
@@ -2749,6 +2825,16 @@ impl App {
 
     /// Art / captions: regular file under media, cache, or generated-art roots.
     pub(super) fn read_sidecar(&self, path: &Path) -> Result<Vec<u8>, Box<HttpResponse>> {
+        let (file, _) = self.open_bounded_sidecar(path)?;
+        read_opened_sidecar(file)
+    }
+
+    /// Open a confined sidecar and return its descriptor's own metadata, so a
+    /// validator always describes the bytes later read from that descriptor.
+    fn open_bounded_sidecar(
+        &self,
+        path: &Path,
+    ) -> Result<(std::fs::File, std::fs::Metadata), Box<HttpResponse>> {
         let opened = self.open_sidecar_file(path).map_err(|_| {
             Box::new(HttpResponse::html(
                 404,
@@ -2756,38 +2842,103 @@ impl App {
                 "sidecar escaped or missing",
             ))
         })?;
-        if opened
-            .file
-            .metadata()
-            .map(|metadata| metadata.len() > rusty_dlna_scan::MAX_SIDECAR_BYTES)
-            .unwrap_or(true)
-        {
-            return Err(Box::new(HttpResponse::html(
+        match opened.file.metadata() {
+            Ok(metadata) if metadata.len() <= rusty_dlna_scan::MAX_SIDECAR_BYTES => {
+                Ok((opened.file, metadata))
+            }
+            _ => Err(Box::new(HttpResponse::html(
                 413,
                 "Payload Too Large",
                 "sidecar too large",
-            )));
+            ))),
         }
-        const MAX_SIDECAR_READ_BYTES: usize = rusty_dlna_scan::MAX_SIDECAR_BYTES as usize;
-        let body = match read_to_end_bounded(opened.file, MAX_SIDECAR_READ_BYTES) {
-            Ok(body) => body,
-            Err(BoundedReadError::LimitExceeded { .. }) => {
-                return Err(Box::new(HttpResponse::html(
-                    413,
-                    "Payload Too Large",
-                    "sidecar too large",
-                )))
-            }
-            Err(BoundedReadError::Io(_)) => {
-                return Err(Box::new(HttpResponse::html(
-                    404,
-                    "Not Found",
-                    "sidecar missing",
-                )))
-            }
-        };
-        Ok(body)
     }
+}
+
+fn read_opened_sidecar(file: std::fs::File) -> Result<Vec<u8>, Box<HttpResponse>> {
+    const MAX_SIDECAR_READ_BYTES: usize = rusty_dlna_scan::MAX_SIDECAR_BYTES as usize;
+    match read_to_end_bounded(file, MAX_SIDECAR_READ_BYTES) {
+        Ok(body) => Ok(body),
+        Err(BoundedReadError::LimitExceeded { .. }) => Err(Box::new(HttpResponse::html(
+            413,
+            "Payload Too Large",
+            "sidecar too large",
+        ))),
+        Err(BoundedReadError::Io(_)) => Err(Box::new(HttpResponse::html(
+            404,
+            "Not Found",
+            "sidecar missing",
+        ))),
+    }
+}
+
+thread_local! {
+    /// Announced SSDP interface address the current HTTP request arrived on.
+    static REQUEST_INGRESS_HOST: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous ingress host when one request finishes.
+struct IngressScope(Option<String>);
+
+impl Drop for IngressScope {
+    fn drop(&mut self) {
+        REQUEST_INGRESS_HOST.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+impl App {
+    /// Only an announced interface address is a trustworthy URL host. Bridge,
+    /// NAT, VPN or loopback ingress keeps the primary advertise address.
+    fn enter_ingress_scope(&self, local: SocketAddr) -> IngressScope {
+        let host = match local {
+            SocketAddr::V4(local) => Some(*local.ip()),
+            SocketAddr::V6(local) => local.ip().to_ipv4_mapped(),
+        }
+        .filter(|ip| {
+            self.ssdp_interfaces
+                .iter()
+                .any(|(address, _)| address == ip)
+        })
+        .map(|ip| ip.to_string());
+        IngressScope(REQUEST_INGRESS_HOST.with(|slot| slot.replace(host)))
+    }
+
+    /// Host for absolute DLNA URLs in the current request.
+    pub(crate) fn url_host(&self) -> String {
+        REQUEST_INGRESS_HOST
+            .with(|slot| slot.borrow().clone())
+            .unwrap_or_else(|| self.advertise_ip.clone())
+    }
+}
+
+/// The caption a renderer receives through `pv:subtitleFileUri` and
+/// Samsung's `CaptionInfo.sec`, with its wire type label and URL.
+pub(super) struct DefaultCaptionAdvertisement {
+    pub(super) type_label: String,
+    pub(super) url: String,
+}
+
+/// An SRT default keeps the `/Captions/{id}.srt` URL, which the caption route
+/// resolves to the same default. Any other format uses its indexed URL and
+/// real type, so a `.srt` URL never serves or labels non-SRT bytes as SRT.
+pub(super) fn default_caption_advertisement(
+    host: &str,
+    port: u16,
+    item: &MediaItem,
+) -> Option<DefaultCaptionAdvertisement> {
+    let caption = rusty_dlna_scan::default_caption(&item.path, &item.captions)?;
+    let url = if caption.ext.eq_ignore_ascii_case("srt") {
+        caption_default_url(host, port, item.detail_id)
+    } else {
+        caption_indexed_url(host, port, item.detail_id, caption.index, &caption.ext)
+    };
+    Some(DefaultCaptionAdvertisement {
+        type_label: caption.ext.to_ascii_uppercase(),
+        url,
+    })
 }
 
 /// HTTP/1.1 requires a dotted-IPv4 Host on every method (SOAP / GENA included).
@@ -2898,6 +3049,11 @@ impl SsdpReplyLimiter {
         }
         entry.1 += datagrams;
         true
+    }
+
+    #[cfg(test)]
+    pub(super) fn tracked_senders(&self) -> usize {
+        self.senders.len()
     }
 }
 
@@ -3107,11 +3263,11 @@ fn parse_wh(res: Option<&str>) -> (u32, u32) {
     (w.parse().unwrap_or(0), h.parse().unwrap_or(0))
 }
 
-fn resized_didl(app: &App, it: &MediaItem, w: u32, h: u32, pn: &str) -> DidlRes {
+fn resized_didl(app: &App, host: &str, it: &MediaItem, w: u32, h: u32, pn: &str) -> DidlRes {
     DidlRes {
         url: format!(
-            "http://{}:{}/Resized/{}.jpg?width={w},height={h}",
-            app.advertise_ip, app.http_port, it.detail_id
+            "http://{host}:{}/Resized/{}.jpg?width={w},height={h}",
+            app.http_port, it.detail_id
         ),
         protocol_info: format!(
             "http-get:*:image/jpeg:{}",
@@ -3138,6 +3294,16 @@ fn jpeg_pn_for_size(w: u32, h: u32) -> &'static str {
     } else {
         "JPEG_LRG"
     }
+}
+
+/// How an original-file open failure is reported. DLNA renderers keep the
+/// historical HTML 403/404 statuses; the browser/app routes report every
+/// unreadable or confinement-rejected file as JSON `404 media_missing`, because
+/// status-only clients map 403 to a sign-in problem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OriginalOpenErrors {
+    Dlna,
+    WebJson,
 }
 
 pub(crate) fn media_read_error_response(

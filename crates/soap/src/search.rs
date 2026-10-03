@@ -483,25 +483,37 @@ pub fn clause_matches(clause: &SearchClause, row: &SearchRow<'_>) -> bool {
             std::borrow::Cow::Borrowed(field(row, prop))
         }
     };
+    // Free text folds Unicode case exactly like the SQLite path; identifiers,
+    // classes and dates keep ASCII case-insensitivity.
+    let fold = |prop: SearchProp, value: &str| {
+        if matches!(
+            prop,
+            SearchProp::Title
+                | SearchProp::Creator
+                | SearchProp::Artist
+                | SearchProp::Genre
+                | SearchProp::Album
+                | SearchProp::Actor
+        ) {
+            rusty_dlna_protocol::soap::search_text_fold(value)
+        } else {
+            value.to_ascii_lowercase()
+        }
+    };
     let compare = |prop, value: &str| {
         let value = if prop == SearchProp::Class {
             full_object_class(value)
         } else {
             std::borrow::Cow::Borrowed(value)
         };
-        normalized(prop)
-            .to_ascii_lowercase()
-            .cmp(&value.to_ascii_lowercase())
+        fold(prop, &normalized(prop)).cmp(&fold(prop, &value))
     };
+    let contains = |prop, needle: &str| fold(prop, &normalized(prop)).contains(&fold(prop, needle));
     match clause {
         SearchClause::All => true,
         SearchClause::Unknown => false,
-        SearchClause::Contains { prop, needle } => normalized(*prop)
-            .to_ascii_lowercase()
-            .contains(&needle.to_ascii_lowercase()),
-        SearchClause::DoesNotContain { prop, needle } => !normalized(*prop)
-            .to_ascii_lowercase()
-            .contains(&needle.to_ascii_lowercase()),
+        SearchClause::Contains { prop, needle } => contains(*prop, needle),
+        SearchClause::DoesNotContain { prop, needle } => !contains(*prop, needle),
         SearchClause::Equals { prop, value } => compare(*prop, value).is_eq(),
         SearchClause::NotEquals { prop, value } => !compare(*prop, value).is_eq(),
         SearchClause::LessThan {
@@ -554,6 +566,36 @@ mod tests {
             is_container: true,
             ..SearchRow::default()
         }
+    }
+
+    /// BubbleUPnP and TV search boxes send `dc:title contains`; `contains` is
+    /// case-insensitive in UPnP CDS, including for non-ASCII titles.
+    #[test]
+    fn free_text_search_folds_unicode_case() {
+        let matches = |criteria: &str, row: &SearchRow<'_>| {
+            row_matches(&try_parse_search_criteria(Some(criteria)).unwrap(), row)
+        };
+        let cyrillic = video("Матриця");
+        let accented = SearchRow {
+            artist: "ÉLAN Quartet",
+            ..video("Élan")
+        };
+        assert!(matches("dc:title contains \"матриця\"", &cyrillic));
+        assert!(matches("dc:title contains \"МАТР\"", &cyrillic));
+        assert!(!matches("dc:title doesNotContain \"матр\"", &cyrillic));
+        assert!(matches("dc:title = \"МАТРИЦЯ\"", &cyrillic));
+        assert!(!matches("dc:title != \"матриця\"", &cyrillic));
+        assert!(matches("dc:title contains \"élan\"", &accented));
+        assert!(matches("upnp:artist contains \"élan q\"", &accented));
+        // Case only: accents are not folded away.
+        assert!(!matches("dc:title contains \"elan\"", &accented));
+        // Identifiers keep ASCII semantics.
+        let identified = SearchRow {
+            id: "64$Ä1",
+            ..video("x")
+        };
+        assert!(!matches("@id = \"64$ä1\"", &identified));
+        assert!(matches("@id = \"64$Ä1\"", &identified));
     }
 
     #[test]

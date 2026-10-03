@@ -5,6 +5,218 @@ publish a signed, content-addressed OCI image with SBOM and provenance.
 
 ## Unreleased
 
+- Fixed an unmounted or missing media root emptying the library. Periodic
+  reconciliation read a vanished root, or an empty mount point, as "every file
+  deleted". It dropped every item under it with its bookmarks, and files that
+  came back got new IDs. Such a root is now held: its items, IDs, bookmarks,
+  and playlists are kept until it returns, while every other root keeps being
+  reconciled. An empty root counts as unmounted when its device differs from
+  the one the last successful pass recorded, so an emptied root still
+  converges. A root that disappears while earlier roots are being walked is
+  held too, and removing a dangling symlink no longer deletes the item it
+  pointed to under a held root. Upgrade note: a catalog written before root
+  devices were recorded cannot tell an emptied root from an unmounted one, so
+  a root emptied before the first pass after upgrading is held until any entry
+  (for example an empty `.keep` file) appears in it or it is removed from the
+  configuration.
+- One unreadable subdirectory (`EACCES`) no longer fails every scan and
+  reconciliation or stops the inotify watcher. It is skipped with a warning,
+  and items and playlists already indexed under it keep their IDs, bookmarks,
+  and metadata. A permission error, stale handle, or I/O error while opening a
+  single file or symlink target no longer removes its row, whether a full
+  reconciliation or an inotify event saw it.
+- `.m2ts`/`.mts` (BDAV/AVCHD), DSF/DFF, and RealMedia files added after the
+  first scan are now admitted. Before, they were dropped without a log line,
+  and existing ones were removed from the catalog when they changed.
+- A malformed or non-XML `.nfo` no longer fails every scan and reconciliation.
+  Scene ASCII-art and scraper-URL NFOs carry no overrides; a bare `&`, `<br>`,
+  and HTML entities are tolerated; and a sidecar that is still not well-formed
+  XML keeps the item's existing metadata (a new item uses its filename) and is
+  logged once.
+- Kodi folder `movie.nfo` now applies to the only video in its folder when
+  that video has no `{stem}.nfo`.
+- M3U/PLS entries written with Windows `\` separators now resolve; drive-letter
+  and UNC entries are skipped.
+- Deleting the first-indexed hard link of a video no longer drops the
+  surviving link from All Video, Series, and Genre.
+- Deleting a PNG (or other converted) poster now clears its artwork on the next
+  reconciliation, and a JPEG poster replaced in place gets a new art URL so
+  clients stop showing the cached image.
+- A media probe that times out (for example while a disk spins up) is retried
+  by later reconciliations, up to three consecutive timeouts, instead of being
+  cached as a failure on the first one. After the third it is cached as failed
+  until the file's size, mtime, or inode changes. A replaced or modified file
+  whose probe times out shows no stream details until a probe succeeds, rather
+  than the previous file's.
+- Items whose scan probe failed now report `embedded_captions_complete: true`,
+  so native clients no longer fail opening them through a doomed enrichment
+  probe. Enrichment now applies `.probe.toml` overrides, and the first startup
+  after upgrading re-probes catalog rows recorded before embedded-subtitle
+  discovery once.
+- The full SQLite integrity check now runs once at startup instead of on every
+  scanner, stage-backup, and writer reopen, and corruption found while running
+  no longer renames the live database from under open connections.
+- Opening a database written by a newer release now fails with a message naming
+  both schema versions, and leaves the file unchanged.
+- Native app copy requests (`reason=native_ios`) for video the server cannot
+  copy are now encoded instead of failing with HTTP 400. This covers 10-bit
+  H.264, H.264 above level 5.1, HEVC Range Extensions, and Dolby Vision
+  Profile 7. SDR sources use the H.264 SDR encode. HDR sources use HEVC HDR10
+  where the server offers it and are otherwise still rejected, so HDR is never
+  silently dropped. Browser requests keep the strict rejection.
+- HEVC stream copy now requires 4:2:0 Main or Main 10 video of at most 10
+  bits. 4:2:2, 4:4:4, and 12-bit Range Extension streams are re-encoded instead
+  of being copied to clients that cannot decode them.
+- Added the additive `video_copy_available` field to video DTOs.
+- A Compatible request that cannot fit the transcode cache limits now returns
+  `503 transcode_storage` with `Retry-After: 30` instead of `503 transcode_busy`,
+  and is counted in `web_player.failures.storage_total`.
+- An active output larger than the whole transcode cache quota no longer evicts
+  every completed cache entry before failing. Completed output is kept, and a
+  warning names `cache_max_mb`.
+
+- Fixed native HLS playback of copied video (the iPhone app's main path and
+  Safari's opt-in native HLS) stopping partway through a title. The playlist
+  froze its target duration at the first one or two keyframe intervals, so a
+  later, longer interval made every playlist reload fail with HTTP 500. A
+  growing copied playlist now waits up to five seconds for 20 seconds of
+  segments before it is first published, and reserves a target duration of at
+  least 10 seconds. No playlist tags change.
+- The generation status (`/api/web/transcode/{id}`) now reports optional
+  `stream_start_seconds`: the source time that output time zero represents.
+  A nonzero seek that copies video from Matroska or MP4 starts at the preceding
+  keyframe, which a bounded source probe establishes beside the producer
+  (accurate to a fraction of a second). Until then, if the probe is skipped or
+  fails, or if a generic-seek container such as MPEG-TS lands between
+  keyframes, the value is `null`. A skipped probe does not count as a helper
+  rejection. The probe runs only on helper slots that no admissible producer
+  could need, so it never turns another session's start into
+  `503 transcode_busy`. Shutdown cancels it and waits for FFprobe to be reaped.
+- SubRip and ASS/SSA caption sidecars no longer fail as a whole because of one
+  bad cue: zero-length, reversed, unreadable, or empty cues are omitted, and an
+  SRT text block split by a stray blank line continues its cue. Sidecars that
+  are not UTF-8 are read as Windows-1252, and UTF-16 files with a byte-order
+  mark are decoded, instead of returning `422 caption_encoding`. Offline
+  packages that store every advertised caption no longer fail on such files.
+- A missing, unreadable, or confinement-rejected media file now returns
+  `404 media_missing` (was 403) from `/api/web/item`, `/web/media` (including
+  `mode=direct`), and `/web/download`, so status-based clients no longer
+  report it as a sign-in problem. DLNA `/MediaItems` keeps its 403.
+- One-item metadata enrichment (`enrich=1`) waits at most ten seconds for
+  helper admission, answering a busy server with `503 transcode_busy` before
+  common client request timeouts.
+- Web `art_url` is now `null` for items without stored artwork instead of a
+  `/Thumbnails` URL that always returned 404.
+- `/AlbumArt` and `/Thumbnails` responses carry a strong file-identity `ETag`
+  and answer a matching `If-None-Match` with 304. Artwork, embedded web
+  assets, and web generation validators share one `If-None-Match` evaluator;
+  `*` matches only on its own.
+- Web library and item ETags include a per-start server tag, so a restart that
+  changes configuration (transcoding, encoder outputs, captions) cannot serve
+  stale capabilities through 304.
+- Recently added (`sort=date_desc`) now orders by file modification time, like
+  the DLNA Recently Added views, instead of NFO or embedded release dates.
+- The Folders view now honors Recently added and Episode/track sorting for its
+  media (subfolders stay first) instead of always using name order.
+- Browser search matches every whitespace-separated word in any order and
+  across fields, so `blade 2049` or `beatles abbey` find their titles. Up to 16
+  distinct words are considered; single-word and exact-phrase searches return
+  at least the same results as before.
+- Fixed remapped (`/Transcode/`) items losing sidecar subtitles: Kodi, LG,
+  BubbleUPnP and other caption-resource renderers now get the caption `<res>`
+  rows after the remap and original rows, and Samsung TVs get
+  `CaptionInfo.sec` on `/Transcode/` responses.
+- Video items with a poster now carry `upnp:albumArtURI`, so VLC, Kodi and
+  BubbleUPnP show movie and episode artwork. The existing thumbnail `<res>` row
+  is unchanged; Samsung's `dlna:profileID` attribute is emitted only when the
+  DIDL declares its namespace.
+- The default subtitle for Samsung `CaptionInfo.sec`, `pv:subtitleFileUri` and
+  `/Captions/{id}.srt` is now the untagged SRT (then any SRT, SMI, or the first
+  sidecar) instead of the alphabetically first file. A non-SRT default is
+  advertised with its own URL and type instead of being labelled SRT.
+- SOAP Search on titles, artists, albums, genres and creators now ignores case
+  for non-ASCII text too ("матриця" finds "Матриця"), matching the browser
+  search.
+- Unicast M-SEARCH to an announced interface (UPnP 1.1 revalidation, add by IP)
+  is now answered, including requests without `MX`, when the sender is on that
+  interface's subnet. Off-link unicast searches are ignored.
+- With several announced interfaces, DIDL, artwork, caption and
+  `presentationURL` addresses now use the interface the renderer connected to,
+  so renderers on a second subnet can play media.
+- `DLNA.ORG_PN` no longer advertises invented profiles for HEVC, MPEG-2 in MP4
+  or H.264 in AVI, and HD H.264 MP4 uses the advertised `AVC_MP4_HP_HD_AAC`
+  profile. Existing catalogs update on the next scan.
+- Changed the default periodic library walk from a fixed 30 seconds to an
+  adaptive 300 to 3600 seconds (`rescan_secs = 300`, `rescan_max_secs` defaults
+  to 3600). Inotify still publishes ordinary local changes immediately; an
+  unchanged library now backs off instead of re-reading every root about every
+  30 seconds. An omitted `rescan_max_secs` is never below `rescan_secs`, and an
+  explicit `rescan_max_secs = 0` keeps a fixed cadence. Lower these for NFS,
+  SMB, or FUSE roots whose remote changes raise no inotify events.
+  Upgrade note: a configuration that sets only `rescan_secs` now backs off up
+  to `max(3600, rescan_secs)` after an idle period; add `rescan_max_secs = 0`
+  to keep the previous fixed cadence.
+- Health no longer reports `degraded` / "scanner success is stale" when periodic
+  reconciliation is disabled (`rescan_secs = 0`) and the library is quiet.
+- Idle keep-alive connections and connections that never send a request are now
+  closed silently. They no longer receive an unrequested `408` that a client
+  reusing the socket could read as the reply to its next request, and they no
+  longer count as request timeouts in delivery metrics.
+- A persistent `accept` failure such as running out of file descriptors now
+  backs off from 10 ms to at most one second with rate-limited warnings,
+  instead of spinning a core and flooding the log.
+- The daemon exits within about one second after `graceful shutdown complete`,
+  even when a blocking read is stuck on a hung media mount.
+- The live `docker-compose.yaml` now sets `stop_grace_period: 45s`, and
+  `restart.sh` stops with the same 45 seconds, so Docker no longer kills the
+  daemon before its 15-second graceful-shutdown budget ends.
+- CI now checks the native-client HTTP contract (schema 2 JSON, native HLS
+  tags, Range, HEAD, DELETE, and progressive downloads) inside the production
+  image on its shipped FFmpeg and each release architecture, and builds and
+  tests the browser gateway image, including `nginx -t` and the HEAD, Range,
+  and DELETE methods native clients use through it.
+- Fixed browser Compatible audio in Chrome and Edge. Audio-only output was sent
+  through a Media Source buffer typed for video and failed on the first append;
+  it now plays through the native audio loader, and its recovery no longer
+  tries to lower a video quality profile.
+- A pause from the media keys, lock screen, or notification while the browser
+  tab is hidden now stays paused. Previously the stream restarted on its own
+  about 20 seconds after returning to the page, sometimes at lower quality. A
+  pause the platform makes by itself in the background no longer triggers that
+  restart either.
+- Play (button, `Space`/`K`, or media keys) after a playback error now runs the
+  recovery the error offers (Retry, Try prepared streaming, or Play original)
+  instead of doing nothing.
+- The focused position slider now moves 10 seconds per arrow key (60 seconds
+  for Page Up/Down, Home/End for start and end) instead of 0.1 seconds, without
+  restarting a Compatible stream for each step.
+- Safari native HLS playback that kept playing in a background tab or Picture
+  in Picture is no longer restarted from scratch on the next pause and play.
+- Lock-screen, notification, and browser media controls show Previous and Next
+  only when they can act (queue neighbors or chapters).
+- Browser player: Back/Forward to the title that is already playing no longer
+  restarts it or asks to resume again; only the library changes.
+- Browser player: Back/Forward and reload restore the library's scroll position
+  and focus the folder card that was opened, instead of returning to the top.
+- Browser player: the Resume/Start over choice takes keyboard focus and is
+  announced to screen readers; choosing keeps focus in the player.
+- Browser player: cards in every view show a progress bar for partly watched
+  titles and a Watched badge for titles that played to the end in this browser.
+- Browser player: Clear progress keeps keyboard focus on the neighbouring card.
+- Browser player: a slow library load, or the focus step after closing the
+  player, no longer pulls keyboard focus back from Search or a newly opened
+  title. Focus moves only when the user has not moved it elsewhere.
+- Browser player: a catalog update or busy server while a list loads is retried
+  automatically, a busy server is no longer reported as a connection problem,
+  and a load that failed offline is retried when the browser reconnects.
+- Browser player: loading shows “Loading…” instead of the previous view's count,
+  a failed load clears the stale count and folder path, and Continue watching
+  hides its no-op Sort control.
+- Web API: `library_state` now describes the whole catalog. An empty search,
+  folder, or kind view on a populated server reports `ready` instead of turning
+  the status indicator amber and announcing an empty server.
+- The browser player's document, scripts, and stylesheet now carry content
+  ETags, so reloads revalidate with 304 instead of downloading about 400 KB.
 - Fixed Compatible stream indexing at the end of a title. FFmpeg writes the
   audio that runs past the last video frame as a final movie fragment without
   video; the fragment index rejected it and failed every later playlist request
@@ -39,6 +251,30 @@ publish a signed, content-addressed OCI image with SBOM and provenance.
 - Fixed a watcher race that left a file unpublished when its writer created it,
   linked another name, and removed the first name before the watcher read the
   create event.
+- Library intake now detects files that are still open for writing. Its `lsof`
+  check read the wrong field and never fired, so a download that paused for
+  more than the five-second settle window could be filed and compared while
+  incomplete. The default `--settle-seconds` is now 30, and an unresponsive
+  `lsof` keeps the file for review.
+- Library intake and the catalog builders now share one container list. Loose
+  `.mov`, `.mpeg`, `.mpg`, `.webm`, and `.wmv` movies that intake filed got no
+  genre/year/age views, posters, or previews, and the maintenance run failed
+  after moving them. The first run after upgrading can add views, posters, and
+  previews for such files already in catalog homes.
+- The poster fetcher no longer deletes an existing poster it cannot validate
+  (for example a large or PNG image saved as `poster.jpg`) and no longer hides
+  operator artwork such as `folder.jpg`, `cover.jpg`, `-fanart`, or PNG posters
+  behind a fetched poster. It reports `SKIP invalid-existing` instead, and new
+  posters never replace or write through an existing name.
+- Posters and managed NFO files now follow the operator's umask instead of
+  being made world-writable (`0666`) or group-writable (`0664`); see
+  `contrib/library/README.md` for tightening files written by older versions.
+- A preview attempt whose hardware decoder times out or stops making progress
+  now retries with software decoding instead of failing the title after up to
+  twice the video duration.
+- The scheduled Rust toolchain updater now pushes and opens its pull request
+  with the `RUST_UPDATE_TOKEN` secret. With `GITHUB_TOKEN` the push of the
+  workflow pin changes was refused, and its pull requests would not run CI.
 - The preview generator no longer makes preview folders world-writable or
   writes through symlinks. New previews follow the process umask; see
   `contrib/library/README.md` for tightening previews made by older versions.

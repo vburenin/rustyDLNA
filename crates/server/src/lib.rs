@@ -13,7 +13,7 @@ use rusty_dlna_helper::{
     HelperGate, JobGate,
 };
 use rusty_dlna_http::{
-    caption_info_sec_url, dlna_get_header_invalid, dlna_org_features, dlna_strict, gen_root_desc,
+    dlna_get_header_invalid, dlna_org_features, dlna_strict, gen_root_desc,
     interactive_on_non_image, is_chunked, live_transcode_response, media_response, now_imf_date,
     parse_byte_range, persist_for_route, protocol_info, realtime_interactive_invalid, route,
     scpd_connection_manager, scpd_content_directory, scpd_registrar, set_caption_info_sec,
@@ -23,8 +23,8 @@ use rusty_dlna_http::{
 };
 use rusty_dlna_protocol::isolation::collides_with_live_ports;
 use rusty_dlna_protocol::paths::{
-    album_art_id_from_path, album_art_url, caption_default_url, caption_from_path,
-    caption_indexed_url, media_item_id_from_path, media_item_url, transcode_id_from_path,
+    album_art_id_from_path, album_art_url, caption_default_url, caption_indexed_url,
+    caption_route_from_path, media_item_id_from_path, media_item_url, transcode_id_from_path,
     transcode_item_url,
 };
 use rusty_dlna_protocol::server_header;
@@ -55,7 +55,7 @@ use rusty_dlna_soap::{
 use rusty_dlna_ssdp::msearch_replies;
 use rusty_dlna_ssdp::{
     jitter_ms, msearch_jitter_ms_range_for_mx, parse_inbound_notify, parse_msearch,
-    try_msearch_replies, try_notify_byebye, ALIVE_DUP_DELAY_MS,
+    parse_unicast_msearch, try_msearch_replies, try_notify_byebye, ALIVE_DUP_DELAY_MS,
 };
 use rusty_dlna_transcode::{
     cache_dest_for_key, cache_part, decide_for_with_default_encoder, dovi_tool_path,
@@ -87,6 +87,7 @@ pub use config::{
     load_config, resolve_http_port, resolve_ssdp_port, try_resolve_http_port,
     try_resolve_ssdp_port, validate_transcode_tools, validate_transcode_tools_with_web, Config,
     ConfigLoadError, ConfigValidationError, TranscodeCfg, WebAiUpscaleCfg, WebCfg,
+    DEFAULT_RESCAN_MAX_SECS, DEFAULT_RESCAN_SECS,
 };
 use derived_image_cache::derived_image_key;
 #[cfg(test)]
@@ -96,18 +97,19 @@ use http_app::{fetch_renderer_description, renderer_xml_body, MAX_RENDERER_DESCR
 use http_app::{
     sniff_renderer_location, trusted_renderer_location, RendererFetchLimiter, SsdpReplyLimiter,
 };
-pub use lifecycle::serve;
 pub(crate) use lifecycle::socket_write_all;
 #[cfg(test)]
 use lifecycle::{
     accept_loop, apply_catalog, apply_catalog_update, apply_prepared_catalog_change, handle_conn,
-    next_reconcile_interval_secs, prepare_scan_change, reply_interface_for_sender,
-    spawn_library_watch, stop_library_watch, stop_library_watch_until, ReconcileOutcome,
+    next_accept_backoff, next_reconcile_interval_secs, prepare_scan_change,
+    reply_interface_for_sender, shutdown_runtime_bounded, spawn_library_watch, stop_library_watch,
+    stop_library_watch_until, ReconcileOutcome,
 };
 use lifecycle::{
     active_ipv4_interfaces, default_route_interface, os_version, read_open_file_range,
     select_advertise_ip, select_ssdp_interfaces, unix_now, usable_lan_ipv4, InterfaceV4,
 };
+pub use lifecycle::{run_daemon, serve};
 use metrics::{ComponentState, RuntimeMetrics};
 #[cfg(test)]
 use rusty_dlna_scan::{
@@ -170,6 +172,9 @@ pub struct App {
     pub cache_dir: PathBuf,
     pub(crate) ai_upscale_profiles: Vec<BrowserAiUpscaleProfile>,
     pub update_id: AtomicU32,
+    /// Opaque per-instance component of web API validators. Web bodies depend
+    /// on configuration that a restart can change without a new generation.
+    pub(crate) web_etag_instance: String,
     pub jobs: JobGate,
     pub(crate) ai_upscale_jobs: JobGate,
     pub(crate) helpers: Arc<HelperGate>,
@@ -552,11 +557,14 @@ impl Drop for DbWriterActivity<'_> {
 
 impl DbPool {
     fn open(path: &Path, readers: usize) -> Result<Self, AppInitError> {
-        let writer = LibraryDb::open(path).map_err(|source| AppInitError::DatabaseOpen {
-            role: "writer",
-            path: path.to_path_buf(),
-            source,
-        })?;
+        // Startup maintenance already ran the full integrity check and any
+        // corrupt-catalog recovery before this pool exists.
+        let writer =
+            LibraryDb::open_runtime(path).map_err(|source| AppInitError::DatabaseOpen {
+                role: "writer",
+                path: path.to_path_buf(),
+                source,
+            })?;
         let readers = (0..readers.max(1))
             .map(|_| {
                 LibraryDb::open_read_only(path).map_err(|source| AppInitError::DatabaseOpen {

@@ -49,6 +49,22 @@ pub fn if_range_matches(if_range: Option<&str>, etag: Option<&str>) -> bool {
     }
 }
 
+/// If-None-Match uses weak comparison: `*` or any listed entity tag whose
+/// opaque value equals `etag`'s, ignoring a `W/` prefix on either side.
+pub fn if_none_match_matches(if_none_match: Option<&str>, etag: &str) -> bool {
+    let opaque = |tag: &str| {
+        let tag = tag.trim();
+        tag.strip_prefix("W/").unwrap_or(tag).to_owned()
+    };
+    let current = opaque(etag);
+    if_none_match.is_some_and(|value| {
+        value.trim() == "*"
+            || value
+                .split(',')
+                .any(|candidate| opaque(candidate) == current)
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteRange {
     /// Inclusive start.
@@ -158,6 +174,22 @@ pub fn read_file_range(path: &std::path::Path, start: u64, end: u64) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn if_none_match_uses_weak_list_comparison() {
+        let etag = "\"original-00ff\"";
+        assert!(if_none_match_matches(Some("\"original-00ff\""), etag));
+        assert!(if_none_match_matches(Some(" W/\"original-00ff\" "), etag));
+        assert!(if_none_match_matches(
+            Some("\"other\", \"original-00ff\""),
+            etag
+        ));
+        assert!(if_none_match_matches(Some("*"), etag));
+        assert!(!if_none_match_matches(None, etag));
+        assert!(!if_none_match_matches(Some(""), etag));
+        assert!(!if_none_match_matches(Some("\"original-00fe\""), etag));
+        assert!(!if_none_match_matches(Some("original-00ff"), etag));
+    }
 
     #[test]
     fn ranges() {

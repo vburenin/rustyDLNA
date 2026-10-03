@@ -121,6 +121,10 @@ pub struct MediaItem {
     pub bookmark_sec: i64,
     /// `BOOKMARKS.WATCH_COUNT`. Default 0 when no row.
     pub watch_count: i64,
+    /// The current stream-probe revision ran on this file and produced no
+    /// stream metadata (a cached failure until the file changes). A live
+    /// re-probe cannot discover more, including embedded subtitles.
+    pub stream_probe_failed: bool,
 }
 
 /// Format milliseconds as rustyDLNA's `H:MM:SS.mmm` duration.

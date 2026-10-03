@@ -392,6 +392,48 @@ test("MSE watchdog preserves deliberate pause and gives an active seek preparati
   expect(await page.evaluate(() => window.__msePlayerFault.generations)).toBe(1);
 });
 
+for (const pauseSource of ["Media Session", "platform"]) {
+  test(`MSE watchdog leaves a ${pauseSource} pause made while hidden paused after the page returns`, async ({ page }) => {
+    await page.addInitScript(() => {
+      let visibilityState = "visible";
+      window.__setVisibility = (state) => {
+        visibilityState = state;
+        document.dispatchEvent(new Event("visibilitychange"));
+      };
+      Object.defineProperty(Document.prototype, "visibilityState", { configurable: true, get: () => visibilityState });
+      window.__mediaActions = {};
+      Object.defineProperty(navigator, "mediaSession", { configurable: true, value: {
+        metadata: null,
+        setActionHandler: (action, handler) => { window.__mediaActions[action] = handler; },
+        setPositionState() {},
+      } });
+    });
+    await installPlayerFault(page, { fault: "playback progress" });
+    await page.clock.runFor(1_000);
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Pause");
+    await page.evaluate((pauseSource) => {
+      window.__setVisibility("hidden");
+      // A lock-screen/media-key command, or the platform pausing a background
+      // tab on its own; neither is a decoder stall.
+      if (pauseSource === "Media Session") window.__mediaActions.pause();
+      else document.querySelector("#video-player").pause();
+      window.__setVisibility("visible");
+    }, pauseSource);
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+    await page.clock.fastForward(25_000);
+    await page.clock.runFor(2_000);
+    await page.clock.fastForward(25_000);
+    await page.clock.runFor(2_000);
+    const state = await page.evaluate(() => window.__msePlayerFault);
+    expect(state.generations).toBe(1);
+    expect(state.cancelled).toEqual([]);
+    expect(new Set(state.modes)).toEqual(new Set([state.modes[0]]));
+    expect(state.paused).toBe(true);
+    await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+    await expect(page.locator("#player-message[role=alert]")).toBeHidden();
+  });
+}
+
 for (const phase of ["headers", "body"]) {
   test(`MSE recovery status cannot hang on ${phase}`, async ({ page }) => {
     await page.goto("/");

@@ -1,9 +1,9 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::Parser;
 use rusty_dlna::{
-    load_config, serve, try_resolve_http_port, try_resolve_ssdp_port, App, AppPreflight, Config,
+    load_config, run_daemon, try_resolve_http_port, try_resolve_ssdp_port, App, AppPreflight,
+    Config,
 };
 use rusty_dlna_protocol::server_header;
 use rusty_dlna_ssdp::try_notify_alive;
@@ -67,6 +67,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{:#?}", preflight.config());
         println!("http_port = {}", preflight.http_port());
         println!("ssdp_port = {}", preflight.ssdp_port());
+        println!(
+            "reconcile_secs = {}..{}",
+            preflight.config().rescan_secs,
+            preflight.config().reconcile_max_secs()
+        );
         println!("listen_ip = {}", preflight.listen_ip());
         println!("advertise_ip = {}", preflight.advertise_ip());
         println!("cache_dir = {}", preflight.cache_dir().display());
@@ -127,11 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         remaps = app.remaps.len(),
         "rustyDLNA starting (scan in background)"
     );
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(serve(Arc::new(app)))?;
-    Ok(())
+    run_daemon(app)
 }
 
 fn run_check(preflight: &AppPreflight, server: &str) -> Result<(), Box<dyn std::error::Error>> {

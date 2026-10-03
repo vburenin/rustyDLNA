@@ -86,6 +86,22 @@ fn catalog_counts(app: &App) -> CatalogCounts {
     counts
 }
 
+/// Reconcile freshness is meaningful only while a periodic reconciliation is
+/// scheduled. With `rescan_secs = 0`, a quiet library publishes nothing, and
+/// watcher liveness plus `last_error` remain the scanner health signals.
+pub(crate) fn scanner_success_stale(
+    rescan_secs: u64,
+    reconcile_max_secs: u64,
+    last_success_unix: Option<u64>,
+    now_unix: u64,
+) -> bool {
+    if rescan_secs == 0 {
+        return false;
+    }
+    let stale_after = reconcile_max_secs.max(300).saturating_mul(3);
+    last_success_unix.is_some_and(|last| now_unix.saturating_sub(last) > stale_after)
+}
+
 fn degrade(health: &mut Health) {
     if *health != Health::Unhealthy {
         *health = Health::Degraded;
@@ -176,15 +192,13 @@ fn status_value(app: &App, detailed: bool) -> (Health, Value) {
         .unwrap_or_default();
     let cache_free_bytes = available_filesystem_bytes(&app.cache_dir).unwrap_or(0);
     let minimum_free_bytes = app.cfg.cache_min_free_mb.saturating_mul(1024 * 1024);
-    let configured_rescan_max = if app.cfg.rescan_max_secs == 0 {
-        app.cfg.rescan_secs
-    } else {
-        app.cfg.rescan_max_secs
-    };
-    let scan_stale_after = configured_rescan_max.max(300).saturating_mul(3);
-    let scan_stale = scan
-        .last_success_unix
-        .is_some_and(|last| unix_now().saturating_sub(last) > scan_stale_after);
+    let configured_rescan_max = app.cfg.reconcile_max_secs();
+    let scan_stale = scanner_success_stale(
+        app.cfg.rescan_secs,
+        configured_rescan_max,
+        scan.last_success_unix,
+        unix_now(),
+    );
     let mut health = Health::Healthy;
     let mut reasons = Vec::new();
     match runtime.http_listener {
@@ -318,6 +332,7 @@ fn status_value(app: &App, detailed: bool) -> (Health, Value) {
         "cancellations_total": remux.web_cancelled_total,
         "failures": {
             "busy_total": remux.web_failures_busy_total,
+            "storage_total": remux.web_failures_storage_total,
             "producer_total": remux.web_failures_producer_total,
         },
         "startup_to_initial_bytes_ms": {

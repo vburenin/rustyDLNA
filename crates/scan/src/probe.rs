@@ -250,6 +250,106 @@ pub fn probe_media_with_cancellation(
     got
 }
 
+/// Result of one bounded scanner probe attempt.
+#[derive(Clone, Debug)]
+pub(crate) enum ProbeOutcome {
+    Probed(Box<MediaProbe>),
+    /// libav read the input but found no usable stream metadata. The catalog
+    /// caches this until the file's stat changes.
+    Failed,
+    /// The helper deadline expired first, for example while a disk spun up.
+    /// This says nothing about the file, so it is retried (boundedly).
+    TimedOut,
+}
+
+impl ProbeOutcome {
+    pub(crate) fn probe(&self) -> Option<&MediaProbe> {
+        match self {
+            Self::Probed(probe) => Some(probe),
+            Self::Failed | Self::TimedOut => None,
+        }
+    }
+}
+
+/// Classify a probe that returned nothing. The libav interrupt deadline is
+/// the only time-based failure, so reaching it means the attempt timed out.
+fn classify_probe(
+    timeout: Duration,
+    cancellation: &CancellationToken,
+    probe: impl FnOnce() -> Option<MediaProbe>,
+) -> ProbeOutcome {
+    let started = Instant::now();
+    match probe() {
+        Some(probe) => ProbeOutcome::Probed(Box::new(probe)),
+        None if !cancellation.is_cancelled()
+            && started.elapsed() >= timeout.max(Duration::from_secs(1)) =>
+        {
+            ProbeOutcome::TimedOut
+        }
+        None => ProbeOutcome::Failed,
+    }
+}
+
+/// Test hook: the next `count` probes of a file (matched by canonical path,
+/// so stable `/proc/self/fd` paths match too) report a deadline expiry.
+#[cfg(test)]
+pub(crate) fn force_probe_timeouts(path: &Path, count: usize) {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    FORCED_TIMEOUTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(path, count);
+}
+
+#[cfg(test)]
+static FORCED_TIMEOUTS: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+fn forced_timeout(path: &Path) -> bool {
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let mut forced = FORCED_TIMEOUTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    match forced.get_mut(&path) {
+        Some(remaining) if *remaining > 0 => {
+            *remaining -= 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn probe_media_outcome(
+    path: &Path,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> ProbeOutcome {
+    #[cfg(test)]
+    if forced_timeout(path) {
+        return ProbeOutcome::TimedOut;
+    }
+    classify_probe(timeout, cancellation, || {
+        probe_media_with_cancellation(path, timeout, cancellation)
+    })
+}
+
+pub(crate) fn probe_image_outcome(
+    path: &Path,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> ProbeOutcome {
+    #[cfg(test)]
+    if forced_timeout(path) {
+        return ProbeOutcome::TimedOut;
+    }
+    classify_probe(timeout, cancellation, || {
+        probe_image_with_cancellation(path, timeout, cancellation)
+    })
+}
+
 /// Probe a still image without exposing libav's image decoder as a video
 /// stream identity. Only dimensions are useful to ContentDirectory.
 pub fn probe_image(path: &Path) -> Option<MediaProbe> {
@@ -1735,6 +1835,30 @@ mod tests {
     use super::*;
     use rusty_dlna_protocol::{CompactStreamMetadata, MAX_COMPACT_STREAM_METADATA_BYTES};
     use std::path::PathBuf;
+
+    #[test]
+    fn probe_outcome_separates_deadline_expiry_from_failure() {
+        let live = CancellationToken::default();
+        assert!(matches!(
+            classify_probe(Duration::from_secs(30), &live, || None),
+            ProbeOutcome::Failed
+        ));
+        // The deadline is never shorter than one second.
+        let slow = || {
+            std::thread::sleep(Duration::from_millis(1_050));
+            None
+        };
+        assert!(matches!(
+            classify_probe(Duration::ZERO, &live, slow),
+            ProbeOutcome::TimedOut
+        ));
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        assert!(matches!(
+            classify_probe(Duration::ZERO, &cancelled, slow),
+            ProbeOutcome::Failed
+        ));
+    }
 
     struct TempDir(PathBuf);
 

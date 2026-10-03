@@ -1,6 +1,6 @@
 import { WebApi } from "./api.js";
-import { LAYOUT_MODES, navigationFromUrl, navigationUrl } from "./core.js";
-import { LibraryController } from "./library.js";
+import { LAYOUT_MODES, navigationFromUrl, navigationKeepsPlayback, navigationUrl } from "./core.js";
+import { historyState, LibraryController } from "./library.js";
 import { PlaybackController } from "./player.js";
 import { loadPreferences } from "./preferences.js";
 import { initialState, Store } from "./store.js";
@@ -135,6 +135,14 @@ if (dom.tabs.length !== 5) {
   throw new Error("The embedded player document is incomplete");
 }
 
+try {
+  // Library lists arrive asynchronously, after the browser would restore a
+  // position. The library restores its own place from each history entry.
+  window.history.scrollRestoration = "manual";
+} catch (_) {
+  // Older engines keep automatic restoration.
+}
+
 const store = new Store(initialState(navigationFromUrl(window.location.href), loadPreferences()));
 const api = new WebApi();
 const layoutScroll = { [LAYOUT_MODES.BROWSE]: 0, [LAYOUT_MODES.WATCH]: 0 };
@@ -224,7 +232,7 @@ function setLayout(layout, { history = "replace", restoreScroll = true } = {}) {
       store.getState().navigation,
       store.getState().server.rootFolderId,
     );
-    window.history.replaceState({}, "", target);
+    window.history.replaceState(historyState(), "", target);
   }
   if (scrollFrame !== null) window.cancelAnimationFrame(scrollFrame);
   if (layout === LAYOUT_MODES.WATCH && landscapeTouch.matches) {
@@ -241,14 +249,27 @@ function setLayout(layout, { history = "replace", restoreScroll = true } = {}) {
   return true;
 }
 
+// Focus deferred to the next frame lands only if nothing claimed focus since:
+// a busy browser can run the frame after the user opened another title or
+// moved into Search.
+function focusNextFrame(target) {
+  const origin = document.activeElement;
+  window.requestAnimationFrame(() => {
+    const active = document.activeElement;
+    const unclaimed = !active || active === document.body || active === document.documentElement;
+    if (!unclaimed && active !== origin && !target.contains(active)) return;
+    target.focus({ preventScroll: true });
+  });
+}
+
 function focusLibrary() {
   setLayout(LAYOUT_MODES.BROWSE);
-  window.requestAnimationFrame(() => dom.libraryPanel.focus({ preventScroll: true }));
+  focusNextFrame(dom.libraryPanel);
 }
 
 function focusPlayer() {
   setLayout(LAYOUT_MODES.WATCH);
-  window.requestAnimationFrame(() => dom.playerStage.focus({ preventScroll: true }));
+  focusNextFrame(dom.playerStage);
 }
 
 function closePlaybackToLibrary() {
@@ -258,12 +279,12 @@ function closePlaybackToLibrary() {
   if (!setLayout(LAYOUT_MODES.BROWSE)) {
     const state = store.getState();
     window.history.replaceState(
-      {},
+      historyState(),
       "",
       navigationUrl(window.location.href, state.navigation, state.server.rootFolderId),
     );
   }
-  window.requestAnimationFrame(() => dom.libraryPanel.focus({ preventScroll: true }));
+  focusNextFrame(dom.libraryPanel);
 }
 
 renderLayout();
@@ -323,7 +344,7 @@ store.subscribe((state, action) => {
   if (state.navigation.itemId !== itemId) {
     supersedePendingNavigation();
     store.dispatch({ type: "NAVIGATE", navigation: { itemId, start: 0 } });
-    window.history.replaceState({}, "", navigationUrl(
+    window.history.replaceState(historyState(), "", navigationUrl(
       window.location.href, store.getState().navigation, state.server.rootFolderId,
     ));
   }
@@ -339,7 +360,12 @@ function navigationIsCurrent(epoch, controller) {
   return epoch === navigationEpoch && !controller.signal.aborted;
 }
 
-async function applyNavigation(navigation, { initial = false } = {}) {
+function historyPlace() {
+  const place = window.history.state?.library;
+  return place && typeof place === "object" ? place : null;
+}
+
+async function applyNavigation(navigation, { initial = false, restore = null } = {}) {
   const timingStart = initial ? 0 : performance.now();
   const epoch = ++navigationEpoch;
   navigationController?.abort();
@@ -347,16 +373,30 @@ async function applyNavigation(navigation, { initial = false } = {}) {
   navigationController = controller;
   try {
     if (initial) {
-      void library.start();
+      void library.start({ restore });
     } else {
       library.cancelPendingSearch();
       void library.navigate(navigation, {
         history: "none",
         focusAfterLoad: !navigation.itemId,
         supersedePending: false,
+        restore,
       });
     }
     if (!navigation.itemId) return;
+    if (!initial && navigationKeepsPlayback(navigation, store.getState().playback)) {
+      // An entry's `t` belongs to the link that created it; never jump the
+      // timeline of the title that keeps playing.
+      if (navigation.start > 0) {
+        store.dispatch({ type: "NAVIGATE", navigation: { start: 0 } });
+        const state = store.getState();
+        window.history.replaceState(historyState(), "", navigationUrl(
+          window.location.href, state.navigation, state.server.rootFolderId,
+        ));
+      }
+      library.markCurrent(navigation.itemId);
+      return;
+    }
     // The complete library continues loading independently. Only its validated
     // first-page capabilities and the linked item's own metadata gate playback.
     let capabilityRequest = library.capabilitiesReady;
@@ -404,7 +444,7 @@ async function applyNavigation(navigation, { initial = false } = {}) {
 }
 
 window.addEventListener("popstate", () => {
-  void applyNavigation(navigationFromUrl(window.location.href));
+  void applyNavigation(navigationFromUrl(window.location.href), { restore: historyPlace() });
 });
 
-void applyNavigation(store.getState().navigation, { initial: true });
+void applyNavigation(store.getState().navigation, { initial: true, restore: historyPlace() });

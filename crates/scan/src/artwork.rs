@@ -4,8 +4,9 @@ use crate::{
     acquire_scan_helper, directory_entry_is_allowed_file, ends_with_ci,
     extract_exif_thumbnail_with_limit_result, is_audio, is_direct_physical_path, is_image,
     is_video, lowercase_hex, open_allowed_file, path_from_db, path_is_allowed_dir,
-    path_is_allowed_file, path_to_db, scan_io, HelperAdmissionError, LibraryDb, MediaHelperControl,
-    PreparedPhysicalFile, RootedFile, ScanConfig, ScanError, ScanResult,
+    path_is_allowed_file, path_to_db, rebase_media_path_for_config, scan_io, HelperAdmissionError,
+    LibraryDb, MediaHelperControl, PreparedPhysicalFile, RootedFile, ScanConfig, ScanError,
+    ScanResult,
 };
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -820,12 +821,24 @@ pub(super) fn refresh_artwork_event(
     }
     let files = ArtworkInventory::new(files);
     let mut touched = false;
+    let mut renewed = false;
     for path in media {
         if !artwork_path_matches_media_with_names(sidecar, &path, &cfg.album_art_names) {
             continue;
         }
         if let Some(existing) = db.find_detail_by_path(&path_to_db(&path))? {
             let selected = find_album_art_in_inventory(&path, &cfg.album_art_names, &files);
+            // A JPEG sidecar is served from its own path, so an in-place
+            // replacement keeps the same ALBUM_ART row. Renew its ID once
+            // per event so the published art URL changes with the image.
+            if !renewed && selected.as_deref() == Some(sidecar) {
+                let art_id = db.detail_album_art(existing.id)?;
+                if art_id > 0
+                    && db.album_art_path(art_id)?.as_deref() == Some(path_to_db(sidecar).as_str())
+                {
+                    renewed = db.renew_album_art_id(&path_to_db(sidecar))?;
+                }
+            }
             attach_album_art_with_sidecar(db, cfg, &path, existing.id, selected.as_deref())?;
             touched = true;
         }
@@ -844,6 +857,42 @@ pub(super) fn recoverable_artwork_error(cfg: &ScanConfig, error: &ScanError) -> 
         ) => true,
         _ => false,
     }
+}
+
+/// A non-JPEG sidecar is stored as its converted JPEG under the owned `art/`
+/// cache, so that file outlives a deleted source poster. It is stale only
+/// when no browseable path of the same physical file still selects a
+/// sidecar; otherwise another alias's poster remains authoritative.
+fn converted_sidecar_was_removed(
+    db: &LibraryDb,
+    cfg: &ScanConfig,
+    detail_id: i64,
+    current: &Path,
+    sidecar: Option<&Path>,
+    path: &Path,
+) -> ScanResult<bool> {
+    let owned_dir = cfg
+        .db_path
+        .as_ref()
+        .and_then(|db_path| db_path.parent())
+        .map(|parent| parent.join("art"));
+    if sidecar.is_some()
+        || owned_dir.is_none_or(|owned| current.parent() != Some(owned.as_path()))
+        || !is_direct_physical_path(path)
+    {
+        return Ok(false);
+    }
+    for alias in db.inode_alias_stats(detail_id)? {
+        cfg.check_cancelled()?;
+        let alias_path = rebase_media_path_for_config(&path_from_db(&alias.path), cfg);
+        if alias_path != path
+            && find_album_art_for_media_path(&alias_path, cfg)
+                .is_some_and(|candidate| path_is_allowed_file(&candidate, cfg))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(super) fn attach_album_art_in_dir(
@@ -911,6 +960,14 @@ pub(super) fn attach_album_art_in_dir(
                         || sidecar
                             .as_ref()
                             .is_none_or(|candidate| candidate == current))
+                    && !converted_sidecar_was_removed(
+                        db,
+                        cfg,
+                        existing.id,
+                        current,
+                        sidecar.as_deref(),
+                        &path,
+                    )?
                 {
                     continue;
                 }

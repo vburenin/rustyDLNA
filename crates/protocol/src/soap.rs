@@ -57,6 +57,16 @@ pub const SEARCH_CAPS: &str = concat!(
     "upnp:class,upnp:genre,@id,@parentID,@refID"
 );
 
+/// Case folding for SOAP Search on free-text properties (`dc:title`,
+/// `dc:creator`, `upnp:artist`, `upnp:album`, `upnp:genre`, `upnp:actor`).
+/// Unicode lowercase, so "Матриця" and "Élan" match regardless of the case a
+/// renderer's keyboard produced. Accents and combining marks are not folded.
+/// Identifiers, classes, dates and numbers keep ASCII case-insensitivity.
+/// The SQLite and in-memory search paths must both use this function.
+pub fn search_text_fold(value: &str) -> String {
+    value.to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,6 +87,14 @@ mod tests {
             Some("X_GetFeatureList")
         );
         assert_eq!(soap_action_method("urn:foo#Nope"), None);
+    }
+
+    #[test]
+    fn search_text_fold_is_unicode_lowercase_without_accent_folding() {
+        assert_eq!(search_text_fold("Матриця"), "матриця");
+        assert_eq!(search_text_fold("ÉLAN"), "élan");
+        assert_eq!(search_text_fold("Straße"), "straße");
+        assert_ne!(search_text_fold("Élan"), search_text_fold("Elan"));
     }
 
     #[test]

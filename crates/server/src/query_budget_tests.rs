@@ -145,8 +145,10 @@ fn browser_api_database_and_fallback_share_unicode_domain_order_and_paging() {
         } else {
             Path::new("/PARENT_ONLY").join(filename)
         };
-        conn.execute("INSERT INTO DETAILS (ID, PATH, TITLE, ARTIST, ALBUM_ARTIST, ALBUM, MIME, DATE, DISC, TRACK, DEVICE, INODE) VALUES (?1, ?2, ?3, ?4, 'A\u{301}RTIST', ?5, 'video/mp4', '2026-01-01', 1, ?6, 99, ?7)",
-            rusqlite::params![id, rusty_dlna_scan::path_to_db(&path), title, artist, album, (index % 2) as i64, if *id == 800005 { 800001 } else { *id }]).unwrap();
+        // Metadata dates rise while file times fall: "recently added" must
+        // follow the file time, as the DLNA Recently Added view does.
+        conn.execute("INSERT INTO DETAILS (ID, PATH, TITLE, ARTIST, ALBUM_ARTIST, ALBUM, MIME, DATE, TIMESTAMP, DISC, TRACK, DEVICE, INODE) VALUES (?1, ?2, ?3, ?4, 'A\u{301}RTIST', ?5, 'video/mp4', ?8, ?9, 1, ?6, 99, ?7)",
+            rusqlite::params![id, rusty_dlna_scan::path_to_db(&path), title, artist, album, (index % 2) as i64, if *id == 800005 { 800001 } else { *id }, format!("20{}-01-01", 10 + index), 4_000_000_000_i64 - index as i64]).unwrap();
         // The reference is inserted first and has a smaller ID; the canonical
         // object must still win, including its empty-detail-title fallback.
         conn.execute("INSERT INTO OBJECTS (OBJECT_ID, PARENT_ID, CLASS, DETAIL_ID, NAME, REF_ID) VALUES (?1, '64', 'item.videoItem', ?2, 'Wrong reference title', ?3)",
@@ -176,6 +178,8 @@ fn browser_api_database_and_fallback_share_unicode_domain_order_and_paging() {
         "CANONICAL",
         "alias",
         "SERIES ONLY",
+        "фильм  альбом",
+        "only series",
     ] {
         let encoded: String = query
             .as_bytes()
@@ -223,6 +227,14 @@ fn browser_api_database_and_fallback_share_unicode_domain_order_and_paging() {
                         "Unicode case matching must find all three physical files"
                     );
                 }
+                // Every term must match, in any order, possibly in different
+                // fields (title and album, artist and album, overlay title).
+                if query == "фильм  альбом" {
+                    assert_eq!(db_json["total"], 2, "{db_json}");
+                }
+                if query == "only series" {
+                    assert_eq!(db_json["total"], 1, "{db_json}");
+                }
                 if query == "raw�file" {
                     assert_eq!(
                         db_json["total"], 1,
@@ -230,11 +242,37 @@ fn browser_api_database_and_fallback_share_unicode_domain_order_and_paging() {
                     );
                 }
 
+                if query.is_empty() && sort == "date_desc" && offset == 0 {
+                    let first = |json: &serde_json::Value| json["entries"][0]["id"].clone();
+                    assert_eq!(first(&db_json), "800001", "{db_json}");
+                    assert_eq!(first(&fallback_json), "800001");
+                }
+
                 nonempty += usize::from(db_json["total"].as_u64().unwrap() > 0);
             }
         }
     }
     assert!(nonempty > 100);
+    let recent = |app: &App| {
+        let response = app.handle(&req(&get(
+            "/api/web/library?view=library&kind=video&sort=date_desc&limit=5",
+            "QueryParity/1",
+        )));
+        let json: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    app.invalidate_catalog_query_cache();
+    let fallback = recent(&app);
+    app.db_pool = pool;
+    app.scan_cfg.db_path = Some(db_path);
+    app.invalidate_catalog_query_cache();
+    assert_eq!(recent(&app), fallback);
+    assert_eq!(fallback, ["800001", "800002", "800003", "800004", "800006"]);
 }
 
 #[test]

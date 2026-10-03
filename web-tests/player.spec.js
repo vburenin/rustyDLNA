@@ -56,7 +56,7 @@ async function openLibrary(page) {
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto("/");
-  await expect(page.locator("#server-state")).toHaveAttribute("data-state", /ready|empty/);
+  await expect(page.locator("#server-state")).toHaveAttribute("data-state", "ready");
   await expect(page.locator("#loading")).toBeHidden();
   return errors;
 }
@@ -683,6 +683,36 @@ test("closing during loading leaves a clean empty player", async ({ page }) => {
   await expect(page.locator("#stage-progress")).toBeHidden();
 });
 
+test("a delayed post-close focus frame never takes focus back from Search", async ({ page }) => {
+  await openLibrary(page);
+  const holdFrames = () => page.evaluate(() => {
+    const requestFrame = window.requestAnimationFrame.bind(window);
+    const held = [];
+    window.requestAnimationFrame = (callback) => held.push(callback);
+    window.releaseHeldFrames = () => {
+      window.requestAnimationFrame = requestFrame;
+      for (const callback of held.splice(0)) callback(performance.now());
+    };
+  });
+
+  // A busy browser runs the close frame after the user moved into Search.
+  await selectTaggedVideo(page);
+  await showPlayerControls(page);
+  await holdFrames();
+  await page.locator("#close-player-button").click();
+  await page.locator("#search-input").focus();
+  await page.evaluate(() => window.releaseHeldFrames());
+  await expect(page.locator("#search-input")).toBeFocused();
+
+  // Unclaimed focus still returns to the library.
+  await selectTaggedVideo(page);
+  await showPlayerControls(page);
+  await holdFrames();
+  await page.locator("#close-player-button").click();
+  await page.evaluate(() => window.releaseHeldFrames());
+  await expect(page.locator("#library-panel")).toBeFocused();
+});
+
 test("library tabs, player scoping, and overlay controls work", async ({ page }) => {
   const errors = await openLibrary(page);
   const folders = page.getByRole("tab", { name: "Folders" });
@@ -1178,6 +1208,263 @@ test("folder history and a pending search cannot leak into navigation", async ({
   await expect(page.getByRole("tab", { name: "Folders" })).toHaveAttribute("aria-selected", "true");
 });
 
+test("folder Back restores the list position and focuses the folder that was opened", async ({ page }) => {
+  await page.setViewportSize({ width: 800, height: 600 });
+  // Pad the library folder so the real video folder sits far below the fold.
+  await page.route("**/api/web/library?**", async (route) => {
+    const url = new URL(route.request().url());
+    const response = await route.fetch();
+    const payload = await response.json();
+    const video = (payload.entries || []).find((entry) => entry.entry_type === "folder" && entry.title === "video");
+    if (url.searchParams.get("view") === "folders" && video && !url.searchParams.get("q")) {
+      const fillers = Array.from({ length: 40 }, (_, index) => ({
+        ...video, id: `${video.id}-filler-${index}`, title: `Filler ${String(index).padStart(2, "0")}`, child_count: 0,
+      }));
+      payload.entries = [...fillers, ...payload.entries];
+      payload.total += fillers.length;
+      payload.has_more = false;
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  await openLibrary(page);
+  await page.getByRole("button", { name: /^Open library,/ }).click();
+  const videoFolder = page.getByRole("button", { name: /^Open video,/ });
+  await expect(videoFolder).toBeVisible();
+  await videoFolder.scrollIntoViewIfNeeded();
+  const before = await page.evaluate(() => window.scrollY);
+  expect(before).toBeGreaterThan(600);
+  await videoFolder.click();
+  await expect(page.locator(".media-card.video").first()).toBeVisible();
+
+  await page.goBack();
+  await expect(videoFolder).toBeFocused();
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(before - 2);
+  expect(Math.abs(await page.evaluate(() => window.scrollY) - before)).toBeLessThanOrEqual(2);
+  await expect(page.locator("#breadcrumbs [aria-current=page]")).toHaveText("library");
+});
+
+test("Back and Forward keep the title that is already playing", async ({ page }) => {
+  await page.addInitScript(() => {
+    const load = HTMLMediaElement.prototype.load;
+    let loadCalls = 0;
+    HTMLMediaElement.prototype.load = function countedLoad() {
+      loadCalls += 1;
+      return load.call(this);
+    };
+    window.__mediaLoadCalls = () => loadCalls;
+  });
+  await serveFixtureMedia(page);
+  const itemRequests = [];
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.startsWith("/api/web/item/")) itemRequests.push(request.url());
+  });
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  await expect.poll(() => page.locator("#video-player").getAttribute("src")).toBeTruthy();
+  const source = await page.locator("#video-player").getAttribute("src");
+  await page.getByRole("tab", { name: "Folders" }).click();
+  await page.getByRole("button", { name: /^Open library,/ }).click();
+  await expect(page.getByRole("button", { name: /^Open video,/ })).toBeVisible();
+  await expect(page).toHaveURL(/item=/);
+  const loads = await page.evaluate(() => window.__mediaLoadCalls());
+  const items = itemRequests.length;
+
+  await page.goBack();
+  await expect(page.getByRole("button", { name: /^Open library,/ })).toBeVisible();
+  await page.goForward();
+  await expect(page.getByRole("button", { name: /^Open video,/ })).toBeVisible();
+  await page.goBack();
+  await expect(page.getByRole("button", { name: /^Open library,/ })).toBeVisible();
+
+  await expect(page.locator("#now-playing-title")).toHaveText("tagged");
+  await expect(page.locator("#resume-prompt")).toBeHidden();
+  expect(await page.locator("#video-player").getAttribute("src")).toBe(source);
+  expect(await page.evaluate(() => window.__mediaLoadCalls())).toBe(loads);
+  expect(itemRequests).toHaveLength(items);
+});
+
+test("library chrome never shows the previous view's count, path, or a no-op Sort", async ({ page }) => {
+  await openLibrary(page);
+  const sort = page.locator(".sort-control");
+  await page.getByRole("tab", { name: "Videos" }).click();
+  await page.locator("#sort-control").selectOption("date_desc");
+  await expect(page).toHaveURL(/sort=date_desc/);
+  await page.getByRole("tab", { name: "Continue watching" }).click();
+  await expect(sort).toBeHidden();
+  await expect(page).toHaveURL(/\?view=continue&sort=date_desc$/);
+  // Neither a reload nor Back/Forward onto Continue watching resets the other
+  // views' sort to Title.
+  await page.reload();
+  await expect(sort).toBeHidden();
+  await page.goBack();
+  await expect(sort).toBeVisible();
+  await expect(page.locator("#sort-control")).toHaveValue("date_desc");
+  await page.goForward();
+  await expect(sort).toBeHidden();
+  await page.getByRole("tab", { name: "Videos" }).click();
+  await expect(sort).toBeVisible();
+  await expect(page.locator("#sort-control")).toHaveValue("date_desc");
+  await expect(page).toHaveURL(/\?view=video&sort=date_desc$/);
+
+  await page.getByRole("tab", { name: "Folders" }).click();
+  await page.getByRole("button", { name: /^Open library,/ }).click();
+  await expect(page.locator("#breadcrumbs [aria-current=page]")).toHaveText("library");
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  await page.route("**/api/web/library?**", async (route) => {
+    await held;
+    await route.fulfill({ status: 503, json: { schema_version: 2, error: {
+      code: "library_unavailable", message: "Unavailable", recoverable: true,
+    } } });
+  });
+  await page.getByRole("button", { name: /^Open video,/ }).click();
+  await expect(page.locator("#loading")).toBeVisible();
+  await expect(page.locator("#library-count")).toHaveText("Loading…");
+  await expect(page.locator("#results-summary")).toHaveText("Loading…");
+  release();
+  await expect(page.locator("#library-empty-title")).toHaveText("Could not load the library");
+  await expect(page.locator("#library-count")).toHaveText("Library unavailable");
+  await expect(page.locator("#results-summary")).toHaveText("");
+  await expect(page.locator("#breadcrumbs")).toBeHidden();
+});
+
+test("an empty view of a populated server is not an empty server", async ({ page }) => {
+  await openLibrary(page);
+  await page.getByRole("tab", { name: "All media" }).click();
+  await page.locator("#search-input").fill("definitely absent from every title");
+  await expect(page.locator("#library-empty-title")).toContainText("No results for");
+  await expect(page.locator("#server-state")).toHaveAttribute("data-state", "ready");
+  await expect(page.locator("#library-live")).toHaveText("Library ready. No items in this view.");
+
+  const empty = await page.context().newPage();
+  await empty.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    await route.fulfill({ response, json: {
+      ...payload, library_state: "empty", entries: [], total: 0, has_more: false, breadcrumbs: payload.breadcrumbs,
+    } });
+  });
+  await empty.goto("/?view=all");
+  await expect(empty.locator("#server-state")).toHaveAttribute("data-state", "empty");
+  await expect(empty.locator("#library-empty-title")).toHaveText("No media indexed yet");
+  await expect(empty.locator("#library-empty-detail")).toContainText("check Server status");
+  await expect(empty.locator("#library-live")).toHaveText("Library ready. The server has no indexed media.");
+  await empty.close();
+});
+
+test("transient catalog races retry automatically and a busy server is not a connection fault", async ({ page }) => {
+  let failures = 0;
+  let failure = null;
+  const videoFirstPages = [];
+  await page.route("**/api/web/library?**", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("kind") !== "video") return route.fallback();
+    if (url.searchParams.get("offset") === "0") videoFirstPages.push(url);
+    if (failures === 0) return route.fallback();
+    failures -= 1;
+    const [status, code] = failure;
+    return route.fulfill({ status, json: { schema_version: 2, error: {
+      code, message: "The library is busy. Try again in a moment.", recoverable: true, action: "retry_library",
+    } } });
+  });
+
+  // The page clock flows naturally until the backoff-cancellation phase pauses it.
+  await page.clock.install();
+
+  // One publication race recovers without a manual Retry.
+  failures = 1;
+  failure = [409, "catalog_changed"];
+  await page.goto("/?view=video");
+  await expect(page.locator("#server-state")).toHaveAttribute("data-state", "ready");
+  await expect(page.locator(".media-card.video").first()).toBeVisible();
+  expect(videoFirstPages).toHaveLength(2);
+
+  // Retries are bounded; a busy server says so instead of blaming the network.
+  videoFirstPages.length = 0;
+  failures = 3;
+  failure = [503, "catalog_busy"];
+  await page.locator("#sort-control").selectOption("date_desc");
+  await expect(page.locator("#library-empty-title")).toHaveText("Could not load the library");
+  await expect(page.locator("#library-empty-detail")).toHaveText("The server is busy updating the library. Retry in a moment.");
+  await expect(page.locator("#library-live")).not.toContainText("connection");
+  expect(videoFirstPages).toHaveLength(3);
+  await expect(page.locator("[data-media-id]")).toHaveCount(0);
+  await page.locator("#library-retry").click();
+  await expect(page.locator("#server-state")).toHaveAttribute("data-state", "ready");
+
+  // Navigation during a backoff cancels the retry; the old view never publishes.
+  // With the page clock paused, backoffs advance only in explicit steps much
+  // shorter than the second backoff (at least 750 ms), so the Audio click lands
+  // inside it however slowly the worker runs.
+  videoFirstPages.length = 0;
+  failures = 100;
+  const pausedAt = await page.evaluate(() => Date.now() + 1_000);
+  await page.clock.pauseAt(pausedAt);
+  await page.locator("#sort-control").selectOption("title");
+  await expect.poll(async () => {
+    if (videoFirstPages.length === 1) await page.clock.runFor(100);
+    return videoFirstPages.length;
+  }, { intervals: [20] }).toBe(2);
+  await page.getByRole("tab", { name: "Audio" }).click();
+  await page.clock.resume();
+  await expect(page.locator(".media-card.audio").first()).toBeVisible();
+  // Past the longest possible second backoff (1250 ms); a surviving retry would fire.
+  await page.clock.runFor(2_000);
+  expect(videoFirstPages).toHaveLength(2);
+  await expect(page.getByRole("tab", { name: "Audio" })).toHaveAttribute("aria-selected", "true");
+  await expect(page.locator("#server-state")).toHaveAttribute("data-state", "ready");
+});
+
+test("reconnecting retries a library load that failed in transport", async ({ page }) => {
+  let aborted = false;
+  await page.route("**/api/web/library?**", async (route) => {
+    if (!aborted) {
+      aborted = true;
+      return route.abort("internetdisconnected");
+    }
+    return route.fallback();
+  });
+  await page.goto("/");
+  await expect(page.locator("#library-empty-title")).toHaveText("Could not load the library");
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect(page.locator("#server-state")).toHaveAttribute("data-state", "ready");
+  await expect(page.locator("#library-empty")).toBeHidden();
+});
+
+test("reloading the library never drops keyboard focus from a hidden Retry", async ({ page }) => {
+  let failing = true;
+  let held = null;
+  await page.route("**/api/web/library?**", async (route) => {
+    if (!failing) return route.fallback();
+    if (held) await held.promise;
+    return route.abort("internetdisconnected");
+  });
+  await page.goto("/");
+  const retry = page.locator("#library-retry");
+  await expect(retry).toBeVisible();
+  held = {};
+  held.promise = new Promise((resolve) => { held.resolve = resolve; });
+  const release = () => held.resolve();
+
+  // Reconnecting retries while Retry has focus: focus waits in the library
+  // panel during loading and returns to Retry when the load fails again.
+  await retry.focus();
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect(page.locator("#loading")).toBeVisible();
+  await expect(retry).toBeHidden();
+  await expect(page.locator("#library-panel")).toBeFocused();
+  release();
+  await expect(retry).toBeVisible();
+  await expect(retry).toBeFocused();
+
+  // A keyboard Retry that succeeds leaves focus in the library panel.
+  failing = false;
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#server-state")).toHaveAttribute("data-state", "ready");
+  await expect(retry).toBeHidden();
+  await expect(page.locator("#library-panel")).toBeFocused();
+});
+
 test("Continue watching survives reload and supports clearing progress", async ({ page }) => {
   const exactId = "9007199254740993";
   await page.addInitScript(() => {
@@ -1261,7 +1548,13 @@ test("Continue watching survives reload and supports clearing progress", async (
   await expect(page.locator(`[data-media-id="${itemId}"] .card-title`)).toHaveText(title);
   await page.getByRole("button", { name: `Clear progress for ${title}` }).click();
   await expect(page.locator(`[data-media-id="${itemId}"]`)).toHaveCount(0);
+  // The removed control's neighbour keeps keyboard focus, not the document.
+  await expect(page.locator(`[data-media-id="${exactId}"] .card-button`)).toBeFocused();
+  await expect(page.locator("#library-live")).toHaveText(`Progress cleared for ${title}.`);
+  await page.getByRole("button", { name: "Clear progress for Exact i64 ID" }).click();
+  await expect(page.locator("#library-empty")).toBeVisible();
   await expect(page.locator("#library-empty-title")).toHaveText("Nothing to continue yet");
+  await expect(page.locator("#library-panel")).toBeFocused();
 });
 
 test("navigating away aborts a later Continue Watching batch", async ({ page }) => {
@@ -1657,7 +1950,7 @@ test("library failure is plain-language and recoverable", async ({ page }) => {
   await expect(page.locator("#library-empty-detail")).toHaveText(/(?:Check the server connection|You appear to be offline)/);
   await expect(page.locator("#library-empty-detail")).not.toContainText("raw helper output");
   await page.locator("#library-retry").click();
-  await expect(page.locator("#server-state")).toHaveAttribute("data-state", /ready|empty/);
+  await expect(page.locator("#server-state")).toHaveAttribute("data-state", "ready");
 });
 
 test("a version-mismatched JSON error cannot masquerade as a current API error", async ({ page }) => {
@@ -2092,7 +2385,7 @@ test("quality preferences follow advertised bounded opaque profile IDs", async (
 
   await page.evaluate(() => localStorage.setItem("rustydlna.quality", "removed-profile"));
   await page.reload();
-  await expect(page.locator("#server-state")).toHaveAttribute("data-state", /ready|empty/);
+  await expect(page.locator("#server-state")).toHaveAttribute("data-state", "ready");
   await expect.poll(() => page.evaluate(() => localStorage.getItem("rustydlna.quality"))).toBe("auto");
 });
 
@@ -2347,7 +2640,7 @@ test("empty advertised quality profiles reset to Auto while a missing legacy fie
 
   profileMode = "empty";
   await page.reload();
-  await expect(page.locator("#server-state")).toHaveAttribute("data-state", /ready|empty/);
+  await expect(page.locator("#server-state")).toHaveAttribute("data-state", "ready");
   await expect.poll(() => page.evaluate(() => localStorage.getItem("rustydlna.quality"))).toBe("auto");
 });
 
@@ -3594,7 +3887,7 @@ test("iPad WebKit reattaches a resumed native HLS source that decodes no data", 
   await expect(page.locator("#player-message[role=alert]")).toBeHidden();
 });
 
-test("iPad sleep restarts native HLS at the saved position on Play", async ({ page, browserName }) => {
+test("iPad sleep restarts native HLS at the saved position on Play; background playback keeps it", async ({ page, browserName }) => {
   test.skip(browserName !== "webkit", "native HLS suspension recovery belongs to Apple WebKit");
   await usePreference(page, "stream", "compat");
   await page.route("**/api/web/library?**", async (route) => {
@@ -3635,7 +3928,25 @@ test("iPad sleep restarts native HLS at the saved position on Play", async ({ pa
         visibilityState = "visible";
         document.dispatchEvent(new Event("visibilitychange"));
       },
+      // Safari keeps a background tab playing (the clock tracks the hidden
+      // time), while device sleep can drain a little buffer and then stop
+      // decoding without delivering pause. hiddenMs advances the page clock.
+      hideWhilePlaying(player, from, advance, hiddenMs) {
+        positions.set(player, from);
+        visibilityState = "hidden";
+        document.dispatchEvent(new Event("visibilitychange"));
+        clockOffset += hiddenMs;
+        if (advance > 0) {
+          positions.set(player, from + advance);
+          player.dispatchEvent(new Event("timeupdate"));
+        }
+        visibilityState = "visible";
+        document.dispatchEvent(new Event("visibilitychange"));
+      },
     };
+    let clockOffset = 0;
+    const nativeNow = performance.now.bind(performance);
+    performance.now = () => nativeNow() + clockOffset;
     Object.defineProperty(Document.prototype, "visibilityState", {
       configurable: true,
       get: () => visibilityState,
@@ -3747,6 +4058,33 @@ test("iPad sleep restarts native HLS at the saved position on Play", async ({ pa
   expect(nativeResume.start).toBe("4350");
   expect(nativeResume.request).not.toBe(loads[1].request);
   await expect(page.locator("#player-message[role=alert]")).toBeHidden();
+
+  // Playback that continued in the background keeps its attachment: a later
+  // pause and play resumes the same generation instead of restarting it.
+  await expect(page.locator("#player-stage")).toHaveClass(/is-playing/);
+  await page.locator("#video-player").evaluate((player) => window.__nativeHlsSleep.hideWhilePlaying(player, 100, 30, 30_000));
+  await page.locator("#play-button").evaluate((button) => button.click());
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+  await page.locator("#play-button").evaluate((button) => button.click());
+  await expect(page.locator("#player-stage")).toHaveClass(/is-playing/);
+  await page.waitForTimeout(100);
+  expect(await page.evaluate(() => window.__nativeHlsSleep.loads.length)).toBe(3);
+
+  // A hidden period whose clock never advanced is still treated as sleep.
+  await page.locator("#video-player").evaluate((player) => window.__nativeHlsSleep.hideWhilePlaying(player, 200, 0, 60_000));
+  await page.locator("#play-button").evaluate((button) => button.click());
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+  await page.locator("#play-button").evaluate((button) => button.click());
+  await expect.poll(() => page.evaluate(() => window.__nativeHlsSleep.loads.length)).toBe(4);
+
+  // Ten minutes of sleep that drained only about a second of buffer before
+  // the decoder stopped is still sleep, not background playback.
+  await expect(page.locator("#player-stage")).toHaveClass(/is-playing/);
+  await page.locator("#video-player").evaluate((player) => window.__nativeHlsSleep.hideWhilePlaying(player, 300, 1.2, 600_000));
+  await page.locator("#play-button").evaluate((button) => button.click());
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+  await page.locator("#play-button").evaluate((button) => button.click());
+  await expect.poll(() => page.evaluate(() => window.__nativeHlsSleep.loads.length)).toBe(5);
 });
 
 test("desktop Safari selects server-generated native HLS", async ({ page }, testInfo) => {
@@ -4539,6 +4877,53 @@ test("a missing direct file is not mislabeled as unsupported", async ({ page }) 
   await card.locator(".card-button").click();
   await expect(page.locator("#player-message-text")).toHaveText("This media file is no longer available.");
   await expect(page.locator("#technical-message")).not.toContainText("raw path");
+});
+
+test("Play after an unsupported original file starts prepared streaming", async ({ page }) => {
+  await usePreference(page, "stream", "direct");
+  const requests = [];
+  await serveFixtureMedia(page, (url) => requests.push(url));
+  await openLibrary(page);
+  await selectTaggedVideo(page);
+  await page.locator("#video-player").dispatchEvent("error");
+  await expect(page.locator("#player-message-text")).toContainText("cannot play the original file");
+  expect(requests.filter((url) => url.searchParams.get("mode") === "compatible")).toHaveLength(0);
+  await showPlayerControls(page);
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Play");
+  await page.locator("#play-button").click();
+  await expect.poll(() => requests.filter((url) => url.searchParams.get("mode") === "compatible").length)
+    .toBeGreaterThan(0);
+  await expect(page.locator("#player-message[role=alert]")).toBeHidden();
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Pause");
+});
+
+test("the Play shortcut after a missing-file error retries the same source", async ({ page }) => {
+  await usePreference(page, "stream", "direct");
+  await openLibrary(page);
+  await openVideoView(page);
+  const card = page.locator(".media-card.video").first();
+  const itemId = await card.getAttribute("data-media-id");
+  await page.route(`**/api/web/item/${itemId}`, (route) => route.fulfill({
+    status: 404,
+    contentType: "application/json",
+    body: JSON.stringify({ schema_version: 2, error: { code: "media_missing", message: "missing", recoverable: true, action: "return_to_library" } }),
+  }));
+  const requests = [];
+  await page.route("**/web/media/*.mp4?**", (route) => {
+    requests.push(new URL(route.request().url()));
+    return route.abort("failed");
+  });
+  await card.locator(".card-button").click();
+  await expect(page.locator("#player-message-text")).toHaveText("This media file is no longer available.");
+  const failed = requests.length;
+  expect(failed).toBeGreaterThan(0);
+  await page.locator("#player-stage").focus();
+  await page.keyboard.press("k");
+  await expect.poll(() => requests.length).toBeGreaterThan(failed);
+  const retried = requests.at(-1);
+  expect(retried.searchParams.get("mode")).not.toBe("compatible");
+  expect(retried.searchParams.get("request")).not.toBe(requests[failed - 1].searchParams.get("request"));
+  await expect(page.locator("#player-message-text")).toHaveText("This media file is no longer available.");
 });
 
 test("a dropped compatible-media connection retries a healthy producer", async ({ page }) => {
@@ -5525,10 +5910,149 @@ test("resume offers Start over and blocked browser storage remains nonfatal", as
     Storage.prototype.removeItem = () => { throw new DOMException("blocked", "SecurityError"); };
   });
   await blocked.goto("/?view=video");
-  await expect(blocked.locator("#server-state")).toHaveAttribute("data-state", /ready|empty/);
+  await expect(blocked.locator("#server-state")).toHaveAttribute("data-state", "ready");
   await blocked.getByRole("button", { name: /^Play tagged\b/ }).click();
   expect(errors).toEqual([]);
   await blocked.close();
+});
+
+async function withTenMinuteCatalog(page, { incomplete = false } = {}) {
+  await page.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    for (const entry of payload.entries || []) {
+      if (entry.entry_type === "media") {
+        entry.duration_seconds = 600;
+        entry.duration = "0:10:00.000";
+        if (incomplete) entry.stream_metadata_complete = false;
+      }
+    }
+    await route.fulfill({ response, json: payload });
+  });
+}
+
+test("the resume choice takes keyboard focus, is announced, and keeps focus in the player", async ({ page }) => {
+  await withTenMinuteCatalog(page, { incomplete: true });
+  await serveFixtureMedia(page);
+  let releaseEnrichment = () => {};
+  let enrichmentStarted = null;
+  await page.route("**/api/web/item/*", async (route) => {
+    const url = new URL(route.request().url());
+    if (enrichmentStarted && url.searchParams.get("enrich") === "1") {
+      await new Promise((resolve) => {
+        releaseEnrichment = resolve;
+        enrichmentStarted();
+      });
+    }
+    const response = await route.fetch();
+    const payload = await response.json();
+    if (payload.item) {
+      payload.item.duration_seconds = 600;
+      payload.item.duration = "0:10:00.000";
+    }
+    await route.fulfill({ response, json: payload });
+  });
+  await page.goto("/?view=video");
+  const card = page.locator(".media-card", { has: page.locator(".card-title", { hasText: /^tagged$/ }) });
+  const itemId = await card.getAttribute("data-media-id");
+  await page.evaluate(({ itemId }) => localStorage.setItem("rustydlna.webProgress.v1", JSON.stringify({
+    [itemId]: { position: 125, duration: 600, updated: Date.now() },
+  })), { itemId });
+
+  // One action: a library re-render between focus and key press would
+  // otherwise send Enter to a detached card.
+  await card.locator(".card-button").press("Enter");
+  await expect(page.locator("#resume-prompt")).toBeVisible();
+  await expect(page.locator("#resume-button")).toBeFocused();
+  await expect(page.locator("#playback-live")).toHaveText("Continue watching? Resume at 2:05, or start over.");
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#resume-prompt")).toBeHidden();
+  await expect(page.locator("#player-stage")).toBeFocused();
+
+  // Focus moved elsewhere while metadata loads is never taken back. Close the
+  // short fixture first so its own final progress flush cannot clear this one.
+  await page.locator("#close-player-button").click();
+  await expect(page.locator("#now-playing")).toBeHidden();
+  await page.evaluate(({ itemId }) => localStorage.setItem("rustydlna.webProgress.v1", JSON.stringify({
+    [itemId]: { position: 125, duration: 600, updated: Date.now() },
+  })), { itemId });
+  const held = new Promise((resolve) => { enrichmentStarted = resolve; });
+  // One action: a library re-render between focus and key press would
+  // otherwise send Enter to a detached card.
+  await card.locator(".card-button").press("Enter");
+  await held;
+  await page.locator("#search-input").focus();
+  releaseEnrichment();
+  await expect(page.locator("#resume-prompt")).toBeVisible();
+  await page.waitForTimeout(100);
+  await expect(page.locator("#search-input")).toBeFocused();
+});
+
+test("library cards show browser-local progress and genuine completion", async ({ page }) => {
+  await usePreference(page, "stream", "direct");
+  await page.addInitScript(() => {
+    const sources = new WeakMap();
+    HTMLMediaElement.prototype.play = () => Promise.resolve();
+    HTMLMediaElement.prototype.pause = () => {};
+    HTMLMediaElement.prototype.load = () => {};
+    Object.defineProperty(HTMLMediaElement.prototype, "src", {
+      configurable: true,
+      get() { return sources.get(this) || ""; },
+      set(value) { sources.set(this, new URL(value, document.baseURI).href); },
+    });
+  });
+  await withTenMinuteCatalog(page);
+  await page.goto("/?view=video");
+  const cards = page.locator(".media-card.video");
+  await expect(cards.nth(2)).toBeVisible();
+  const [partialId, watchedId, plainId] = await cards.evaluateAll((elements) => elements.slice(0, 3)
+    .map((element) => element.dataset.mediaId));
+  await page.evaluate(({ partialId, watchedId }) => {
+    localStorage.setItem("rustydlna.webProgress.v1", JSON.stringify({
+      [partialId]: { position: 150, duration: 600, updated: Date.now() },
+    }));
+    localStorage.setItem("rustydlna.webWatched.v1", JSON.stringify({ [watchedId]: Date.now() }));
+  }, { partialId, watchedId });
+  await page.reload();
+  const partial = page.locator(`[data-media-id="${partialId}"]`);
+  const watched = page.locator(`[data-media-id="${watchedId}"]`);
+  const plain = page.locator(`[data-media-id="${plainId}"]`);
+  await expect(partial.locator(".card-progress-fill")).toHaveAttribute("style", /--card-progress: 25%/);
+  await expect(partial.locator(".card-button")).toHaveAttribute("aria-label", /\. 25% watched, 7:30 left$/);
+  await expect(watched.locator(".card-watched")).toHaveText("Watched");
+  await expect(watched.locator(".card-button")).toHaveAttribute("aria-label", /\. Watched$/);
+  await expect(plain.locator(".card-progress, .card-watched")).toHaveCount(0);
+  // Progress overlays the artwork; it never changes measured card geometry.
+  const heights = await page.locator(`[data-media-id="${partialId}"] .art, [data-media-id="${plainId}"] .art`)
+    .evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().height));
+  expect(heights[0]).toBeCloseTo(heights[1], 1);
+
+  // Only a genuine end of playback records completion. Media loading is
+  // stubbed, so the element reports the clock each case needs.
+  const endAt = (seconds) => page.locator("#video-player").evaluate((video, seconds) => {
+    Object.defineProperty(video, "currentTime", { configurable: true, get: () => seconds, set() {} });
+    video.dispatchEvent(new Event("ended"));
+  }, seconds);
+  const watchedIds = () => page.evaluate(() => Object.keys(
+    JSON.parse(localStorage.getItem("rustydlna.webWatched.v1") || "{}"),
+  ));
+  // A direct file that ends 9:30 early (for example, truncated) finishes
+  // playback but is not completion.
+  const earlyId = await cards.nth(3).evaluate((element) => element.dataset.mediaId);
+  await cards.nth(3).locator(".card-button").click();
+  await expect.poll(() => page.locator("#video-player").evaluate((video) => video.src)).toContain("/web/media/");
+  await endAt(30);
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Replay");
+  expect(await watchedIds()).not.toContain(earlyId);
+  await plain.locator(".card-button").click();
+  await expect.poll(() => page.locator("#video-player").evaluate((video) => video.src)).toContain(`/web/media/${plainId}`);
+  await endAt(600);
+  await expect.poll(() => page.evaluate(({ plainId }) => (
+    Object.hasOwn(JSON.parse(localStorage.getItem("rustydlna.webWatched.v1") || "{}"), plainId)
+  ), { plainId })).toBe(true);
+  await page.getByRole("tab", { name: "Audio" }).click();
+  await page.getByRole("tab", { name: "Videos" }).click();
+  await expect(page.locator(`[data-media-id="${plainId}"] .card-watched`)).toHaveText("Watched");
 });
 
 test("switching titles flushes progress to the title that was playing", async ({ page }) => {
@@ -5866,6 +6390,16 @@ test("already-complete broken artwork shows the fallback and releases its loadin
       get() { return broken.has(this.getAttribute("src")) ? true : complete.call(this); },
     });
   });
+  // Items without stored art advertise a null art_url; give every card a URL
+  // so enough broken images exercise the slot accounting.
+  await page.route("**/api/web/library?**", async (route) => {
+    const response = await route.fetch();
+    const payload = await response.json();
+    for (const entry of payload.entries || []) {
+      if (entry.entry_type === "media") entry.art_url = `/AlbumArt/1-${entry.id}.jpg`;
+    }
+    await route.fulfill({ response, json: payload });
+  });
   let releaseArtwork;
   const held = new Promise((resolve) => { releaseArtwork = resolve; });
   await page.route(/\/(?:Thumbnails|AlbumArt)\//, async (route) => {
@@ -6031,10 +6565,12 @@ test("a generation change while loading metadata is recoverable without partial 
   await generationChangeRequested;
   await expect(page.locator("[data-media-id]")).toHaveCount(0);
   releaseGenerationChange();
-  await expect(page.locator("#server-state")).toHaveAttribute("data-state", "error");
-  await expect(page.locator("[data-media-id]")).toHaveCount(0);
-  await page.locator("#library-retry").click();
-  await expect(page.locator("#server-state")).toHaveAttribute("data-state", /ready|empty/);
+  // The snapshot restarts from its first page automatically, never resuming
+  // with pages from the older generation.
+  await expect(page.locator("[data-media-id]").first()).toBeAttached();
+  await expect(page.locator("#loading")).toBeHidden();
+  await expect(page.locator("#server-state")).toHaveAttribute("data-state", "ready");
+  await expect(page.locator("#library-empty")).toBeHidden();
   const ids = await page.locator("[data-media-id]").evaluateAll((cards) => cards.map((card) => card.dataset.mediaId));
   expect(new Set(ids).size).toBe(ids.length);
 });
@@ -6155,6 +6691,168 @@ test("reduced motion, 200% zoom, and focus restoration remain usable", async ({ 
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   await page.getByRole("tab", { name: "Audio" }).click();
   await expect(page.locator("#library-panel")).toBeFocused();
+});
+
+for (const mode of ["direct", "compat"]) {
+  test(`arrow keys on the focused timeline seek by the player step (${mode})`, async ({ page }) => {
+    await usePreference(page, "stream", mode);
+    // One entry per source generation; a media element may re-request ranges.
+    const requests = [];
+    await serveFixtureMedia(page, (url) => {
+      if (!requests.some((seen) => seen.searchParams.get("request") === url.searchParams.get("request"))) requests.push(url);
+    });
+    await page.addInitScript(() => {
+      // Hold a long title still so each key press is observable exactly.
+      const positions = new WeakMap();
+      Object.defineProperty(HTMLMediaElement.prototype, "currentTime", {
+        configurable: true,
+        get() { return positions.get(this) ?? 0; },
+        set(value) { positions.set(this, Number(value)); },
+      });
+      HTMLMediaElement.prototype.play = () => Promise.resolve();
+    });
+    await page.route("**/api/web/library?**", async (route) => {
+      const response = await route.fetch();
+      const payload = await response.json();
+      for (const item of payload.entries || []) {
+        if (item.entry_type === "media" && item.title === "tagged") {
+          Object.assign(item, { duration_seconds: 600, duration: "0:10:00.000" });
+        }
+      }
+      await route.fulfill({ response, json: payload });
+    });
+    await openLibrary(page);
+    await selectTaggedVideo(page);
+    await expect(page.locator("#timeline")).toHaveAttribute("max", "600");
+    await expect.poll(() => requests.length).toBe(1);
+    // Metadata reports the source's start position; press keys only after it.
+    await expect.poll(() => page.locator("#video-player").evaluate((video) => video.readyState)).toBeGreaterThanOrEqual(1);
+    await page.locator("#timeline").focus();
+    for (const key of ["ArrowRight", "ArrowUp", "PageUp"]) await page.keyboard.press(key);
+    await expect(page.locator("#timeline")).toHaveValue("80");
+    await expect(page.locator("#timeline")).toHaveAttribute("aria-valuetext", /^1:20 of 10:00$/);
+    await page.keyboard.press("ArrowLeft");
+    await expect(page.locator("#timeline")).toHaveValue("70");
+    await expect(page.locator("#timeline")).toBeFocused();
+    if (mode === "direct") {
+      expect(await page.locator("#video-player").evaluate((video) => video.currentTime)).toBe(70);
+      await page.keyboard.press("Home");
+      await expect(page.locator("#timeline")).toHaveValue("0");
+      expect(requests).toHaveLength(1);
+    } else {
+      // Rapid steps share the compatible-seek debounce: one replacement only.
+      await expect.poll(() => requests.length).toBe(2);
+      await page.waitForTimeout(800);
+      expect(requests).toHaveLength(2);
+      expect(requests[1].searchParams.get("mode")).toBe("compatible");
+    }
+  });
+}
+
+test("Media Session previous/next are registered only while they can act", async ({ page }) => {
+  await usePreference(page, "stream", "direct");
+  await serveFixtureMedia(page);
+  await page.addInitScript(() => {
+    const positions = new WeakMap();
+    Object.defineProperty(HTMLMediaElement.prototype, "currentTime", {
+      configurable: true,
+      get() { return positions.get(this) ?? 0; },
+      set(value) { positions.set(this, Number(value)); },
+    });
+    HTMLMediaElement.prototype.play = () => Promise.resolve();
+    window.__mediaActions = {};
+    window.__mediaActionCalls = [];
+    Object.defineProperty(navigator, "mediaSession", { configurable: true, value: {
+      metadata: null,
+      setPositionState() {},
+      setActionHandler: (action, handler) => {
+        window.__mediaActionCalls.push(action);
+        window.__mediaActions[action] = handler;
+      },
+    } });
+  });
+  await page.route("**/api/web/library?**", async (route) => {
+    const url = new URL(route.request().url());
+    const response = await route.fetch();
+    const payload = await response.json();
+    if (url.searchParams.get("kind") !== "video") return route.fulfill({ response, json: payload });
+    const base = payload.entries.find((entry) => entry.entry_type === "media" && entry.title === "tagged");
+    const entries = [1, 2, 3].map((index) => ({
+      ...base, id: String(41000 + index), title: `Queue ${index}`, art_url: null,
+      duration_seconds: 600, duration: "0:10:00.000", stream_metadata_complete: true,
+      chapters: index === 3 ? [
+        { index: 0, start_seconds: 0, title: "Opening" },
+        { index: 1, start_seconds: 300, title: "Finale" },
+      ] : [],
+    }));
+    await route.fulfill({ response, json: { ...payload, entries, offset: 0, total: 3, has_more: false } });
+  });
+  const handlers = () => page.evaluate(() => ({
+    previous: typeof window.__mediaActions.previoustrack,
+    next: typeof window.__mediaActions.nexttrack,
+  }));
+  await openLibrary(page);
+  await openVideoView(page);
+  const cards = page.locator(".media-card.video");
+  await expect(cards).toHaveCount(3);
+
+  // First queue item: nothing before it.
+  await cards.first().locator(".card-button").click();
+  await expect(page.locator("#now-playing-title")).toHaveText("Queue 1");
+  await expect.poll(handlers).toEqual({ previous: "undefined", next: "function" });
+
+  // Last queue item with chapters: Next still moves to the final chapter.
+  await cards.last().locator(".card-button").click();
+  await expect(page.locator("#now-playing-title")).toHaveText("Queue 3");
+  await expect.poll(handlers).toEqual({ previous: "function", next: "function" });
+  // Metadata reports the source's start position; seek only after it.
+  await expect.poll(() => page.locator("#video-player").evaluate((video) => video.readyState)).toBeGreaterThanOrEqual(2);
+  await page.evaluate(() => window.__mediaActions.nexttrack());
+  await expect(page.locator("#timeline")).toHaveValue("300");
+  // Final chapter at the end of the queue: Next is withdrawn, not a no-op.
+  await expect.poll(handlers).toEqual({ previous: "function", next: "object" });
+  expect(await page.evaluate(() => window.__mediaActions.nexttrack)).toBeNull();
+
+  const calls = await page.evaluate(() => window.__mediaActionCalls.filter((action) => action.endsWith("track")).length);
+  // Clock updates re-evaluate availability without re-registering handlers.
+  await page.locator("#video-player").evaluate((video) => {
+    for (let index = 0; index < 5; index += 1) video.dispatchEvent(new Event("timeupdate"));
+  });
+  expect(await page.evaluate(() => window.__mediaActionCalls.filter((action) => action.endsWith("track")).length)).toBe(calls);
+
+  await page.locator("#close-player-button").evaluate((button) => button.click());
+  await expect.poll(handlers).toEqual({ previous: "object", next: "object" });
+});
+
+test("compatible audio plays through the native audio loader, not a video-typed Media Source", async ({ page, browserName }) => {
+  // Playwright's Linux Firefox reports a decode error for this prepared AAC
+  // output through either loader, so it cannot show which loader succeeded.
+  test.skip(browserName === "firefox", "prepared AAC audio does not decode in this Firefox build");
+  await usePreference(page, "stream", "compat");
+  const media = [];
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith("/web/media/")) media.push(url);
+  });
+  await page.addInitScript(() => {
+    window.__sourceBufferTypes = [];
+    if (typeof globalThis.MediaSource !== "function") return;
+    const addSourceBuffer = MediaSource.prototype.addSourceBuffer;
+    MediaSource.prototype.addSourceBuffer = function recordSourceBuffer(type) {
+      window.__sourceBufferTypes.push(type);
+      return addSourceBuffer.call(this, type);
+    };
+  });
+  await openLibrary(page);
+  await page.getByRole("tab", { name: "Audio", exact: true }).click();
+  await page.locator(".media-card.audio .card-button").first().click();
+  // The fixture is a fraction of a second long, so successful playback ends.
+  await expect(page.locator("#play-button")).toHaveAttribute("aria-label", "Replay");
+  await expect(page.locator("#player-message[role=alert]")).toBeHidden();
+  const compatible = media.filter((url) => url.searchParams.get("mode") === "compatible");
+  expect(compatible.length).toBeGreaterThan(0);
+  expect(compatible.filter((url) => url.searchParams.has("delivery"))).toEqual([]);
+  expect(await page.evaluate(() => window.__sourceBufferTypes)).toEqual([]);
 });
 
 test("direct failure stays visible until compatible media is playable", async ({ page }) => {
@@ -6605,7 +7303,7 @@ test("asynchronous library and playback states use deduplicated polite live regi
     }
   });
   releaseLibrary();
-  await expect(page.locator("#server-state")).toHaveAttribute("data-state", /ready|empty/);
+  await expect(page.locator("#server-state")).toHaveAttribute("data-state", "ready");
   await expect(libraryLive).toHaveText(/^Library ready\./);
 
   await usePreference(page, "stream", "direct");

@@ -243,9 +243,11 @@ pub struct DidlRes {
     pub resolution: Option<String>,
     pub sample_frequency: Option<i64>,
     pub nr_audio_channels: Option<i64>,
-    /// Filter `pv:subtitleFileType` — always `SRT` when set.
+    /// Filter `pv:subtitleFileType` — the default caption's uppercase type
+    /// (`SRT`, `SMI`, `ASS`, ...).
     pub pv_subtitle_type: Option<String>,
-    /// Filter `pv:subtitleFileUri` — `/Captions/{id}.srt` (first caption).
+    /// Filter `pv:subtitleFileUri` — the default caption: `/Captions/{id}.srt`
+    /// for an SRT default, otherwise its indexed `/Captions/{id}/{n}.{ext}`.
     pub pv_subtitle_uri: Option<String>,
 }
 
@@ -337,7 +339,9 @@ pub fn emit_didl_object(o: &DidlObject, bits: &FilterBits) -> String {
             s.push(c);
             s.push_str("</av:mediaClass>");
         }
-        emit_album_art_uri(&mut s, o);
+        if bits.upnp_album_art {
+            emit_album_art_uri(&mut s, o, bits);
+        }
         s.push_str("</container>");
         s
     } else {
@@ -482,7 +486,7 @@ pub fn emit_didl_object(o: &DidlObject, bits: &FilterBits) -> String {
             }
         }
         if bits.upnp_album_art {
-            emit_album_art_uri(&mut s, o);
+            emit_album_art_uri(&mut s, o, bits);
         }
         s.push_str("</item>");
         s
@@ -509,11 +513,12 @@ fn truncate_chars(s: &str, max: usize) -> &str {
     }
 }
 
-fn emit_album_art_uri(s: &mut String, o: &DidlObject) {
+fn emit_album_art_uri(s: &mut String, o: &DidlObject, bits: &FilterBits) {
     let Some(uri) = &o.album_art_uri else {
         return;
     };
-    if o.album_art_profile {
+    // `dlna:profileID` is only well-formed when DIDL-Lite declares xmlns:dlna.
+    if o.album_art_profile && bits.dlna_ns {
         s.push_str("<upnp:albumArtURI dlna:profileID=\"JPEG_TN\">");
     } else {
         s.push_str("<upnp:albumArtURI>");
@@ -2315,6 +2320,26 @@ mod tests {
                 .iter()
                 .any(|(_, info)| info.contains("DLNA.ORG_PN=AVC_TS_HD_50_AC3_T")),
             "{bravia:?}"
+        );
+    }
+
+    /// Sony BDP keeps its video/avi MPEG_PS alias rows for the PN values the
+    /// scanner now derives: the conformant HD H.264 MP4 profile, and AVI whose
+    /// H.264 stream no longer carries an invented AVC_MP4 PN.
+    #[test]
+    fn sony_bdp_aliases_survive_conformant_pn_derivation() {
+        let aliases = |mime: &str, pn: Option<&str>| {
+            extra_ci1_protocol_infos(ClientKind::SonyBdp, mime, pn)
+                .into_iter()
+                .filter(|(m, info)| m == "video/avi" && info.contains("MPEG_PS_"))
+                .count()
+        };
+        assert_eq!(aliases("video/mp4", Some("AVC_MP4_HP_HD_AAC")), 2);
+        assert_eq!(aliases("video/mp4", Some("AVC_MP4_MP_HD_AAC_MULT5")), 2);
+        assert_eq!(aliases("video/x-msvideo", None), 2);
+        assert_eq!(
+            aliases("video/x-msvideo", Some("AVC_MP4_MP_HD_AAC_MULT5")),
+            2
         );
     }
 

@@ -858,6 +858,14 @@ fn collect_events<'a>(
             continue;
         }
         let Some(name) = ev.name else {
+            // `IGNORED` for a descriptor this tree does not track is the
+            // acknowledgement of a watch the tree builder released itself (an
+            // unreadable subdirectory). It says nothing about media; treating
+            // it as directory loss would schedule a full reconcile that
+            // rebuilds the tree and releases the same watch again, forever.
+            if ev.mask.contains(EventMask::IGNORED) && !wds.contains_key(&ev.wd) {
+                continue;
+            }
             if ev
                 .mask
                 .intersects(EventMask::IGNORED | EventMask::DELETE_SELF | EventMask::MOVE_SELF)
@@ -1004,6 +1012,18 @@ fn collect_events<'a>(
 }
 
 type DirectoryInode = (u64, u64);
+
+/// A vanished or unreadable (`EACCES`) subdirectory is left unwatched instead
+/// of failing the whole tree, matching the scanner, which skips it and keeps
+/// its catalog rows. Configured roots are `required` and stay fatal. Once the
+/// directory becomes readable, periodic reconciliation indexes it and the
+/// next tree rebuild watches it.
+fn optional_directory_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+    )
+}
 type WatchPaths = HashMap<WatchDescriptor, Vec<PathBuf>>;
 type DirectoryWatches = HashMap<DirectoryInode, WatchDescriptor>;
 type WatchedDirectoryPaths = HashSet<PathBuf>;
@@ -1352,7 +1372,7 @@ fn add_tree_watches_with_limit(
         let name = raw_name.to_string_lossy();
         let metadata = match std::fs::metadata(&current) {
             Ok(metadata) => metadata,
-            Err(error) if !required && error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if !required && optional_directory_unavailable(&error) => continue,
             Err(error) => return Err(error),
         };
         let inode = (metadata.dev(), metadata.ino());
@@ -1383,7 +1403,7 @@ fn add_tree_watches_with_limit(
             }
             let wd = match add_watch(ino, &current) {
                 Ok(wd) => wd,
-                Err(error) if !required && error.kind() == io::ErrorKind::NotFound => {
+                Err(error) if !required && optional_directory_unavailable(&error) => {
                     watched_directories.remove(&current);
                     continue;
                 }
@@ -1396,7 +1416,7 @@ fn add_tree_watches_with_limit(
         ancestors.push(inode);
         let entries = match std::fs::read_dir(&current) {
             Ok(entries) => entries,
-            Err(error) if !required && error.kind() == io::ErrorKind::NotFound => {
+            Err(error) if !required && optional_directory_unavailable(&error) => {
                 forget_watched_directory(
                     wds,
                     directory_inodes,
@@ -1405,6 +1425,13 @@ fn add_tree_watches_with_limit(
                     &wd,
                     &current,
                 );
+                // A vanished directory's watch is already gone; an unreadable
+                // one still holds a kernel watch nobody tracks any more.
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && !directory_inodes.contains_key(&inode)
+                {
+                    let _ = ino.watches().remove(wd);
+                }
                 continue;
             }
             Err(error) => return Err(error),
@@ -2056,6 +2083,117 @@ mod tests {
         assert_eq!(telemetry.dropped_events_total.load(Ordering::Relaxed), 1);
         assert_eq!(telemetry.full_reconciles.load(Ordering::Relaxed), 1);
         assert_eq!(telemetry.targeted_batches.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn watch_tree_skips_an_unreadable_subdirectory_but_not_an_unreadable_root() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore(Vec<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+        }
+        let tmp = TempDir::new("watch-unreadable");
+        let root = tmp.join("media");
+        let locked = root.join("locked");
+        std::fs::create_dir_all(root.join("open")).unwrap();
+        std::fs::create_dir_all(locked.join("inner")).unwrap();
+        let _restore = Restore(vec![root.clone(), locked.clone()]);
+        let cfg = ScanConfig {
+            media_dirs: vec![root.clone()],
+            ..ScanConfig::default()
+        };
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            eprintln!("skipping: this process bypasses directory permissions");
+            return;
+        }
+
+        let (_ino, wds, _inodes, watched) = build_watch_tree(&cfg).unwrap();
+        assert!(watched.contains(&root));
+        assert!(watched.contains(&root.join("open")));
+        assert!(!watched.contains(&locked));
+        assert_eq!(wds.len(), 2);
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (_ino, _wds, _inodes, watched) = build_watch_tree(&cfg).unwrap();
+        assert!(
+            watched.contains(&locked.join("inner")),
+            "a rebuild watches it again"
+        );
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let error = build_watch_tree(&cfg).expect_err("a configured root stays required");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn released_watch_of_an_unreadable_directory_does_not_force_a_full_reconcile() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let tmp = TempDir::new("watch-released-ignored");
+        let root = tmp.join("media");
+        let locked = root.join("locked");
+        std::fs::create_dir_all(locked.join("inner")).unwrap();
+        let _restore = Restore(locked.clone());
+        let cfg = ScanConfig {
+            media_dirs: vec![root.clone()],
+            ..ScanConfig::default()
+        };
+        // FUSE without `default_permissions`, LSM open hooks, or a chmod race:
+        // the watch is accepted, then listing the directory is refused.
+        let mut locked_after_watch = false;
+        let (mut ino, mut wds, mut inodes, mut watched) = build_watch_tree(&cfg).unwrap();
+        rebuild_watch_tree_with(
+            &cfg,
+            &mut ino,
+            &mut wds,
+            &mut inodes,
+            &mut watched,
+            &mut |candidate, path| {
+                let wd = candidate.watches().add(path, MASK)?;
+                if path.ends_with("locked") {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))?;
+                    locked_after_watch = std::fs::read_dir(path).is_err();
+                }
+                Ok(wd)
+            },
+        )
+        .unwrap();
+        if !locked_after_watch {
+            eprintln!("skipping: this process bypasses directory permissions");
+            return;
+        }
+        assert_eq!(wds.len(), 1, "only the root stays tracked");
+        assert!(!watched.contains(&locked));
+
+        // The builder released the untracked kernel watch; its IGNORED
+        // acknowledgement is the only queued event.
+        assert!(poll_fd(ino.as_raw_fd(), 2_000).unwrap());
+        let mut buffer = [0u8; 4096];
+        let events = ino.read_events(&mut buffer).unwrap();
+        let mut batch = PendingBatch::default();
+        collect_events(
+            events,
+            &wds,
+            &watched,
+            &cfg,
+            &mut batch,
+            &mut PendingCreates::default(),
+        );
+        assert!(batch.raw_events > 0, "the IGNORED event was delivered");
+        assert!(
+            !batch.requires_full_reconcile(),
+            "a self-released watch must not schedule a full reconcile and tree rebuild"
+        );
     }
 
     #[test]

@@ -26,6 +26,7 @@ struct Projection {
     generation: u32,
     folder: String,
     query: String,
+    sort: &'static str,
     ids: Arc<[String]>,
     bytes: usize,
 }
@@ -53,9 +54,13 @@ impl FolderProjectionCache {
         generation: u32,
         folder: &str,
         query: &str,
+        sort: &str,
     ) -> Option<(Arc<[String]>, usize)> {
         let position = self.entries.iter().position(|entry| {
-            entry.generation == generation && entry.folder == folder && entry.query == query
+            entry.generation == generation
+                && entry.folder == folder
+                && entry.query == query
+                && entry.sort == sort
         })?;
         let entry = self.entries.remove(position)?;
         let ids = (Arc::clone(&entry.ids), entry.bytes);
@@ -68,11 +73,12 @@ impl FolderProjectionCache {
         generation: u32,
         folder: &str,
         query: &str,
+        sort: &'static str,
         ids: Arc<[String]>,
         bytes: usize,
     ) -> Vec<Projection> {
         let mut retired = Vec::new();
-        if self.get(generation, folder, query).is_some() || bytes > MAX_PROJECTION_BYTES {
+        if self.get(generation, folder, query, sort).is_some() || bytes > MAX_PROJECTION_BYTES {
             return retired;
         }
         while self.entries.len() >= MAX_PROJECTIONS
@@ -90,6 +96,7 @@ impl FolderProjectionCache {
             generation,
             folder: folder.into(),
             query: query.into(),
+            sort,
             ids,
             bytes,
         });
@@ -135,6 +142,57 @@ impl FolderProjectionCache {
     }
 }
 
+/// Folders always precede media and keep name order. Media follow the
+/// requested sort with the flat view's fields: newest file modification time
+/// for `date_desc`, or album/show, disc/season, and track/episode for
+/// `episode`; the lowercase name and stable object ID break ties.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct FolderSortKey {
+    rank: u8,
+    added: std::cmp::Reverse<(i64, i64)>,
+    album: String,
+    disc: i64,
+    track: i64,
+    title: String,
+    id: String,
+}
+
+impl FolderSortKey {
+    fn new(entry: &WebEntry<'_>, sort: &str) -> Self {
+        let (added, album, disc, track) = match (entry, sort) {
+            (WebEntry::Media(item), "date_desc") => (
+                rusty_dlna_scan::web_recently_added_key(item.mtime),
+                String::new(),
+                0,
+                0,
+            ),
+            (WebEntry::Media(item), "episode") => (
+                (0, 0),
+                rusty_dlna_scan::web_search_normalize(item.album.as_deref().unwrap_or("")),
+                item.disc.unwrap_or(0),
+                item.track.unwrap_or(0),
+            ),
+            _ => ((0, 0), String::new(), 0, 0),
+        };
+        Self {
+            rank: entry.rank(),
+            added: std::cmp::Reverse(added),
+            album,
+            disc,
+            track,
+            title: entry.sort_title(),
+            id: entry.stable_id().to_owned(),
+        }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.album
+            .capacity()
+            .saturating_add(self.title.capacity())
+            .saturating_add(self.id.capacity())
+    }
+}
+
 fn changed() -> HttpResponse {
     api_error(
         409,
@@ -166,6 +224,9 @@ pub(super) fn page(
     if requested_generation.is_some_and(|expected| expected != generation) {
         return changed();
     }
+    // The page is published only if this generation is still current after
+    // projection, so this whole-library state belongs to the same snapshot.
+    let library_has_media = catalog_has_web_media(&catalog);
     let Some(breadcrumbs) = physical_folder_chain(&catalog, folder_id) else {
         return api_error(
             404,
@@ -176,7 +237,7 @@ pub(super) fn page(
         );
     };
     // Validate the folder and generation before acknowledging an unchanged URL.
-    if let Some(response) = generation_not_modified(req, generation) {
+    if let Some(response) = generation_not_modified(req, app, generation) {
         return response;
     }
     let breadcrumb_dtos: Vec<_> = breadcrumbs
@@ -203,7 +264,7 @@ pub(super) fn page(
     let (cached, epoch) = {
         let mut cache = lock_recover(&app.folder_projection_cache);
         (
-            cache.get(generation, folder_id, normalized_query),
+            cache.get(generation, folder_id, normalized_query, sort),
             Arc::clone(&cache.epoch),
         )
     };
@@ -213,7 +274,7 @@ pub(super) fn page(
     } else {
         let child_count = current.children.len();
         drop(catalog);
-        let mut key_bytes = child_count.saturating_mul(std::mem::size_of::<(u8, String, String)>());
+        let mut key_bytes = child_count.saturating_mul(std::mem::size_of::<FolderSortKey>());
         if control.check_work_items(child_count).is_err()
             || control.check_work_bytes(key_bytes).is_err()
         {
@@ -257,14 +318,12 @@ pub(super) fn page(
                 if let Some(entry) = entry
                     .filter(|entry| normalized_query.is_empty() || entry.matches(normalized_query))
                 {
-                    let title = entry.sort_title();
-                    key_bytes = key_bytes
-                        .saturating_add(title.capacity())
-                        .saturating_add(entry.stable_id().len());
+                    let key = FolderSortKey::new(&entry, sort);
+                    key_bytes = key_bytes.saturating_add(key.heap_bytes());
                     if control.check_work_bytes(key_bytes).is_err() {
                         return query_budget_error();
                     }
-                    keys.push((entry.rank(), title, entry.stable_id().to_owned()));
+                    keys.push(key);
                 }
             }
             drop(catalog);
@@ -308,8 +367,8 @@ pub(super) fn page(
             }
             bytes = bytes
                 .saturating_add(std::mem::size_of::<String>())
-                .saturating_add(keys[key].2.capacity());
-            ids.push(std::mem::take(&mut keys[key].2));
+                .saturating_add(keys[key].id.capacity());
+            ids.push(std::mem::take(&mut keys[key].id));
         }
         (Arc::<[String]>::from(ids), bytes)
     };
@@ -389,6 +448,7 @@ pub(super) fn page(
             generation,
             folder_id,
             normalized_query,
+            sort,
             Arc::clone(&ids),
             projection_bytes,
         );
@@ -408,6 +468,7 @@ pub(super) fn page(
     }
     generation_json_response(
         req,
+        app,
         generation,
         &WebLibraryPage {
             schema_version: WEB_SCHEMA_VERSION,
@@ -415,7 +476,7 @@ pub(super) fn page(
             server_name: app.cfg.friendly_name.clone(),
             root_folder_id: rusty_dlna_protocol::object_id::BROWSEDIR_ID.into(),
             capabilities: web_capabilities(app),
-            library_state: if ids.is_empty() { "empty" } else { "ready" },
+            library_state: library_state(library_has_media),
             view: "folders",
             folder: Some(folder),
             breadcrumbs: breadcrumb_dtos,
@@ -501,20 +562,43 @@ mod tests {
                 + index.to_string().len()
                 + std::mem::size_of::<String>()
                 + id.capacity();
-            cache.insert(0, "folder", &index.to_string(), Arc::from(vec![id]), bytes);
+            cache.insert(
+                0,
+                "folder",
+                &index.to_string(),
+                "title",
+                Arc::from(vec![id]),
+                bytes,
+            );
         }
         assert_eq!(cache.entries.len(), MAX_PROJECTIONS);
         assert!(cache.bytes <= MAX_PROJECTION_BYTES);
-        assert!(cache.get(0, "folder", "0").is_none());
-        assert_eq!(cache.get(0, "folder", "99").unwrap().0[0], "id-99");
+        assert!(cache.get(0, "folder", "0", "title").is_none());
+        assert_eq!(cache.get(0, "folder", "99", "title").unwrap().0[0], "id-99");
+        // Each sort order owns its projection; orders never share cached IDs.
+        assert!(cache.get(0, "folder", "99", "date_desc").is_none());
+        cache.insert(
+            0,
+            "folder",
+            "99",
+            "date_desc",
+            Arc::from(vec!["recent".into()]),
+            8,
+        );
+        assert_eq!(
+            cache.get(0, "folder", "99", "date_desc").unwrap().0[0],
+            "recent"
+        );
+        assert_eq!(cache.get(0, "folder", "99", "title").unwrap().0[0], "id-99");
         drop(std::mem::take(&mut cache));
         assert!(!Arc::ptr_eq(&cache.epoch, &epoch));
-        assert!(cache.get(0, "folder", "99").is_none());
+        assert!(cache.get(0, "folder", "99", "title").is_none());
         assert_eq!(cache.bytes, 0);
         cache.insert(
             0,
             "folder",
             "oversized",
+            "title",
             Arc::from(vec!["x".repeat(MAX_PROJECTION_BYTES)]),
             MAX_PROJECTION_BYTES + 1,
         );
@@ -526,11 +610,12 @@ mod tests {
         let mut cache = FolderProjectionCache::default();
         let first: Arc<[String]> = Arc::from(vec!["first".into()]);
         let observed = Arc::downgrade(&first);
-        cache.insert(0, "folder", "first", first, MAX_PROJECTION_BYTES);
+        cache.insert(0, "folder", "first", "title", first, MAX_PROJECTION_BYTES);
         let retired = cache.insert(
             0,
             "folder",
             "second",
+            "title",
             Arc::from(vec!["second".into()]),
             MAX_PROJECTION_BYTES,
         );

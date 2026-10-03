@@ -764,6 +764,7 @@ fn finished_reads_preserve_validation_reuse_etag_and_cache_recency() {
                     &request,
                     &served,
                     "video/mp4",
+                    None,
                     false,
                 )
                 .await
@@ -1826,4 +1827,213 @@ fn copied_seek_accepts_the_sources_actual_keyframe_lead_in() {
     let (_, with_source) = judged_with_source(&source, &unseeked, &expected, 0);
     assert!(with_source.unwrap_err().contains(" track covers "));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Source time of the first video packet FFmpeg copies for `-ss <seek>`,
+/// measured with the original timeline retained.
+fn ffmpeg_copied_seek_landing(source: &Path, seek: &str, accurate: bool) -> f64 {
+    let dir = source.parent().unwrap();
+    let stem = source.extension().unwrap().to_str().unwrap();
+    let landing = dir.join(format!("landing-{stem}-{seek}-{accurate}.nut"));
+    let mut arguments = Vec::new();
+    if !accurate {
+        arguments.push("-noaccurate_seek");
+    }
+    arguments.extend([
+        "-ss",
+        seek,
+        "-i",
+        source.to_str().unwrap(),
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "copy",
+        "-copyts",
+        "-frames:v",
+        "1",
+        "-f",
+        "nut",
+        landing.to_str().unwrap(),
+    ]);
+    run_ffmpeg(&arguments);
+    let probe = |arguments: &[&str]| {
+        let output = std::process::Command::new("ffprobe")
+            .args(["-v", "error"])
+            .args(arguments)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let value = |text: &str, name: &str| {
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(name)?.strip_prefix('='))
+            .and_then(|value| value.parse::<f64>().ok())
+    };
+    let first = probe(&[
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "packet=pts_time",
+        "-of",
+        "default=nw=1",
+        landing.to_str().unwrap(),
+    ]);
+    let start = probe(&[
+        "-show_entries",
+        "format=start_time",
+        "-of",
+        "default=nw=1",
+        source.to_str().unwrap(),
+    ]);
+    value(&first, "pts_time").unwrap() - value(&start, "start_time").unwrap_or(0.0)
+}
+
+#[test]
+fn copied_seek_origin_repeats_ffmpegs_keyframe_landing() {
+    // 239-frame GOPs at 24 fps put keyframes at 9.958 s, 19.917 s and
+    // 29.875 s. A seek to 30 s is inside FFmpeg's decode-time seek
+    // allowance for B-frame Matroska video but not for MP4.
+    let dir = temp_dir("copied-seek-origin");
+    let mkv = dir.join("source.mkv");
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=64x64:rate=24:duration=45",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000:duration=45",
+        "-c:v",
+        "libx264",
+        "-threads",
+        "1",
+        "-preset",
+        "ultrafast",
+        "-bf",
+        "3",
+        "-g",
+        "239",
+        "-keyint_min",
+        "239",
+        "-sc_threshold",
+        "0",
+        "-c:a",
+        "ac3",
+        mkv.to_str().unwrap(),
+    ]);
+    let mp4 = dir.join("source.mp4");
+    run_ffmpeg(&[
+        "-i",
+        mkv.to_str().unwrap(),
+        "-c",
+        "copy",
+        mp4.to_str().unwrap(),
+    ]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut origins = Vec::new();
+    for source in [&mkv, &mp4] {
+        for seek in ["15", "25", "30"] {
+            let origin = source_evidence::copied_seek_origin(
+                &std::fs::File::open(source).unwrap(),
+                seek.parse().unwrap(),
+                deadline,
+                &[&AtomicBool::new(false)],
+            )
+            .unwrap()
+            .expect("copied seek origin");
+            for accurate in [false, true] {
+                let actual = ffmpeg_copied_seek_landing(source, seek, accurate);
+                assert!(
+                    (origin - actual).abs() < 0.01,
+                    "{} seek {seek}: probe {origin}, ffmpeg {actual}",
+                    source.display()
+                );
+            }
+            assert!(origin <= seek.parse::<f64>().unwrap() + 0.01);
+            origins.push(origin);
+        }
+    }
+    // Matroska's decode-time seek allowance moves the 30 s seek to the
+    // earlier keyframe; MP4 lands on the keyframe 125 ms before 30 s.
+    assert!(origins[2] < 20.0, "{origins:?}");
+    assert!((origins[5] - 29.875).abs() < 0.05, "{origins:?}");
+
+    // Output time zero of the real browser fragment command, with audio
+    // mapped and encoded as in production, is that origin: the output covers
+    // the rest of the source from it. Audio and B-frame decode lead around
+    // the keyframe may move zero a fraction of a second earlier.
+    let (origin, covered) = (origins[1], browser_seek_coverage(&mkv, "25"));
+    assert!(
+        (origin + covered - 45.0).abs() < 0.25,
+        "origin {origin} + output {covered} should reach the 45 s source end"
+    );
+
+    // MPEG-TS seeks by a generic timestamp search that lands between
+    // keyframes. FFmpeg emits the audio from that landing while copied video
+    // waits for its next keyframe, so no keyframe is the output's origin
+    // there: the probe reports it unknown rather than a wrong time.
+    let ts = dir.join("source.ts");
+    run_ffmpeg(&[
+        "-i",
+        mkv.to_str().unwrap(),
+        "-c",
+        "copy",
+        ts.to_str().unwrap(),
+    ]);
+    for seek in ["15", "25", "30"] {
+        let origin = source_evidence::copied_seek_origin(
+            &std::fs::File::open(&ts).unwrap(),
+            seek.parse().unwrap(),
+            deadline,
+            &[&AtomicBool::new(false)],
+        )
+        .unwrap();
+        let covered = browser_seek_coverage(&ts, seek);
+        if let Some(origin) = origin {
+            assert!(
+                (origin + covered - 45.0).abs() < 0.25,
+                "ts seek {seek}: origin {origin} + output {covered} misses the source end"
+            );
+        }
+        if seek == "25" {
+            assert_eq!(origin, None, "ts seek 25 lands mid-GOP");
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Length of the production-shaped browser output for a copied-video seek
+/// with the first audio stream mapped and encoded.
+fn browser_seek_coverage(source: &Path, seek: &str) -> f64 {
+    let stem = source.extension().unwrap().to_str().unwrap();
+    let output = source.with_file_name(format!("seeked-{stem}-{seek}.mp4"));
+    let mut arguments = vec![
+        "-noaccurate_seek",
+        "-ss",
+        seek,
+        "-i",
+        source.to_str().unwrap(),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+    ];
+    arguments.extend(BROWSER_FRAGMENTS);
+    arguments.extend(["1", output.to_str().unwrap()]);
+    run_ffmpeg(&arguments);
+    let expected = RemuxOutputExpectation {
+        video_codec: Some("h264".into()),
+        audio_codecs: vec!["aac".into()],
+        duration_seconds: Some(45.0),
+        seek_seconds: seek.parse().unwrap(),
+        video_copy: true,
+    };
+    coverage_of(&output, &expected).0.longest()
 }

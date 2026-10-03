@@ -17,7 +17,10 @@ import {
   bufferedSeekTarget,
   captionCueWindow,
   captionWindowStarts,
+  cardProgress,
   chooseSource,
+  libraryErrorMessage,
+  libraryRetryDelay,
   compatibleSegmentStart,
   compatibleDecodeRecovery,
   mediaSourceBufferAheadSeconds,
@@ -31,11 +34,13 @@ import {
   hdrDisplaySupport,
   hdrVideoOutputCandidate,
   mediaMatchesQuery,
+  SEARCH_MAX_TERMS,
   mediaSourceStallReason,
   nativeHlsQualityProfile,
   nativeHlsHevcCopyEligible,
   encodingPreset,
   navigationFromUrl,
+  navigationKeepsPlayback,
   navigationUrl,
   negotiateCompatibleStreams,
   originalAudioTrackIndex,
@@ -63,7 +68,12 @@ import {
   sourceBoundedQualityProfile,
   SOURCE_MODES,
   STREAM_MODES,
+  timelineKeySeekTarget,
   timelineValueText,
+  availableErrorActions,
+  mediaSessionTrackActions,
+  nativeHlsPlaybackContinued,
+  playbackError,
   trickplayFrame,
   trickplayPreloadUrls,
   validDetailId,
@@ -72,7 +82,7 @@ import {
   videoOutputConfiguration,
 } from "./core.js";
 import { initialState, Store } from "./store.js";
-import { loadPreferences, progressDetails, progressSnapshot } from "./preferences.js";
+import { loadPreferences, markWatched, progressDetails, progressSnapshot, watchedSnapshot } from "./preferences.js";
 
 test("title completion tolerates rounded metadata but rejects truncated streams", () => {
   assert.equal(playbackEndedEarly(40.4, 600), true);
@@ -335,6 +345,87 @@ test("progress snapshots parse browser storage once for repeated lookups", () =>
   }
 });
 
+test("history navigation keeps the title that is already playing", () => {
+  const playing = { item: { id: 42 }, status: "playing" };
+  assert.equal(navigationKeepsPlayback({ itemId: "42", start: 0 }, playing), true);
+  assert.equal(navigationKeepsPlayback({ itemId: "42", start: 125 }, playing), true, "an old t= never jumps playback");
+  for (const status of ["paused", "idle", "loading", "ended"]) {
+    assert.equal(navigationKeepsPlayback({ itemId: "42" }, { ...playing, status }), true, status);
+  }
+  assert.equal(navigationKeepsPlayback({ itemId: "42" }, { ...playing, status: "error" }), false,
+    "history can retry a failed title");
+  assert.equal(navigationKeepsPlayback({ itemId: "43" }, playing), false);
+  assert.equal(navigationKeepsPlayback({ itemId: null }, playing), false);
+  assert.equal(navigationKeepsPlayback({ itemId: "42" }, { item: null, status: "idle" }), false);
+});
+
+test("card progress shows resumable positions and completion without inventing either", () => {
+  assert.equal(cardProgress({}), null);
+  assert.equal(cardProgress({ position: 12, duration: 3600 }), null, "trivial positions are not progress");
+  assert.equal(cardProgress({ position: 3550, duration: 3600 }), null, "near-end positions are discarded");
+  assert.deepEqual(cardProgress({ position: 900, duration: 3600 }), {
+    state: "partial", percent: 25, label: "25% watched, 45:00 left",
+  });
+  assert.equal(cardProgress({ position: 30, duration: 1_000_000 }).percent, 1, "a real position never rounds to 0%");
+  assert.deepEqual(cardProgress({ position: 0, duration: 3600, watched: true }), {
+    state: "watched", percent: 100, label: "Watched",
+  });
+  assert.equal(cardProgress({ position: 900, duration: 3600, watched: true }).state, "partial",
+    "a rewatch in progress shows its position");
+  assert.equal(cardProgress({ position: 900, duration: 0 }), null);
+});
+
+test("watched markers are bounded and separate from resume progress", () => {
+  const stored = new Map();
+  globalThis.localStorage = {
+    getItem: (key) => stored.get(key) ?? null,
+    setItem: (key, value) => stored.set(key, String(value)),
+  };
+  try {
+    stored.set("rustydlna.webWatched.v1", JSON.stringify({ 1: 10, bad: "nope" }));
+    assert.deepEqual([...watchedSnapshot()], ["1"]);
+    for (let index = 0; index < 505; index += 1) markWatched(1000 + index);
+    const watched = JSON.parse(stored.get("rustydlna.webWatched.v1"));
+    assert.equal(Object.keys(watched).length, 500);
+    assert.equal(watchedSnapshot().has("1504"), true);
+    assert.equal(stored.has("rustydlna.webProgress.v1"), false);
+    stored.set("rustydlna.webWatched.v1", "[1, 2]");
+    assert.equal(watchedSnapshot().size, 0);
+    globalThis.localStorage = { getItem: () => { throw new Error("blocked"); }, setItem: () => { throw new Error("blocked"); } };
+    assert.equal(watchedSnapshot().size, 0);
+    assert.equal(markWatched(7), false);
+  } finally {
+    delete globalThis.localStorage;
+  }
+});
+
+test("library loads retry only transient catalog races, with bounded jittered backoff", () => {
+  const changed = { code: "catalog_changed", recoverable: true };
+  const busy = { code: "catalog_busy", recoverable: true, status: 503 };
+  assert.equal(libraryRetryDelay(changed, 0, () => 0), 188);
+  assert.equal(libraryRetryDelay(changed, 0, () => 1), 313);
+  assert.equal(libraryRetryDelay(busy, 1, () => 0.5), 1000);
+  assert.equal(libraryRetryDelay(busy, 2, () => 0.5), null, "retries are bounded");
+  assert.equal(libraryRetryDelay(changed, -1), null);
+  for (const error of [
+    { code: "schema_mismatch", recoverable: false },
+    { code: "invalid_page", recoverable: true },
+    { code: "library_unavailable", status: 503, recoverable: true },
+    { code: "catalog_busy", recoverable: false },
+    new TypeError("Failed to fetch"),
+    null,
+  ]) assert.equal(libraryRetryDelay(error, 0, () => 0.5), null, JSON.stringify(error));
+});
+
+test("library errors explain busy servers without blaming the connection", () => {
+  assert.match(libraryErrorMessage({ code: "catalog_busy" }), /busy/);
+  assert.doesNotMatch(libraryErrorMessage({ code: "catalog_busy" }), /connection/);
+  assert.match(libraryErrorMessage({ code: "catalog_changed" }), /changed/);
+  assert.match(libraryErrorMessage(new TypeError("Failed to fetch"), false), /offline/);
+  assert.match(libraryErrorMessage({ code: "server_error", message: "raw helper output" }), /connection/);
+  assert.doesNotMatch(libraryErrorMessage({ code: "server_error", message: "raw helper output" }), /raw/);
+});
+
 test("Continue Watching search matches the same displayed media fields", () => {
   const item = {
     file_name: "The.File.2026.mkv",
@@ -347,6 +438,27 @@ test("Continue Watching search matches the same displayed media fields", () => {
     assert.equal(mediaMatchesQuery(item, query), true, query);
   }
   assert.equal(mediaMatchesQuery(item, "missing title"), false);
+});
+
+test("Continue Watching search needs every word, in any order or field", () => {
+  const item = {
+    file_name: "Blade Runner 2049 (2017).mkv",
+    title: "Blade Runner: 2049",
+    artist: "The Beatles",
+    album: "Abbey Road",
+  };
+  for (const query of ["blade 2049", "2049  BLADE", "runner: 2049", "beatles abbey", "road blade blade"]) {
+    assert.equal(mediaMatchesQuery(item, query), true, query);
+  }
+  for (const query of ["blade 1982", "beatles help", "%"]) {
+    assert.equal(mediaMatchesQuery(item, query), false, query);
+  }
+  // Duplicates do not consume the cap; only the first sixteen distinct terms
+  // are considered, matching the server.
+  assert.equal(mediaMatchesQuery(item, `${"blade ".repeat(20)}unmatched`), false);
+  const sixteen = ["b", "bl", "bla", "blad", "blade", "r", "ru", "run", "runn", "runne", "runner", "2", "20", "204", "2049", "a"];
+  assert.equal(new Set(sixteen).size, SEARCH_MAX_TERMS);
+  assert.equal(mediaMatchesQuery(item, `${sixteen.join(" ")} unmatched`), true);
 });
 
 test("source choice is explicit about forced and unavailable modes", () => {
@@ -1158,6 +1270,13 @@ test("URL state round-trips folder, search, sort, and flat views", () => {
   const continuing = navigationFromUrl("http://server/?view=continue");
   assert.equal(continuing.view, "continue");
   assert.equal(navigationUrl("http://server/", continuing, "root"), "/?view=continue");
+  // Continue watching has one fixed order, but its entry keeps the sort chosen
+  // for the other views so a reload or Back/Forward onto it preserves that sort.
+  const carried = navigationUrl("http://server/", { ...continuing, sort: "date_desc" }, "root");
+  assert.equal(carried, "/?view=continue&sort=date_desc");
+  const reloaded = navigationFromUrl(`http://server${carried}`);
+  assert.equal(reloaded.view, "continue");
+  assert.equal(reloaded.sort, "date_desc");
   const deep = navigationFromUrl("http://server/?view=video&item=42&t=90");
   assert.equal(deep.itemId, "42");
   assert.equal(deep.start, 90);
@@ -1379,4 +1498,86 @@ test("Media Source reserve is wall-clock time at the current playback rate", () 
     assert.equal(mediaSourceBufferAheadSeconds(rate), 30, String(rate));
   }
   assert.equal(mediaSourceBufferAheadSeconds(16), 120);
+});
+
+test("audio-only compatible recovery never walks the video quality ladder", () => {
+  const profiles = [
+    { id: "auto", max_width: 3840, max_height: 2160, max_video_kbps: 25000, audio_kbps: 192 },
+    { id: "data_saver", max_width: 1280, max_height: 720, max_video_kbps: 3000, audio_kbps: 128, automatic_fallback: true },
+  ];
+  const context = {
+    negotiation: { video: "transcode", audio: "transcode", videoOutput: "h264_sdr" },
+    mediaCode: 3, producerState: "producing", mediaSourceDelivery: false, mediaSourceRetry: false,
+    hdrEncodingSupported: false, androidMediaSourceSupported: false, profiles, quality: "auto", preferredQuality: "auto",
+  };
+  assert.equal(compatibleDecodeRecovery({ ...context, item: { kind: "video" } }).quality, "data_saver");
+  assert.equal(compatibleDecodeRecovery({ ...context, item: { kind: "audio" } }), null);
+  // Copied audio still gets the portable AAC conversion.
+  const copied = compatibleDecodeRecovery({
+    ...context, item: { kind: "audio" }, negotiation: { ...context.negotiation, audio: "copy" },
+  });
+  assert.equal(copied.streamNegotiation.audio, "transcode");
+});
+
+test("timeline keys seek by the player's step instead of the range's 0.1-second step", () => {
+  assert.equal(timelineKeySeekTarget("ArrowRight", 100, 7200), 110);
+  assert.equal(timelineKeySeekTarget("ArrowUp", 100, 7200), 110);
+  assert.equal(timelineKeySeekTarget("ArrowLeft", 100, 7200), 90);
+  assert.equal(timelineKeySeekTarget("ArrowDown", 100, 7200), 90);
+  assert.equal(timelineKeySeekTarget("PageUp", 100, 7200), 160);
+  assert.equal(timelineKeySeekTarget("PageDown", 100, 7200), 40);
+  assert.equal(timelineKeySeekTarget("ArrowLeft", 4, 7200), 0);
+  assert.equal(timelineKeySeekTarget("ArrowRight", 7195, 7200), 7200);
+  assert.equal(timelineKeySeekTarget("Home", 100, 7200), 0);
+  assert.equal(timelineKeySeekTarget("End", 100, 7200), 7200);
+  assert.equal(timelineKeySeekTarget("End", 100, 0), null);
+  assert.equal(timelineKeySeekTarget("ArrowRight", Number.NaN, 7200), 10);
+  for (const key of ["Tab", "Enter", " ", "k"]) assert.equal(timelineKeySeekTarget(key, 100, 7200), null);
+});
+
+test("Play during an error performs the first recovery action the banner offers", () => {
+  const offered = (code, sourceMode, transcoding) => availableErrorActions(playbackError(code), { sourceMode, transcoding });
+  assert.deepEqual(offered("unsupported_direct", SOURCE_MODES.ORIGINAL, true), ["try_compatible"]);
+  assert.deepEqual(offered("unsupported_direct", SOURCE_MODES.ORIGINAL, false), []);
+  assert.deepEqual(offered("transcode_failed", SOURCE_MODES.COMPATIBLE, true), ["retry", "play_original"]);
+  assert.deepEqual(offered("transcode_failed", SOURCE_MODES.COMPATIBLE, false), ["play_original"]);
+  assert.deepEqual(offered("media_missing", SOURCE_MODES.ORIGINAL, false), ["retry"]);
+  assert.deepEqual(offered("transcode_disabled", SOURCE_MODES.ORIGINAL, false), ["play_original"]);
+  assert.deepEqual(offered("unknown", SOURCE_MODES.ORIGINAL, true), ["retry", "try_compatible"]);
+  assert.deepEqual(availableErrorActions(null, { sourceMode: null, transcoding: true }), []);
+});
+
+test("native HLS stays live after hiding only when its clock clearly advanced", () => {
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: 100, visibleTime: 130, hiddenMs: 30_000 }), true);
+  // Short hides need proportionally less progress, but some progress.
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: 100, visibleTime: 100.9, hiddenMs: 1_000 }), true);
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: 100, visibleTime: 100.03, hiddenMs: 10 }), false);
+  // Ten minutes of sleep that drained about a second of buffer is not playback.
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: 100, visibleTime: 101.2, hiddenMs: 600_000 }), false);
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: 100, visibleTime: 104, hiddenMs: 10_000 }), false);
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: 100, visibleTime: 690, hiddenMs: 600_000 }), true);
+  // The expected progress follows the element's playback rate.
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: 100, visibleTime: 400, hiddenMs: 600_000, playbackRate: 2 }), false);
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: 100, visibleTime: 1_280, hiddenMs: 600_000, playbackRate: 2 }), true);
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: 100, visibleTime: 260, hiddenMs: 600_000, playbackRate: 0.5 }), true);
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: 100, visibleTime: 690, hiddenMs: 600_000, playbackRate: Number.NaN }), true);
+  // Device sleep can suspend decoding without a pause event.
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: 100, visibleTime: 100, hiddenMs: 60_000 }), false);
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: 100, visibleTime: 100.2, hiddenMs: 60_000 }), false);
+  assert.equal(nativeHlsPlaybackContinued({ paused: true, hiddenTime: 100, visibleTime: 130, hiddenMs: 30_000 }), false);
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: Number.NaN, visibleTime: 130, hiddenMs: 30_000 }), false);
+  assert.equal(nativeHlsPlaybackContinued({ paused: false, hiddenTime: 130, visibleTime: 20, hiddenMs: 30_000 }), false);
+});
+
+test("Media Session previous/next follow chapter and queue availability", () => {
+  assert.deepEqual(mediaSessionTrackActions({}), { previous: false, next: false });
+  assert.deepEqual(mediaSessionTrackActions({ hasPrevious: true }), { previous: true, next: false });
+  assert.deepEqual(mediaSessionTrackActions({ hasNext: true }), { previous: false, next: true });
+  const chapters = [{ start_seconds: 0 }, { start_seconds: 60 }, { start_seconds: 120 }];
+  assert.deepEqual(mediaSessionTrackActions({ chapters, currentTime: 1 }), { previous: false, next: true });
+  assert.deepEqual(mediaSessionTrackActions({ chapters, currentTime: 10 }), { previous: true, next: true });
+  assert.deepEqual(mediaSessionTrackActions({ chapters, currentTime: 61 }), { previous: true, next: true });
+  assert.deepEqual(mediaSessionTrackActions({ chapters, currentTime: 130 }), { previous: true, next: false });
+  assert.deepEqual(mediaSessionTrackActions({ chapters, currentTime: 130, hasNext: true }), { previous: true, next: true });
+  assert.deepEqual(mediaSessionTrackActions({ chapters, currentTime: 1, hasPrevious: true }), { previous: true, next: true });
 });

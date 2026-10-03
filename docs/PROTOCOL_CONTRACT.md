@@ -44,6 +44,18 @@ The scanner recognizes the explicit single-file demuxers in
 DASH, HLS, concat manifests and image sequences cannot become catalog media by
 using an admitted filename extension. Library playlist parsing remains separate.
 
+Files that reconciliation or the watcher finds after the first scan, and
+existing rows whose size, timestamp, or inode changed, are admitted by one
+header classifier (`crates/scan/src/admission.rs`) before any full probe.
+Distinctive magic is accepted directly: EBML, ISO BMFF, RIFF, FLV, ASF, Ogg,
+JPEG, FLAC, DSF (`DSD ` followed by its 28-byte header-chunk size), DSDIFF
+(`FRM8` with form type `DSD `), and RealMedia (`.RMF`). Plausible but weak headers get a short bounded `ffprobe` that must
+find an audio or video stream: MPEG-TS (sync byte at offset 0), BDAV/AVCHD
+`.m2ts`/`.mts` (192-byte packets, so the sync byte is at offsets 4, 196, and
+388), MPEG-PS, and ID3/MPEG audio frames. Anything else is rejected, so a text
+file named `.mkv` is never indexed. Raw `.pcm` has no header and is admitted
+only by the full scan's probe.
+
 Before libav opens headers or discovers streams, a custom seekable AVIO reads
 only the admitted regular-file descriptor, and its nested-open callback rejects
 all secondary I/O. Attached pictures use the same owner and limits. Image resize,
@@ -60,6 +72,20 @@ FFmpeg 8), which provides the seekable `fd` protocol. The custom AVIO adapter is
 compiled against the installed libav headers to account for structure layouts.
 This is a demuxer I/O boundary, not an OS sandbox for arbitrary decoder code.
 
+A probe that reaches its helper deadline (for example while a disk spins up)
+is not cached as a failure; it is retried by the next full reconciliation or
+startup backfill. The entry keeps its stored stream metadata only when that
+metadata was recorded at the current stream-probe revision for the same file
+(for example a probe-sidecar or subtitle-discovery re-probe). When the file's
+size, mtime, or inode changed, or the stored metadata predates the current
+revision, the stream metadata is cleared as for a failed probe, so the entry
+and its hard-link aliases never describe the previous content. After three
+consecutive deadline expiries the file is cached as a failed probe and retried
+only after its size, mtime, or inode changes, like any other failed probe.
+Startup backfill also re-probes, once, entries whose stored stream descriptor
+predates embedded-subtitle discovery (no `@s` record); cached failed probes
+have no descriptor and are not retried.
+
 Stream-probe revision 7 rechecks older catalog entries in the private scan stage.
 A failed probe removes an old entry only when a bounded, byte-only format probe
 positively recognizes an unsupported demuxer. It reads at most 1 MiB and never
@@ -70,10 +96,26 @@ aliases reuse their existing probe result.
 ## Artwork and NFO
 
 - Kodi `*-poster.jpg/.png`, `*-fanart.jpg/.png`, folder `poster.jpg`.
-- PNG converted to JPEG for DLNA.
+- PNG converted to JPEG for DLNA. The converted copy is dropped by the next
+  reconciliation once no browseable path of that physical file still selects
+  a poster sidecar; a poster beside one hard link stays authoritative for its
+  poster-less aliases.
+- A JPEG sidecar replaced in place gets a new album-art ID when its watcher
+  event is processed, so `/AlbumArt/{id}-{detail}.jpg` URLs change and clients
+  that cache by URL fetch the new image.
 - Optional video thumbnails only when no sidecar/embedded art.
+- Audio and video items with artwork carry `upnp:albumArtURI` (when the Filter
+  allows it), which VLC, Kodi/Platinum, and BubbleUPnP read for posters. Video
+  items also keep the `image/jpeg` `JPEG_TN` `<res>` row (plus Samsung CDE's
+  `JPEG_SM` row); Xbox gets no image `<res>`. The `dlna:profileID="JPEG_TN"`
+  attribute is limited to Samsung profiles and emitted only when the DIDL
+  declares `xmlns:dlna`. Containers carry no artwork.
 - Video Series (`2$E`) and Genre (`2$9`) from NFO `showtitle` / `<genre>`.
 - `tvshow.nfo` metadata applied to episodes.
+- Kodi folder `movie.nfo` applies to a video without its own `{stem}.nfo`
+  only while its directory holds exactly one candidate video (samples,
+  trailers, excluded, and unfinished names do not count). Adding a second
+  video or removing it re-evaluates every video in that directory.
 - Movie `<outline>` is the spoiler-safe About description and DLNA
   `dc:description`; `<plot>` is retained separately and revealed only through
   the browser's explicit spoiler disclosure.
@@ -83,7 +125,7 @@ aliases reuse their existing probe result.
 
 Targeted NFO events and periodic reconciliation use the same precedence:
 filename/mtime defaults, embedded metadata, inherited `tvshow.nfo`, then local
-NFO overrides. Removing a sidecar or an individual tag restores the underlying
+NFO overrides (`{stem}.nfo`, which fully replaces any folder `movie.nfo`). Removing a sidecar or an individual tag restores the underlying
 value and rebuilds the affected virtual groups for every physical alias. The
 catalog stores a fingerprint of the effective parsed NFO, including missing
 fields. A changed fingerprint during reconciliation causes one physical
@@ -93,9 +135,18 @@ reusing the cloned embedded/default base when it has no previous NFO override.
 Video filename titles stay local to each alias unless the effective NFO supplies
 a title or show title; genre-only metadata does not replace those defaults. Catalogs predating
 this fingerprint reconstruct their metadata once during reconciliation.
-Malformed sidecars, cancellation, or probe-operation errors leave the published
-catalog intact; a media decoder that returns no metadata still has the valid
-filename/mtime defaults.
+Cancellation or probe-operation errors leave the published catalog intact; a
+media decoder that returns no metadata still has the valid filename/mtime
+defaults. An `.nfo` whose first significant byte is not `<` (scene ASCII art,
+a scraper URL) carries no overrides. Parsing tolerates a bare `&`, `<br>`, and
+unknown HTML entities. A sidecar that is still not well-formed XML (for
+example, half-written) never fails a scan: an item already in the catalog keeps
+its stored presentation and NFO fingerprint until the sidecar parses again,
+and a newly admitted item indexes with whatever sidecars did parse. Each such
+file is logged once per path and parser message. Because an item's NFO
+metadata is refreshed as a whole, a malformed inherited `tvshow.nfo` holds
+back NFO updates, including edits to valid `{stem}.nfo` files, for every
+episode below it until it parses again.
 
 Media and sidecar reads require a regular-file descriptor confined to a
 configured root. Both the Linux `openat2` path and its component-walking
@@ -113,6 +164,13 @@ HDR, width, and height. Its bounded canonical semantic fingerprint is persisted
 per browseable path, while the underlying libav probe and generated artwork are
 shared once per physical file. This lets hard-link and symlink aliases keep
 different path-local overlays without duplicating the physical probe.
+
+Video virtual views (All Video, Series, Genre, Actor) list one entry per
+physical file, owned by the first path that attached it. When that path is
+deleted, forgotten, or removed as unsupported or unviable, the same scanner
+transaction moves those entries to a surviving hard-link or symlink alias, so
+the survivor stays listed without a rebuild. The moved entries get object IDs derived from the
+survivor's detail ID.
 
 Sidecar creation, replacement, deletion, and offline edits converge through
 targeted, periodic, full, and fill-missing scans. Removing an override replaces
@@ -159,6 +217,12 @@ inode), while probe-sidecar overlays remain path-local. External caption
 sidecars are also path-local: from its first publication, each alias lists only
 the captions owned by its own path, or none. Later NFO/poster updates
 rewrite every compatible alias. Deleting one path must not delete the others.
+Removing a path also drops same-inode aliases that are affirmatively gone,
+except aliases under a root the pass holds as unavailable. A targeted pass
+checks only the roots owning its events, so it also keeps aliases whose root
+currently lists no entries and leaves them to the next whole-library pass. A
+dangling link therefore cannot delete the IDs and bookmarks of an unmounted
+root's item.
 
 Recursive `tvshow.nfo` refresh follows the catalog walker's ancestor device/inode
 cycle policy. Self-links and links to ancestors are pruned, while separate
@@ -186,6 +250,22 @@ admitted nor converted.
 Advertise `/Captions/{id}/{n}.{ext}` and `/Captions/{id}.srt`. Indexed caption
 numbers are unsigned 32-bit values; negative and overflowing indices are
 rejected, while a decorative suffix after the numeric prefix remains compatible.
+Indexes follow sidecar path order and are stable for the browser and API.
+
+Renderers that take one default subtitle (`pv:subtitleFileUri` /
+`pv:subtitleFileType` and Samsung's `CaptionInfo.sec` header) receive the
+item's default caption: an SRT when one exists, otherwise SMI, otherwise any
+sidecar. Within each tier the untagged `{stem}.{ext}` precedes language
+variants, and ties keep the lowest index. An SRT default is advertised as
+`/Captions/{id}.srt`, and that non-indexed route serves the same default. A
+non-SRT default is advertised by its indexed URL with its real uppercase type,
+so an advertised `.srt` URL never carries another format. `sec:CaptionInfoEx` and caption `<res>` rows still list every
+sidecar.
+
+Sidecars follow the source timeline, which a remap preserves. Items advertised
+with a `/Transcode/` remap therefore keep their caption `<res>` rows (after the
+remap and original rows) for `CAPTION_RES` renderers, and `/Transcode/` media
+responses answer `getCaptionInfo.sec` like `/MediaItems/` does.
 
 ## Persisted stream metadata
 
@@ -245,6 +325,13 @@ the stored short form (for example `item.videoItem`). `contains` and
 are complementary; substring needles are never prefixed. Stored classes and
 object IDs are unchanged.
 
+Free-text properties (`dc:title`, `dc:creator`, `upnp:artist`, `upnp:album`,
+`upnp:genre`, `upnp:actor`) compare with Unicode lowercase folding for every
+operator, identically in SQLite and memory: `contains "матриця"` finds
+"Матриця" and `contains "élan"` finds "Élan". Accents and combining marks are
+not folded. `@id`, `@parentID`, `@refID`, `upnp:class`, and `dc:date` keep
+ASCII case-insensitive comparison.
+
 SOAP Search criteria admit at most 128 KiB of UTF-8 input, 512 tokens, and
 64 KiB per literal. Before expanding parentheses, rustyDLNA checks the complete
 expression against 256 OR groups, 64 clauses per group, 1,024 total expanded
@@ -277,10 +364,20 @@ media details, while disappeared playlists are still removed. Targeted media
 arrivals and playlist events reuse known playlist paths and resolve requested
 members through path/inode indexes, retaining duplicates, alias-local paths,
 encoding rules, and references that become available after later media arrivals.
+An entry resolves as written first, because Linux filenames may contain `\`.
+A relative entry that contains `\` and no `/` (written by a Windows player) is
+then retried with `/` separators. Drive-letter (`C:\`, `file:///C:/`),
+root-relative (`\Music`), and UNC (`\\server\share`) entries name another
+machine's filesystem and are skipped. Unresolved entries are logged as one
+bounded per-playlist count at debug level.
 
-Browser search lowercases Unicode text with Rust's lowercase mapping and matches
-literal substrings of the displayed title, artist, album artist, album, and
-filename. It does not search parent directory names, fold accents, normalize
+Browser search lowercases Unicode text with Rust's lowercase mapping, splits the
+query on whitespace into at most 16 distinct terms, and requires each term to be
+a literal substring of at least one of the displayed title, artist, album
+artist, album, and filename; terms may match different fields. A field that
+contains the whole query still matches. Browser "recently added" order uses the
+stored file modification time (whole seconds, then the raw stamp) newest first,
+never NFO or embedded dates. Search does not search parent directory names, fold accents, normalize
 composed/decomposed Unicode, or interpret wildcard characters. SQLite and memory
 use the same functions, including byte-preserving stored-path decoding followed
 by lossy filename presentation. This browser rule does not change SOAP search.
@@ -325,6 +422,20 @@ compatibility; HTTP header OWS parsing itself remains limited to SP/HTAB.
 Search-response jitter stays within the parsed, five-second-capped `MX` window;
 the compatible `MX: 0` form is answered without an artificial delay.
 
+Multicast M-SEARCH requires `MX`. A unicast M-SEARCH sent to an announced
+interface's `<address>:1900` (UPnP 1.1 revalidation, "add by IP") arrives on
+that interface's reply socket, which is also read. It may omit `MX` (a present
+`MX` must still be a valid integer), is answered at once from the same socket
+with that interface's `LOCATION`, and passes the same per-sender reply limiter
+and worker bound. Because unicast is routable while the multicast group is
+link-scoped, a unicast search is answered only when the sender is a usable LAN
+address (not loopback, link-local, multicast, broadcast, or the subnet's
+network/broadcast address) inside the receiving interface's own subnet.
+Off-link senders are dropped before the reply limiter, so an announced public,
+DMZ, or routed-VPN address is never an SSDP reflection source. Only M-SEARCH is accepted there: unicast NOTIFYs and stray
+responses meant for other SSDP stacks on the host are ignored and never start
+renderer-description fetches.
+
 Outbound SSDP builders validate UUID, host, search-target, `SERVER`, and `DATE`
 line safety before generating any datagram, and a service-type index is checked
 rather than used for unchecked indexing. Production callers use the fallible
@@ -338,6 +449,26 @@ reply list.
 Keep-Alive for SOAP/desc/art/captions. **Never** for `/MediaItems/`
 (or a transcode pipe). Host must be literal IPv4 or 400. TimeSeek
 without Range → 406.
+
+Absolute DLNA URLs (rootDesc `presentationURL`, DIDL `<res>`,
+`upnp:albumArtURI`, caption URLs, and `CaptionInfo.sec`) use the local address
+the request's TCP connection arrived on when that address is one of the
+announced SSDP interfaces, so each subnet receives the same address SSDP gave it
+in `LOCATION`. Any other local address (Docker bridge/NAT, VPN, loopback) uses
+the primary advertise address. The browser JSON/HLS API and downloads do not
+build absolute URLs from either address.
+
+`DLNA.ORG_PN` is derived from stored stream columns and is emitted only as a
+profile name or as no PN; protocolInfo without a PN keeps `OP`/`FLAGS`, as
+Matroska always has. HD (720p to 1080p) H.264 MP4 without AC-3 uses
+`AVC_MP4_HP_HD_AAC`, the profile ConnectionManager advertises for `video/mp4`
+(High-profile decoders also decode Main). HEVC in MP4 or TS, MPEG-2 in MP4, and
+H.264 in AVI have no conformant DLNA profile and carry no PN. The HD AC-3 and
+above-1080p H.264 MP4 names and the H.264/MPEG-2 MPEG-TS `_ISO` names are
+unchanged, because Sony BDP/Bravia, Toshiba, and FreeBox workarounds key on
+those prefixes and TS needs packet-size detection before it can choose between
+`_ISO` and timestamped profiles. Each scan reconciliation rewrites stored PNs
+from the stored stream columns, so existing catalogs converge without reprobing.
 
 Original GET/HEAD and byte ranges retain the descriptor opened through media-root
 confinement. Empty original files return `200` with `Content-Length: 0`; their
@@ -364,6 +495,11 @@ A persistent TCP connection serves at most 100 requests. The final response
 advertises `Connection: close` before the server closes the socket; preceding
 responses retain their normal persistence policy. Idle connections also have
 the configured `keep_alive_timeout_secs` deadline (30 seconds by default).
+A connection that reaches its keep-alive or header deadline without sending
+any byte of a next request is closed silently, with no `408` and no delivery
+observation, so a client reusing a pooled socket never reads an unsolicited
+response. `408 Request Timeout` answers only a partially received request
+header or body.
 
 HTTP field names use the shared RFC token grammar, and optional whitespace is
 only SP/HTAB. Final response serialization validates the public status, reason,

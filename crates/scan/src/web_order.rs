@@ -8,6 +8,14 @@ pub fn web_search_normalize(value: &str) -> String {
     value.to_lowercase()
 }
 
+/// "Recently added" order key, compared newest first. Like the DLNA Recently
+/// Added views it uses the stored file modification time, never NFO or
+/// embedded dates; legacy second and current nanosecond stamps compare by
+/// whole seconds before the raw value.
+pub fn web_recently_added_key(mtime: i64) -> (i64, i64) {
+    (crate::normalized_mtime_seconds(mtime), mtime)
+}
+
 pub fn web_media_file_name(path: &Path, title: &str) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -26,6 +34,35 @@ pub fn web_media_matches(item: &crate::MediaItem, normalized_query: &str) -> boo
     )
 }
 
+/// Distinct terms considered from one browser search. Each term adds one
+/// substring scan per field and row, so longer queries ignore later words.
+pub const WEB_SEARCH_MAX_TERMS: usize = 16;
+
+/// Whitespace-separated terms of a normalized browser query, without
+/// duplicates and capped at [`WEB_SEARCH_MAX_TERMS`]. Punctuation stays part of
+/// its term, so `%`, `_`, and `\` remain literal characters.
+pub fn web_search_terms(normalized_query: &str) -> Vec<&str> {
+    let mut terms = Vec::new();
+    for term in normalized_query.split_whitespace() {
+        if terms.len() == WEB_SEARCH_MAX_TERMS {
+            break;
+        }
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+/// A browser search matches when every term occurs in at least one of the
+/// already-normalized fields; different terms may match different fields.
+/// Any field containing the whole query therefore still matches.
+pub fn web_search_fields_match(normalized_fields: &[&str], normalized_query: &str) -> bool {
+    web_search_terms(normalized_query)
+        .into_iter()
+        .all(|term| normalized_fields.iter().any(|field| field.contains(term)))
+}
+
 pub(crate) fn web_media_fields_match(
     path: &Path,
     title: &str,
@@ -34,15 +71,25 @@ pub(crate) fn web_media_fields_match(
     album: Option<&str>,
     normalized_query: &str,
 ) -> bool {
-    if normalized_query.is_empty()
-        || web_search_normalize(&web_media_file_name(path, title)).contains(normalized_query)
-    {
+    if normalized_query.is_empty() {
         return true;
     }
-    [Some(title), artist, album_artist, album]
-        .into_iter()
-        .flatten()
-        .any(|value| web_search_normalize(value).contains(normalized_query))
+    // Normalize each field once per row, independent of the term count.
+    let fields = [
+        Some(web_media_file_name(path, title).as_str()),
+        Some(title),
+        artist,
+        album_artist,
+        album,
+    ]
+    .into_iter()
+    .flatten()
+    .map(web_search_normalize)
+    .collect::<Vec<_>>();
+    web_search_fields_match(
+        &fields.iter().map(String::as_str).collect::<Vec<_>>(),
+        normalized_query,
+    )
 }
 
 /// An explicitly numbered movie's containing collection. No media is renamed.
@@ -113,6 +160,47 @@ mod tests {
         assert_ne!(web_search_normalize("E\u{301}"), web_search_normalize("É"));
         assert_ne!(web_search_normalize("É"), "e");
         assert_eq!(web_search_normalize("Straße %_\\"), "straße %_\\");
+    }
+
+    #[test]
+    fn search_terms_match_in_any_order_across_fields() {
+        let path = Path::new("/movies/Blade Runner 2049 (2017).mkv");
+        let matches = |title: &str, artist: Option<&str>, album: Option<&str>, query: &str| {
+            web_media_fields_match(path, title, artist, None, album, query)
+        };
+        for query in [
+            "",
+            "blade 2049",
+            "2049   blade",
+            "runner: 2049",
+            "(2017).mkv blade",
+        ] {
+            assert!(matches("Blade Runner: 2049", None, None, query), "{query}");
+        }
+        assert!(!matches("Blade Runner: 2049", None, None, "blade 1982"));
+        assert!(matches(
+            "Come Together",
+            Some("the beatles"),
+            Some("abbey road"),
+            "beatles abbey"
+        ));
+        assert!(!matches(
+            "Come Together",
+            Some("the beatles"),
+            Some("abbey road"),
+            "beatles help"
+        ));
+        // Punctuation is literal: a symbol-only query never matches everything.
+        assert!(!matches("Blade Runner: 2049", None, None, "%"));
+        assert!(matches("100% Literal_Name", None, None, "% _name"));
+        assert_eq!(web_search_terms("a  b a\tc"), ["a", "b", "c"]);
+        let many = (0..40)
+            .map(|index| format!("t{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(web_search_terms(&many).len(), WEB_SEARCH_MAX_TERMS);
+        assert!(web_search_terms(" \t ").is_empty());
+        assert!(web_search_fields_match(&["anything"], " "));
     }
 
     #[test]

@@ -59,3 +59,41 @@ test("Android MSE independently copies streams, preserves Auto copies, and selec
     }
   }
 });
+
+test("compatible audio never uses the video-typed Media Source delivery", async (t) => {
+  const saved = Object.fromEntries(["navigator", "MediaSource"].map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
+  t.after(() => {
+    for (const [key, descriptor] of Object.entries(saved)) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else delete globalThis[key];
+    }
+  });
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: {
+    userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+  } });
+  const accepted = [];
+  globalThis.MediaSource = class {
+    static isTypeSupported(type) { accepted.push(type); return true; }
+  };
+  const state = initialState({}, { streamMode: "compat", quality: "auto", encodingPreset: "balanced" });
+  state.server.capabilities = {
+    transcoding: true,
+    quality_profiles: [{ id: "auto", max_width: 3840, max_height: 2160, max_video_kbps: 25000, audio_kbps: 192 }],
+    video_outputs: [{ id: "h264_sdr", mse_content_type: 'video/mp4; codecs="avc1.640033,mp4a.40.2"' }],
+  };
+  const player = { canPlayType: (type) => /mp4a\.|avc1\./.test(type) ? "probably" : "" };
+  const selector = new SourceSelector();
+  const resolve = (item) => selector.resolve(selector.prepare(item, state, player, {}), item, state, player);
+
+  const audio = await resolve({ kind: "audio", audio_codec: "alac", duration_seconds: 240 });
+  assert.equal(audio.sourceMode, "compatible");
+  assert.equal(audio.mediaSourceDelivery, false);
+  assert.equal(audio.mediaSourceType, null);
+  assert.deepEqual(accepted, []);
+
+  // Control: the same capabilities still select Media Source for video.
+  const video = await resolve({ kind: "video", width: 1920, height: 1080, video_codec: "mpeg2video",
+    audio_codec: "ac3", frame_rate: "24/1", hdr: "sdr", bit_depth: 8 });
+  assert.equal(video.mediaSourceDelivery, true);
+  assert.equal(video.mediaSourceType, 'video/mp4; codecs="avc1.640033,mp4a.40.2"');
+});

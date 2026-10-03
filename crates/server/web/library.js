@@ -1,6 +1,9 @@
 import {
+  cardProgress,
   clockLabel,
   itemDuration,
+  libraryErrorMessage,
+  libraryRetryDelay,
   mediaDetails,
   mediaMatchesQuery,
   navigationUrl,
@@ -9,7 +12,7 @@ import {
   resumePosition,
   validDetailId,
 } from "./core.js";
-import { clearProgress, progressDetails, progressSnapshot, savePreference } from "./preferences.js";
+import { clearProgress, progressDetails, progressSnapshot, savePreference, watchedSnapshot } from "./preferences.js";
 import { fetchArtwork } from "./artwork.js";
 
 const CONTINUE_BATCH_SIZE = 100;
@@ -17,6 +20,22 @@ const MAX_CONTINUE_ITEMS = 500;
 const MAX_ACTIVE_ARTWORK = 4;
 const ARTWORK_DEADLINE_MS = 60_000;
 const ARTWORK_OFFSCREEN_GRACE_MS = 5_000;
+// Browsers rate-limit history writes; record the library place only after
+// scrolling settles, and always immediately before leaving the entry.
+const PLACE_SAVE_DELAY_MS = 500;
+
+// History entries carry the library place beside other state. URL query
+// parameters remain the navigation identity; this state is only a hint.
+export function historyState(patch = {}) {
+  const current = window.history.state;
+  return { ...(current && typeof current === "object" ? current : {}), ...patch };
+}
+
+function cardKey(card) {
+  if (card?.dataset.mediaId) return `m:${card.dataset.mediaId}`;
+  if (card?.dataset.folderId) return `f:${card.dataset.folderId}`;
+  return null;
+}
 
 export class LibraryController {
   #store;
@@ -38,6 +57,8 @@ export class LibraryController {
   #chunkKeys = new WeakMap();
   #chunkHeights = new Map();
   #cardsById = new Map();
+  #retryWake = null;
+  #placeTimer = null;
 
   constructor({ store, api, dom, onSelect, onNavigate = () => {} }) {
     this.#store = store;
@@ -49,12 +70,12 @@ export class LibraryController {
     this.#setupArtworkLoading();
   }
 
-  start() {
+  start({ restore = null } = {}) {
     const navigation = this.#store.getState().navigation;
     this.#dom.searchInput.value = navigation.query;
     this.#dom.sortControl.value = navigation.sort;
     this.syncTabs();
-    return this.load();
+    return this.load({ restore });
   }
 
   get capabilitiesReady() {
@@ -66,9 +87,14 @@ export class LibraryController {
     this.#searchTimer = null;
   }
 
-  navigate(navigation, { history = "push", focusAfterLoad = true, supersedePending = true } = {}) {
+  navigate(navigation, {
+    history = "push", focusAfterLoad = true, supersedePending = true, restore = null, originKey = null,
+  } = {}) {
     if (supersedePending) this.#onNavigate();
     this.cancelPendingSearch();
+    // Record where the outgoing entry was before its list is replaced.
+    if (history === "push") this.#rememberPlace(originKey);
+    else this.#cancelPlaceSave();
     this.#api.abortLibrary();
     this.#continueController?.abort();
     this.#store.dispatch({ type: "NAVIGATE", navigation });
@@ -78,35 +104,87 @@ export class LibraryController {
     this.syncTabs();
     if (history !== "none") {
       const target = navigationUrl(window.location.href, state.navigation, state.server.rootFolderId);
-      history === "replace" ? window.history.replaceState({}, "", target) : window.history.pushState({}, "", target);
+      // A replaced search or sort is a different list; its old place no longer applies.
+      history === "replace"
+        ? window.history.replaceState(historyState({ library: null }), "", target)
+        : window.history.pushState({}, "", target);
     }
-    return this.load({ focusAfterLoad });
+    return this.load({ focusAfterLoad, restore });
   }
 
-  async load({ focusAfterLoad = false } = {}) {
-    const requestId = ++this.#request;
-    let resolveCapabilities;
-    let rejectCapabilities;
-    this.#capabilitiesReady = new Promise((resolve, reject) => {
-      resolveCapabilities = resolve;
-      rejectCapabilities = reject;
+  #capabilityRequest() {
+    let resolve;
+    let reject;
+    this.#capabilitiesReady = new Promise((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
     });
     // Ordinary library navigation has no linked selection awaiting this promise.
     // Its error is still reported by the complete-library path below.
     void this.#capabilitiesReady.catch(() => {});
+    return { resolve, reject };
+  }
+
+  #retryDelay(delay) {
+    return new Promise((resolve) => {
+      const timer = window.setTimeout(() => {
+        this.#retryWake = null;
+        resolve();
+      }, delay);
+      this.#retryWake = () => {
+        window.clearTimeout(timer);
+        resolve();
+      };
+    });
+  }
+
+  #cancelRetryDelay() {
+    const wake = this.#retryWake;
+    this.#retryWake = null;
+    wake?.();
+  }
+
+  async load({ focusAfterLoad = false, restore = null } = {}) {
+    const requestId = ++this.#request;
+    // A superseded load wakes from its backoff, sees the newer request, and stops.
+    this.#cancelRetryDelay();
+    let capabilities = this.#capabilityRequest();
+    let published = false;
     const onFirstPage = (payload) => {
       if (requestId !== this.#request) throw new DOMException("Library request replaced.", "AbortError");
+      // An automatic retry publishes a newer first page. A linked selection
+      // follows the replacement promise, as it does after a manual Retry.
+      if (published) capabilities = this.#capabilityRequest();
+      published = true;
       this.#publishCapabilities(requestId, payload);
-      resolveCapabilities(payload);
+      capabilities.resolve(payload);
     };
+    // Loading hides Retry and the empty-state actions. Keep keyboard focus in
+    // the library rather than letting it fall to the document, and return it to
+    // the same Retry if this load fails again.
+    const hiddenFocus = this.#focusLeavingHiddenControls();
+    const focusOrigin = document.activeElement;
     this.#store.dispatch({ type: "LIBRARY_LOADING", requestId });
     const current = this.#store.getState();
     this.render();
     if (current.navigation.view !== "continue") this.#continueProgress = null;
     try {
-      const payload = current.navigation.view === "continue"
-        ? await this.#continueWatchingPage(current.navigation.query, onFirstPage)
-        : await this.#api.librarySnapshot(current.navigation, { onFirstPage });
+      let payload;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          // Each attempt restarts from the first page without a generation, so
+          // a published list never mixes pages from two catalog snapshots.
+          payload = current.navigation.view === "continue"
+            ? await this.#continueWatchingPage(current.navigation.query, onFirstPage)
+            : await this.#api.librarySnapshot(current.navigation, { onFirstPage });
+          break;
+        } catch (error) {
+          const delay = requestId === this.#request ? libraryRetryDelay(error, attempt) : null;
+          if (delay === null) throw error;
+          await this.#retryDelay(delay);
+          if (requestId !== this.#request) throw new DOMException("Library request replaced.", "AbortError");
+        }
+      }
       if (requestId !== this.#request) return;
       const batches = this.#cardBatches(payload.entries, current.navigation);
       let batch = batches.next();
@@ -122,15 +200,118 @@ export class LibraryController {
         this.#store.dispatch({ type: "NAVIGATE", navigation: { folder: payload.root_folder_id } });
       }
       this.render(batch.value);
-      if (focusAfterLoad) {
+      if (restore && typeof restore === "object") {
+        this.#restorePlace(requestId, restore, focusAfterLoad && (focusOrigin || document.body));
+      } else if (focusAfterLoad && this.#focusUnmoved(focusOrigin)) {
         this.#dom.libraryPanel.focus({ preventScroll: true });
       }
     } catch (error) {
-      rejectCapabilities(error);
+      capabilities.reject(error);
       if (error?.name === "AbortError" || requestId !== this.#request) return;
       this.#store.dispatch({ type: "LIBRARY_ERROR", requestId, error });
       this.render();
+      if (hiddenFocus?.retry && !hiddenFocus.retry.hidden && document.activeElement === this.#dom.libraryPanel) {
+        hiddenFocus.retry.focus({ preventScroll: true });
+      }
     }
+  }
+
+  // A load may move focus only while the user has not taken it elsewhere, for
+  // example into Search or the player while a slow page was still arriving.
+  #focusUnmoved(origin) {
+    const active = document.activeElement;
+    return !active || active === document.body || active === document.documentElement
+      || active === origin || this.#dom.libraryPanel.contains(active);
+  }
+
+  // Moves focus from a control the loading state is about to hide to the
+  // library panel. Returns null when focus was elsewhere; otherwise `retry` is
+  // the Retry button to refocus if the load fails again.
+  #focusLeavingHiddenControls() {
+    const active = document.activeElement;
+    const { libraryEmpty, libraryRetry, libraryRetryTop, libraryPanel } = this.#dom;
+    if (!(active instanceof Element) || !(active === libraryRetryTop || libraryEmpty.contains(active))) return null;
+    libraryPanel.focus({ preventScroll: true });
+    return { retry: active === libraryRetryTop || active === libraryRetry ? active : null };
+  }
+
+  // Landscape Watch scrolls the library beside the player instead of the page.
+  #libraryScroller() {
+    const section = this.#dom.libraryPanel.closest(".library");
+    if (!section) return null;
+    const overflow = getComputedStyle(section).overflowY;
+    return ["auto", "scroll"].includes(overflow) && section.scrollHeight > section.clientHeight ? section : null;
+  }
+
+  #cardForKey(key) {
+    if (typeof key !== "string") return null;
+    const id = key.slice(2);
+    if (key.startsWith("m:")) return this.#cardsById.get(id) ?? null;
+    if (!key.startsWith("f:")) return null;
+    for (const card of this.#dom.grid.querySelectorAll(".media-card.folder")) {
+      if (card.dataset.folderId === id) return card;
+    }
+    return null;
+  }
+
+  #cancelPlaceSave() {
+    if (this.#placeTimer !== null) window.clearTimeout(this.#placeTimer);
+    this.#placeTimer = null;
+  }
+
+  #schedulePlaceSave() {
+    this.#cancelPlaceSave();
+    this.#placeTimer = window.setTimeout(() => {
+      this.#placeTimer = null;
+      this.#rememberPlace();
+    }, PLACE_SAVE_DELAY_MS);
+  }
+
+  #rememberPlace(originKey = null) {
+    this.#cancelPlaceSave();
+    // Loading and failed views have no list position worth returning to.
+    if (this.#store.getState().library.status !== "ready") return;
+    const active = document.activeElement;
+    const focused = active instanceof Element && this.#dom.grid.contains(active)
+      ? active.closest(".media-card") : null;
+    const card = this.#cardForKey(originKey) || focused;
+    const scroller = this.#libraryScroller();
+    const place = {
+      scrollY: window.scrollY,
+      libraryScrollTop: scroller ? scroller.scrollTop : null,
+      cardKey: cardKey(card),
+      cardTop: card ? card.getBoundingClientRect().top : null,
+    };
+    try {
+      window.history.replaceState(historyState({ library: place }), "");
+    } catch (_) {
+      // A rate-limited history write only loses this optional hint.
+    }
+  }
+
+  #restorePlace(requestId, place, focus) {
+    // Wait for the published grid, including reserved chunk heights, to lay out.
+    window.requestAnimationFrame(() => {
+      if (requestId !== this.#request) return;
+      const scroller = this.#libraryScroller();
+      const libraryTop = Number(place.libraryScrollTop);
+      const pageTop = Number(place.scrollY);
+      if (scroller && place.libraryScrollTop !== null && Number.isFinite(libraryTop)) scroller.scrollTop = libraryTop;
+      else if (!scroller && Number.isFinite(pageTop)) window.scrollTo({ top: pageTop, left: 0, behavior: "auto" });
+      const card = this.#cardForKey(place.cardKey);
+      const cardTop = Number(place.cardTop);
+      if (card && place.cardTop !== null && Number.isFinite(cardTop)) {
+        // Align the card the user left from, even if card heights changed.
+        const delta = card.getBoundingClientRect().top - cardTop;
+        if (Math.abs(delta) >= 1) {
+          if (scroller) scroller.scrollTop += delta;
+          else window.scrollBy({ top: delta, left: 0, behavior: "auto" });
+        }
+      }
+      if (focus && this.#focusUnmoved(focus)) {
+        (card?.querySelector(".card-button") || this.#dom.libraryPanel).focus({ preventScroll: true });
+      }
+    });
   }
 
   #publishCapabilities(requestId, payload) {
@@ -161,21 +342,33 @@ export class LibraryController {
     this.#announceState(library, server, noun);
     if (library.status === "error") {
       this.#dom.libraryEmptyTitle.textContent = "Could not load the library";
-      this.#dom.libraryEmptyDetail.textContent = friendlyLibraryError(library.error);
+      this.#dom.libraryEmptyDetail.textContent = libraryErrorMessage(library.error, navigator.onLine);
       this.#dom.libraryCount.textContent = "Library unavailable";
+      // The previous view's count and folder path do not describe this view.
+      this.#dom.resultsSummary.textContent = "";
+      this.#dom.breadcrumbs.replaceChildren();
+      this.#dom.breadcrumbs.hidden = true;
       this.#dom.libraryPanel.setAttribute("aria-busy", "false");
       return;
     }
-    this.#dom.libraryPanel.setAttribute("aria-busy", String(library.status === "loading"));
-    this.#dom.libraryCount.textContent = library.status === "loading" ? "Connecting…" : `${library.total} ${noun}`;
+    const loading = library.status === "loading";
+    this.#dom.libraryPanel.setAttribute("aria-busy", String(loading));
+    this.#dom.libraryCount.textContent = loading
+      ? (server.state === "connecting" ? "Connecting…" : "Loading…")
+      : `${library.total} ${noun}`;
+    // `empty` describes the whole server; an empty search or folder is not one.
+    const emptyServer = server.state === "empty" && !navigation.query && navigation.view !== "continue";
     this.#dom.libraryEmptyTitle.textContent = navigation.query ? `No results for “${navigation.query}”`
-      : navigation.view === "continue" ? "Nothing to continue yet" : "No media found";
+      : navigation.view === "continue" ? "Nothing to continue yet"
+        : emptyServer ? "No media indexed yet" : "No media found";
     this.#dom.libraryEmptyDetail.textContent = navigation.query ? "Try a different search or clear it to see this view."
       : navigation.view === "continue" ? "Start watching or listening. Your saved progress will appear here on this browser."
-        : "Try another folder or media view.";
-    this.#dom.resultsSummary.textContent = navigation.query
-      ? `${library.total} ${library.total === 1 ? "result" : "results"} for “${navigation.query}”`
-      : `${library.total} ${noun}`;
+        : emptyServer ? "The server has not indexed any video or audio yet. If a scan is running, check Server status."
+          : "Try another folder or media view.";
+    this.#dom.resultsSummary.textContent = loading ? "Loading…"
+      : navigation.query
+        ? `${library.total} ${library.total === 1 ? "result" : "results"} for “${navigation.query}”`
+        : `${library.total} ${noun}`;
     this.renderBreadcrumbs();
     this.renderCards(cards);
     this.syncTabs();
@@ -189,7 +382,7 @@ export class LibraryController {
       if (["Connecting to the library.", "Loading the library."].includes(this.#liveMessage)) return;
       message = server.state === "connecting" ? "Connecting to the library." : "Loading the library.";
     } else if (library.status === "error") {
-      message = "The library is unavailable. Check the server connection and try again.";
+      message = `The library is unavailable. ${libraryErrorMessage(library.error, navigator.onLine)}`;
     } else if (library.status === "ready" && server.state === "empty") {
       message = "Library ready. The server has no indexed media.";
     } else if (library.status === "ready" && library.total > 0) {
@@ -263,6 +456,16 @@ export class LibraryController {
       tab.setAttribute("aria-selected", String(selected));
       tab.tabIndex = selected ? 0 : -1;
       if (selected) this.#dom.libraryPanel.setAttribute("aria-labelledby", tab.id);
+    }
+    // Continue watching is always ordered by most recent progress; a Sort
+    // control there would only add history entries without changing the list.
+    const sort = this.#dom.sortControl.closest("label");
+    if (sort) {
+      const hide = navigation.view === "continue";
+      if (hide && sort.contains(document.activeElement)) {
+        this.#dom.tabs.find((tab) => tab.getAttribute("aria-selected") === "true")?.focus();
+      }
+      sort.hidden = hide;
     }
   }
 
@@ -341,10 +544,16 @@ export class LibraryController {
         entry.entry_type, entry.kind, Boolean(entry.file_name && entry.file_name !== entry.title), mediaDetails(entry),
       ]));
     };
+    // Read browser-local progress once per published list, not once per card.
+    const hasMedia = entries.some((entry) => entry.entry_type === "media");
+    const marks = {
+      progress: navigation.view === "continue" ? this.#continueProgress : (hasMedia ? progressSnapshot() : null),
+      watched: hasMedia ? watchedSnapshot() : new Set(),
+    };
     let batchStarted = performance.now();
     let batchCount = 0;
     for (const entry of entries) {
-      const card = entry.entry_type === "folder" ? this.#folderCard(entry) : this.#mediaCard(entry);
+      const card = entry.entry_type === "folder" ? this.#folderCard(entry) : this.#mediaCard(entry, marks);
       if (entry.entry_type === "media" && !byId.has(String(entry.id))) byId.set(String(entry.id), card);
       const collection = navigation.view === "library" && navigation.sort === "title"
         ? entry.collection : null;
@@ -385,12 +594,16 @@ export class LibraryController {
   #folderCard(folder) {
     const article = document.createElement("article");
     article.className = "media-card folder";
+    article.dataset.folderId = String(folder.id);
     const button = document.createElement("button");
     button.type = "button";
     button.className = "card-button";
     const count = Number(folder.child_count || 0);
     button.setAttribute("aria-label", `Open ${folder.title}, ${count} ${count === 1 ? "item" : "items"}`);
-    button.addEventListener("click", () => this.navigate({ view: "folders", folder: folder.id, kind: "all", query: "" }));
+    button.addEventListener("click", () => this.navigate(
+      { view: "folders", folder: folder.id, kind: "all", query: "" },
+      { originKey: `f:${folder.id}` },
+    ));
     const art = document.createElement("span");
     art.className = "art";
     const icon = document.createElement("span");
@@ -409,20 +622,28 @@ export class LibraryController {
     return article;
   }
 
-  #mediaCard(item) {
+  #mediaCard(item, { progress = null, watched = new Set() } = {}) {
     const article = document.createElement("article");
     article.className = `media-card ${item.kind}`;
     article.dataset.mediaId = String(item.id);
     const button = document.createElement("button");
     button.type = "button";
     button.className = "card-button";
-    button.setAttribute("aria-label", `Play ${item.title}. ${mediaDetails(item)}`.trim());
+    // Never fall back to one storage read per card.
+    const saved = progressDetails(item.id, progress instanceof Map ? progress : new Map());
+    const marks = cardProgress({
+      position: saved.position,
+      duration: itemDuration(item) || saved.duration,
+      watched: watched.has(String(item.id)),
+    });
+    const description = [mediaDetails(item), marks?.label].filter(Boolean).join(". ");
+    button.setAttribute("aria-label", `Play ${item.title}. ${description}`.trim());
     button.addEventListener("click", () => {
       this.#onNavigate();
       this.snapshotQueue();
       this.#store.dispatch({ type: "NAVIGATE", navigation: { itemId: String(item.id), start: 0 } });
-      window.history.replaceState({}, "", navigationUrl(window.location.href, this.#store.getState().navigation, this.#store.getState().server.rootFolderId));
-      this.#onSelect(item, { preserveQueue: true });
+      window.history.replaceState(historyState(), "", navigationUrl(window.location.href, this.#store.getState().navigation, this.#store.getState().server.rootFolderId));
+      this.#onSelect(item, { preserveQueue: true, focusPrompt: true });
       this.markCurrent(item.id);
     });
     const art = document.createElement("span");
@@ -445,6 +666,24 @@ export class LibraryController {
     play.className = "card-play";
     play.setAttribute("aria-hidden", "true");
     art.append(play);
+    // Overlays keep every card's geometry identical for chunk measurement.
+    // The button label carries the same text for assistive technology.
+    if (marks?.state === "partial") {
+      const bar = document.createElement("span");
+      bar.className = "card-progress";
+      bar.setAttribute("aria-hidden", "true");
+      const fill = document.createElement("span");
+      fill.className = "card-progress-fill";
+      fill.style.setProperty("--card-progress", `${marks.percent}%`);
+      bar.append(fill);
+      art.append(bar);
+    } else if (marks?.state === "watched") {
+      const badge = document.createElement("span");
+      badge.className = "card-watched";
+      badge.setAttribute("aria-hidden", "true");
+      badge.textContent = marks.label;
+      art.append(badge);
+    }
     const title = document.createElement("span");
     title.className = "card-title";
     title.textContent = item.title;
@@ -482,24 +721,36 @@ export class LibraryController {
     cardActions.append(detailsButton);
     article.append(cardActions);
     if (this.#store.getState().navigation.view === "continue") {
-      const progress = progressDetails(item.id, this.#continueProgress);
       const actions = document.createElement("div");
       actions.className = "progress-actions";
       const label = document.createElement("span");
-      label.textContent = `${clockLabel(progress.position)} watched`;
+      label.textContent = `${clockLabel(saved.position)} watched`;
       const clear = document.createElement("button");
       clear.type = "button";
       clear.textContent = "Clear progress";
       clear.setAttribute("aria-label", `Clear progress for ${item.title}`);
-      clear.addEventListener("click", () => {
-        clearProgress(item.id);
-        this.#store.dispatch({ type: "LIBRARY_REMOVE_ENTRY", id: item.id });
-        this.render();
-      });
+      clear.addEventListener("click", () => this.#clearProgress(item));
       actions.append(label, clear);
       article.append(actions);
     }
     return article;
+  }
+
+  #clearProgress(item) {
+    const entries = this.#store.getState().library.entries;
+    const index = entries.findIndex((entry) => String(entry.id) === String(item.id));
+    // Re-rendering removes the focused button. Keep the keyboard position on
+    // the neighbouring card instead of dropping focus to the document.
+    const neighbor = index < 0 ? null : (entries[index + 1] ?? entries[index - 1] ?? null);
+    clearProgress(item.id);
+    this.#store.dispatch({ type: "LIBRARY_REMOVE_ENTRY", id: item.id });
+    this.render();
+    const card = neighbor ? this.#cardsById.get(String(neighbor.id)) : null;
+    const target = card?.querySelector(".card-button") || this.#dom.libraryPanel;
+    target.focus({ preventScroll: true });
+    card?.scrollIntoView({ block: "nearest" });
+    this.#liveMessage = `Progress cleared for ${item.title}.`;
+    this.#dom.libraryLive.textContent = this.#liveMessage;
   }
 
   #showDetails(item) {
@@ -562,6 +813,8 @@ export class LibraryController {
     const schedule = () => this.#scheduleArtwork();
     // Capture also covers the independently scrolling landscape library.
     window.addEventListener("scroll", schedule, { passive: true, capture: true });
+    window.addEventListener("scroll", () => this.#schedulePlaceSave(), { passive: true, capture: true });
+    window.addEventListener("pagehide", () => this.#rememberPlace());
     window.addEventListener("resize", schedule);
     this.#dom.grid.addEventListener("contentvisibilityautostatechange", schedule);
     if (typeof window.ResizeObserver === "function") {
@@ -745,6 +998,14 @@ export class LibraryController {
     });
     this.#dom.libraryRetry.addEventListener("click", () => this.load());
     this.#dom.libraryRetryTop.addEventListener("click", () => this.load());
+    window.addEventListener("online", () => {
+      // Reconnecting retries only a load that failed in transport. Server
+      // answers keep their manual Retry; a newer load supersedes this one.
+      const { library } = this.#store.getState();
+      if (library.status !== "error") return;
+      if (library.error?.name === "ApiError" && library.error.code !== "network") return;
+      void this.load();
+    });
     this.#dom.searchInput.addEventListener("input", () => {
       this.cancelPendingSearch();
       this.#searchTimer = window.setTimeout(() => {
@@ -773,10 +1034,4 @@ export class LibraryController {
       });
     });
   }
-}
-
-function friendlyLibraryError(error) {
-  if (error?.code === "catalog_changed") return "The library changed while loading. Retry to refresh it.";
-  if (!navigator.onLine) return "You appear to be offline. Reconnect, then retry.";
-  return "Check the server connection, then retry.";
 }

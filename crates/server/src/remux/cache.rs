@@ -456,8 +456,24 @@ fn maintain_inventory_locked(
     let max_age =
         Duration::from_secs(u64::from(app.cfg.transcode.cache_max_age_days).saturating_mul(86_400));
     let now = SystemTime::now();
-    if sweep || inventory.bytes > quota || free_shortfall > 0 {
-        let pressure = inventory.bytes > quota || free_shortfall > 0;
+    let over_limits = inventory.bytes > quota || free_shortfall > 0;
+    // Evicting every completed, unprotected entry cannot help when active
+    // outputs alone exceed the limits, for example one copied output larger
+    // than the whole quota. Keep the completed cache then; the oversized
+    // producer still observes the unsatisfied limits below.
+    let pressure = over_limits
+        && eviction_can_satisfy_limits(app, &inventory, &active, requested, quota, free_shortfall);
+    if over_limits && !pressure {
+        tracing::warn!(
+            cache_bytes = inventory.bytes,
+            cache_max_mb = app.cfg.transcode.cache_max_mb,
+            cache_min_free_mb = app.cfg.cache_min_free_mb,
+            free_shortfall,
+            "active transcode outputs exceed the cache limits; completed cache entries are kept. \
+             Raise cache_max_mb above the largest compatible output, or free cache filesystem space"
+        );
+    }
+    if sweep || pressure {
         let mut candidates = inventory
             .entries
             .iter()
@@ -467,7 +483,7 @@ fn maintain_inventory_locked(
             })
             .map(|(path, entry)| (path.clone(), *entry))
             .collect::<Vec<_>>();
-        if inventory.bytes > quota || free_shortfall > 0 {
+        if pressure {
             candidates.sort_unstable_by_key(|(_, entry)| entry.used);
         }
         #[cfg(test)]
@@ -478,7 +494,7 @@ fn maintain_inventory_locked(
             let mut refreshed = Vec::new();
             for (path, entry) in candidates {
                 let aged = now.duration_since(entry.used).unwrap_or_default() > max_age;
-                if !aged && inventory.bytes <= quota && free_shortfall == 0 {
+                if !aged && (!pressure || (inventory.bytes <= quota && free_shortfall == 0)) {
                     continue;
                 }
                 let Some(_reservation) = app.transcode_cache.try_reserve(&path) else {
@@ -525,7 +541,7 @@ fn maintain_inventory_locked(
                         .saturating_sub(crate::available_filesystem_bytes(&app.cache_dir)?);
                 }
             }
-            if inventory.bytes <= quota && free_shortfall == 0 {
+            if !pressure || (inventory.bytes <= quota && free_shortfall == 0) {
                 break;
             }
             refreshed.sort_unstable_by_key(|(_, entry)| entry.used);
@@ -540,6 +556,41 @@ fn maintain_inventory_locked(
     } else {
         Ok(inventory.bytes)
     }
+}
+
+/// Whether unlinking every completed entry that no job or admission owns could
+/// bring the cache within its quota and free-space target. Unlinking cannot
+/// free more than those entries' bytes, so eviction is skipped only when it
+/// cannot succeed.
+fn eviction_can_satisfy_limits(
+    app: &App,
+    inventory: &Inventory,
+    active: &HashSet<PathBuf>,
+    requested: &HashSet<PathBuf>,
+    quota: u64,
+    free_shortfall: u64,
+) -> bool {
+    let waited = Instant::now();
+    let jobs = crate::lock_recover(&app.remuxes);
+    app.remux_metrics
+        .cache_registry_wait
+        .record(waited.elapsed());
+    let protected = jobs
+        .values()
+        .map(|job| job.dest.clone())
+        .collect::<HashSet<_>>();
+    drop(jobs);
+    let reclaimable = inventory
+        .entries
+        .iter()
+        .filter(|(path, entry)| {
+            entry.completed
+                && !active.contains(*path)
+                && !requested.contains(*path)
+                && !protected.contains(*path)
+        })
+        .fold(0_u64, |total, (_, entry)| total.saturating_add(entry.bytes));
+    inventory.bytes.saturating_sub(reclaimable) <= quota && reclaimable >= free_shortfall
 }
 
 pub(super) fn maintain_app_cache(
@@ -985,6 +1036,7 @@ mod tests {
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
             effective_recipe: Mutex::new(None),
+            stream_origin: std::sync::OnceLock::new(),
         })
     }
 
@@ -1217,6 +1269,31 @@ mod tests {
         assert_eq!(enforce_active_cache_limits(&app).unwrap(), 700_000);
         assert!(!output.exists());
         assert!(job.part.exists());
+        crate::lock_recover(&app.remuxes).clear();
+    }
+
+    #[test]
+    fn oversized_active_output_fails_limits_without_evicting_completed_entries() {
+        let directory = TempDir::new("oversized-active");
+        let app = test_app(&directory);
+        let completed = test_job(&directory, 2);
+        std::fs::write(&completed.dest, vec![0; 300_000]).unwrap();
+        let job = test_job(&directory, 1);
+        // One growing output already exceeds the whole 1 MiB quota.
+        std::fs::write(&job.part, vec![0; 1_200_000]).unwrap();
+        crate::lock_recover(&app.remuxes).insert("oversized".into(), job.clone());
+        assert!(enforce_active_cache_limits(&app).is_err());
+        assert!(completed.dest.exists());
+        assert_eq!(
+            app.remux_metrics
+                .cache_evicted_files
+                .load(Ordering::Relaxed),
+            0
+        );
+        // When eviction can satisfy the quota, LRU pressure still reclaims.
+        std::fs::write(&job.part, vec![0; 900_000]).unwrap();
+        assert_eq!(enforce_active_cache_limits(&app).unwrap(), 900_000);
+        assert!(!completed.dest.exists());
         crate::lock_recover(&app.remuxes).clear();
     }
 

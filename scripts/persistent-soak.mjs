@@ -340,7 +340,7 @@ try {
   report.fixtures = { playback_sha256: await fileHash(template), cancellation_sha256: await fileHash(join(library, "cancellation.mkv")),
     probe: JSON.parse(await command("ffprobe", ["-v", "error", "-show_streams", "-show_format", "-of", "json", template])) };
   const config = join(run, "server.toml");
-  await writeFile(config, `friendly_name = "persistent soak"\nmedia_dir = ["library"]\ncache_dir = "cache"\ndb_dir = "db"\nlisten_ip = "127.0.0.1"\nadvertise_ip = "127.0.0.1"\nrescan_secs = 2\nscan_workers = 2\nhelper_max_jobs = 4\ncache_min_free_mb = 0\n[transcode]\nenable = true\nencoder = "libx264"\nmax_jobs = 2\ncache_max_mb = ${options["cache-mb"]}\n[web]\nencoder = "libx264"\n`);
+  await writeFile(config, `friendly_name = "persistent soak"\nmedia_dir = ["library"]\ncache_dir = "cache"\ndb_dir = "db"\nlisten_ip = "127.0.0.1"\nadvertise_ip = "127.0.0.1"\nrescan_secs = 2\nrescan_max_secs = 0\nscan_workers = 2\nhelper_max_jobs = 4\ncache_min_free_mb = 0\n[transcode]\nenable = true\nencoder = "libx264"\nmax_jobs = 2\ncache_max_mb = ${options["cache-mb"]}\n[web]\nencoder = "libx264"\n`);
   server = spawn(binary, ["-c", config, "-p", String(options.port)], { detached: true, stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, RUSTY_DLNA_SSDP_PORT: String(options["ssdp-port"]) } });
   server.on("error", (error) => { monitorFailure = error; });

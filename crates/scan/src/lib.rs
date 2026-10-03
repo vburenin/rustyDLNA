@@ -53,9 +53,10 @@ pub use db::{
 pub use metadata::*;
 pub use nfo::{
     episode_display_title, nfo_date_from_text, nfo_for_file, nfo_for_file_with_policy,
-    nfo_for_file_with_policy_result, nfo_too_large, parse_nfo_text, split_genres, NfoError,
-    NfoMeta,
+    nfo_for_file_with_policy_result, nfo_lookup_with_policy, nfo_too_large, parse_nfo_text,
+    split_genres, InvalidNfo, NfoError, NfoLookup, NfoMeta,
 };
+use probe::ProbeOutcome;
 pub use probe::{
     attached_pic_stream, extract_attached_pic, extract_attached_pic_result,
     extract_attached_pic_with_limits_result, extract_attached_pic_with_timeout_result,
@@ -73,6 +74,7 @@ pub use rooted_io::{
     path_is_allowed_dir, path_is_allowed_file, path_is_live_file, path_is_under_roots, path_to_db,
     rebase_media_path_for_config, RootedFile,
 };
+pub(crate) use rooted_io::{open_refusal_means_unwanted, path_is_definitely_gone};
 pub use rusty_dlna_helper::{
     CancellationToken, HelperAdmissionError, HelperGate, HelperMetrics, HelperPermit,
 };
@@ -83,7 +85,8 @@ pub use watch::{
 };
 pub use web_order::{
     video_collection, web_media_file_name, web_media_matches, web_media_title_key,
-    web_search_normalize, VideoCollection,
+    web_recently_added_key, web_search_fields_match, web_search_normalize, web_search_terms,
+    VideoCollection, WEB_SEARCH_MAX_TERMS,
 };
 
 use rusty_dlna_protocol::object_id::{
@@ -161,15 +164,29 @@ pub fn is_skipped_dir_os_name(name: &OsStr) -> bool {
 
 /// True when a stored path sits under a skip/exclude rule.
 pub fn path_is_unwanted(path: &Path, cfg: &ScanConfig) -> bool {
+    let live = rebase_media_path_for_config(path, cfg);
+    let refused = match open_allowed_file(&live, cfg) {
+        Ok(_) => false,
+        // Only root-confinement refusals, non-regular files, and affirmative
+        // absence mark the path unwanted. Permission, stale-handle, and I/O
+        // failures are unknown, so the row, its IDs, and bookmarks are kept.
+        Err(error) => open_refusal_means_unwanted(&error),
+    };
+    refused || path_is_excluded_by_config(path, cfg)
+}
+
+/// The configuration-only part of [`path_is_unwanted`]: root media types,
+/// exclusions, skipped directories, and unfinished/sample/artwork names. It
+/// touches no filesystem state, so it also applies to rows whose subtree is
+/// currently unavailable.
+pub(crate) fn path_is_excluded_by_config(path: &Path, cfg: &ScanConfig) -> bool {
     let name = path
         .file_name()
         .map(|value| value.to_string_lossy())
         .unwrap_or_default();
     let live = rebase_media_path_for_config(path, cfg);
-    !path_is_allowed_file(&live, cfg)
-        || !cfg
-            .root_types_for_path(&live)
-            .is_some_and(|types| types.allows(&name))
+    !cfg.root_types_for_path(&live)
+        .is_some_and(|types| types.allows(&name))
         || path_excluded(path, &name, cfg)
         || path
             .components()
@@ -517,8 +534,48 @@ fn attach_image_virtuals(
     Ok(())
 }
 
+/// Effective NFO lookup with the scanner's admission policy.
+fn nfo_lookup(cfg: &ScanConfig, path: &Path) -> Result<NfoLookup, NfoError> {
+    nfo_lookup_with_policy(path, &cfg.media_dirs, cfg.wide_links, || {
+        sole_candidate_video_in_dir(path, cfg)
+    })
+}
+
+/// Kodi's folder-level `movie.nfo` describes a folder's only movie. It applies
+/// only while the directory holds exactly one video the scanner would admit by
+/// name and path policy, so extras and a second cut never inherit the movie's
+/// metadata. Audio never uses it.
+fn sole_candidate_video_in_dir(path: &Path, cfg: &ScanConfig) -> bool {
+    let is_video_name = |candidate: &Path| {
+        candidate
+            .file_name()
+            .is_some_and(|name| is_video(&name.to_string_lossy()))
+    };
+    if !is_video_name(path) || path_is_unwanted(path, cfg) {
+        return false;
+    }
+    let Some(entries) = path.parent().and_then(|dir| std::fs::read_dir(dir).ok()) else {
+        return false;
+    };
+    // Cheapest checks first; the walk stops at the second candidate.
+    let mut candidates = 0_usize;
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        if !is_video_name(&candidate) || !candidate.is_file() || path_is_unwanted(&candidate, cfg) {
+            continue;
+        }
+        candidates = candidates.saturating_add(1);
+        if candidates > 1 {
+            return false;
+        }
+    }
+    candidates == 1
+}
+
 fn apply_nfo(db: &LibraryDb, cfg: &ScanConfig, path: &Path, detail_id: i64) -> ScanResult<bool> {
-    let nfo = nfo_for_file_with_policy_result(path, &cfg.media_dirs, cfg.wide_links)?;
+    // The caller has just reset this item to file defaults, so the metadata
+    // that did parse is the best available presentation.
+    let nfo = nfo_lookup(cfg, path)?.meta;
     if nfo.is_empty() {
         return Ok(false);
     }
@@ -563,17 +620,41 @@ fn apply_nfo_in_dir_with_stack(
     if !path_is_allowed_dir(dir, cfg) {
         return Ok(false);
     }
-    let key = inode_key(&std::fs::metadata(dir).map_err(|error| scan_io(dir, error))?);
+    let key = match std::fs::metadata(dir) {
+        Ok(metadata) => inode_key(&metadata),
+        Err(error) if unreadable_subdirectory(&error, false) => {
+            warn_unreadable_directory(dir, &error);
+            return Ok(false);
+        }
+        Err(error) => return Err(scan_io(dir, error)),
+    };
     // Only ancestors are cycles. Separate aliases to the same directory must
     // still be visited, exactly as in the primary catalog walker.
     if ancestors.insert(key, ()).is_some() {
         return Ok(false);
     }
-    let rd = std::fs::read_dir(dir).map_err(|error| scan_io(dir, error))?;
+    // NFO refresh never deletes rows; an unreadable directory simply keeps
+    // its current metadata.
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(error) if unreadable_subdirectory(&error, false) => {
+            warn_unreadable_directory(dir, &error);
+            ancestors.remove(&key);
+            return Ok(false);
+        }
+        Err(error) => return Err(scan_io(dir, error)),
+    };
     let mut any = false;
     for ent in rd {
         cfg.check_cancelled()?;
-        let ent = ent.map_err(|error| scan_io(dir, error))?;
+        let ent = match ent {
+            Ok(ent) => ent,
+            Err(error) if unreadable_subdirectory(&error, false) => {
+                warn_unreadable_directory(dir, &error);
+                break;
+            }
+            Err(error) => return Err(scan_io(dir, error)),
+        };
         let path = ent.path();
         let name = ent.file_name().to_string_lossy().into_owned();
         let is_dir = match ent.file_type() {
@@ -667,11 +748,19 @@ fn refresh_nfo_periodic(db: &LibraryDb, cfg: &ScanConfig, rows: &[DetailStat]) -
         cfg.check_cancelled()?;
         aliases.sort_by(|left, right| left.1.cmp(&right.1));
         let mut parsed = Vec::with_capacity(aliases.len());
+        let mut any_invalid = false;
         for (id, path) in &aliases {
             cfg.check_cancelled()?;
             let live = rebase_media_path_for_config(path, cfg);
-            let nfo = nfo_for_file_with_policy_result(&live, &cfg.media_dirs, cfg.wide_links)?;
-            parsed.push((*id, live, nfo));
+            let lookup = nfo_lookup(cfg, &live)?;
+            any_invalid |= lookup.invalid.is_some();
+            parsed.push((*id, live, lookup.meta));
+        }
+        if any_invalid {
+            // A malformed (possibly half-written) sidecar is not evidence
+            // that overrides were removed. Keep this physical item's stored
+            // presentation and provenance until the sidecar parses again.
+            continue;
         }
         let Some((selected_id, selected_path, selected_nfo)) = parsed
             .iter()
@@ -1478,29 +1567,13 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-/// Open the catalog, preserving a corrupt database and its WAL sidecars before
-/// creating a fresh database. Busy, permission, migration, and other errors
-/// are propagated unchanged: those states are retryable and must never be
-/// mistaken for corruption.
+/// Startup open: run the full integrity check and preserve a corrupt database
+/// and its WAL sidecars before creating a fresh database. Busy, permission,
+/// migration, and other errors are propagated unchanged: those states are
+/// retryable and must never be mistaken for corruption. This runs before any
+/// long-lived connection exists; runtime opens never move the live files.
 pub(crate) fn open_library_db(path: &Path) -> ScanResult<LibraryDb> {
-    open_library_db_controlled(path, None)
-}
-
-fn open_library_db_cancelled(
-    path: &Path,
-    cancellation: &CancellationToken,
-) -> ScanResult<LibraryDb> {
-    open_library_db_controlled(path, Some(cancellation))
-}
-
-fn open_library_db_controlled(
-    path: &Path,
-    cancellation: Option<&CancellationToken>,
-) -> ScanResult<LibraryDb> {
-    let open = || match cancellation {
-        Some(cancellation) => LibraryDb::open_with_cancellation(path, cancellation.clone()),
-        None => LibraryDb::open(path),
-    };
+    let open = || LibraryDb::open(path);
     match open() {
         Ok(db) => Ok(db),
         Err(error) if is_corrupt_database_error(&error) => {
@@ -1532,10 +1605,22 @@ fn open_library_db_controlled(
     }
 }
 
-/// Persist the UPnP SystemUpdateID using the same checked/recovering database
-/// open policy as scanner writes.
+/// Runtime open of a catalog verified at startup. Corruption found here is
+/// reported as an error; the live files are never renamed while the server's
+/// pooled connections still reference them.
+fn open_library_db_cancelled(
+    path: &Path,
+    cancellation: &CancellationToken,
+) -> ScanResult<LibraryDb> {
+    Ok(LibraryDb::open_with_cancellation(
+        path,
+        cancellation.clone(),
+    )?)
+}
+
+/// Persist the UPnP SystemUpdateID using the runtime database open policy.
 pub fn persist_system_update_id(path: &Path, id: u32) -> ScanResult<()> {
-    open_library_db(path)?.set_update_id(id)?;
+    LibraryDb::open_runtime(path)?.set_update_id(id)?;
     Ok(())
 }
 
@@ -1611,6 +1696,9 @@ fn forget_matching(cfg: &ScanConfig, path: &Path, tree: bool) -> ScanResult<usiz
     let Some(db) = open_library(cfg)? else {
         return Ok(0);
     };
+    // The forgotten paths themselves always go; their dangling aliases are
+    // kept while the alias's root lists nothing (an unmounted root).
+    let held = HeldSubtrees::default();
     let transaction = db.transaction()?;
     let rows = db.all_detail_stats()?;
     let mut n = 0usize;
@@ -1623,15 +1711,52 @@ fn forget_matching(cfg: &ScanConfig, path: &Path, tree: bool) -> ScanResult<usiz
             paths_are_same_media(&p, path, cfg)
         };
         if hit {
-            n += db.remove_path_and_symlink_aliases(&p)?;
+            n += db.remove_path_and_symlink_aliases(&p, &|alias| held.keeps_alias(alias, cfg))?;
         }
     }
     cfg.check_cancelled()?;
+    rehome_removed_inode_virtuals(&db, cfg)?;
     if n > 0 {
         advance_scan_catalog_epoch(&db)?;
     }
     transaction.commit()?;
     Ok(n)
+}
+
+/// Video virtual views (All Video, Series, Genre, Actor) list one entry per
+/// physical inode, owned by the path that attached it first. Deleting that
+/// path removes the entries, so give them to a surviving hard-link or symlink
+/// alias in the same transaction. Repeated calls are idempotent: the inode
+/// checks never add a second entry.
+fn rehome_removed_inode_virtuals(db: &LibraryDb, cfg: &ScanConfig) -> ScanResult<()> {
+    for (device, inode) in db.take_removed_inodes() {
+        cfg.check_cancelled()?;
+        let mut survivors = db.details_with_inode(device, inode)?;
+        survivors.sort_by_key(|(id, _)| *id);
+        for (id, _) in survivors {
+            let Some(browse) = db.browse_object_for_detail(id)? else {
+                continue;
+            };
+            let Some((class, title)) = db.object_class_and_name(&browse)? else {
+                continue;
+            };
+            if !class.contains("video") {
+                continue;
+            }
+            if !db.all_video_has_inode(device, inode)? {
+                db.upsert_object(
+                    &format!("{VIDEO_ALL_ID}${id:X}"),
+                    VIDEO_ALL_ID,
+                    &class,
+                    Some(id),
+                    &title,
+                    Some(&browse),
+                )?;
+            }
+            attach_video_virtuals(db, id, &class, &browse)?;
+        }
+    }
+    Ok(())
 }
 
 fn advance_scan_catalog_epoch(db: &LibraryDb) -> ScanResult<u64> {
@@ -1799,6 +1924,29 @@ pub fn caption_language_for_media(sidecar: &Path, media: &Path) -> Option<String
                 .map(|byte| char::from(byte.to_ascii_lowercase()))
                 .collect()
         })
+}
+
+/// The sidecar renderers receive as the single default subtitle
+/// (`/Captions/{id}.srt`, `pv:subtitleFileUri`, Samsung `CaptionInfo.sec`).
+///
+/// SRT is preferred because that is the format those fields name. Without
+/// SRT, SMI (natively rendered by Samsung TVs) is preferred, then any caption.
+/// Within each tier the untagged `{stem}.{ext}` precedes language variants,
+/// and ties keep the lowest stable index, so the choice is deterministic.
+pub fn default_caption<'a>(media: &Path, captions: &'a [Caption]) -> Option<&'a Caption> {
+    let rank = |caption: &Caption| {
+        let format = if caption.ext.eq_ignore_ascii_case("srt") {
+            0u8
+        } else if caption.ext.eq_ignore_ascii_case("smi") {
+            1
+        } else {
+            2
+        };
+        let tagged = caption_variant_for_media(&caption.path, media)
+            .is_none_or(|variant| !variant.is_empty());
+        (format, tagged, caption.index)
+    };
+    captions.iter().min_by_key(|caption| rank(caption))
 }
 
 fn caption_extension_for_path(path: &Path) -> &'static str {
@@ -2146,6 +2294,16 @@ pub fn parse_resolution(s: Option<&str>) -> (u32, u32) {
 }
 
 /// DLNA PN from stored stream identity. Matroska deliberately stays empty.
+///
+/// A PN is a claim a strict renderer matches against its sink table, so a
+/// stream with no conformant profile gets no PN (protocolInfo keeps OP/FLAGS,
+/// exactly like Matroska). HEVC (MP4 and TS), MPEG-2 in MP4 and H.264 in AVI
+/// therefore stay empty. HD H.264 MP4 up to 1920x1080 uses `AVC_MP4_HP_HD_AAC`,
+/// the profile ConnectionManager advertises for it (High-profile decoders
+/// also decode Main). The HD AC-3 and above-1080p H.264 MP4 names and the
+/// H.264/MPEG-2 TS names are kept: renderer workarounds (Sony BDP/Bravia,
+/// Toshiba, FreeBox) key on those PN prefixes, and TS needs packet-size
+/// detection to choose between the `_ISO` and timestamped profiles.
 pub fn dlna_pn_from_probe(
     container: &str,
     video: &str,
@@ -2160,6 +2318,7 @@ pub fn dlna_pn_from_probe(
         return None;
     }
     let hd = height >= 720 || width >= 1280;
+    let within_1080 = width <= 1920 && height <= 1080;
     match container {
         "mkv" => None,
         "mp4" => match video {
@@ -2167,6 +2326,8 @@ pub fn dlna_pn_from_probe(
                 if hd {
                     if matches!(audio, "ac3" | "eac3") {
                         "AVC_MP4_MP_HD_AC3"
+                    } else if within_1080 {
+                        "AVC_MP4_HP_HD_AAC"
                     } else {
                         "AVC_MP4_MP_HD_AAC_MULT5"
                     }
@@ -2177,32 +2338,11 @@ pub fn dlna_pn_from_probe(
                 }
                 .into(),
             ),
-            "hevc" => Some(
-                if hd {
-                    if matches!(audio, "ac3" | "eac3") {
-                        "HEVC_MP4_BL_Main10_L5_HD1080_AC3"
-                    } else {
-                        "HEVC_MP4_BL_Main10_L5_HD1080_AAC"
-                    }
-                } else {
-                    "HEVC_MP4_BL_Main10_L4_HD720_AAC"
-                }
-                .into(),
-            ),
             "mpeg4" => Some("MPEG4_P2_MP4_ASP_AAC".into()),
-            "mpeg2" => Some("MPEG_PS_PAL".into()),
             _ => None,
         },
         "avi" => match video {
             "mpeg4" | "other" => Some("MPEG4_P2_AVI_ASP_L5_SO".into()),
-            "h264" => Some(
-                if hd {
-                    "AVC_MP4_MP_HD_AAC_MULT5"
-                } else {
-                    "AVC_MP4_MP_SD_AAC_MULT5"
-                }
-                .into(),
-            ),
             _ => None,
         },
         "mpeg-ts" | "ts" => match video {
@@ -2222,7 +2362,6 @@ pub fn dlna_pn_from_probe(
                 }
                 .into(),
             ),
-            "hevc" => Some("HEVC_TS_HD_EU_ISO".into()),
             _ => None,
         },
         _ => None,
@@ -2375,7 +2514,7 @@ fn persist_probe_with_opened(
     opened: &RootedFile,
 ) -> ScanResult<bool> {
     let got = match known {
-        Some(got) => Some(got),
+        Some(got) => ProbeOutcome::Probed(Box::new(got)),
         None => probe_opened_media(cfg, path, opened)?,
     };
     persist_prepared_probe(db, cfg, path, id, got)
@@ -2385,37 +2524,77 @@ fn probe_opened_media(
     cfg: &ScanConfig,
     path: &Path,
     opened: &RootedFile,
-) -> ScanResult<Option<MediaProbe>> {
+) -> ScanResult<ProbeOutcome> {
     cfg.check_cancelled()?;
     let helper_permit = acquire_scan_helper(cfg)?;
-    let stable_path = opened.proc_path();
-    let got = if path.file_name().is_some_and(is_image_os_name) {
-        crate::probe::probe_image_with_cancellation(
-            &stable_path,
-            cfg.external_command_timeout,
-            &cfg.cancellation,
-        )
-    } else {
-        crate::probe::probe_media_with_cancellation(
-            &stable_path,
-            cfg.external_command_timeout,
-            &cfg.cancellation,
-        )
-    };
+    let got = probe_stable_path(cfg, path, &opened.proc_path());
     drop(helper_permit);
     cfg.check_cancelled()?;
     Ok(got)
 }
 
-/// Persist an already-attempted probe. `None` is a cached failure and must not
-/// reopen the same physical file on the serial SQLite publication pass.
+fn probe_stable_path(cfg: &ScanConfig, path: &Path, stable_path: &Path) -> ProbeOutcome {
+    if path.file_name().is_some_and(is_image_os_name) {
+        crate::probe::probe_image_outcome(
+            stable_path,
+            cfg.external_command_timeout,
+            &cfg.cancellation,
+        )
+    } else {
+        crate::probe::probe_media_outcome(
+            stable_path,
+            cfg.external_command_timeout,
+            &cfg.cancellation,
+        )
+    }
+}
+
+/// Consecutive probe deadline expiries tolerated before a file is cached as
+/// a failed probe (retried again only after its stat changes).
+const MAX_STREAM_PROBE_TIMEOUTS: i64 = 3;
+
+/// Persist an already-attempted probe. `Failed` is a cached failure and must
+/// not reopen the same physical file on the serial SQLite publication pass.
+/// `TimedOut` leaves the row a probe candidate for the next reconciliation or
+/// startup backfill, up to [`MAX_STREAM_PROBE_TIMEOUTS`] consecutive expiries.
+/// It keeps stored stream metadata only when that metadata was stamped at
+/// the current revision for the unchanged file; after a stat change it is
+/// cleared like a failed probe (see [`LibraryDb::defer_detail_stream_probe`]).
 fn persist_prepared_probe(
     db: &LibraryDb,
     cfg: &ScanConfig,
     path: &Path,
     id: i64,
-    got: Option<MediaProbe>,
+    got: ProbeOutcome,
 ) -> ScanResult<bool> {
+    let got = match got {
+        ProbeOutcome::Probed(got) => Some(*got),
+        ProbeOutcome::Failed => None,
+        ProbeOutcome::TimedOut => {
+            if db.defer_detail_stream_probe(id, MAX_STREAM_PROBE_TIMEOUTS)? {
+                // Record the sidecar provenance so the sidecar pass does not
+                // spend a second deadline on this file in the same pass.
+                let fingerprint = current_probe_sidecar_fingerprint(cfg, path)?;
+                db.set_detail_probe_sidecar_fingerprint(id, &fingerprint)?;
+                tracing::warn!(
+                    target: "rusty_dlna",
+                    path = %path.display(),
+                    timeout_ms = rusty_dlna_helper::duration_millis_saturating(
+                        cfg.external_command_timeout
+                    ),
+                    "media probe timed out; it will be retried"
+                );
+                return Ok(false);
+            }
+            tracing::warn!(
+                target: "rusty_dlna",
+                path = %path.display(),
+                attempts = MAX_STREAM_PROBE_TIMEOUTS,
+                "media probe kept timing out; caching it as failed until the file changes"
+            );
+            None
+        }
+    };
     if path.file_name().is_some_and(is_image_os_name) {
         db.set_detail_probe_sidecar_fingerprint(id, NO_PROBE_SIDECAR_FINGERPRINT)?;
         let Some(got) = got else {
@@ -2554,6 +2733,16 @@ fn merge_sidecar(cfg: &ScanConfig, path: &Path, probe: &mut SourceProbe) -> Scan
     Ok(NO_PROBE_SIDECAR_FINGERPRINT.to_string())
 }
 
+/// Apply a media path's `.probe.toml` overrides to a live probe exactly as
+/// the scanner does before persisting one. Sidecar reads are root-confined.
+pub fn apply_probe_sidecar_overrides(
+    cfg: &ScanConfig,
+    path: &Path,
+    probe: &mut SourceProbe,
+) -> ScanResult<()> {
+    merge_sidecar(cfg, path, probe).map(|_| ())
+}
+
 fn current_probe_sidecar_fingerprint(cfg: &ScanConfig, path: &Path) -> ScanResult<String> {
     if path.file_name().is_some_and(is_image_os_name) {
         return Ok(NO_PROBE_SIDECAR_FINGERPRINT.to_string());
@@ -2578,7 +2767,7 @@ fn refresh_probe_sidecars_for_details(
         (left.device, left.inode, &left.path).cmp(&(right.device, right.inode, &right.path))
     });
     let mut changed = false;
-    let mut last_raw_probe: Option<(PhysicalFileKey, Option<MediaProbe>)> = None;
+    let mut last_raw_probe: Option<(PhysicalFileKey, ProbeOutcome)> = None;
     for detail in details {
         cfg.check_cancelled()?;
         let current = current_probe_sidecar_fingerprint(cfg, &detail.path)?;
@@ -2801,11 +2990,14 @@ pub fn load_existing(cfg: &ScanConfig) -> Catalog {
     if !path.exists() {
         return Catalog::new();
     }
-    match open_library_db(path).and_then(|db| {
-        let n = db.detail_count()?;
-        let cat = load_catalog_with_policy(&db, cfg)?;
-        Ok((n, cat))
-    }) {
+    // Startup already verified (and, if needed, recovered) this database.
+    match LibraryDb::open_runtime(path)
+        .map_err(ScanError::from)
+        .and_then(|db| {
+            let n = db.detail_count()?;
+            let cat = load_catalog_with_policy(&db, cfg)?;
+            Ok((n, cat))
+        }) {
         Ok((n, cat)) if !cat.items.is_empty() || !cat.containers.is_empty() => {
             tracing::info!(
                 target: "rusty_dlna",
@@ -2922,12 +3114,19 @@ fn repair_video_titles_with_db(
             wanted.clone()
         } else {
             let live = rebase_media_path_for_config(&stored_path, cfg);
-            let nfo_title = if path_is_allowed_file(&live, cfg) {
-                nfo_for_file_with_policy_result(&live, &cfg.media_dirs, cfg.wide_links)?.title
+            let nfo = if path_is_allowed_file(&live, cfg) {
+                Some(nfo_lookup(cfg, &live)?)
             } else {
                 None
             };
-            let wanted = nfo_title.unwrap_or(filename_title);
+            let wanted = match nfo {
+                // Keep the stored title while a selected sidecar is malformed.
+                Some(NfoLookup {
+                    invalid: Some(_), ..
+                }) => current.clone(),
+                Some(NfoLookup { meta, .. }) => meta.title.unwrap_or(filename_title),
+                None => filename_title,
+            };
             desired_by_physical.insert(key, wanted.clone());
             wanted
         };
@@ -2976,12 +3175,13 @@ fn scan_inner(cfg: &ScanConfig, rebuild: bool) -> ScanResult<Catalog> {
 
 fn scan_with_db(cfg: &ScanConfig, rebuild: bool, db: &LibraryDb) -> ScanResult<Catalog> {
     cfg.check_cancelled()?;
+    let held = hold_unavailable_media_roots(cfg, db, None)?;
     let transaction = db.transaction()?;
     if rebuild {
         db.clear_objects()?;
     }
     db.seed_virtual_containers()?;
-    {
+    let mut held = {
         let mut walker = DbWalker {
             db,
             cfg,
@@ -2993,15 +3193,21 @@ fn scan_with_db(cfg: &ScanConfig, rebuild: bool, db: &LibraryDb) -> ScanResult<C
             preparation_batches: 0,
             peak_pending: 0,
             physical_artwork_inventories: HashMap::new(),
+            held,
         };
         for root in &cfg.media_dirs {
             cfg.check_cancelled()?;
+            if walker.held.contains(root, cfg) {
+                continue;
+            }
             let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
             let title = cfg
                 .root_title_for_path(&root)
                 .unwrap_or("media")
                 .to_string();
             walker.walk(&root, BROWSEDIR_ID, &title)?;
+            #[cfg(test)]
+            after_root_walk(&root);
         }
         walker.index_pending()?;
         tracing::info!(
@@ -3011,13 +3217,19 @@ fn scan_with_db(cfg: &ScanConfig, rebuild: bool, db: &LibraryDb) -> ScanResult<C
             batch_limit = walker.pending_limit,
             "ordered scan publication complete"
         );
-    }
-    db.prune_missing_files()?;
+        walker.held
+    };
+    // Walking earlier roots can take minutes; a root that went away since
+    // the first check must be held before anything is pruned.
+    hold_newly_unavailable_media_roots(cfg, db, None, &mut held)?;
+    db.prune_missing_files(&|path| held.contains(path, cfg))?;
     cfg.check_cancelled()?;
-    db.prune_excluded_paths(cfg)?;
+    db.prune_excluded_paths(cfg, &|path| held.contains(path, cfg))?;
     cfg.check_cancelled()?;
-    playlist::sync_playlists(db, cfg)?;
+    playlist::sync_playlists(db, cfg, &mut held)?;
+    record_media_root_devices(cfg, db, &held)?;
     cfg.check_cancelled()?;
+    rehome_removed_inode_virtuals(db, cfg)?;
     db.prune_empty_folders()?;
     let expired_bookmarks =
         db.prune_expired_bookmarks(cfg.bookmark_retention_days, unix_now_seconds())?;
@@ -3051,7 +3263,7 @@ fn fill_missing_av_meta_with_db(
     cfg.check_cancelled()?;
     let transaction = db.transaction()?;
     let mut filled = 0usize;
-    let mut last_raw_probe: Option<(PhysicalFileKey, Option<MediaProbe>)> = None;
+    let mut last_raw_probe: Option<(PhysicalFileKey, ProbeOutcome)> = None;
     for nullable_identity in [true, false] {
         let mut after = (i64::MIN, i64::MIN, i64::MIN);
         loop {
@@ -3074,19 +3286,21 @@ fn fill_missing_av_meta_with_db(
                     continue;
                 }
                 let live = rebase_media_path_for_config(&decoded, cfg);
+                // Filling is best effort. A file that is unreadable right now
+                // (permissions, a stale handle, a failing mount) is kept by
+                // `path_is_unwanted` and retried on a later pass; it must not
+                // fail startup maintenance.
                 let opened = match open_allowed_file(&live, cfg) {
                     Ok(opened) => opened,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::NotFound
-                                | std::io::ErrorKind::PermissionDenied
-                                | std::io::ErrorKind::InvalidInput
-                        ) =>
-                    {
+                    Err(error) => {
+                        tracing::debug!(
+                            target: "rusty_dlna",
+                            path = %live.display(),
+                            %error,
+                            "stream metadata fill skipped an unreadable file"
+                        );
                         continue;
                     }
-                    Err(error) => return Err(scan_io(&live, error)),
                 };
                 let metadata = opened
                     .file
@@ -3107,7 +3321,7 @@ fn fill_missing_av_meta_with_db(
                     got
                 };
                 cfg.check_cancelled()?;
-                let unsupported = if got.is_none() {
+                let unsupported = if matches!(got, ProbeOutcome::Failed) {
                     let _probe_permit = acquire_scan_helper(cfg)?;
                     probe::media_input_is_explicitly_unsupported(
                         &opened.proc_path(),
@@ -3119,7 +3333,9 @@ fn fill_missing_av_meta_with_db(
                 };
                 if unsupported {
                     cfg.check_cancelled()?;
-                    db.remove_path_and_symlink_aliases(&row.path)?;
+                    // Only this row: dangling aliases are left to the prune
+                    // passes, which know which roots are unavailable.
+                    db.remove_path_and_symlink_aliases(&row.path, &|_| true)?;
                     filled += 1;
                     continue;
                 }
@@ -3135,6 +3351,7 @@ fn fill_missing_av_meta_with_db(
     if filled > 0 {
         tracing::info!(filled, "stream metadata fill done");
     }
+    rehome_removed_inode_virtuals(db, cfg)?;
     let derived = db.backfill_derived_stream_fields()?;
     if derived > 0 {
         tracing::info!(
@@ -3277,6 +3494,16 @@ fn monitor_dirty_with_db(
         None
     };
     cfg.check_cancelled()?;
+    // Rows under a held subtree (an unavailable root, or a subdirectory the
+    // walk cannot read) are unknown rather than deleted. Targeted events
+    // below a held root are dropped; the root is reconciled once it returns.
+    let mut held = hold_unavailable_media_roots(cfg, db, (!restat_all).then_some(dirty))?;
+    let available_dirty: Vec<PathBuf> = dirty
+        .iter()
+        .filter(|path| !held.contains(path, cfg))
+        .cloned()
+        .collect();
+    let dirty = available_dirty.as_slice();
     let mut targeted_dirty = dirty.to_vec();
     let mut probe_sidecar_owners = HashMap::new();
     if !restat_all {
@@ -3291,10 +3518,13 @@ fn monitor_dirty_with_db(
         targeted_dirty.dedup();
     }
     let listed = if restat_all {
-        list_media_files(cfg)?
+        list_media_files(cfg, &mut held)?
     } else {
-        list_dirty_media_files(cfg, &targeted_dirty)?
+        list_dirty_media_files(cfg, &targeted_dirty, &mut held)?
     };
+    // A root that went away while earlier roots were listed reads as empty;
+    // hold it before any of its rows are judged.
+    hold_newly_unavailable_media_roots(cfg, db, (!restat_all).then_some(dirty), &mut held)?;
     let dirty_db_paths: Vec<String> = targeted_dirty
         .iter()
         .flat_map(|path| equivalent_media_paths(path, cfg))
@@ -3341,8 +3571,17 @@ fn monitor_dirty_with_db(
         if !restat_all && !dirty_rels.contains(&key) {
             continue;
         }
-        if (path_is_unwanted(&decoded, cfg) || !listed_by_rel.contains_key(&key))
-            && db.remove_path_and_symlink_aliases(&row.path)? > 0
+        // Unlisted rows below a held subtree are unknown, not gone; only
+        // configuration-driven exclusion still removes them.
+        let unwanted = if held.contains(&decoded, cfg) {
+            path_is_excluded_by_config(&decoded, cfg)
+        } else {
+            path_is_unwanted(&decoded, cfg) || !listed_by_rel.contains_key(&key)
+        };
+        if unwanted
+            && db
+                .remove_path_and_symlink_aliases(&row.path, &|alias| held.keeps_alias(alias, cfg))?
+                > 0
         {
             log_library_file(&decoded, "removed", "library file removed");
             removed += 1;
@@ -3397,6 +3636,11 @@ fn monitor_dirty_with_db(
             removed += 1;
         }
     }
+    let deferred_probes = if restat_all {
+        db.details_with_deferred_stream_probe()?
+    } else {
+        HashSet::new()
+    };
     let mut indexing_artwork = ArtworkSelectionCache::default();
     let mut indexing_captions = CaptionInventoryCache::default();
     for (path_s, st) in &listed {
@@ -3445,7 +3689,9 @@ fn monitor_dirty_with_db(
                             || live_ino != row.inode;
                         if grew {
                             if grew && !file_is_viable_opened(&opened.file, cfg)? {
-                                db.remove_path_and_symlink_aliases(&row.path)?;
+                                db.remove_path_and_symlink_aliases(&row.path, &|alias| {
+                                    held.keeps_alias(alias, cfg)
+                                })?;
                                 log_library_file(&st.path, "removed", "library file removed");
                                 removed += 1;
                                 continue;
@@ -3499,6 +3745,14 @@ fn monitor_dirty_with_db(
                             if probed || grew {
                                 changed += 1;
                             }
+                        } else if deferred_probes.contains(&row.id)
+                            && apply_or_reuse_probe(
+                                db, cfg, &st.path, row.id, live_dev, live_ino, &opened,
+                            )?
+                        {
+                            // A probe that hit its deadline retries on the
+                            // next reconciliation, boundedly.
+                            changed += 1;
                         }
                     }
                 }
@@ -3560,7 +3814,14 @@ fn monitor_dirty_with_db(
             "library probe-sidecar reconciliation complete"
         );
         let nfo_started = std::time::Instant::now();
-        let nfo_changed = refresh_nfo_periodic(db, cfg, &db.all_detail_stats()?)?;
+        // A held subtree hides its NFO too; do not reset its items' metadata
+        // to filename defaults while it cannot be read.
+        let nfo_rows: Vec<DetailStat> = db
+            .all_detail_stats()?
+            .into_iter()
+            .filter(|row| !held.contains(&path_from_db(&row.path), cfg))
+            .collect();
+        let nfo_changed = refresh_nfo_periodic(db, cfg, &nfo_rows)?;
         sidecar_changed |= nfo_changed;
         tracing::info!(
             target: "rusty_dlna",
@@ -3649,6 +3910,12 @@ fn monitor_dirty_with_db(
                 .entry(dir.to_path_buf())
                 .and_modify(|current| *current |= recursive)
                 .or_insert(recursive);
+        } else if is_video(&name.to_string_lossy())
+            && std::fs::symlink_metadata(dir.join(nfo::FOLDER_MOVIE_NFO)).is_ok()
+        {
+            // A video arriving or leaving changes whether the folder's
+            // `movie.nfo` describes its one remaining movie.
+            nfo_dirs.entry(dir.to_path_buf()).or_insert(false);
         }
     }
     dirty_probe_details.sort_by(|left, right| (left.id, &left.path).cmp(&(right.id, &right.path)));
@@ -3660,16 +3927,19 @@ fn monitor_dirty_with_db(
     }
     changed += usize::from(sidecar_changed);
     let playlists_changed = if restat_all {
-        playlist::sync_playlists(db, cfg)?
+        playlist::sync_playlists(db, cfg, &mut held)?
     } else if added > 0 || removed > 0 || dirty.iter().any(|path| playlist::is_playlist(path)) {
         // Previously unresolved entries may become playable when media arrives.
         // Known playlist paths avoid a second whole-library directory walk.
-        playlist::sync_targeted_playlists(db, cfg, dirty)?
+        playlist::sync_targeted_playlists(db, cfg, dirty, &held)?
     } else {
         false
     };
     if playlists_changed {
         changed += 1;
+    }
+    if restat_all {
+        record_media_root_devices(cfg, db, &held)?;
     }
     if restat_all {
         tracing::info!(
@@ -3691,6 +3961,7 @@ fn monitor_dirty_with_db(
             changed += expired_bookmarks;
         }
     }
+    rehome_removed_inode_virtuals(db, cfg)?;
     removed += db.prune_empty_folders()?;
     let stale_art = db.prune_unreferenced_album_art()?;
     let delta = ScanDelta {
@@ -3882,25 +4153,327 @@ fn attach_listed_if_missing(
     Ok(true)
 }
 
-fn list_media_files(cfg: &ScanConfig) -> ScanResult<HashMap<String, ListedFile>> {
+/// SETTINGS prefix for the device (`st_dev`) each configured root was on when
+/// the last successful whole-library pass listed it. Additive: older catalogs
+/// simply have no record yet.
+const MEDIA_ROOT_DEVICE_SETTING_PREFIX: &str = "media_root_device:";
+
+/// Decide which configured roots cannot be trusted during this pass. A held
+/// root is skipped by every walker, and its catalog rows, IDs, bookmarks,
+/// NFO metadata, and playlists are kept; every other root is reconciled
+/// normally, so one offline root never blocks the rest of the library or
+/// startup.
+///
+/// A root is held when it is missing, is not a directory, or cannot be
+/// listed. For whole-library passes, a root that lists no entries while the
+/// catalog still holds items under it is also held when its device differs
+/// from the one recorded by the last successful pass (or none is recorded
+/// yet). That is what an unmounted NFS/SMB/USB mount point, or a bind mount
+/// that captured the empty directory underneath one, looks like. A root that
+/// was emptied on its recorded device converges normally. Targeted passes
+/// (`dirty`) only check the roots owning those paths and never apply the
+/// empty-root rule.
+fn hold_unavailable_media_roots(
+    cfg: &ScanConfig,
+    db: &LibraryDb,
+    dirty: Option<&[PathBuf]>,
+) -> ScanResult<HeldSubtrees> {
+    let mut held = HeldSubtrees::default();
+    hold_newly_unavailable_media_roots(cfg, db, dirty, &mut held)?;
+    Ok(held)
+}
+
+/// Apply [`hold_unavailable_media_roots`] again to roots `held` does not
+/// already hold. A pass calls this after its walk and before it judges any
+/// row, so a root that disappears while earlier roots are being walked is
+/// held rather than pruned.
+fn hold_newly_unavailable_media_roots(
+    cfg: &ScanConfig,
+    db: &LibraryDb,
+    dirty: Option<&[PathBuf]>,
+    held: &mut HeldSubtrees,
+) -> ScanResult<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut catalog_roots: Option<HashMap<String, usize>> = None;
+    for root in &cfg.media_dirs {
+        cfg.check_cancelled()?;
+        if held.contains(root, cfg) {
+            continue;
+        }
+        let Some((identity, _)) = root_relative_path(root, cfg) else {
+            continue;
+        };
+        if let Some(dirty) = dirty {
+            if !dirty.iter().any(|path| {
+                root_relative_path(path, cfg).is_some_and(|(owner, _)| owner == identity)
+            }) {
+                continue;
+            }
+        }
+        let reason = match std::fs::metadata(root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing".to_string(),
+            Err(error) => format!("not accessible ({error})"),
+            Ok(metadata) if !metadata.is_dir() => "not a directory".to_string(),
+            Ok(metadata) => match std::fs::read_dir(root).map(|mut entries| entries.next()) {
+                Err(error) | Ok(Some(Err(error))) => format!("not readable ({error})"),
+                Ok(Some(Ok(_))) => continue,
+                Ok(None) if dirty.is_some() => continue,
+                Ok(None) => {
+                    let recorded = db
+                        .setting(&format!("{MEDIA_ROOT_DEVICE_SETTING_PREFIX}{identity}"))?
+                        .and_then(|value| value.parse::<u64>().ok());
+                    if recorded == Some(metadata.dev()) {
+                        continue;
+                    }
+                    if catalog_roots.is_none() {
+                        let mut counts = HashMap::new();
+                        for row in db.all_detail_stats()? {
+                            if let Some((owner, _)) =
+                                root_relative_path(&path_from_db(&row.path), cfg)
+                            {
+                                *counts.entry(owner).or_insert(0usize) += 1;
+                            }
+                        }
+                        catalog_roots = Some(counts);
+                    }
+                    let items = catalog_roots
+                        .as_ref()
+                        .and_then(|counts| counts.get(&identity).copied())
+                        .unwrap_or(0);
+                    if items == 0 {
+                        continue;
+                    }
+                    match recorded {
+                        Some(_) => format!(
+                            "empty and on a different device than at the last successful scan \
+                             ({items} catalog items)"
+                        ),
+                        None => format!("empty with no recorded device ({items} catalog items)"),
+                    }
+                }
+            },
+        };
+        tracing::warn!(
+            target: "rusty_dlna",
+            root = %root.display(),
+            %reason,
+            "media root unavailable; keeping its catalog items, IDs, and bookmarks until it returns"
+        );
+        held.hold(root, cfg);
+    }
+    Ok(())
+}
+
+/// Record the device of every root a successful whole-library pass listed, so
+/// a later empty listing on a different device reads as unmounted.
+fn record_media_root_devices(
+    cfg: &ScanConfig,
+    db: &LibraryDb,
+    held: &HeldSubtrees,
+) -> ScanResult<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    for root in &cfg.media_dirs {
+        cfg.check_cancelled()?;
+        if held.contains(root, cfg) {
+            continue;
+        }
+        let Some((identity, _)) = root_relative_path(root, cfg) else {
+            continue;
+        };
+        let Ok(metadata) = std::fs::metadata(root) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            db.set_setting(
+                &format!("{MEDIA_ROOT_DEVICE_SETTING_PREFIX}{identity}"),
+                &metadata.dev().to_string(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Root-relative subtrees whose contents cannot be trusted during this pass:
+/// unavailable configured roots and subdirectories whose listing was refused
+/// with `PermissionDenied`. Catalog rows beneath them are unknown, not
+/// missing: they keep their IDs, bookmarks, NFO metadata, and playlists until
+/// the subtree can be read again. Only configuration-driven exclusion still
+/// removes them.
+#[derive(Debug, Default)]
+struct HeldSubtrees(HashSet<(String, PathBuf)>);
+
+impl HeldSubtrees {
+    fn hold(&mut self, dir: &Path, cfg: &ScanConfig) {
+        if let Some(entry) = root_relative_path(dir, cfg) {
+            self.0.insert(entry);
+        }
+    }
+
+    fn hold_unreadable(&mut self, dir: &Path, cfg: &ScanConfig, error: &std::io::Error) {
+        warn_unreadable_directory(dir, error);
+        self.hold(dir, cfg);
+    }
+
+    /// Whether a removal cascade must keep `alias`, another path of the same
+    /// physical file that reads as gone. Besides held subtrees, an alias is
+    /// kept while its configured root lists nothing: a targeted pass checks
+    /// only the roots owning its events, and every file of an unmounted root
+    /// reads as gone. The alias's own row is still judged by the next
+    /// whole-library pass, which applies the full unavailable-root rules.
+    fn keeps_alias(&self, alias: &Path, cfg: &ScanConfig) -> bool {
+        self.contains(alias, cfg)
+            || cfg.selected_root(alias).is_some_and(|root| {
+                !std::fs::read_dir(root.configured_path)
+                    .is_ok_and(|mut entries| matches!(entries.next(), Some(Ok(_))))
+            })
+    }
+
+    /// Classify a listing's failure to open one file. Affirmative absence and
+    /// root-policy refusals leave the file unlisted, so its row is removed.
+    /// Any other OS error (`EACCES`, `ESTALE`, `EIO`, ...) holds the file, so
+    /// its row, IDs, and bookmarks are kept until it can be opened again.
+    fn hold_unopenable_file(&mut self, path: &Path, cfg: &ScanConfig, error: &std::io::Error) {
+        if open_refusal_means_unwanted(error) {
+            return;
+        }
+        tracing::debug!(
+            target: "rusty_dlna",
+            path = %path.display(),
+            %error,
+            "media file cannot be opened right now; keeping its catalog item"
+        );
+        self.hold(path, cfg);
+    }
+
+    /// True when `path` or one of its ancestors below its root is held. Cost
+    /// is proportional to the path depth, not to the number of held subtrees.
+    fn contains(&self, path: &Path, cfg: &ScanConfig) -> bool {
+        if self.0.is_empty() {
+            return false;
+        }
+        let Some(mut probe) = root_relative_path(path, cfg) else {
+            return false;
+        };
+        loop {
+            if self.0.contains(&probe) {
+                return true;
+            }
+            if !probe.1.pop() {
+                return false;
+            }
+        }
+    }
+}
+
+/// Configured-root identity plus root-relative path, so a row stored under a
+/// historical root alias still matches a directory listed under the current
+/// root. Identity is the stable root key when roots are configured by key,
+/// otherwise the configured path (two plain roots may share a basename).
+fn root_relative_path(path: &Path, cfg: &ScanConfig) -> Option<(String, PathBuf)> {
+    let root = cfg.selected_root(path)?;
+    let relative = path.strip_prefix(root.relative_to).ok()?.to_path_buf();
+    let identity = if cfg.media_roots.is_empty() {
+        format!("path:{}", path_to_db(root.configured_path))
+    } else {
+        format!("key:{}", root.key)
+    };
+    Some((identity, relative))
+}
+
+/// One warning per unreadable directory per process (bounded), so periodic
+/// reconciliation does not repeat it every pass.
+fn warn_unreadable_directory(dir: &Path, error: &std::io::Error) {
+    const MAX_REMEMBERED: usize = 1024;
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+        std::sync::LazyLock::new(Default::default);
+    let first = {
+        let mut warned = WARNED.lock().unwrap_or_else(|error| error.into_inner());
+        warned.len() < MAX_REMEMBERED && warned.insert(dir.to_path_buf())
+    };
+    if first {
+        tracing::warn!(
+            target: "rusty_dlna",
+            path = %dir.display(),
+            %error,
+            "unreadable media directory skipped; its catalog items are kept until it can be read"
+        );
+    } else {
+        tracing::debug!(
+            target: "rusty_dlna",
+            path = %dir.display(),
+            %error,
+            "unreadable media directory skipped"
+        );
+    }
+}
+
+/// Only `PermissionDenied` below a configured root is a skippable subtree.
+/// Other errors (EIO, ENOTCONN, ESTALE) usually mean a dropped mount and fail
+/// the pass so the published catalog is retained.
+fn unreadable_subdirectory(error: &std::io::Error, is_root: bool) -> bool {
+    !is_root && error.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+fn list_media_files(
+    cfg: &ScanConfig,
+    held: &mut HeldSubtrees,
+) -> ScanResult<HashMap<String, ListedFile>> {
     cfg.check_cancelled()?;
     let mut out = HashMap::new();
     let mut walk_stack: HashMap<(u64, u64), ()> = HashMap::new();
     for root in &cfg.media_dirs {
         cfg.check_cancelled()?;
+        if held.contains(root, cfg) {
+            continue;
+        }
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
         let title = cfg
             .root_title_for_path(&root)
             .unwrap_or("media")
             .to_string();
-        list_into(&mut out, cfg, &mut walk_stack, &root, &title)?;
+        let mut walk = ListWalk {
+            out: &mut out,
+            walk_stack: &mut walk_stack,
+            held,
+        };
+        list_into(&mut walk, cfg, &root, &title, true)?;
+        #[cfg(test)]
+        after_root_walk(&root);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+type RootWalkHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Called after each whole-library walk finishes one root, so tests can
+    /// change the filesystem between roots of one pass.
+    static AFTER_ROOT_WALK: std::cell::RefCell<Option<RootWalkHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_root_walk(root: &Path) {
+    AFTER_ROOT_WALK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(root);
+        }
+    });
+}
+
+#[cfg(test)]
+fn set_after_root_walk(hook: Option<RootWalkHook>) {
+    AFTER_ROOT_WALK.with(|slot| *slot.borrow_mut() = hook);
 }
 
 fn list_dirty_media_files(
     cfg: &ScanConfig,
     dirty: &[PathBuf],
+    held: &mut HeldSubtrees,
 ) -> ScanResult<HashMap<String, ListedFile>> {
     let mut listed = HashMap::new();
     for path in dirty {
@@ -3922,8 +4495,11 @@ fn list_dirty_media_files(
             || !cfg
                 .root_types_for_path(path)
                 .is_some_and(|types| types.allows(&name))
-            || !path_is_allowed_file(path, cfg)
         {
+            continue;
+        }
+        if let Err(error) = open_allowed_file(path, cfg) {
+            held.hold_unopenable_file(path, cfg, &error);
             continue;
         }
         if let Some(progress) = &cfg.progress {
@@ -3934,32 +4510,71 @@ fn list_dirty_media_files(
     Ok(listed)
 }
 
+struct ListWalk<'a> {
+    out: &'a mut HashMap<String, ListedFile>,
+    walk_stack: &'a mut HashMap<(u64, u64), ()>,
+    held: &'a mut HeldSubtrees,
+}
+
 fn list_into(
-    out: &mut HashMap<String, ListedFile>,
+    walk: &mut ListWalk<'_>,
     cfg: &ScanConfig,
-    walk_stack: &mut HashMap<(u64, u64), ()>,
     dir: &Path,
     title: &str,
+    is_root: bool,
 ) -> ScanResult<()> {
     cfg.check_cancelled()?;
-    let Ok(metadata) = std::fs::metadata(dir) else {
-        return Ok(());
+    let metadata = match std::fs::metadata(dir) {
+        Ok(metadata) => metadata,
+        // A root that vanished after `hold_unavailable_media_roots` checked
+        // it is unavailable, not empty.
+        Err(_) if is_root => {
+            walk.held.hold(dir, cfg);
+            return Ok(());
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) if unreadable_subdirectory(&error, is_root) => {
+            walk.held.hold_unreadable(dir, cfg, &error);
+            return Ok(());
+        }
+        Err(error) => return Err(scan_io(dir, error)),
     };
     if !metadata.is_dir() {
         return Ok(());
     }
     let dir_key = inode_key(&metadata);
-    if walk_stack.contains_key(&dir_key) {
+    if walk.walk_stack.contains_key(&dir_key) {
         return Ok(());
     }
     if !path_is_allowed_dir(dir, cfg) || path_excluded(dir, title, cfg) {
         return Ok(());
     }
-    walk_stack.insert(dir_key, ());
-    let rd = std::fs::read_dir(dir).map_err(|error| scan_io(dir, error))?;
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(error) if unreadable_subdirectory(&error, is_root) => {
+            walk.held.hold_unreadable(dir, cfg, &error);
+            return Ok(());
+        }
+        Err(error) => return Err(scan_io(dir, error)),
+    };
+    walk.walk_stack.insert(dir_key, ());
     for ent in rd {
         cfg.check_cancelled()?;
-        let ent = ent.map_err(|error| scan_io(dir, error))?;
+        let ent = match ent {
+            Ok(ent) => ent,
+            Err(error) if unreadable_subdirectory(&error, is_root) => {
+                walk.held.hold_unreadable(dir, cfg, &error);
+                break;
+            }
+            Err(error) => return Err(scan_io(dir, error)),
+        };
         let path = ent.path();
         let raw_name = ent.file_name();
         let name = raw_name.to_string_lossy().into_owned();
@@ -3974,7 +4589,7 @@ fn list_into(
             if is_skipped_dir_os_name(&raw_name) || path_excluded(&path, &name, cfg) {
                 continue;
             }
-            list_into(out, cfg, walk_stack, &path, &name)?;
+            list_into(walk, cfg, &path, &name, false)?;
             continue;
         }
         if is_unfinished_name(&name)
@@ -3988,9 +4603,14 @@ fn list_into(
                 .root_types_for_path(&path)
                 .is_some_and(|types| types.allows(&name))
             || (!file_type.is_file() && !file_type.is_symlink())
-            || (file_type.is_symlink() && !path_is_allowed_file(&path, cfg))
         {
             continue;
+        }
+        if file_type.is_symlink() {
+            if let Err(error) = open_allowed_file(&path, cfg) {
+                walk.held.hold_unopenable_file(&path, cfg, &error);
+                continue;
+            }
         }
         // Existence only. Stat the whole tree on every reconcile was
         // tens of thousands of HDD/NAS syscalls and stalled Browse.
@@ -3998,16 +4618,16 @@ fn list_into(
         if let Some(progress) = &cfg.progress {
             progress.record(&path);
         }
-        out.insert(path_s, ListedFile { path });
-        if out.len().is_multiple_of(5_000) {
+        walk.out.insert(path_s, ListedFile { path });
+        if walk.out.len().is_multiple_of(5_000) {
             tracing::info!(
                 target: "rusty_dlna",
-                files = out.len(),
+                files = walk.out.len(),
                 "library walk progress"
             );
         }
     }
-    walk_stack.remove(&dir_key);
+    walk.walk_stack.remove(&dir_key);
     Ok(())
 }
 
@@ -4169,7 +4789,7 @@ fn index_one_file_with_artwork(
         None
     };
     let format_probe = prepared
-        .and_then(|prepared| prepared.probe.as_ref())
+        .and_then(|prepared| prepared.probe.probe())
         .or(eager_probe.as_ref());
     let needs_input_check = prepared.is_some_and(|prepared| prepared.probe_attempted)
         || inode_source.as_ref().is_none_or(|source| {
@@ -4177,7 +4797,11 @@ fn index_one_file_with_artwork(
                 || source.size != current_physical.size
                 || source.timestamp < current_physical.timestamp
         });
-    let unsupported = if format_probe.is_none() && needs_input_check {
+    // A deadline expiry says nothing about the format; do not spend a second
+    // helper deadline on the same slow file.
+    let probe_timed_out =
+        prepared.is_some_and(|prepared| matches!(prepared.probe, ProbeOutcome::TimedOut));
+    let unsupported = if format_probe.is_none() && needs_input_check && !probe_timed_out {
         let _probe_permit = acquire_scan_helper(cfg)?;
         probe::media_input_is_explicitly_unsupported(
             &stable_path,
@@ -4189,7 +4813,9 @@ fn index_one_file_with_artwork(
     };
     if unsupported {
         cfg.check_cancelled()?;
-        db.remove_path_and_symlink_aliases(&path_to_db(path))?;
+        // Only this row: dangling aliases are left to the prune passes, which
+        // know which roots are unavailable.
+        db.remove_path_and_symlink_aliases(&path_to_db(path), &|_| true)?;
         return Ok(false);
     }
     cfg.check_cancelled()?;
@@ -4213,7 +4839,11 @@ fn index_one_file_with_artwork(
         .file_stem()
         .map(display_os_name)
         .unwrap_or_else(|| name.clone());
-    let nfo = nfo_for_file_with_policy_result(path, &cfg.media_dirs, cfg.wide_links)?;
+    let NfoLookup {
+        meta: nfo,
+        invalid: invalid_nfo,
+    } = nfo_lookup(cfg, path)?;
+    let nfo_is_valid = invalid_nfo.is_none();
     let display_title = nfo.title.as_deref().unwrap_or(&title);
 
     if let Some(existing) = db.find_detail_by_path(&path_s)? {
@@ -4267,7 +4897,7 @@ fn index_one_file_with_artwork(
         if stat_changed {
             apply_nfo_to_detail(db, id, &nfo)?;
             db.set_detail_nfo_fingerprint(id, &nfo.fingerprint())?;
-        } else {
+        } else if nfo_is_valid {
             refresh_nfo_periodic(db, cfg, &db.inode_alias_stats(id)?)?;
             apply_nfo_to_detail(db, id, &nfo)?;
         }
@@ -4335,7 +4965,7 @@ fn index_one_file_with_artwork(
                 db.update_detail_title(id, &title)?;
             }
             db.set_detail_collection_source(id, &opened, cfg)?;
-            if !nfo.is_empty() {
+            if nfo_is_valid && !nfo.is_empty() {
                 let aliases = db.inode_alias_stats(id)?;
                 let empty_fingerprint = NfoMeta::default().fingerprint();
                 let base_is_unmodified = aliases
@@ -4515,9 +5145,10 @@ pub fn rebuild_objects(cfg: &ScanConfig) -> ScanResult<Catalog> {
 }
 
 fn rebuild_objects_with_db(cfg: &ScanConfig, db: &LibraryDb) -> ScanResult<Catalog> {
+    let mut held = hold_unavailable_media_roots(cfg, db, None)?;
     let transaction = db.transaction()?;
-    db.prune_missing_files()?;
-    db.prune_excluded_paths(cfg)?;
+    db.prune_missing_files(&|path| held.contains(path, cfg))?;
+    db.prune_excluded_paths(cfg, &|path| held.contains(path, cfg))?;
     let rows = db.all_detail_stats()?;
     let saved = db.snapshot_objects()?;
     let live_details: HashSet<i64> = rows.iter().map(|row| row.id).collect();
@@ -4560,7 +5191,8 @@ fn rebuild_objects_with_db(cfg: &ScanConfig, db: &LibraryDb) -> ScanResult<Catal
             }
         }
     }
-    playlist::sync_playlists(db, cfg)?;
+    playlist::sync_playlists(db, cfg, &mut held)?;
+    rehome_removed_inode_virtuals(db, cfg)?;
     db.prune_empty_folders()?;
     cfg.check_cancelled()?;
     transaction.commit()?;
@@ -4667,7 +5299,7 @@ struct PreparedPhysicalFile {
     physical: PhysicalFileKey,
     probe_sidecar_fingerprint: String,
     probe_attempted: bool,
-    probe: Option<MediaProbe>,
+    probe: ProbeOutcome,
     mime_hint: Option<String>,
     album_art: PreparedAlbumArt,
 }
@@ -4693,7 +5325,7 @@ struct PhysicalPreparationGroup {
 struct PreparedRawPhysicalFile {
     physical: PhysicalFileKey,
     physical_changed: bool,
-    probe: Option<MediaProbe>,
+    probe: ProbeOutcome,
     album_art: PreparedAlbumArt,
 }
 
@@ -4884,24 +5516,12 @@ fn prepare_pending_files_with_inventories(
             } else {
                 None
             };
-            let probe = probe_attempted
-                .then(|| {
-                    let stable_path = opened.proc_path();
-                    if file.path.file_name().is_some_and(is_image_os_name) {
-                        crate::probe::probe_image_with_cancellation(
-                            &stable_path,
-                            cfg.external_command_timeout,
-                            &cfg.cancellation,
-                        )
-                    } else {
-                        crate::probe::probe_media_with_cancellation(
-                            &stable_path,
-                            cfg.external_command_timeout,
-                            &cfg.cancellation,
-                        )
-                    }
-                })
-                .flatten();
+            // An unattempted probe is never persisted (`probe_attempted`).
+            let probe = if probe_attempted {
+                probe_stable_path(cfg, &file.path, &opened.proc_path())
+            } else {
+                ProbeOutcome::Failed
+            };
             cfg.check_cancelled()?;
             drop(_probe_permit);
             let sidecar = file
@@ -4970,6 +5590,8 @@ struct DbWalker<'a> {
     preparation_batches: usize,
     peak_pending: usize,
     physical_artwork_inventories: HashMap<PathBuf, ArtworkInventory>,
+    /// Unavailable roots plus subdirectories this walk could not read.
+    held: HeldSubtrees,
 }
 
 impl DbWalker<'_> {
@@ -5031,7 +5653,16 @@ impl DbWalker<'_> {
 
     fn walk(&mut self, dir: &Path, parent_id: &str, title: &str) -> ScanResult<()> {
         self.cfg.check_cancelled()?;
-        if !path_is_allowed_dir(dir, self.cfg) || path_excluded(dir, title, self.cfg) {
+        let is_root = parent_id == BROWSEDIR_ID;
+        if !path_is_allowed_dir(dir, self.cfg) {
+            // A configured root always satisfies the root policy, so a refusal
+            // means it vanished after `hold_unavailable_media_roots` checked it.
+            if is_root {
+                self.held.hold(dir, self.cfg);
+            }
+            return Ok(());
+        }
+        if path_excluded(dir, title, self.cfg) {
             return Ok(());
         }
         let dir_key = std::fs::metadata(dir).ok().map(|m| inode_key(&m));
@@ -5042,8 +5673,20 @@ impl DbWalker<'_> {
             }
             self.walk_stack.insert(key, ());
         }
-        let rd = std::fs::read_dir(dir).map_err(|error| scan_io(dir, error))?;
-        let folder_id = if parent_id == BROWSEDIR_ID {
+        // An unreadable subdirectory is skipped, not failed: it is held, so
+        // its catalog rows survive the prune passes, and its playlists stay.
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(error) if unreadable_subdirectory(&error, is_root) => {
+                self.held.hold_unreadable(dir, self.cfg, &error);
+                if let Some(key) = dir_key {
+                    self.walk_stack.remove(&key);
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(scan_io(dir, error)),
+        };
+        let folder_id = if is_root {
             folder_object_id(self.db, parent_id, title)?
         } else {
             parent_id.to_string()
@@ -5052,7 +5695,14 @@ impl DbWalker<'_> {
         let mut ents = Vec::new();
         for entry in rd {
             self.cfg.check_cancelled()?;
-            ents.push(entry.map_err(|error| scan_io(dir, error))?);
+            match entry {
+                Ok(entry) => ents.push(entry),
+                Err(error) if unreadable_subdirectory(&error, is_root) => {
+                    self.held.hold_unreadable(dir, self.cfg, &error);
+                    break;
+                }
+                Err(error) => return Err(scan_io(dir, error)),
+            }
         }
         ents.sort_by_key(|e| e.file_name());
         let artwork_files = ArtworkInventory::new(
