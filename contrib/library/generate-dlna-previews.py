@@ -32,6 +32,7 @@ import json
 import math
 import os
 import re
+import secrets
 import selectors
 import signal
 import shutil
@@ -201,6 +202,42 @@ def ffmpeg_sheet_pattern(directory: Path, revision: str) -> str:
 
 def is_preview_container(name: str) -> bool:
     return name == PREVIEW_CONTAINER or name.endswith(LEGACY_DIRECTORY_SUFFIX)
+
+
+def ensure_preview_directory(directory: Path) -> None:
+    """Create or accept one real preview directory without following symlinks.
+
+    New directories take the process umask; existing directories keep their
+    mode. A symlink or non-directory at the path is refused so output cannot be
+    redirected outside the source directory.
+    """
+    try:
+        os.mkdir(directory)
+    except FileExistsError:
+        pass
+    try:
+        descriptor = os.open(
+            directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+    except OSError as error:
+        if os.path.islink(directory):
+            raise RuntimeError(
+                f"refusing symlinked preview path: {directory}"
+            ) from error
+        raise RuntimeError(f"preview path is not a directory: {directory}") from error
+    os.close(descriptor)
+
+
+def require_real_preview_directories(directory: Path) -> None:
+    """Re-check the preview container and title directory before publishing."""
+    for path in (directory.parent, directory):
+        if os.path.islink(path) or not path.is_dir():
+            raise RuntimeError(f"refusing symlinked preview path: {path}")
+
+
+def open_preview_file(path: Path, flags: int) -> int:
+    """Open a preview-owned file with the umask's default mode, never via a symlink."""
+    return os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o666)
 
 
 def fsync_directory(directory: Path) -> None:
@@ -815,13 +852,15 @@ def generate_one(
     if not force and manifest_is_current(source, stat, current, request, sampling_mode):
         return source, "current"
 
-    directory.parent.mkdir(mode=0o777, parents=False, exist_ok=True)
-    os.chmod(directory.parent, 0o777)
-    directory.mkdir(mode=0o777, parents=False, exist_ok=True)
-    os.chmod(directory, 0o777)
+    ensure_preview_directory(directory.parent)
+    ensure_preview_directory(directory)
 
     lock_path = directory / ".generate.lock"
-    with lock_path.open("a+b") as lock:
+    try:
+        lock_descriptor = open_preview_file(lock_path, os.O_RDWR | os.O_CREAT | os.O_APPEND)
+    except OSError as error:
+        raise RuntimeError(f"cannot open preview lock {lock_path}: {error}") from error
+    with os.fdopen(lock_descriptor, "a+b") as lock:
         acquire_lock_interruptibly(lock, stop_event)
         if stop_event.is_set():
             raise PreviewInterrupted
@@ -1022,9 +1061,11 @@ def generate_one(
                 if TEMP_SHEET_RE.fullmatch(child.name):
                     child.unlink(missing_ok=True)
             raise PreviewInterrupted
+        require_real_preview_directories(directory)
         final_paths = [directory / f"sheet-{revision}-{index:04}.jpg" for index in range(sheet_count)]
         for temporary, final in zip(temp_paths, final_paths, strict=True):
-            os.chmod(temporary, 0o666)
+            if os.path.islink(temporary) or not temporary.is_file():
+                raise RuntimeError(f"refusing non-regular temporary sheet: {temporary.name}")
             os.replace(temporary, final)
         fsync_directory(directory)
 
@@ -1043,18 +1084,18 @@ def generate_one(
         }
         if request.scale_divisor is not None:
             manifest["scale_divisor"] = request.scale_divisor
-        fd, temporary_name = tempfile.mkstemp(prefix=".manifest.", suffix=".tmp", dir=directory)
+        temporary_name = directory / f".manifest.{secrets.token_hex(8)}.tmp"
+        fd = open_preview_file(temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as output:
                 json.dump(manifest, output, indent=2, sort_keys=True)
                 output.write("\n")
                 output.flush()
                 os.fsync(output.fileno())
-            os.chmod(temporary_name, 0o666)
             os.replace(temporary_name, directory / MANIFEST_NAME)
             fsync_directory(directory)
         finally:
-            Path(temporary_name).unlink(missing_ok=True)
+            temporary_name.unlink(missing_ok=True)
 
         keep = {path.name for path in final_paths}
         for child in directory.iterdir():

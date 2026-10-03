@@ -101,6 +101,27 @@ allows up to five seconds for termination, then kills remaining processes and
 reaps its child before releasing the title lock. The previous published
 preview revision stays usable.
 
+The preview generator never changes permissions. New `.rusty_previews/`
+directories, sprite sheets, the lock file, and `manifest.json` get the default
+creation modes filtered by the operator's umask, and existing directories keep
+their mode. Run it with a umask (or as a user/group) that lets the rustyDLNA
+service account read the output; it needs no write access. If `.rusty_previews`
+or a title directory beneath it is a symlink, that title fails with
+`refusing symlinked preview path` (or `preview path is not a directory` for
+another non-directory) and nothing is written through the link; lock and
+manifest files are opened without following symlinks.
+
+Migration: earlier versions made every preview directory world-writable
+(`0777`) and its files `0666`. Those modes are not tightened automatically.
+After reviewing the command, remove world write from existing preview trees
+only. `find` does not follow symlinks, and only real directories and regular
+files are changed:
+
+```sh
+find /path/to/library \( -path '*/.rusty_previews' -o -path '*/.rusty_previews/*' \) \
+  \( -type d -o -type f \) -perm -o+w -exec chmod o-w {} +
+```
+
 ## Credentials
 
 TMDB and OMDb keys are read only from the environment. The programs already

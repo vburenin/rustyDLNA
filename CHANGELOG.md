@@ -39,6 +39,9 @@ publish a signed, content-addressed OCI image with SBOM and provenance.
 - Fixed a watcher race that left a file unpublished when its writer created it,
   linked another name, and removed the first name before the watcher read the
   create event.
+- The preview generator no longer makes preview folders world-writable or
+  writes through symlinks. New previews follow the process umask; see
+  `contrib/library/README.md` for tightening previews made by older versions.
 - Increased the Media Source playback reserve from ten media seconds to about
   30 seconds of real time, scaled by the playback rate, within the existing
   compressed-byte budget.

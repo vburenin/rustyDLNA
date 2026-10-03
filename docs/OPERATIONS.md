@@ -86,6 +86,14 @@ or `RUSTY_DLNA_MEDIA`; caches and IMDb dumps stay in
 `<library>/.rusty-library/`. rustyDLNA does not run them, and they must not
 embed TMDB or OMDb credentials.
 
+The preview generator creates its directories and files with the operator's
+umask, never changes the mode of an existing directory, and refuses a
+symlinked `.rusty_previews` or title directory instead of writing through it.
+Older versions created world-writable (`0777`) preview directories and `0666`
+files; those are not tightened automatically. See the
+[operator guide](../contrib/library/README.md#safe-intake-and-conversion) for a
+command that removes world write from preview trees only.
+
 Operator intake and Profile 7 archiving use atomic no-replace moves, including
 rollback and privileged retries. Occupied destinations (even dangling symlinks
 or concurrent arrivals) are preserved; cross-device and unsupported native

@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
+import os
+import shutil
+import stat
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 sys.dont_write_bytecode = True
@@ -141,6 +148,153 @@ class ImageSequencePatternTests(unittest.TestCase):
                 ".sheet-0123456789abcdef-%04d.tmp.jpg"
             )
         )
+
+
+def fake_ffmpeg_sheets(layout):
+    """Write minimal valid sheets to the image2 pattern, as FFmpeg would."""
+
+    def run(command, *args, **kwargs):
+        pattern = command[-1]
+        count = int(command[command.index("-frames:v") + 1])
+        for index in range(count):
+            with open(pattern % index, "wb") as output:
+                output.write(
+                    minimal_jpeg(
+                        layout.frame_width * layout.columns,
+                        layout.frame_height * layout.rows,
+                    )
+                )
+        return 0
+
+    return run
+
+
+def tree_snapshot(root: Path) -> list[tuple[str, int, bytes]]:
+    entries = []
+    for path in sorted(root.rglob("*")):
+        info = path.lstat()
+        content = path.read_bytes() if stat.S_ISREG(info.st_mode) else b""
+        entries.append((str(path.relative_to(root)), info.st_mode, content))
+    return entries
+
+
+class PreviewPermissionTests(unittest.TestCase):
+    """Preview output never broadens permissions or follows symlinks."""
+
+    REQUEST = preview_module.PreviewRequest((64, 64), None, None)
+
+    def setUp(self) -> None:
+        self.previous_umask = os.umask(0o027)
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.library = self.base / "library"
+        self.library.mkdir(mode=0o750)
+        os.chmod(self.library, 0o750)
+        self.source = self.library / "Title.mp4"
+        self.source.write_bytes(b"synthetic")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+        os.umask(self.previous_umask)
+
+    def generate_fake(self) -> tuple[Path, str]:
+        layout = preview_module.layout_for_frame(64, 64)
+        with (
+            mock.patch.object(preview_module, "probe_media", return_value=(1, 64, 64)),
+            mock.patch.object(
+                preview_module,
+                "run_ffmpeg_with_progress",
+                side_effect=fake_ffmpeg_sheets(layout),
+            ),
+        ):
+            return preview_module.generate_one(
+                self.source, "unused", "unused", True, self.REQUEST,
+                "none", False, "accurate", "synthetic", threading.Event(),
+            )
+
+    def assert_no_world_bits(self, root: Path) -> None:
+        for path in [root, *root.rglob("*")]:
+            mode = stat.S_IMODE(path.lstat().st_mode)
+            self.assertEqual(mode & 0o007, 0, f"{path} has mode {mode:o}")
+
+    def test_existing_directory_mode_is_kept_and_outputs_follow_umask(self) -> None:
+        container = self.library / preview_module.PREVIEW_CONTAINER
+        container.mkdir(mode=0o750)
+        os.chmod(container, 0o750)
+        _, status = self.generate_fake()
+        self.assertTrue(status.startswith("generated"), status)
+        self.assertEqual(stat.S_IMODE(container.stat().st_mode), 0o750)
+        self.assertEqual(stat.S_IMODE(self.library.stat().st_mode), 0o750)
+        self.assert_no_world_bits(container)
+        directory = preview_module.preview_directory(self.source)
+        self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o750)
+        manifest = directory / preview_module.MANIFEST_NAME
+        self.assertEqual(stat.S_IMODE(manifest.stat().st_mode), 0o640)
+
+    def test_symlinked_container_outside_tree_is_refused(self) -> None:
+        outside = self.base / "outside"
+        outside.mkdir(mode=0o750)
+        os.chmod(outside, 0o750)
+        (outside / "sentinel.txt").write_text("keep\n", encoding="utf-8")
+        before = (stat.S_IMODE(outside.stat().st_mode), tree_snapshot(outside))
+        (self.library / preview_module.PREVIEW_CONTAINER).symlink_to(outside)
+        with self.assertRaisesRegex(RuntimeError, "symlinked preview path"):
+            self.generate_fake()
+        self.assertEqual(
+            (stat.S_IMODE(outside.stat().st_mode), tree_snapshot(outside)), before
+        )
+
+    def test_symlinked_title_directory_outside_tree_is_refused(self) -> None:
+        outside = self.base / "outside"
+        outside.mkdir(mode=0o750)
+        os.chmod(outside, 0o750)
+        (outside / "sentinel.txt").write_text("keep\n", encoding="utf-8")
+        before = (stat.S_IMODE(outside.stat().st_mode), tree_snapshot(outside))
+        container = self.library / preview_module.PREVIEW_CONTAINER
+        container.mkdir()
+        (container / self.source.stem).symlink_to(outside)
+        with self.assertRaisesRegex(RuntimeError, "symlinked preview path"):
+            self.generate_fake()
+        self.assertEqual(
+            (stat.S_IMODE(outside.stat().st_mode), tree_snapshot(outside)), before
+        )
+
+    @unittest.skipUnless(
+        shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg/ffprobe unavailable"
+    )
+    def test_real_ffmpeg_run_publishes_usable_umask_restricted_previews(self) -> None:
+        self.source.unlink()
+        subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc=size=128x72:rate=10:duration=3",
+                "-c:v", "mpeg4", "-y", str(self.source),
+            ],
+            check=True,
+            timeout=60,
+        )
+        _, status = preview_module.generate_one(
+            self.source, "ffmpeg", "ffprobe", False, self.REQUEST,
+            "none", False, "accurate", "synthetic", threading.Event(),
+        )
+        self.assertTrue(status.startswith("generated"), status)
+        directory = preview_module.preview_directory(self.source)
+        manifest = json.loads(
+            (directory / preview_module.MANIFEST_NAME).read_text(encoding="utf-8")
+        )
+        self.assertTrue(
+            preview_module.manifest_is_current(
+                self.source, self.source.stat(), manifest, self.REQUEST, "accurate"
+            )
+        )
+        sheets = sorted(directory.glob("sheet-*.jpg"))
+        self.assertTrue(sheets)
+        width = manifest["frame_width"] * manifest["columns"]
+        height = manifest["frame_height"] * manifest["rows"]
+        for sheet in sheets:
+            self.assertEqual(preview_module.jpeg_dimensions(sheet), (width, height))
+        self.assertFalse(list(directory.glob(".*.tmp*")))
+        self.assert_no_world_bits(directory.parent)
 
 
 if __name__ == "__main__":
