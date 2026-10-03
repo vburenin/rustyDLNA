@@ -91,6 +91,11 @@ not install dependencies.
 - The CI quality job installs `clang libavformat-dev ffmpeg curl` through apt;
   Python, shell tools, and GNU utilities must also be available. Operator tools
   use FFmpeg and FFprobe. Additional CI jobs declare their own dependencies.
+- The scanner's libavformat bindings are generated from the installed headers
+  once and are not regenerated when system FFmpeg changes. After upgrading
+  `libavformat-dev` to a new major version, run
+  `cargo clean -p ffmpeg-sys-next`; stale bindings link against the new library
+  and crash probing tests with `SIGSEGV`.
 
 The workflows are authoritative. The quality job
 runs `scripts/check.sh` directly; it does not call `scripts/agent-verify.sh`.

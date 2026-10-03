@@ -153,8 +153,10 @@ fi
 if command -v systemd-analyze >/dev/null 2>&1; then
 	if ! SYSTEMD_VERIFY=$(systemd-analyze verify contrib/systemd/rusty-dlna.service 2>&1); then
 		# The example's native binary is intentionally not installed on CI hosts.
+		# Diagnostics about the host's own installed units are not about this file.
 		SYSTEMD_UNEXPECTED=$(printf '%s\n' "$SYSTEMD_VERIFY" | \
-			grep -Fv 'Command /usr/local/bin/rusty-dlna is not executable: No such file or directory' || true)
+			grep -Fv 'Command /usr/local/bin/rusty-dlna is not executable: No such file or directory' | \
+			grep -Ev '^(/usr/lib|/lib|/etc|/run)/systemd/' || true)
 		test -n "$SYSTEMD_VERIFY" && test -z "$SYSTEMD_UNEXPECTED" || {
 			printf '%s\n' "$SYSTEMD_VERIFY" >&2
 			exit 1
