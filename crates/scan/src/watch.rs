@@ -270,6 +270,9 @@ struct PendingCreate {
 struct PendingCreates {
     by_inode: HashMap<FileInode, PendingCreate>,
     inode_by_path: HashMap<PathBuf, FileInode>,
+    /// Created names that were already unlinked when the watcher stat'ed them.
+    /// Their writer's CLOSE_WRITE still names them but has no inode to match.
+    vanished_creates: HashSet<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -289,6 +292,44 @@ impl PendingCreates {
     fn clear(&mut self) {
         self.by_inode.clear();
         self.inode_by_path.clear();
+        self.vanished_creates.clear();
+    }
+
+    fn observe_vanished_create(&mut self, paths: &[PathBuf]) {
+        if self.vanished_creates.len().saturating_add(paths.len()) <= MAX_PENDING_CREATE_PATHS {
+            self.vanished_creates.extend(paths.iter().cloned());
+        }
+    }
+
+    /// A writer can create a file, give it another name, and unlink the first
+    /// name before the watcher reads the CREATE record. Its close then names a
+    /// path with no recorded inode. Release the pending names in that
+    /// directory; a still-open sibling is republished by its own close.
+    fn close_vanished(&mut self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        let mut released = Vec::new();
+        for path in paths {
+            if !self.vanished_creates.remove(path) {
+                continue;
+            }
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            let inodes = self
+                .by_inode
+                .iter()
+                .filter(|(_, pending)| {
+                    pending
+                        .eligible_paths
+                        .iter()
+                        .any(|candidate| candidate.parent() == Some(parent))
+                })
+                .map(|(inode, _)| *inode)
+                .collect::<Vec<_>>();
+            for inode in inodes {
+                released.extend(self.remove_inode(inode));
+            }
+        }
+        released
     }
 
     fn can_track_paths(&self, paths: &[PathBuf]) -> bool {
@@ -848,6 +889,15 @@ fn collect_events<'a>(
             } else {
                 None
             };
+        if create_history.is_none()
+            && ev.mask.contains(EventMask::CREATE)
+            && !ev.mask.contains(EventMask::ISDIR)
+            && paths
+                .iter()
+                .all(|path| std::fs::symlink_metadata(path).is_err())
+        {
+            pending_creates.observe_vanished_create(&paths);
+        }
         if matches!(create_history, Some(CreateHistoryDisposition::Overflow)) {
             batch.collapse_to_full();
             continue;
@@ -865,10 +915,11 @@ fn collect_events<'a>(
             continue;
         }
         if ev.mask.contains(EventMask::CLOSE_WRITE) {
-            if let Some(aliases) = pending_creates.close_inode(&paths) {
-                for alias in aliases {
-                    batch.add_file(alias);
-                }
+            let aliases = pending_creates
+                .close_inode(&paths)
+                .unwrap_or_else(|| pending_creates.close_vanished(&paths));
+            for alias in aliases {
+                batch.add_file(alias);
             }
         }
         if ev.mask.contains(EventMask::DELETE) {
@@ -1787,6 +1838,42 @@ mod tests {
         assert!(batch.requires_full_reconcile());
         assert!(pending.by_inode.is_empty());
         assert!(pending.inode_by_path.is_empty());
+    }
+
+    #[test]
+    fn pending_create_history_releases_aliases_when_the_created_name_vanished() {
+        // Delayed consumption: the writer created original.mkv, linked
+        // alias.mkv, and unlinked original.mkv before the CREATE was statted.
+        // Only the alias has an inode; the close still names original.mkv.
+        let inode = (7, 12);
+        let original = PathBuf::from("/v/original.mkv");
+        let alias = PathBuf::from("/v/alias.mkv");
+        let elsewhere = PathBuf::from("/w/other.mkv");
+        let mut pending = PendingCreates::default();
+        pending.observe_vanished_create(std::slice::from_ref(&original));
+        pending.observe_create(inode, 1, std::slice::from_ref(&alias));
+        pending.remember_eligible(inode, alias.clone());
+        pending.observe_create((7, 13), 1, std::slice::from_ref(&elsewhere));
+        pending.remember_eligible((7, 13), elsewhere.clone());
+        pending.observe_unlink(std::slice::from_ref(&original));
+
+        // Nothing is published before the writer closes.
+        let mut batch = PendingBatch::default();
+        pending.settle(&mut batch);
+        assert!(batch.add_files.is_empty());
+
+        assert_eq!(pending.close_inode(std::slice::from_ref(&original)), None);
+        assert_eq!(
+            pending.close_vanished(std::slice::from_ref(&original)),
+            [alias]
+        );
+        // A writer in another directory is not released early.
+        assert!(pending.by_inode.contains_key(&(7, 13)));
+        // An unrelated close of an unknown name releases nothing.
+        assert!(pending
+            .close_vanished(std::slice::from_ref(&PathBuf::from("/w/unknown.mkv")))
+            .is_empty());
+        assert!(pending.by_inode.contains_key(&(7, 13)));
     }
 
     #[test]
