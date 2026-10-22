@@ -2,7 +2,7 @@
 # (see docker-compose.yaml). This file must not request host network —
 # docker-compose.test.yaml stays on a bridge with no published 8200/1900.
 
-FROM rust:1.98.1-trixie@sha256:462a9af3c54fb4718850d3c602fc0e54452c20b1c12a4e4080fdb001d4b9acbf AS build
+FROM rust:1.99.0-trixie@sha256:81015672d6939b0265f09adf96d5de125482bb1330106076956b0518e74edc90 AS build
 
 # The minimal Ubuntu image has no CA bundle yet. Bootstrap verified HTTPS
 # from the digest-pinned toolchain image; Ubuntu's ca-certificates package
