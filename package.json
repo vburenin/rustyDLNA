@@ -8,7 +8,7 @@
     "test:web": "npm run test:web-unit && npm run test:web-browser"
   },
   "devDependencies": {
-    "@axe-core/playwright": "^4.13.0",
-    "@playwright/test": "^1.62.1"
+    "@axe-core/playwright": "^4.14.0",
+    "@playwright/test": "^1.64.1"
   }
 }
