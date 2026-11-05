@@ -7,7 +7,7 @@ FROM rust:1.98.1-trixie@sha256:462a9af3c54fb4718850d3c602fc0e54452c20b1c12a4e408
 # The minimal Ubuntu image has no CA bundle yet. Bootstrap verified HTTPS
 # from the digest-pinned toolchain image; Ubuntu's ca-certificates package
 # replaces this bundle during installation. Never disable TLS verification.
-FROM ubuntu:resolute-20260811.1@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b AS ubuntu-base
+FROM ubuntu:resolute-20261024.1@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS ubuntu-base
 ARG UBUNTU_ARCHIVE_HOST=archive.ubuntu.com
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN case "$UBUNTU_ARCHIVE_HOST" in \
