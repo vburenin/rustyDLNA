@@ -2284,6 +2284,7 @@ impl App {
                             vec![match plan.audio {
                                 AudioAction::ToAc3 => "ac3".into(),
                                 AudioAction::ToAac => "aac".into(),
+                                AudioAction::ToFlac => "flac".into(),
                                 AudioAction::Copy => {
                                     rusty_dlna_protocol::CompactStreamMetadata::parse(
                                         &probe.audio_streams,
@@ -2338,6 +2339,7 @@ impl App {
                         AudioAction::Copy => RemuxAudio::Copy,
                         AudioAction::ToAc3 => RemuxAudio::Ac3,
                         AudioAction::ToAac => RemuxAudio::Aac,
+                        AudioAction::ToFlac => RemuxAudio::Flac,
                     },
                     caption_info_sec: caption_sec,
                 });

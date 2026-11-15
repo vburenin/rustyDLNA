@@ -349,6 +349,23 @@ impl Index {
             .retain(|(_, generation), _| *generation != Some((session_id, request_id)));
     }
 
+    /// Records a published native target for one generation, as its first
+    /// playlist view would, without requiring media fragments.
+    #[cfg(test)]
+    pub(super) fn publish_native_target_for_test(&mut self, session_id: u64, request_id: u64) {
+        self.native_targets.insert(
+            (false, Some((session_id, request_id))),
+            MIN_HLS_TARGET_DURATION_SECONDS,
+        );
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_native_target(&self, session_id: u64, request_id: u64) -> bool {
+        self.native_targets
+            .keys()
+            .any(|(_, generation)| *generation == Some((session_id, request_id)))
+    }
+
     pub(super) fn playlist_view_for(
         &mut self,
         independent_fragments: bool,

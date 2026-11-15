@@ -8501,6 +8501,171 @@ fn native_copy_requests_encode_ineligible_sdr_video_and_keep_hdr_or_reject() {
 }
 
 #[test]
+fn native_profile8_copies_keep_dolby_vision_configuration_for_native_clients_only() {
+    let app = testdata_app();
+    let detail_id = read_recover(&app.catalog)
+        .items
+        .values()
+        .find(|item| item.path.ends_with("tagged.mp4"))
+        .unwrap()
+        .detail_id;
+    let set_hdr = |hdr: &str, codec: &str| {
+        let mut catalog = write_recover(&app.catalog);
+        let object_id = catalog.by_detail[&detail_id].clone();
+        let item = catalog.items.get_mut(&object_id).unwrap();
+        item.probe.video = "hevc".into();
+        item.probe.video_profile = "Main 10".into();
+        item.probe.video_level = 153;
+        item.probe.pixel_format = "yuv420p10le".into();
+        item.probe.bit_depth = 10;
+        item.probe.codec_string = format!("{codec},mp4a.40.2");
+        item.probe.hdr = hdr.into();
+        item.probe.video_timestamp_mode = "valid".into();
+        item.probe.audio = "aac".into();
+        item.probe.audio_streams = "1:0:aac:2".into();
+        item.duration = Some("00:01:00.000".into());
+    };
+    let request = |target: String, agent: &str| {
+        let response = app.handle(&req(&get(&target, agent)));
+        assert_eq!(
+            response.status,
+            200,
+            "{target}: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+        response.remux_job.expect("copied output job")
+    };
+    // rustyView's exact query shapes for playback, HLS, and downloads.
+    let native = |extension: &str, extra: &str| {
+        request(
+            format!(
+                "/web/media/{detail_id}.{extension}?mode=compatible&start=0&quality=auto&video_mode=copy&audio_mode=transcode&reason=native_ios&request=7&session=7{extra}"
+            ),
+            "Native/1.0",
+        )
+    };
+    let browser = || {
+        request(
+            format!("/web/media/{detail_id}.mp4?quality=auto&video_mode=copy&audio_mode=transcode"),
+            "Browser/1.0",
+        )
+    };
+    let keeps = |spec: &RemuxJobSpec| {
+        assert!(
+            spec.args.windows(2).any(|pair| pair == ["-c:v", "copy"]),
+            "{:?}",
+            spec.args
+        );
+        spec.args
+            .windows(2)
+            .any(|pair| pair == ["-strict", "unofficial"])
+    };
+
+    set_hdr("dv-p8", "hvc1.2.4.L153.B0");
+    let browser_spec = browser();
+    assert!(!keeps(&browser_spec), "browsers keep HEVC-only signaling");
+    for (extension, extra) in [
+        ("mp4", ""),
+        ("m3u8", "&delivery=hls"),
+        ("mp4", "&download_audio=selected"),
+    ] {
+        let spec = native(extension, extra);
+        assert!(keeps(&spec), "native {extension}{extra}: {:?}", spec.args);
+        assert_ne!(spec.cache_key, browser_spec.cache_key, "outputs differ");
+    }
+
+    // HDR10 has no Dolby Vision record; its native copy is unchanged.
+    set_hdr("hdr10", "hvc1.2.4.L153.B0");
+    assert!(!keeps(&native("mp4", "")));
+}
+
+#[test]
+fn native_flac_audio_output_is_a_lossless_streaming_opt_in() {
+    let app = testdata_app();
+    let detail_id = read_recover(&app.catalog)
+        .items
+        .values()
+        .find(|item| item.path.ends_with("tagged.mp4"))
+        .unwrap()
+        .detail_id;
+    let item = app.handle(&req(&get(
+        &format!("/api/web/item/{detail_id}"),
+        "Native/1.0",
+    )));
+    let item: serde_json::Value = serde_json::from_slice(&item.body).unwrap();
+    assert_eq!(
+        item["item"]["prepared_audio_outputs"],
+        serde_json::json!(["aac", "flac"])
+    );
+
+    let media = |extra: &str| {
+        app.handle(&req(&get(
+            &format!(
+                "/web/media/{detail_id}.m3u8?mode=compatible&start=0&quality=auto&video_mode=transcode&reason=native_ios&request=7&session=7&delivery=hls{extra}"
+            ),
+            "Native/1.0",
+        )))
+    };
+    let has = |spec: &RemuxJobSpec, pair: [&str; 2]| spec.args.windows(2).any(|args| args == pair);
+    let aac = media("&audio_mode=transcode")
+        .remux_job
+        .expect("AAC output");
+    assert!(
+        has(&aac, ["-c:a", "aac"]) && has(&aac, ["-ac", "2"]),
+        "{:?}",
+        aac.args
+    );
+    for extra in [
+        "&audio_mode=transcode&audio_output=flac",
+        "&audio_output=flac",
+    ] {
+        let response = media(extra);
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let flac = response.remux_job.expect("FLAC output");
+        assert!(has(&flac, ["-c:a", "flac"]), "{:?}", flac.args);
+        assert!(has(&flac, ["-bits_per_raw_sample:a", "24"]));
+        assert!(
+            !has(&flac, ["-ac", "2"]),
+            "lossless output keeps every channel"
+        );
+        assert_eq!(flac.audio, RemuxAudio::Flac);
+        assert_ne!(flac.cache_key, aac.cache_key);
+    }
+    assert_eq!(
+        media("&audio_mode=transcode&audio_output=aac")
+            .remux_job
+            .expect("explicit AAC")
+            .cache_key,
+        aac.cache_key
+    );
+
+    for (extra, code) in [
+        ("&audio_mode=copy&audio_output=flac", "invalid_audio_output"),
+        ("&audio_output=opus", "invalid_audio_output"),
+        (
+            "&audio_output=flac&download_audio=selected",
+            "invalid_audio_output",
+        ),
+        ("&audio_output=flac&audio_output=aac", "invalid_parameter"),
+    ] {
+        let response = media(extra);
+        assert_eq!(response.status, 400, "{extra}");
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"]["code"], code, "{extra}");
+    }
+    let direct = app.handle(&req(&get(
+        &format!("/web/media/{detail_id}.mp4?mode=direct&audio_output=flac"),
+        "Native/1.0",
+    )));
+    assert_eq!(direct.status, 400);
+}
+
+#[test]
 fn web_item_does_not_advertise_aac_as_mpeg4_part_2_video_support() {
     let app = testdata_app();
     let detail_id = {

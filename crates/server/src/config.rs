@@ -899,6 +899,9 @@ fn required_encoder_inventory(
             Some(AudioAction::ToAac) => {
                 audio.insert("aac".to_owned());
             }
+            Some(AudioAction::ToFlac) => {
+                audio.insert("flac".to_owned());
+            }
             Some(AudioAction::Copy) | None => {}
         }
     }

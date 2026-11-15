@@ -5,6 +5,29 @@ publish a signed, content-addressed OCI image with SBOM and provenance.
 
 ## Unreleased
 
+- HLS and Media Source streams that copy the video are now input-paced: the
+  first five minutes of media are produced at full speed, then the producer
+  reads at eight times playback speed. Before, a copied 4K stream read and
+  wrote the whole film at disk speed (29 GB in about 70 seconds) on every
+  start and out-of-window seek, saturating the storage that serves every other
+  request. Streams that encode video keep their 30-second lead and 1× pacing,
+  and progressive downloads stay unpaced. A seek past the produced window
+  starts a new generation, as it already did for encoded streams.
+- Fixed one stream's playlist refresh stalling the whole server. Starting,
+  cancelling or replacing a stream waited, under the global job lock, for a
+  playlist update that was reading that stream's growing output from disk.
+  With saturated storage every request, health checks included, waited about
+  a minute. Those paths now queue the stream's playlist cleanup instead.
+- Compatible streams accept `audio_output=flac` for transcoded audio and item
+  DTOs advertise `prepared_audio_outputs`. FLAC is lossless 48 kHz/24-bit and
+  keeps every source channel (standard 7.1 order), where AAC output is a stereo
+  downmix. rustyView on Apple TV requests it for DTS and TrueHD tracks.
+- Native rustyView playback, HLS, and offline copies of Dolby Vision Profile 8
+  video now keep the source's Dolby Vision configuration record. The copied
+  `hvc1` track carries `dvvC` beside `hvcC`, so an Apple TV or iPhone with a
+  Dolby Vision display shows Dolby Vision instead of HDR10, and other devices
+  still play the HDR10-compatible base layer. Browser requests keep the
+  HEVC-only signaling, and the change has its own cache revision.
 - Fixed an unmounted or missing media root emptying the library. Periodic
   reconciliation read a vanished root, or an empty mount point, as "every file
   deleted". It dropped every item under it with its bookmarks, and files that

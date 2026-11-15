@@ -533,6 +533,7 @@ pub enum RemuxAudio {
     Copy,
     Ac3,
     Aac,
+    Flac,
 }
 
 impl HttpResponse {

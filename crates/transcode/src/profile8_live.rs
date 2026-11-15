@@ -158,6 +158,7 @@ fn run(
         AudioAction::Copy => mux.extend(["-c:a", "copy"].map(Into::into)),
         AudioAction::ToAc3 => mux.extend(["-c:a", "ac3", "-b:a", "640k"].map(Into::into)),
         AudioAction::ToAac => mux.extend(["-c:a", "aac", "-b:a", "256k"].map(Into::into)),
+        AudioAction::ToFlac => mux.extend(FLAC_AUDIO_ARGS.map(Into::into)),
     }
     mux.extend(live_frag_os_tail(output.as_os_str()));
     use_inherited_media_input(&mut mux, 1, 7)?;

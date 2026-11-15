@@ -198,6 +198,10 @@ format, color metadata, Dolby Vision configuration, and converted RPU bytes.
 - **HDR10-compatible output** uses PQ `smpte2084`, BT.2020, and 10-bit pixels.
   ffmpeg flags: `-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc`,
   `-tag:v hvc1`, 10-bit `p010le`.
+- **Dolby Vision Profile 8** copied for a native rustyView request keeps its
+  RPUs and configuration record: the `hvc1` entry carries `dvvC` beside
+  `hvcC` (`-strict unofficial`). Browser copies drop only the record and stay
+  HEVC HDR10 to every player. See [`WEB_PLAYER.md`](WEB_PLAYER.md).
 - **Dolby Vision Profile 7** (BL+EL+RPU, `compatibility_id=6`) cannot.
   That is what blacks out Google Streamer. The encoder must strip EL/RPU
   (ffmpeg already logs `Skipping NAL 63`). Output is HDR10, not DV.
@@ -239,26 +243,35 @@ admission returns retryable busy. Cancellation tombstones and shared-session
 ownership still apply while waiting; the old producer cannot remove the
 replacement's registry entry or output.
 
-HLS/Media Source output that encodes either track runs without input pacing for
-its first 30 seconds of media, then reads at playback rate. This preserves a
-useful startup buffer without racing through the rest of a feature film at full
-CPU/GPU or cache-write utilization. On FFmpeg 8 and newer, the catch-up rate is
-raised only while filling that lead; otherwise its near-realtime default also
-paces the accurate-seek preroll and delays the first fragment by several
-seconds. Older FFmpeg releases do not expose that catch-up option and retain
-their legacy initial-burst behavior without it.
-Fragmented remuxes that copy both tracks remain unpaced because they consume
-negligible encoder resources. Playlist,
-fragment, and reconnect requests from one browser generation reuse its initial
-descriptor-backed job plan; completed output stays protected from cache
-eviction while the generation heartbeat remains active.
+HLS/Media Source output is input-paced. Output that encodes video runs without
+pacing for its first 30 seconds of media, then reads at playback rate. This
+preserves a useful startup buffer without racing through the rest of a feature
+film at full CPU/GPU or cache-write utilization. Output that copies video, with
+copied or encoded audio, runs unpaced for its first 300 seconds of media, then
+reads at eight times playback rate. Copying needs no encoder, but unpaced it
+reads and writes the whole film at storage speed (a 4K remux wrote 29 GB in
+about 70 seconds) for every start and out-of-window seek, saturating the array
+that serves every other request. Five minutes covers a native player's forward
+buffer. At 8× a typical 4K remux reads a few tens of MB/s, the produced window
+grows seven minutes per minute watched, and a whole film is ready within about a
+quarter hour. A seek beyond the produced window starts a new generation, as it
+already did for encoded output. On FFmpeg 8 and newer, the catch-up rate is
+raised while filling the initial lead and whenever storage or the encoder delays
+the producer; otherwise its near-realtime default also paces the accurate-seek
+preroll and delays the first fragment by several seconds. Older FFmpeg releases
+do not expose that catch-up option and retain their legacy initial-burst
+behavior without it. FFmpeg's lag detection assumes video frames less than 0.3
+seconds apart: sparser video interleaved with audio paces near 1× after the
+lead. Playlist, fragment, and reconnect requests from one browser generation
+reuse its initial descriptor-backed job plan; completed output stays protected
+from cache eviction while the generation heartbeat remains active.
 
 Resource-aware admission and demand pacing remain experiments. The daemon keeps
 its existing fair global helper gate, title ceiling, independent AI-upscale
-ceiling and encoder threading defaults. A fixed 1× producer can lose its initial
-lead during sustained 2× playback, and a paused browser suspends its MSE downloads
-but does not stop a shared producer. A per-viewer pause must not stop another
-viewer or a native/download consumer.
+ceiling and encoder threading defaults. A fixed 1× encoding producer can lose
+its initial lead during sustained 2× playback, and a paused browser suspends
+its MSE downloads but does not stop a shared producer. A per-viewer pause must
+not stop another viewer or a native/download consumer.
 
 The opt-in `resource_budget` server example creates disposable 40-second,
 640×360/24-fps SDR H.264/AAC media and compares three explicitly separate arms:

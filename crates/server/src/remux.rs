@@ -367,6 +367,9 @@ pub struct RemuxJob {
     cacheable: bool,
     started: Instant,
     hls_index: Mutex<hls::Index>,
+    /// Generation forgets queued while a playlist scan held `hls_index`.
+    /// Registry holders must never wait for that lock; see `forget_generation`.
+    forgotten_generations: Mutex<Vec<(u64, u64)>>,
     effective_recipe: Mutex<Option<fallback::EffectiveRecipe>>,
     /// Source time of output zero for a nonzero copied-video seek, once the
     /// bounded source probe has repeated FFmpeg's keyframe landing.
@@ -758,7 +761,7 @@ impl RemuxJob {
         if let Some(replaced) = replaced.filter(|replaced| Some(*replaced) != request_id) {
             request_ids.remove(&replaced);
             if let Some(session_id) = session_id {
-                crate::lock_recover(&self.hls_index).forget_generation(session_id, replaced);
+                self.forget_generation(session_id, replaced);
             }
         }
         if let Some(request_id) = request_id {
@@ -779,7 +782,7 @@ impl RemuxJob {
         }
         drop(sessions);
         if let Some(session_id) = session_id {
-            crate::lock_recover(&self.hls_index).forget_generation(session_id, request_id);
+            self.forget_generation(session_id, request_id);
         }
         crate::lock_recover(&self.web_request_ids).remove(&request_id)
     }
@@ -787,8 +790,41 @@ impl RemuxJob {
     fn remove_web_session(&self, session_id: u64) -> Option<u64> {
         let request_id = crate::lock_recover(&self.web_sessions).remove(&session_id)?;
         crate::lock_recover(&self.web_request_ids).remove(&request_id);
-        crate::lock_recover(&self.hls_index).forget_generation(session_id, request_id);
+        self.forget_generation(session_id, request_id);
         Some(request_id)
+    }
+
+    /// Lock this job's HLS index after applying generation forgets that were
+    /// queued while a playlist or status request held it.
+    fn lock_hls_index(&self) -> std::sync::MutexGuard<'_, hls::Index> {
+        let mut index = crate::lock_recover(&self.hls_index);
+        let forgotten = std::mem::take(&mut *crate::lock_recover(&self.forgotten_generations));
+        for (session_id, request_id) in forgotten {
+            index.forget_generation(session_id, request_id);
+        }
+        index
+    }
+
+    /// Forget one generation's native playlist state without waiting for the
+    /// index. Attach, cancellation and session pruning call this while they
+    /// hold the global job registry, and a playlist or status request holds
+    /// the index while it reads growing output from disk. Waiting here once
+    /// stalled every request, health checks included, for most of a minute
+    /// while storage was saturated. A busy index applies the queued forget
+    /// the next time it is locked; a superseded generation never serves again.
+    fn forget_generation(&self, session_id: u64, request_id: u64) {
+        match self.hls_index.try_lock() {
+            Ok(mut index) => index.forget_generation(session_id, request_id),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+                .into_inner()
+                .forget_generation(session_id, request_id),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let mut queued = crate::lock_recover(&self.forgotten_generations);
+                if !queued.contains(&(session_id, request_id)) {
+                    queued.push((session_id, request_id));
+                }
+            }
+        }
     }
 
     fn has_web_requests(&self) -> bool {
@@ -1126,6 +1162,7 @@ fn spawn_ffmpeg(
                         RemuxAudio::Copy => rusty_dlna_transcode::AudioAction::Copy,
                         RemuxAudio::Ac3 => rusty_dlna_transcode::AudioAction::ToAc3,
                         RemuxAudio::Aac => rusty_dlna_transcode::AudioAction::ToAac,
+                        RemuxAudio::Flac => rusty_dlna_transcode::AudioAction::ToFlac,
                     },
                     audio_index: spec.audio_index,
                     container: "mp4",
@@ -2286,6 +2323,7 @@ fn attach_job_attempt(
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            forgotten_generations: Mutex::new(Vec::new()),
             effective_recipe: Mutex::new(reused_fallback),
             stream_origin: std::sync::OnceLock::new(),
         });
@@ -2373,6 +2411,7 @@ fn attach_job_attempt(
         cacheable: spec.cacheable,
         started: Instant::now(),
         hls_index: Mutex::new(hls::Index::default()),
+        forgotten_generations: Mutex::new(Vec::new()),
         effective_recipe: Mutex::new(None),
         stream_origin: std::sync::OnceLock::new(),
     });
@@ -2797,7 +2836,7 @@ pub(crate) fn web_job_produced_seconds(
     }
     let complete = state == RemuxState::Complete;
     let output = job.open_output().ok()?;
-    let mut index = crate::lock_recover(&job.hls_index);
+    let mut index = job.lock_hls_index();
     index.update_file(&output, complete).ok()?;
     index.produced_duration_seconds()
 }
@@ -3543,7 +3582,7 @@ async fn serve_fragment_playlist(
             let output = index_job
                 .open_output()
                 .map_err(|error| format!("open HLS media: {error}"))?;
-            let mut index = crate::lock_recover(&index_job.hls_index);
+            let mut index = index_job.lock_hls_index();
             index.update_file(&output, complete)?;
             let observed = (observe_fragment && index.produced_duration_seconds().is_some())
                 .then(Instant::now);
@@ -4597,6 +4636,7 @@ mod tests {
             cacheable: false,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            forgotten_generations: Mutex::new(Vec::new()),
             effective_recipe: Mutex::new(None),
             stream_origin: std::sync::OnceLock::new(),
         });
@@ -4630,6 +4670,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            forgotten_generations: Mutex::new(Vec::new()),
             effective_recipe: Mutex::new(None),
             stream_origin: std::sync::OnceLock::new(),
         })
@@ -5382,6 +5423,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            forgotten_generations: Mutex::new(Vec::new()),
             effective_recipe: Mutex::new(None),
             stream_origin: std::sync::OnceLock::new(),
         });
@@ -5710,6 +5752,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            forgotten_generations: Mutex::new(Vec::new()),
             effective_recipe: Mutex::new(None),
             stream_origin: std::sync::OnceLock::new(),
         });
@@ -5833,6 +5876,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            forgotten_generations: Mutex::new(Vec::new()),
             effective_recipe: Mutex::new(None),
             stream_origin: std::sync::OnceLock::new(),
         });
@@ -5898,6 +5942,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            forgotten_generations: Mutex::new(Vec::new()),
             effective_recipe: Mutex::new(None),
             stream_origin: std::sync::OnceLock::new(),
         });
@@ -6058,6 +6103,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            forgotten_generations: Mutex::new(Vec::new()),
             effective_recipe: Mutex::new(None),
             stream_origin: std::sync::OnceLock::new(),
         });
@@ -7921,6 +7967,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            forgotten_generations: Mutex::new(Vec::new()),
             effective_recipe: Mutex::new(None),
             stream_origin: std::sync::OnceLock::new(),
         });
@@ -8523,6 +8570,84 @@ mod tests {
         });
         holder.join().unwrap();
     }
+    #[test]
+    fn registry_holders_do_not_wait_for_a_busy_playlist_index() {
+        // A playlist or status request holds a job's index while it reads the
+        // growing output; on saturated storage that took most of a minute.
+        // Cancellation and supersession hold the global registry, so waiting
+        // for that index there stalled every request, health checks included.
+        let dir = temp_dir("registry-index-contention");
+        let app = test_app(&dir, 2);
+        let mut old = Arc::try_unwrap(growing_test_job(&dir, 42, b"output"))
+            .ok()
+            .unwrap();
+        old.web = true;
+        let old = Arc::new(old);
+        old.add_web_request(Some(9), Some(77)).unwrap();
+        old.lock_hls_index().publish_native_target_for_test(9, 77);
+        crate::lock_recover(&app.remuxes).insert("web:42:old".into(), old.clone());
+
+        let index_job = old.clone();
+        let (locked, held) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _index = crate::lock_recover(&index_job.hls_index);
+            locked.send(()).unwrap();
+            let _ = resume.recv_timeout(Duration::from_secs(10));
+        });
+        held.recv_timeout(Duration::from_secs(1)).unwrap();
+        let within = |label: &'static str, work: Box<dyn FnOnce() + Send>| {
+            let (done, finished) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                work();
+                done.send(()).unwrap();
+            });
+            finished
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap_or_else(|_| panic!("{label} waited for the busy playlist index"));
+            worker.join().unwrap();
+        };
+
+        // DELETE of the playing generation, as a scrub sends it.
+        let cancel_app = app.clone();
+        within(
+            "cancellation",
+            Box::new(move || assert!(cancel_web_request(&cancel_app, 42, Some(9), 77))),
+        );
+        // A newer generation in the same viewing supersedes the old owner
+        // under the registry before starting its own producer.
+        old.add_web_request(Some(9), Some(77)).unwrap();
+        let mut newer = job_spec(&dir, "newer-generation", Vec::new());
+        newer.job_key = "web:42:newer".into();
+        newer.web_session_id = Some(9);
+        newer.web_request_id = Some(78);
+        newer.args = vec![
+            "cp".into(),
+            newer.src.as_os_str().to_owned(),
+            cache_part(&newer.dest).into_os_string(),
+        ];
+        let attach_app = app.clone();
+        let attached = Arc::new(Mutex::new(None));
+        let slot = attached.clone();
+        within(
+            "newer generation",
+            Box::new(move || {
+                *slot.lock().unwrap() = Some(attach_for_client(attach_app, newer).unwrap());
+            }),
+        );
+        assert!(!old.owns_web_request(Some(9), 77));
+        let newer = attached.lock().unwrap().take().unwrap();
+        wait_until(Duration::from_secs(3), || {
+            newer.producer_finished.load(Ordering::Acquire)
+        });
+
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        // The queued forget is applied before the index serves again.
+        assert!(!old.lock_hls_index().has_native_target(9, 77));
+        assert!(old.forgotten_generations.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn cancellation_before_helper_spawn_releases_same_key_for_replacement() {
         let dir = temp_dir("cancel-before-spawn");

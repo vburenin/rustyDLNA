@@ -341,6 +341,13 @@ by SDR. The fallback is derived only from the URL and stored probe facts, so
 seeks, HLS resources, downloads and cache identity resolve to that encode, and
 `/api/web/transcode` reports its effective encoder.
 
+A native `reason=native_ios` copy of Dolby Vision Profile 8 video keeps the
+source's Dolby Vision configuration: the `hvc1` sample entry carries `dvvC`
+beside `hvcC` (FFmpeg writes it at `-strict unofficial`). Apple players select
+Dolby Vision output from it and otherwise decode the HDR10-compatible base
+layer. Browser copies keep HEVC-only signaling, so Media Source codec checks
+are unchanged.
+
 The scanner also samples presentation and decode timestamps before approving
 H.264/HEVC stream copy. Some malformed MP4 files contain reordered frames but
 store every presentation timestamp in decode order; copying those packets
@@ -1211,7 +1218,7 @@ used in item, media, caption, preview, and transcode-status URLs.
 | `/api/web/transcode/{id}?session={session_id}&request={generation_id}` | GET returns generation-scoped `queued`, `starting`, `producing`, `ready`, `cancelled`, or `failed` state plus optional `produced_seconds` measured from complete output-fragment timestamps and optional `stream_start_seconds`, the source time that output time zero represents (the requested start for encoded or trimmed output; for a nonzero copied-video seek, the preceding keyframe FFmpeg begins at, or `null` until a bounded source probe establishes it or when the landing is not a keyframe; reported only with the owning `request`); POST with a bounded startup `event` records the current generation's server-clock observation, or `selection_to_frame`, `seek_to_frame`, and `capability_negotiation` with an integer `elapsed_ms` from 0–120,000 records browser-local elapsed time; DELETE records and cancels an abandoned generation |
 | `/web/download/{id}` | Original video as an attachment, with byte ranges and the source filename |
 | `/web/media/{id}.mp4?mode=direct` | Original jailed media with byte ranges |
-| `/web/media/{id}.mp4?...` | Compatible stream with validated audio track, start, quality, negotiated `video_mode`/`video_output`/`audio_mode`, reason, playback session, and generation parameters |
+| `/web/media/{id}.mp4?...` | Compatible stream with validated audio track, start, quality, negotiated `video_mode`/`video_output`/`audio_mode`/`audio_output`, reason, playback session, and generation parameters |
 | `/Captions/{id}/{index}...?format=webvtt` | Jailed browser caption conversion |
 | `/status` and `/api/status` | Operator status and metrics |
 
@@ -1416,6 +1423,14 @@ qualify for that existing HDR output contract; otherwise clients may request
 `h264_sdr`, retain the original, or explain why their HDR requirement cannot be
 met. This list is additive and does not replace browser capability probing.
 
+Every DTO also lists `prepared_audio_outputs` (`aac` and `flac` while
+compatible playback is enabled). Transcoded streaming audio is AAC unless the
+request adds `audio_output=flac`: lossless FLAC at 48 kHz/24-bit that keeps the
+source channels, including standard 7.1, instead of AAC's stereo downmix.
+rustyView on Apple TV uses it for tracks it cannot play as-is, such as DTS and
+TrueHD, and copies AAC, AC-3, and E-AC-3. `audio_output` is rejected with copied
+audio and with `download_audio`; offline copies keep their per-track contract.
+
 ### Browser-only gateway
 
 `docker-compose.web.yaml` runs a separate `rusty-web` nginx container in front
@@ -1487,7 +1502,7 @@ The output directory must be new. The test retains generated two/eight-hour,
 128×72, 2 fps video-only sources, copied fragmented output, exact helper commands,
 FFmpeg identity, FFprobe packet timing, decoded-frame hashes, playlists and ten
 raw index/formatting samples per title. Late GOPs grow from two to twelve seconds.
-It uses the production HLS copy builder; copy-only input already has no pacing.
+It uses the production HLS copy builder with only its input pacing removed.
 Full EVENT durations/counts are checked against FFprobe; the
 source and output must decode to identical frames. This measures metadata and
 formatting cost. Actual Safari/device polling, backward/forward seeks, reconnect,

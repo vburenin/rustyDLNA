@@ -421,6 +421,8 @@ struct WebMediaItem {
     compatible_video_encoder: String,
     repair_video_encoder: String,
     prepared_video_outputs: Vec<&'static str>,
+    /// Transcoded audio outputs a client may request with `audio_output`.
+    prepared_audio_outputs: Vec<&'static str>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1963,6 +1965,11 @@ fn media_dto(app: &App, item: &MediaItem) -> WebMediaItem {
         } else {
             vec!["h264_sdr"]
         },
+        prepared_audio_outputs: if app.cfg.transcode.enable {
+            vec!["aac", "flac"]
+        } else {
+            vec![]
+        },
     }
 }
 
@@ -2987,6 +2994,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
         "video_mode",
         "video_output",
         "audio_mode",
+        "audio_output",
         "download_audio",
         "delivery",
         "hls_offset",
@@ -3259,6 +3267,22 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             )
         }
     };
+    // Lossless FLAC is an opt-in for players that decode it natively, such as
+    // rustyView on Apple TV. Copied audio has no output to choose, and offline
+    // downloads keep their established per-track AAC/copy contract.
+    let flac_audio = match params.get("audio_output") {
+        None | Some("aac") => false,
+        Some("flac") if !copy_audio_requested && params.get("download_audio").is_none() => true,
+        _ => {
+            return api_error(
+                400,
+                "invalid_audio_output",
+                "Choose aac or flac output for transcoded streaming audio.",
+                false,
+                None,
+            )
+        }
+    };
     let download_audio = match params.get("download_audio") {
         None => None,
         Some(value @ ("selected" | "all")) if delivery == "mp4" && start_seconds == 0 => Some(value),
@@ -3289,6 +3313,7 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             "video_mode",
             "video_output",
             "audio_mode",
+            "audio_output",
             "delivery",
             "hls_offset",
             "hls_length",
@@ -3535,16 +3560,26 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
             source.hdr,
         )
     };
+    // rustyView's native Apple players receive a copied Profile 8 stream with
+    // its Dolby Vision configuration. They select Dolby Vision output from it
+    // and otherwise decode the HDR10-compatible base layer. Browser requests
+    // keep the established HEVC-only signaling.
+    let keep_dolby_vision = is_video
+        && copy_video
+        && fallback_reason == "native_ios"
+        && source.hdr == rusty_dlna_transcode::HdrKind::DolbyVisionProfile8;
     let plan = TranscodePlan {
         decision: Decision::Recode,
         action: RecodeAction::Browser,
         rule: Some("embedded-web-player".into()),
         keep_hdr10: preserve_hevc_hdr,
-        drop_dolby_vision: true,
+        drop_dolby_vision: !keep_dolby_vision,
         video_encoder: video_encoder.into(),
         hardware_decode,
         audio: if copy_audio {
             AudioAction::Copy
+        } else if flac_audio {
+            AudioAction::ToFlac
         } else {
             AudioAction::ToAac
         },
@@ -3571,6 +3606,8 @@ pub(crate) fn media(app: &App, req: &HttpRequest, peer: SocketAddr) -> HttpRespo
     let output_mime = if is_video { "video/mp4" } else { "audio/mp4" };
     let remux_audio = if copy_audio {
         RemuxAudio::Copy
+    } else if flac_audio {
+        RemuxAudio::Flac
     } else {
         RemuxAudio::Aac
     };

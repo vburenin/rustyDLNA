@@ -129,7 +129,28 @@ pub enum AudioAction {
     Copy,
     ToAc3,
     ToAac,
+    /// Lossless FLAC keeping the source channels (up to 7.1) at 48 kHz and
+    /// 24 bits. Requested by native Apple players, which decode it and send
+    /// multichannel PCM to the receiver. Not a `[[remap]]` choice.
+    #[serde(skip)]
+    ToFlac,
 }
+
+/// FFmpeg output options for [`AudioAction::ToFlac`]. FLAC's 8-channel
+/// assignment is standard 7.1 (back and side pairs), unlike the 8-channel
+/// AAC and ALAC configurations FFmpeg can encode, which place the extra pair
+/// at the front. 24-bit samples hold every lossless Blu-ray source exactly
+/// while staying within what Apple's FLAC decoder accepts.
+const FLAC_AUDIO_ARGS: [&str; 8] = [
+    "-c:a",
+    "flac",
+    "-ar",
+    "48000",
+    "-sample_fmt",
+    "s32",
+    "-bits_per_raw_sample:a",
+    "24",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrowserQuality {
@@ -148,6 +169,7 @@ const SDR_TONEMAP_CACHE_REVISION: &str = "sdr-tonemap-libplacebo-v2";
 const BROWSER_HDR_SOURCE_CACHE_REVISION: &str = "browser-hdr-source-v1";
 const BROWSER_AAC_FILTER_CACHE_REVISION: &str = "browser-aac-adtstoasc-v1";
 const BROWSER_HEVC_TAG_CACHE_REVISION: &str = "browser-hevc-hvc1-v1";
+const BROWSER_DOLBY_VISION_CONFIG_CACHE_REVISION: &str = "browser-dolby-vision-p8-config-v1";
 const BROWSER_MIXED_COPY_SEEK_CACHE_REVISION: &str = "browser-mixed-copy-seek-v2";
 const BROWSER_CUDA_DOWNLOAD_CACHE_REVISION: &str = "browser-cuda-download-v1";
 const BROWSER_VULKAN_TONEMAP_CACHE_REVISION: &str = "browser-vulkan-tonemap-v1";
@@ -252,6 +274,9 @@ struct BrowserOutputPolicy {
     apply_sdr_tonemap: bool,
     filter_copied_aac: bool,
     tag_hevc_as_hvc1: bool,
+    /// Copied Dolby Vision Profile 8 video whose plan keeps Dolby Vision. The
+    /// output retains the source configuration record beside `hvcC`.
+    keep_dolby_vision_configuration: bool,
     seek: BrowserSeekPolicy,
 }
 
@@ -285,6 +310,10 @@ fn browser_output_policy(
         filter_copied_aac: audio_is_copied && options.selected_audio == AudioCodec::Aac,
         tag_hevc_as_hvc1: options.source_video == Some(VideoCodec::Hevc)
             && matches!(plan.video_encoder.as_str(), "copy" | "hevc_nvenc"),
+        keep_dolby_vision_configuration: video_is_copied
+            && options.source_video == Some(VideoCodec::Hevc)
+            && options.source_hdr == HdrKind::DolbyVisionProfile8
+            && !plan.drop_dolby_vision,
         seek,
     }
 }
@@ -1197,6 +1226,7 @@ pub fn ffmpeg_grow_args(src_path: &str, dst_path: &str, plan: &TranscodePlan) ->
                     a.extend(["-ac".into(), "2".into()]);
                 }
             }
+            AudioAction::ToFlac => a.extend(FLAC_AUDIO_ARGS.map(String::from)),
         }
     }
     a.extend(live_frag_tail(dst_path));
@@ -1461,35 +1491,69 @@ fn apply_browser_hls_keyframes(args: &mut [OsString], hls: bool) {
     }
 }
 
+/// FFmpeg input pacing for one fragmented HLS/Media Source generation: read
+/// `initial_burst_seconds` of media unpaced, then `rate` times playback speed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HlsInputPacing {
+    rate: &'static str,
+    initial_burst_seconds: &'static str,
+}
+
+/// Encoded video stays close to playback rate so a feature film is not
+/// encoded at full GPU/CPU utilization ahead of a viewer who may leave.
+const ENCODED_VIDEO_HLS_PACING: HlsInputPacing = HlsInputPacing {
+    rate: "1",
+    initial_burst_seconds: "30",
+};
+
+/// Copied video costs storage bandwidth instead of encoder time. Unpaced, a
+/// 4K remux reads and writes the whole film at disk speed (tens of GB within
+/// about a minute) for every start and out-of-window seek, saturating the
+/// array that also serves every other request. Five minutes of media covers
+/// a large native forward buffer. 8x then reads a typical 4K remux at a few
+/// tens of MB/s, a fraction of array throughput, while the produced window
+/// grows seven minutes per minute watched, so most seeks soon land inside
+/// it and a whole film is ready within about a quarter hour.
+const COPIED_VIDEO_HLS_PACING: HlsInputPacing = HlsInputPacing {
+    rate: "8",
+    initial_burst_seconds: "300",
+};
+
 fn apply_browser_hls_pacing(
     args: &mut Vec<OsString>,
     hls: bool,
-    encoding_stream: bool,
+    copied_video: bool,
     readrate_catchup: bool,
 ) {
-    if !hls || !encoding_stream {
+    if !hls {
         return;
     }
+    let pacing = if copied_video {
+        COPIED_VIDEO_HLS_PACING
+    } else {
+        ENCODED_VIDEO_HLS_PACING
+    };
     let input = args
         .iter()
         .position(|argument| argument == "-i")
         .expect("ffmpeg browser command must include an input");
-    let mut pacing = vec![
+    let mut input_options = vec![
         OsString::from("-readrate"),
-        OsString::from("1"),
+        OsString::from(pacing.rate),
         OsString::from("-readrate_initial_burst"),
-        OsString::from("30"),
+        OsString::from(pacing.initial_burst_seconds),
     ];
     if readrate_catchup {
         // FFmpeg 8 defaults catch-up to 1.05x. That turns the nominal initial
         // burst into real-time decoding, including keyframe preroll discarded
         // by an accurate input seek. Let startup run at the pipeline's natural
-        // rate; readrate still takes over once the thirty-second lead is
-        // filled. Older FFmpeg releases do not expose this option and retain
-        // their original unbounded catch-up behavior without it.
-        pacing.extend([OsString::from("-readrate_catchup"), OsString::from("100")]);
+        // rate; readrate still takes over once the initial lead is filled, and
+        // a producer delayed by storage or the encoder recovers its lead.
+        // Older FFmpeg releases do not expose this option and retain their
+        // original unbounded catch-up behavior without it.
+        input_options.extend([OsString::from("-readrate_catchup"), OsString::from("100")]);
     }
-    args.splice(input..input, pacing);
+    args.splice(input..input, input_options);
 }
 
 fn apply_browser_encoding_preset(
@@ -1581,20 +1645,31 @@ fn browser_ffmpeg_os_args_with_readrate_catchup(
             [OsString::from("-tag:v"), OsString::from("hvc1")],
         );
     }
+    if policy.keep_dolby_vision_configuration {
+        // FFmpeg's MP4 muxer writes the Dolby Vision configuration record
+        // (`dvvC`) only at unofficial strictness. The sample entry stays
+        // `hvc1`, so a decoder without Dolby Vision plays the HDR10-compatible
+        // base layer while a Dolby Vision display uses the copied RPUs.
+        let output = args.len().saturating_sub(1);
+        args.splice(
+            output..output,
+            [OsString::from("-strict"), OsString::from("unofficial")],
+        );
+    }
     // Some Android hardware decoders require every separately appended movie
     // fragment to begin at a random-access point even though MSE retains one
     // continuous SourceBuffer timeline. Keep the one-second IDR cadence for
     // both native HLS and MSE fragmented delivery.
     apply_browser_hls_keyframes(&mut args, options.hls);
     // Fragment consumers retain a bounded playback window. Produce an
-    // unrestricted initial buffer, then stay close to playback rate instead
-    // of encoding the remainder of a feature film as fast as the machine can
-    // run. Streams that copy both tracks remain unpaced because they use
-    // negligible CPU and do not create encoded output ahead of playback.
+    // unrestricted initial buffer, then pace input instead of encoding or
+    // copying the remainder of a feature film as fast as the machine can run.
+    // Copied video (with copied or encoded audio) gets a longer lead and a
+    // faster rate than encoded video; see the two pacing constants.
     apply_browser_hls_pacing(
         &mut args,
         options.hls,
-        plan.video_encoder != "copy" || plan.audio != AudioAction::Copy,
+        plan.video_encoder == "copy",
         readrate_catchup,
     );
     apply_browser_input_seek(&mut args, options.start_seconds, policy.seek);
@@ -2936,6 +3011,10 @@ fn browser_cache_key_from_base(
     if policy.tag_hevc_as_hvc1 {
         cache_key.push('-');
         cache_key.push_str(BROWSER_HEVC_TAG_CACHE_REVISION);
+    }
+    if policy.keep_dolby_vision_configuration {
+        cache_key.push('-');
+        cache_key.push_str(BROWSER_DOLBY_VISION_CONFIG_CACHE_REVISION);
     }
     if policy.seek != BrowserSeekPolicy::Accurate {
         cache_key.push('-');
@@ -4298,6 +4377,7 @@ fn profile8_commands(
         AudioAction::ToAac => {
             mux.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "256k".into()])
         }
+        AudioAction::ToFlac => mux.extend(FLAC_AUDIO_ARGS.map(OsString::from)),
     }
     mux.extend(live_frag_os_tail(dest_part.as_os_str()));
     Profile8Commands {
@@ -5772,10 +5852,90 @@ action = "audio-ac3"
     }
 
     #[test]
+    fn copied_hls_reads_its_lead_unpaced_then_eight_times_playback_speed() {
+        let tmp = tool_test_dir("copied-hls-pacing");
+        let source = tmp.join("source.mkv");
+        let output = tmp.join("output.mp4.part");
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(60);
+        // Eighty seconds past the five-minute lead: unpaced input finishes in
+        // well under a second, 8x takes ten seconds, 4x would take twenty, and
+        // a missing lead would read all 380 seconds at 8x. Use film frame
+        // spacing: FFmpeg's 0.3-second lag detector misreads sparse
+        // half-second video frames interleaved with audio and paces near 1x.
+        let mut generate: Vec<OsString> = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=s=64x36:r=24:d=380",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=380",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+            "-shortest",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        generate.push(source.as_os_str().to_owned());
+        run_cmd_controlled(&generate, deadline(), &cancelled, None).unwrap();
+        let version = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-version"])
+            .output()
+            .unwrap();
+        let version = String::from_utf8_lossy(&version.stdout);
+        let catchup = ffmpeg_major_version(version.lines().next().unwrap_or_default())
+            .is_some_and(|major| major >= 8);
+        let plan = TranscodePlan {
+            decision: Decision::Recode,
+            action: RecodeAction::Browser,
+            video_encoder: "copy".into(),
+            audio: AudioAction::Copy,
+            container: "mp4",
+            browser_quality: Some(BrowserQuality::Auto),
+            ..TranscodePlan::default()
+        };
+        let options = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::Balanced,
+            source_video: Some(VideoCodec::H264),
+            selected_audio: AudioCodec::Aac,
+            source_hdr: HdrKind::Sdr,
+            start_seconds: 0,
+            hls: true,
+        };
+        let args =
+            browser_ffmpeg_os_args_with_readrate_catchup(&source, &output, &plan, options, catchup);
+        let started = std::time::Instant::now();
+        run_cmd_controlled(&args, deadline(), &cancelled, None).unwrap();
+        let elapsed = started.elapsed().as_secs_f64();
+        assert!(
+            (8.0..=15.0).contains(&elapsed),
+            "copied HLS took {elapsed:.1}s; expected a 300s unpaced lead, then 8x"
+        );
+        let bytes = std::fs::read(&output).unwrap();
+        assert!(bytes.windows(4).any(|word| word == b"moof"));
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
     fn browser_copy_options_add_aac_and_hevc_mp4_signaling() {
         let plan = TranscodePlan {
             decision: Decision::Recode,
             action: RecodeAction::Browser,
+            drop_dolby_vision: true,
             video_encoder: "copy".into(),
             audio: AudioAction::Copy,
             container: "mp4",
@@ -5809,6 +5969,83 @@ action = "audio-ac3"
             ]
         );
         assert!(!args.iter().any(|argument| argument == "-init_hw_device"));
+    }
+
+    #[test]
+    fn browser_copy_keeps_profile8_dolby_vision_configuration_only_when_planned() {
+        let keep = TranscodePlan {
+            decision: Decision::Recode,
+            action: RecodeAction::Browser,
+            drop_dolby_vision: false,
+            video_encoder: "copy".into(),
+            audio: AudioAction::ToAac,
+            container: "mp4",
+            browser_quality: Some(BrowserQuality::Auto),
+            ..TranscodePlan::default()
+        };
+        let profile8 = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::Balanced,
+            source_video: Some(VideoCodec::Hevc),
+            selected_audio: AudioCodec::TrueHd,
+            source_hdr: HdrKind::DolbyVisionProfile8,
+            start_seconds: 0,
+            hls: true,
+        };
+        let strict = |plan: &TranscodePlan, options: BrowserOutputOptions| {
+            let args = browser_ffmpeg_os_args(
+                Path::new("source.mkv"),
+                Path::new("output.mp4.part"),
+                plan,
+                options,
+            );
+            assert_eq!(args.last().unwrap(), "output.mp4.part");
+            let kept = args
+                .windows(2)
+                .any(|pair| pair == ["-strict", "unofficial"]);
+            let key = browser_cache_key_from_base("base".into(), plan, options);
+            assert_eq!(
+                kept,
+                key.contains(BROWSER_DOLBY_VISION_CONFIG_CACHE_REVISION),
+                "arguments and cache identity must agree: {key}"
+            );
+            kept
+        };
+
+        assert!(strict(&keep, profile8), "copied Profile 8 keeps its record");
+        let drop = TranscodePlan {
+            drop_dolby_vision: true,
+            ..keep.clone()
+        };
+        assert!(!strict(&drop, profile8), "browser plans drop Dolby Vision");
+        for hdr in [
+            HdrKind::Sdr,
+            HdrKind::Hdr10,
+            HdrKind::DolbyVisionProfile5,
+            HdrKind::DolbyVisionProfile7,
+            HdrKind::DolbyVisionOther,
+        ] {
+            let options = BrowserOutputOptions {
+                source_hdr: hdr,
+                ..profile8
+            };
+            assert!(
+                !strict(&keep, options),
+                "{hdr:?} has no Profile 8 record to keep"
+            );
+        }
+        let encoded = TranscodePlan {
+            video_encoder: "hevc_nvenc".into(),
+            ..keep.clone()
+        };
+        assert!(
+            !strict(&encoded, profile8),
+            "an encode cannot carry the RPUs"
+        );
+        let audio_only = BrowserOutputOptions {
+            source_video: None,
+            ..profile8
+        };
+        assert!(!strict(&keep, audio_only));
     }
 
     #[test]
@@ -5924,12 +6161,8 @@ action = "audio-ac3"
             &copy_plan,
             mse,
         );
-        assert!(mixed_hls_args
-            .windows(2)
-            .any(|pair| pair == ["-readrate", "1"]));
-        assert!(mixed_hls_args
-            .windows(2)
-            .any(|pair| pair == ["-readrate_catchup", "100"]));
+        // Copied video uses the storage-bound pacing whether audio is
+        // encoded (for example FLAC from DTS) or copied.
         copy_plan.audio = AudioAction::Copy;
         let copied_hls_args = browser_ffmpeg_os_args(
             Path::new("source.mkv"),
@@ -5937,8 +6170,25 @@ action = "audio-ac3"
             &copy_plan,
             mse,
         );
-        assert!(!copied_hls_args.iter().any(|arg| arg == "-readrate"));
-        assert!(!copied_hls_args.iter().any(|arg| arg == "-readrate_catchup"));
+        for args in [&mixed_hls_args, &copied_hls_args] {
+            assert!(args.windows(2).any(|pair| pair == ["-readrate", "8"]));
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["-readrate_initial_burst", "300"]));
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["-readrate_catchup", "100"]));
+            let input = args.iter().position(|arg| arg == "-i").unwrap();
+            let pacing = args.iter().position(|arg| arg == "-readrate").unwrap();
+            assert!(pacing < input, "pacing must be an input option");
+        }
+        let copied_progressive_args = browser_ffmpeg_os_args(
+            Path::new("source.mkv"),
+            Path::new("output.mp4.part"),
+            &copy_plan,
+            BrowserOutputOptions { hls: false, ..mse },
+        );
+        assert!(!copied_progressive_args.iter().any(|arg| arg == "-readrate"));
 
         plan.video_encoder = "h264_nvenc".into();
         plan.browser_quality = Some(BrowserQuality::DataSaver);
@@ -6691,6 +6941,136 @@ action = "audio-ac3"
         assert!(error.contains("timed out"), "{error}");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn browser_flac_output_is_bit_exact_7_1_for_native_players() {
+        use std::process::{Command, Stdio};
+        let run = |args: &[std::ffi::OsString]| {
+            Command::new("ffmpeg")
+                .args(args)
+                .stdin(Stdio::null())
+                .output()
+        };
+        if run(&["-nostdin".into(), "-version".into()]).is_err() {
+            eprintln!("skip FLAC output (no ffmpeg)");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rdlna-flac-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.mkv");
+        let output = dir.join("output.mp4.part");
+        // Eight distinct tones: a swapped or mixed channel changes the hash.
+        let tones = (0..8)
+            .map(|channel| format!("0.5*sin(2*PI*{}*t)", 200 + channel * 100))
+            .collect::<Vec<_>>()
+            .join("|");
+        let made = run(&[
+            "-nostdin",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=4:size=160x90:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("aevalsrc=exprs={tones}:c=7.1:s=48000:d=4"),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "pcm_s24le",
+            source.to_str().unwrap(),
+        ]
+        .map(std::ffi::OsString::from))
+        .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+
+        let plan = TranscodePlan {
+            decision: Decision::Recode,
+            action: RecodeAction::Browser,
+            drop_dolby_vision: true,
+            video_encoder: "copy".into(),
+            audio: AudioAction::ToFlac,
+            container: "mp4",
+            browser_quality: Some(BrowserQuality::Auto),
+            ..TranscodePlan::default()
+        };
+        let options = BrowserOutputOptions {
+            encoding_preset: BrowserEncodingPreset::Balanced,
+            source_video: Some(VideoCodec::H264),
+            selected_audio: AudioCodec::Other,
+            source_hdr: HdrKind::Sdr,
+            start_seconds: 0,
+            hls: true,
+        };
+        let args = browser_ffmpeg_os_args(&source, &output, &plan, options);
+        assert!(
+            !args.windows(2).any(|pair| pair == ["-ac", "2"]),
+            "lossless output keeps every channel: {args:?}"
+        );
+        let converted = run(&args[1..]).unwrap();
+        assert!(
+            converted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&converted.stderr)
+        );
+
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "a:0", "-show_entries"])
+            .arg("stream=codec_name,codec_tag_string,channels,channel_layout,sample_rate,bits_per_raw_sample")
+            .args(["-of", "compact"])
+            .arg(&output)
+            .output()
+            .unwrap();
+        let probe = String::from_utf8_lossy(&probe.stdout).into_owned();
+        for field in [
+            "codec_name=flac",
+            "codec_tag_string=fLaC",
+            "sample_rate=48000",
+            "channels=8",
+            "channel_layout=7.1",
+            "bits_per_raw_sample=24",
+        ] {
+            assert!(probe.contains(field), "missing {field}: {probe}");
+        }
+        let pcm_hash = |path: &Path| {
+            let decoded = run(&[
+                "-nostdin".into(),
+                "-loglevel".into(),
+                "error".into(),
+                "-i".into(),
+                path.as_os_str().to_os_string(),
+                "-map".into(),
+                "0:a:0".into(),
+                "-c:a".into(),
+                "pcm_s24le".into(),
+                "-f".into(),
+                "md5".into(),
+                "-".into(),
+            ])
+            .unwrap();
+            assert!(
+                decoded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&decoded.stderr)
+            );
+            String::from_utf8(decoded.stdout).unwrap()
+        };
+        assert_eq!(
+            pcm_hash(&output),
+            pcm_hash(&source),
+            "FLAC must decode to the source's exact samples in the same channel order"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

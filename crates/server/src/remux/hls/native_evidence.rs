@@ -130,13 +130,24 @@ fn measure_native_variable_gop_history() {
                 selected_audio: AudioCodec::Other,
                 source_hdr: HdrKind::Sdr,
                 start_seconds: 0,
-                // Copy-only HLS already omits pacing in production. Exercise the
-                // native recipe without overriding any generated arguments.
                 hls: true,
             },
         );
         assert_eq!(args.remove(0), "ffmpeg");
-        assert!(!args.iter().any(|arg| arg == "-readrate"));
+        // Production paces copied HLS input (a two-minute lead, then 2x).
+        // This experiment measures metadata and formatting, not delivery
+        // timing, so drop only those input-rate options; every output
+        // argument stays exactly as production generates it.
+        let paced = args.len();
+        for option in ["-readrate", "-readrate_initial_burst", "-readrate_catchup"] {
+            if let Some(index) = args.iter().position(|arg| arg == option) {
+                args.drain(index..index + 2);
+            }
+        }
+        assert!(args.len() < paced, "copied HLS should carry input pacing");
+        assert!(!args
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("-readrate")));
         run(Command::new("ffmpeg").args(args), &mut log);
         let mut hashes = Vec::new();
         for path in [&source, &output] {

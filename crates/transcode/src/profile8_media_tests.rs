@@ -410,6 +410,84 @@ fn streaming_fragment_rewrite_preserves_genuine_video_packets_and_pixels() {
     );
 }
 
+/// Copies a genuine Profile 8.1 source with the browser argument builder and
+/// reports the output's codec tag and Dolby Vision profile, if any.
+fn browser_copy_dolby_vision(source: &Path, output: &Path, drop_dolby_vision: bool) -> String {
+    let plan = TranscodePlan {
+        decision: Decision::Recode,
+        action: RecodeAction::Browser,
+        drop_dolby_vision,
+        video_encoder: "copy".into(),
+        audio: AudioAction::ToAac,
+        container: "mp4",
+        browser_quality: Some(BrowserQuality::Auto),
+        ..TranscodePlan::default()
+    };
+    let options = BrowserOutputOptions {
+        encoding_preset: BrowserEncodingPreset::Balanced,
+        source_video: Some(VideoCodec::Hevc),
+        selected_audio: AudioCodec::Ac3,
+        source_hdr: HdrKind::DolbyVisionProfile8,
+        start_seconds: 0,
+        hls: false,
+    };
+    let args = browser_ffmpeg_os_args(source, output, &plan, options);
+    supervised(Path::new("ffmpeg"), &args[1..]).unwrap();
+    let mut probe = strings(&[
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_tag_string:stream_side_data=dv_profile,dv_bl_signal_compatibility_id",
+        "-of",
+        "compact",
+    ]);
+    probe.push(output.into());
+    String::from_utf8(supervised(Path::new("ffprobe"), &probe).unwrap()).unwrap()
+}
+
+#[test]
+fn browser_copy_writes_profile8_configuration_only_when_kept() {
+    let Some(_) = available() else { return };
+    let dir = scratch("browser-dv-config");
+    // The server's own Profile-8 converter supplies a genuine 8.1 source with
+    // a container configuration record, as a Profile 8 MKV or MP4 has.
+    let source = dir.0.join("profile8.mp4");
+    let plan = TranscodePlan {
+        decision: Decision::Recode,
+        action: RecodeAction::RemuxP8,
+        video_encoder: "copy".into(),
+        audio: AudioAction::ToAc3,
+        container: "mp4",
+        ..TranscodePlan::default()
+    };
+    run_remux_p8_file_controlled(
+        &fs::File::open(fixture()).unwrap(),
+        &fixture(),
+        &source,
+        &plan,
+        Instant::now() + Duration::from_secs(60),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+
+    let kept = browser_copy_dolby_vision(&source, &dir.0.join("kept.mp4"), false);
+    assert!(kept.contains("codec_tag_string=hvc1"), "{kept}");
+    assert!(
+        kept.contains("dv_profile=8"),
+        "native output keeps the record: {kept}"
+    );
+    assert!(kept.contains("dv_bl_signal_compatibility_id=1"), "{kept}");
+
+    let dropped = browser_copy_dolby_vision(&source, &dir.0.join("dropped.mp4"), true);
+    assert!(dropped.contains("codec_tag_string=hvc1"), "{dropped}");
+    assert!(
+        !dropped.contains("dv_profile"),
+        "browser output stays HEVC-only: {dropped}"
+    );
+}
+
 #[test]
 fn streaming_profile8_preserves_genuine_packet_timing_pixels_and_rpu() {
     let Some(dovi) = available() else { return };

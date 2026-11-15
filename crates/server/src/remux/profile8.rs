@@ -253,6 +253,7 @@ mod tests {
             cacheable: true,
             started: Instant::now(),
             hls_index: Mutex::new(hls::Index::default()),
+            forgotten_generations: Mutex::new(Vec::new()),
             effective_recipe: Mutex::new(None),
             stream_origin: std::sync::OnceLock::new(),
         }
